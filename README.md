@@ -1,60 +1,61 @@
 # recall
 
-Search past Claude Code and Codex sessions — instantly, from the terminal.
+Your past Claude Code and Codex sessions, searchable.
 
 ## The problem
 
-You had a great conversation with Claude about authentication middleware last week. Or was it two weeks ago? Which project was it?
+You solved an authentication problem with Claude last week. Now you need that approach again — but which project was it? Which session?
 
 **Without recall:**
 
 ```
-ls ~/.claude/projects/
-  # 47 directories, each named like "-Users-me-GitHub-project"
-
 find ~/.claude -name "*.jsonl" | wc -l
-  # 3,851 files
+  3,851
 
 grep -r "authentication" ~/.claude/projects/ | head
-  # wall of raw JSONL... 12,000+ lines across hundreds of files
+  {"type":"user","message":{"role":"user","content":[{"type":"text","text":"I need to
+  {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"H
+  {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Now let's a
+  ...12,000+ lines of raw JSONL
 ```
-
-Your AI coding history is scattered across thousands of JSONL files with no search.
 
 **With recall:**
 
 ```sh
-recall "authentication middleware"
-
-Found 3 sessions (index: 3,851 sessions, 52,288 messages):
+recall "authentication"
 
 [1] 2026-02-27 | stateful-sleeping-cosmos | kagami [claude]
     /Users/me/GitHub/kagami
     > Enable API keys Allow users and/or organizations to **authenticate**
       with your API programmatically...
 
-[2] 2026-02-08 | fluffy-rolling-lampson | main [claude]
+[2] 2026-02-08 | fluffy-rolling-lampson | kai [claude]
     /Users/me/GitHub/kai/main
     > **authenticator** / isAuthenticated path: ...NID OAuth2 + PKCE
       **authentication** with nonce...
+
+[3] 2026-02-08 | frolicking-juggling-storm | kizalas [claude]
+    /Users/me/GitHub/kizalas/dev
+    > ...全 57 エンドポイント を 15 グループに分類 — **Authentication** (4),
+      Administrator (5), Tenant (5)...
 ```
 
-One command. Full-text search across every session, ranked by relevance and recency. Your coding history becomes searchable knowledge.
+3,851 sessions, 52,000 messages — searched in under a second.
 
 ## When to use recall (and when not to)
 
 **Use recall when:**
 
-- You remember discussing something but not when or where — "that database migration approach"
-- You want to reuse a solution from a previous project — "how did I set up ESLint last time?"
-- You need to find a specific session to continue work — filter by project, time range, or source
+- "How did I set up ESLint in that project?" — you remember the topic, not the session
+- "Show me everything about database migrations from the last week" — time + topic filtering
+- "What did Claude suggest for error handling in myapp?" — project-scoped search
 
 **Use grep when:**
 
-- You know the exact file — `cat ~/.claude/projects/.../session.jsonl`
+- You know the exact file path
 - You need regex matching over raw JSONL
 
-recall doesn't replace grep. It covers the case grep can't: searching by concept across thousands of session files.
+recall doesn't replace grep. It covers the case grep can't: finding sessions by what you talked about.
 
 ## Setup
 
@@ -83,37 +84,15 @@ Add to your project's `CLAUDE.md`:
 
 ## Usage
 
-### Basic search
-
 ```sh
-recall "error handling"
+recall "error handling"                                    # basic search
+recall "database migration" --project /Users/me/GitHub/app # filter by project
+recall "React Router" --days 7                             # last 7 days only
+recall "async runtime" --source codex                      # Codex sessions only
+recall "auth AND middleware"                                # boolean operators
 ```
 
-Uses [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT` operators.
-
-### Filter by project
-
-```sh
-recall "database migration" --project /Users/me/GitHub/myapp
-```
-
-Prefix match — `/Users/me/GitHub` matches all projects under that path.
-
-### Filter by time
-
-```sh
-recall "React Router" --days 7
-```
-
-### Filter by source
-
-```sh
-recall "async runtime" --source codex
-```
-
-`claude` or `codex`.
-
-### Options
+Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
 
 | Flag        | Description                                 |
 | ----------- | ------------------------------------------- |
@@ -128,26 +107,15 @@ recall "async runtime" --source codex
 
 ```
 ~/.claude/projects/**/*.jsonl  ─┐
-                                ├─→ JSONL parser → SQLite FTS5 index → BM25 + recency search
+                                ├─→ Parse → SQLite FTS5 index → Search
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-**Indexing** — On first run, recall scans `~/.claude/projects/` and `~/.codex/sessions/` for JSONL session files, parses them, and builds a full-text index at `~/.recall.db`. Subsequent runs are incremental — only files with changed mtime are re-indexed.
+**Indexing** — First run scans `~/.claude/projects/` and `~/.codex/sessions/`, parses JSONL files, and builds a full-text index at `~/.recall.db`. Subsequent runs are incremental — only changed files are re-indexed.
 
-**Parsing** — Two JSONL formats are handled:
+**Parsing** — Claude Code and Codex JSONL formats are both handled. Tool-use blocks and system prompts are filtered out — only user/assistant text is indexed.
 
-- **Claude Code**: `type` / `message.content` / `cwd` / `timestamp` entries
-- **Codex**: `session_meta` / `response_item` entries + legacy format fallback
-
-Tool-use blocks, system prompts, and boilerplate are filtered out. Only human-readable user/assistant text is indexed.
-
-**Search** — Three-pass query:
-
-1. FTS5 MATCH with BM25 ranking, grouped by session
-2. Batch metadata lookup (project, source, timestamp)
-3. Per-session snippet extraction with keyword highlighting (`**bold**`)
-
-Results are re-ranked with an exponential recency boost (30-day half-life, 20% weight) — recent sessions surface higher when relevance scores are close.
+**Ranking** — BM25 relevance with a recency boost. Recent sessions rank higher when relevance scores are close.
 
 ## Architecture
 
