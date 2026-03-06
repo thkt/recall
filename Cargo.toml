@@ -2,6 +2,9 @@
 name = "recall"
 version = "0.1.0"
 edition = "2024"
+description = "Full-text search CLI for past Claude Code and Codex sessions"
+license = "MIT"
+repository = "https://github.com/thkt/recall"
 
 [dependencies]
 anyhow = "1"
