@@ -138,6 +138,10 @@ Single binary, zero runtime dependencies. SQLite is statically linked.
 - **Unix DB permissions** — The database file is created with `0600` permissions on Unix. Other platforms use default permissions.
 - **No export** — Search results show excerpts. To view full sessions, open the JSONL file directly.
 
+## Acknowledgements
+
+This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/recall). The original idea of making past Claude Code sessions searchable came from there. This is a Rust reimplementation — single binary, no runtime dependencies, fast startup.
+
 ## License
 
 MIT
