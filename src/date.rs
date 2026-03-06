@@ -57,7 +57,11 @@ mod tests {
     fn test_roundtrip() {
         for days in [0, 1, 365, 10000, 19783, 20000, -1, -719468] {
             let (y, m, d) = civil_from_days(days);
-            assert_eq!(days_from_civil(y, m, d), Some(days), "roundtrip failed for day {days}");
+            assert_eq!(
+                days_from_civil(y, m, d),
+                Some(days),
+                "roundtrip failed for day {days}"
+            );
         }
     }
 

@@ -82,13 +82,12 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
     );
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn.prepare(&fts_sql).context("Failed to prepare search query")?;
+    let mut stmt = conn
+        .prepare(&fts_sql)
+        .context("Failed to prepare search query")?;
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })
         .context("Search query failed")?;
 
@@ -107,7 +106,9 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
     if ranked.is_empty()
         && let Some(err_msg) = first_error
     {
-        anyhow::bail!("Invalid search query: {err_msg}. Use words, \"quoted phrases\", or AND/OR/NOT operators.");
+        anyhow::bail!(
+            "Invalid search query: {err_msg}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
+        );
     }
 
     if ranked.is_empty() {
@@ -124,7 +125,8 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
         .iter()
         .map(|(sid, _)| Box::new(sid.clone()) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    let meta_refs: Vec<&dyn rusqlite::types::ToSql> = meta_params.iter().map(|p| p.as_ref()).collect();
+    let meta_refs: Vec<&dyn rusqlite::types::ToSql> =
+        meta_params.iter().map(|p| p.as_ref()).collect();
 
     let mut meta_stmt = conn.prepare(&meta_sql)?;
     let mut meta_map: std::collections::HashMap<String, SessionData> = meta_stmt
@@ -153,14 +155,17 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
                     return None;
                 }
             };
-            Some((sid.clone(), SessionData {
-                session_id: sid,
-                source,
-                file_path: fp,
-                project: proj,
-                slug,
-                timestamp: ts,
-            }))
+            Some((
+                sid.clone(),
+                SessionData {
+                    session_id: sid,
+                    source,
+                    file_path: fp,
+                    project: proj,
+                    slug,
+                    timestamp: ts,
+                },
+            ))
         })
         .collect();
 
@@ -173,13 +178,17 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
         .filter_map(|(session_id, rank)| {
             let session = meta_map.remove(&session_id)?;
             let snippet: String = snippet_stmt
-                .query_row(
-                    rusqlite::params![query, &session_id],
-                    |row| row.get(0),
-                )
+                .query_row(rusqlite::params![query, &session_id], |row| row.get(0))
                 .unwrap_or_default();
             let ts = session.timestamp;
-            Some((rank, ts, SearchResult { session, excerpt: snippet }))
+            Some((
+                rank,
+                ts,
+                SearchResult {
+                    session,
+                    excerpt: snippet,
+                },
+            ))
         })
         .collect();
 

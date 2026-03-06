@@ -168,7 +168,14 @@ fn print_results(results: &[search::SearchResult], stats: &indexer::IndexStats) 
         let slug = strip_control_chars(&s.slug);
         let project = strip_control_chars(&s.project);
         let file_path = strip_control_chars(&s.file_path);
-        println!("[{}] {} | {} | {} [{}]", i + 1, date, slug, proj_name, s.source);
+        println!(
+            "[{}] {} | {} | {} [{}]",
+            i + 1,
+            date,
+            slug,
+            proj_name,
+            s.source
+        );
         if !project.is_empty() {
             println!("    {project}");
         }
@@ -247,7 +254,10 @@ mod tests {
 
     #[test]
     fn test_strip_control_chars_ansi() {
-        assert_eq!(strip_control_chars("hello \x1b[31mred\x1b[0m world"), "hello red world");
+        assert_eq!(
+            strip_control_chars("hello \x1b[31mred\x1b[0m world"),
+            "hello red world"
+        );
     }
 
     #[test]

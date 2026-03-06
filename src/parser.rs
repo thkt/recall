@@ -141,7 +141,8 @@ fn parse_iso_timestamp(val: &Value) -> Option<i64> {
             };
 
             let days = date::days_from_civil(year, month, day)?;
-            let epoch_ms = days * 86_400_000 + hour * 3_600_000 + min * 60_000 + sec * 1000 + millis;
+            let epoch_ms =
+                days * 86_400_000 + hour * 3_600_000 + min * 60_000 + sec * 1000 + millis;
             Some(epoch_ms)
         }
         Value::Number(n) => n.as_i64(),
@@ -157,8 +158,8 @@ fn update_earliest(earliest: &mut Option<i64>, ts: i64) {
 }
 
 pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let session_id = path
@@ -265,8 +266,8 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
 }
 
 pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
 
     let mut session_id = path

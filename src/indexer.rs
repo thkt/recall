@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::parser::{parse_claude_session, parse_codex_session, Source};
+use crate::parser::{Source, parse_claude_session, parse_codex_session};
 
 pub struct IndexStats {
     pub indexed: usize,
@@ -62,7 +62,8 @@ pub(crate) fn index_from_dirs(
         eprintln!("Found {} source files", sources.len());
     }
 
-    let tx = conn.unchecked_transaction()
+    let tx = conn
+        .unchecked_transaction()
         .context("Failed to begin transaction")?;
 
     // Disable FTS5 auto-merge during bulk insert for performance.
@@ -160,10 +161,8 @@ pub(crate) fn index_from_dirs(
         [],
     )?;
 
-    let total_sessions: i64 =
-        conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-    let total_messages: i64 =
-        conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+    let total_sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+    let total_messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
 
     Ok(IndexStats {
         indexed,
