@@ -2,6 +2,8 @@
 
 Your past Claude Code and Codex sessions, searchable.
 
+[日本語](./README.ja.md)
+
 ## The problem
 
 You solved an authentication problem with Claude last week. Now you need that approach again — but which project was it? Which session?
