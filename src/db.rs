@@ -1,6 +1,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
+const FTS_TOKENIZER: &str = "porter unicode61";
+
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
@@ -19,15 +21,39 @@ fn create_schema(conn: &Connection) -> Result<()> {
             slug TEXT,
             timestamp INTEGER,
             mtime REAL
-        );
+        );",
+    )?;
 
-        CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
+    migrate_fts_if_needed(conn)?;
+
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
             session_id UNINDEXED,
             role,
             text,
-            tokenize='porter unicode61'
-        );",
-    )?;
+            tokenize='{FTS_TOKENIZER}'
+        );"
+    ))?;
+    Ok(())
+}
+
+fn migrate_fts_if_needed(conn: &Connection) -> Result<()> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+
+    if !sql.contains(FTS_TOKENIZER) {
+        conn.execute_batch("DROP TABLE messages; DELETE FROM sessions;")?;
+    }
+
     Ok(())
 }
 

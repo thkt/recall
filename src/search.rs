@@ -21,10 +21,36 @@ pub struct SearchOptions {
     pub now_ms: Option<i64>,
 }
 
+fn extract_search_words(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .filter(|w| !matches!(w.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT"))
+        .map(|w| {
+            w.trim_matches(|c: char| c == '"' || c == '*' || c == '(' || c == ')')
+                .to_string()
+        })
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+fn has_cjk(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c,
+            '\u{2E80}'..='\u{9FFF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{FE30}'..='\u{FE4F}'
+            | '\u{FF00}'..='\u{FFEF}'
+            | '\u{20000}'..='\u{2FA1F}'
+        )
+    })
+}
+
 /// Full-text search over indexed session messages.
 ///
-/// Uses FTS5 MATCH syntax: bare words, "quoted phrases", AND/OR/NOT.
-/// Results are ranked by BM25 with an exponential recency boost.
+/// Uses FTS5 MATCH with porter stemming for non-CJK queries.
+/// Falls back to `instr()`-based substring matching for CJK queries
+/// (porter unicode61 cannot segment CJK text).
+/// Results are ranked by BM25 (FTS5) or recency-only (instr fallback).
 pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
     let now_ms = match opts.now_ms {
         Some(ms) => ms,
@@ -37,7 +63,20 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
         .context("timestamp overflow")?,
     };
 
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(query.to_string())];
+    let terms = extract_search_words(query);
+    let use_instr = terms.iter().any(|t| has_cjk(t));
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if use_instr {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        for term in &terms {
+            params.push(Box::new(term.clone()));
+        }
+    } else {
+        params.push(Box::new(query.to_string()));
+    }
     let mut conditions = Vec::new();
 
     if let Some(ref project) = opts.project {
@@ -70,20 +109,34 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
     let candidate_limit = opts.limit * 3;
     params.push(Box::new(candidate_limit as i64));
 
-    // Pass 1: FTS5 ranking query with GROUP BY.
-    // snippet() can't be used with GROUP BY, so we get it separately.
-    let fts_sql = format!(
-        "SELECT session_id, MIN(rank) as best_rank
-         FROM messages
-         WHERE messages MATCH ?{session_filter}
-         GROUP BY session_id
-         ORDER BY best_rank
-         LIMIT ?"
-    );
+    // Pass 1: FTS5 ranking (porter) or instr() substring fallback for CJK.
+    let pass1_sql = if use_instr {
+        let instr_conds: Vec<String> = terms
+            .iter()
+            .map(|_| "instr(text, ?) > 0".to_string())
+            .collect();
+        format!(
+            "SELECT session_id, 0.0 as best_rank
+             FROM messages
+             WHERE {}{session_filter}
+             GROUP BY session_id
+             LIMIT ?",
+            instr_conds.join(" AND ")
+        )
+    } else {
+        format!(
+            "SELECT session_id, MIN(rank) as best_rank
+             FROM messages
+             WHERE messages MATCH ?{session_filter}
+             GROUP BY session_id
+             ORDER BY best_rank
+             LIMIT ?"
+        )
+    };
 
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let mut stmt = conn
-        .prepare(&fts_sql)
+        .prepare(&pass1_sql)
         .context("Failed to prepare search query")?;
     let rows = stmt
         .query_map(param_refs.as_slice(), |row| {
@@ -169,16 +222,22 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
         })
         .collect();
 
-    // Pass 3: Per-result snippet (FTS5 snippet() requires direct MATCH context).
-    let mut snippet_stmt = conn.prepare(
-        "SELECT snippet(messages, 2, '**', '**', '...', 20) FROM messages WHERE messages MATCH ? AND session_id = ? LIMIT 1"
-    )?;
+    // Pass 3: Per-result snippet.
+    let snippet_term: &str = if use_instr { &terms[0] } else { query };
+    let snippet_sql = if use_instr {
+        "SELECT substr(text, max(1, instr(text, ?1) - 60), 200) FROM messages WHERE instr(text, ?1) > 0 AND session_id = ?2 LIMIT 1"
+    } else {
+        "SELECT snippet(messages, 2, '**', '**', '...', 20) FROM messages WHERE messages MATCH ?1 AND session_id = ?2 LIMIT 1"
+    };
+    let mut snippet_stmt = conn.prepare(snippet_sql)?;
     let candidates: Vec<_> = ranked
         .into_iter()
         .filter_map(|(session_id, rank)| {
             let session = meta_map.remove(&session_id)?;
             let snippet: String = snippet_stmt
-                .query_row(rusqlite::params![query, &session_id], |row| row.get(0))
+                .query_row(rusqlite::params![snippet_term, &session_id], |row| {
+                    row.get(0)
+                })
                 .unwrap_or_default();
             let ts = session.timestamp;
             Some((
@@ -425,6 +484,126 @@ mod tests {
 
         // With escaping, "%" is literal — no project starts with "%"
         assert!(results.is_empty());
+    }
+
+    // Short query fallback (instr)
+
+    #[test]
+    fn test_short_query_japanese_2char() {
+        let (_dir, conn) = setup_search_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "型安全についての議論");
+
+        let results = search(
+            &conn,
+            "型安",
+            &SearchOptions {
+                project: None,
+                days: None,
+                source: None,
+                limit: 10,
+                now_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session.session_id, "s1");
+        assert!(!results[0].excerpt.is_empty());
+    }
+
+    #[test]
+    fn test_short_query_single_char() {
+        let (_dir, conn) = setup_search_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "Rust言語の型システム");
+
+        let results = search(
+            &conn,
+            "型",
+            &SearchOptions {
+                project: None,
+                days: None,
+                source: None,
+                limit: 10,
+                now_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_short_query_no_match() {
+        let (_dir, conn) = setup_search_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "hello world");
+
+        let results = search(
+            &conn,
+            "没有",
+            &SearchOptions {
+                project: None,
+                days: None,
+                source: None,
+                limit: 10,
+                now_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_cjk_ascii_query() {
+        let (_dir, conn) = setup_search_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "Rustの型安全について");
+        insert_session(&conn, "s2", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s2", "user", "Pythonのパフォーマンス");
+
+        let results = search(
+            &conn,
+            "Rust 型安全",
+            &SearchOptions {
+                project: None,
+                days: None,
+                source: None,
+                limit: 10,
+                now_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session.session_id, "s1");
+    }
+
+    #[test]
+    fn test_short_query_with_project_filter() {
+        let (_dir, conn) = setup_search_db();
+        insert_session(&conn, "s1", "claude", "/home/me/proj-a", 1709251200000);
+        insert_message(&conn, "s1", "user", "型安全の設計");
+        insert_session(&conn, "s2", "claude", "/home/me/proj-b", 1709251200000);
+        insert_message(&conn, "s2", "user", "型安全の設計");
+
+        let results = search(
+            &conn,
+            "型安",
+            &SearchOptions {
+                project: Some("/home/me/proj-a".to_string()),
+                days: None,
+                source: None,
+                limit: 10,
+                now_ms: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session.project, "/home/me/proj-a");
     }
 
     #[test]
