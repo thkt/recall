@@ -1,12 +1,12 @@
 # recall
 
-過去の Claude Code / Codex セッションを全文検索できる CLI ツールです。
+過去のClaude Code / Codexセッションを全文検索できるCLIツールです。
 
 [English](./README.md)
 
 ## 概要
 
-Claude Code や Codex のセッションは `~/.claude/projects/` や `~/.codex/sessions/` に JSONL として保存されますが、数が増えると grep で探すのは現実的ではありません。
+Claude CodeやCodexのセッションは `~/.claude/projects/` や `~/.codex/sessions/` にJSONLとして保存される。数が増えるとgrepでは探しきれない。
 
 ```sh
 find ~/.claude -name "*.jsonl" | wc -l
@@ -19,7 +19,7 @@ grep -r "authentication" ~/.claude/projects/ | head
   ...12,000+ lines of raw JSONL
 ```
 
-recall は JSONL を SQLite FTS5 でインデックス化し、話した内容からセッションを探せるようにします。
+recallはJSONLをSQLite FTS5でインデックス化し、話した内容からセッションを探せるようにします。
 
 ```sh
 recall "authentication"
@@ -40,22 +40,22 @@ recall "authentication"
       Administrator (5), Tenant (5)...
 ```
 
-3,851 セッション、52,000 メッセージでも 1 秒以内で検索できます。
+3,851セッション、52,000メッセージでも1秒以内で検索できます。
 
 ## 使い分け
 
-recall が向いているケース:
+recallは以下のケースに向いています。
 
 - トピックは覚えているがセッションがわからない
 - 期間とトピックで絞り込みたい
 - 特定プロジェクトでの会話を探したい
 
-grep が向いているケース:
+grepは以下のケースに向いています。
 
 - 正確なファイルパスがわかっている
-- 生の JSONL に対して正規表現マッチしたい
+- 生のJSONLに対して正規表現マッチしたい
 
-recall は grep の代替ではなく、grep ではカバーできない「話した内容でセッションを探す」用途で使います。
+recallはgrepの代替ではなく、grepではカバーできない「話した内容でセッションを探す」用途で使います。
 
 ## インストール
 
@@ -65,13 +65,13 @@ Homebrew (macOS):
 brew install thkt/tap/recall
 ```
 
-ソースからビルドする場合は Rust 1.85+ が必要です。
+ソースからビルドする場合はRust 1.85+ が必要です。
 
 ```sh
 cargo install --path .
 ```
 
-API キーや設定ファイルは不要です。2.4 MB のシングルバイナリで動作します。
+APIキーや設定ファイルは不要です。2.4 MBのシングルバイナリで動作します。
 
 ## Claude Code 連携
 
@@ -115,11 +115,11 @@ recall "auth AND middleware"                                # ブール演算子
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-初回実行時に `~/.claude/projects/` と `~/.codex/sessions/` をスキャンし、JSONL を解析して `~/.recall.db` に全文検索インデックスを構築します。以降は変更されたファイルのみ再インデックスします。
+初回実行時に `~/.claude/projects/` と `~/.codex/sessions/` をスキャンし、JSONLを解析して `~/.recall.db` に全文検索インデックスを構築します。以降は変更されたファイルのみ再インデックスします。
 
-Claude Code と Codex の両方の JSONL フォーマットに対応しています。tool_use ブロックやシステムプロンプトは除外し、ユーザーとアシスタントのテキストだけをインデックスします。
+Claude CodeとCodexの両方のJSONLフォーマットに対応しています。tool_useブロックやシステムプロンプトは除外し、ユーザーとアシスタントのテキストだけをインデックスします。
 
-検索結果は BM25 関連度スコアに recency boost を加算してランキングします。スコアが近い場合は新しいセッションが上位に表示されます。
+検索結果はBM25関連度スコアにrecency boostを加算してランキングします。スコアが近い場合は新しいセッションが上位に表示されます。
 
 ## アーキテクチャ
 
@@ -133,18 +133,18 @@ src/
 └── date.rs       日付ユーティリティ（Howard Hinnant アルゴリズム）
 ```
 
-シングルバイナリで、ランタイム依存はありません。SQLite は静的リンクしています。
+シングルバイナリで、ランタイム依存はありません。SQLiteは静的リンクしています。
 
 ## 制限事項
 
-- `~/.claude/projects/` と `~/.codex/sessions/` のローカルセッションのみ検索します。クラウド同期には対応していません。
-- 画像、ツール結果、バイナリコンテンツはインデックスしません。
-- Unix ではデータベースファイルを `0600` パーミッションで作成します。他のプラットフォームではデフォルトのパーミッションです。
-- 検索結果は抜粋表示です。完全なセッションを見るには JSONL ファイルを直接開いてください。
+- `~/.claude/projects/` と `~/.codex/sessions/` のローカルセッションのみ検索する。クラウド同期には対応していない。
+- 画像、ツール結果、バイナリコンテンツはインデックスしない。
+- Unixではデータベースファイルを `0600` パーミッションで作成する。他のプラットフォームではデフォルトのパーミッションである。
+- 検索結果は抜粋表示である。完全なセッションを見るにはJSONLファイルを直接開く。
 
 ## 謝辞
 
-[arjunkmrm/recall](https://github.com/arjunkmrm/recall) のアイデアをもとに Rust で書き直しました。シングルバイナリ、依存なし、高速起動、CJK（日本語・中国語・韓国語）検索に対応しています。
+[arjunkmrm/recall](https://github.com/arjunkmrm/recall) のアイデアをもとにRustで書き直しました。シングルバイナリ、依存なし、高速起動、CJK（日本語・中国語・韓国語）検索に対応しています。
 
 ## ライセンス
 
