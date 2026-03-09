@@ -8,7 +8,7 @@
 
 Claude Code や Codex のセッションは `~/.claude/projects/` や `~/.codex/sessions/` に JSONL として保存されますが、数が増えると grep で探すのは現実的ではありません。
 
-```
+```sh
 find ~/.claude -name "*.jsonl" | wc -l
   3,851
 
@@ -109,7 +109,7 @@ recall "auth AND middleware"                                # ブール演算子
 
 ## 仕組み
 
-```
+```text
 ~/.claude/projects/**/*.jsonl  ─┐
                                 ├─→ Parse → SQLite FTS5 index → Search
 ~/.codex/sessions/**/*.jsonl   ─┘
@@ -123,7 +123,7 @@ Claude Code と Codex の両方の JSONL フォーマットに対応していま
 
 ## アーキテクチャ
 
-```
+```text
 src/
 ├── main.rs       CLI エントリポイント、表示フォーマット
 ├── parser.rs     Claude Code / Codex の JSONL パーサー

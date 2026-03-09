@@ -10,7 +10,7 @@ You solved an authentication problem with Claude last week. Now you need that ap
 
 **Without recall:**
 
-```
+```sh
 find ~/.claude -name "*.jsonl" | wc -l
   3,851
 
@@ -113,7 +113,7 @@ Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_sy
 
 ## How it works
 
-```
+```text
 ~/.claude/projects/**/*.jsonl  ─┐
                                 ├─→ Parse → SQLite FTS5 index → Search
 ~/.codex/sessions/**/*.jsonl   ─┘
@@ -127,7 +127,7 @@ Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_sy
 
 ## Architecture
 
-```
+```text
 src/
 ├── main.rs       CLI entry point, display formatting
 ├── parser.rs     JSONL parsers for Claude Code and Codex formats
