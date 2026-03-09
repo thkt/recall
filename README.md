@@ -63,7 +63,13 @@ recall doesn't replace grep. It covers the case grep can't: finding sessions by 
 
 ### Install
 
-Build from source (requires Rust 1.85+):
+**Homebrew (macOS):**
+
+```sh
+brew install thkt/tap/recall
+```
+
+**Build from source** (requires Rust 1.85+):
 
 ```sh
 cargo install --path .
@@ -142,7 +148,7 @@ Single binary, zero runtime dependencies. SQLite is statically linked.
 
 ## Acknowledgements
 
-This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/recall). The original idea of making past Claude Code sessions searchable came from there. This is a Rust reimplementation — single binary, no runtime dependencies, fast startup.
+This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/recall). The original idea of making past Claude Code sessions searchable came from there. This is a Rust reimplementation — single binary, no runtime dependencies, fast startup, and CJK (Japanese, Chinese, Korean) search support.
 
 ## License
 
