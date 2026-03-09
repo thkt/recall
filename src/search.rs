@@ -21,6 +21,18 @@ pub struct SearchOptions {
     pub now_ms: Option<i64>,
 }
 
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self {
+            project: None,
+            days: None,
+            source: None,
+            limit: 10,
+            now_ms: None,
+        }
+    }
+}
+
 fn extract_search_words(query: &str) -> Vec<String> {
     query
         .split_whitespace()
@@ -68,9 +80,6 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
 
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
     if use_instr {
-        if terms.is_empty() {
-            return Ok(Vec::new());
-        }
         for term in &terms {
             params.push(Box::new(term.clone()));
         }
@@ -309,18 +318,7 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "how to implement authentication");
 
-        let results = search(
-            &conn,
-            "authentication",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        )
-        .unwrap();
+        let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
@@ -333,18 +331,7 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "hello world");
 
-        let results = search(
-            &conn,
-            "nonexistent_term_xyz",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        )
-        .unwrap();
+        let results = search(&conn, "nonexistent_term_xyz", &SearchOptions::default()).unwrap();
 
         assert!(results.is_empty());
     }
@@ -367,11 +354,8 @@ mod tests {
             &conn,
             "testing search",
             &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
                 now_ms: Some(now_ms),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -393,10 +377,7 @@ mod tests {
             "error handling",
             &SearchOptions {
                 project: Some("/home/me/proj-a".to_string()),
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -417,11 +398,8 @@ mod tests {
             &conn,
             "debugging",
             &SearchOptions {
-                project: None,
-                days: None,
                 source: Some(Source::Codex),
-                limit: 10,
-                now_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -445,11 +423,9 @@ mod tests {
             &conn,
             "rust compiler",
             &SearchOptions {
-                project: None,
                 days: Some(7),
-                source: None,
-                limit: 10,
                 now_ms: Some(now_ms),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -474,10 +450,7 @@ mod tests {
             "wildcard",
             &SearchOptions {
                 project: Some("%".to_string()),
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -486,26 +459,15 @@ mod tests {
         assert!(results.is_empty());
     }
 
-    // Short query fallback (instr)
+    // CJK fallback (instr)
 
     #[test]
-    fn test_short_query_japanese_2char() {
+    fn test_cjk_japanese_2char() {
         let (_dir, conn) = setup_search_db();
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "型安全についての議論");
 
-        let results = search(
-            &conn,
-            "型安",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        )
-        .unwrap();
+        let results = search(&conn, "型安", &SearchOptions::default()).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
@@ -513,45 +475,23 @@ mod tests {
     }
 
     #[test]
-    fn test_short_query_single_char() {
+    fn test_cjk_single_char() {
         let (_dir, conn) = setup_search_db();
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "Rust言語の型システム");
 
-        let results = search(
-            &conn,
-            "型",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        )
-        .unwrap();
+        let results = search(&conn, "型", &SearchOptions::default()).unwrap();
 
         assert_eq!(results.len(), 1);
     }
 
     #[test]
-    fn test_short_query_no_match() {
+    fn test_cjk_no_match() {
         let (_dir, conn) = setup_search_db();
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "hello world");
 
-        let results = search(
-            &conn,
-            "没有",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        )
-        .unwrap();
+        let results = search(&conn, "没有", &SearchOptions::default()).unwrap();
 
         assert!(results.is_empty());
     }
@@ -564,25 +504,14 @@ mod tests {
         insert_session(&conn, "s2", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s2", "user", "Pythonのパフォーマンス");
 
-        let results = search(
-            &conn,
-            "Rust 型安全",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        )
-        .unwrap();
+        let results = search(&conn, "Rust 型安全", &SearchOptions::default()).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
     }
 
     #[test]
-    fn test_short_query_with_project_filter() {
+    fn test_cjk_with_project_filter() {
         let (_dir, conn) = setup_search_db();
         insert_session(&conn, "s1", "claude", "/home/me/proj-a", 1709251200000);
         insert_message(&conn, "s1", "user", "型安全の設計");
@@ -594,10 +523,7 @@ mod tests {
             "型安",
             &SearchOptions {
                 project: Some("/home/me/proj-a".to_string()),
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -612,17 +538,7 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "hello world");
 
-        let result = search(
-            &conn,
-            "\"unbalanced quote",
-            &SearchOptions {
-                project: None,
-                days: None,
-                source: None,
-                limit: 10,
-                now_ms: None,
-            },
-        );
+        let result = search(&conn, "\"unbalanced quote", &SearchOptions::default());
 
         let err_msg = match result {
             Err(e) => e.to_string(),

@@ -141,10 +141,12 @@ Single binary, zero runtime dependencies. SQLite is statically linked.
 
 ## Limitations
 
-- **Local sessions only** — Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync.
-- **Text only** — Images, tool results, and binary content are not indexed.
-- **Unix DB permissions** — The database file is created with `0600` permissions on Unix. Other platforms use default permissions.
-- **No export** — Search results show excerpts. To view full sessions, open the JSONL file directly.
+| Limitation          | Details                                                                                                      |
+| ------------------- | ------------------------------------------------------------------------------------------------------------ |
+| Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync                                      |
+| Text only           | Images, tool results, and binary content are not indexed                                                     |
+| Unix DB permissions | The database file is created with `0600` permissions on Unix. Other platforms use default permissions         |
+| No export           | Search results show excerpts. To view full sessions, open the JSONL file directly                            |
 
 ## Acknowledgements
 

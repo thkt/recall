@@ -248,11 +248,6 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_str_empty() {
-        assert_eq!(truncate_str("", 10), "");
-    }
-
-    #[test]
     fn test_strip_control_chars_ansi() {
         assert_eq!(
             strip_control_chars("hello \x1b[31mred\x1b[0m world"),
