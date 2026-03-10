@@ -1,8 +1,8 @@
+**English** | [日本語](README.ja.md)
+
 # recall
 
 Your past Claude Code and Codex sessions, searchable.
-
-[日本語](./README.ja.md)
 
 ## The problem
 

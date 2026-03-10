@@ -1,8 +1,8 @@
+[English](README.md) | **日本語**
+
 # recall
 
 過去のClaude Code / Codexセッションを全文検索できるCLIツールです。
-
-[English](./README.md)
 
 ## 概要
 
