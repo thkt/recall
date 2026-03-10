@@ -45,43 +45,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_strip_control_chars_ansi() {
-        assert_eq!(
-            strip_control_chars("hello \x1b[31mred\x1b[0m world"),
-            "hello red world"
-        );
-    }
-
-    #[test]
-    fn test_strip_control_chars_clean() {
-        assert_eq!(strip_control_chars("normal text"), "normal text");
-    }
-
-    #[test]
-    fn test_strip_control_chars_preserves_newlines() {
-        assert_eq!(strip_control_chars("line1\nline2"), "line1\nline2");
-    }
-
-    #[test]
-    fn test_strip_control_chars_osc() {
-        assert_eq!(
-            strip_control_chars("before\x1b]0;title\x07after"),
-            "beforeafter"
-        );
-        assert_eq!(
-            strip_control_chars("before\x1b]0;title\x1b\\after"),
-            "beforeafter"
-        );
-    }
-
-    #[test]
-    fn test_strip_control_chars_osc_unterminated() {
-        assert_eq!(strip_control_chars("before\x1b]0;title"), "before");
-    }
-
-    #[test]
-    fn test_strip_control_chars_csi_unterminated() {
-        // CSI sequence with no terminating alphabetic char — consumes rest of string
-        assert_eq!(strip_control_chars("before\x1b[31"), "before");
+    fn test_strip_control_chars() {
+        for (input, expected) in [
+            ("normal text", "normal text"),
+            ("line1\nline2", "line1\nline2"),
+            ("hello \x1b[31mred\x1b[0m world", "hello red world"),
+            ("before\x1b]0;title\x07after", "beforeafter"),
+            ("before\x1b]0;title\x1b\\after", "beforeafter"),
+            ("before\x1b]0;title", "before"),   // unterminated OSC
+            ("before\x1b[31", "before"),         // unterminated CSI
+        ] {
+            assert_eq!(strip_control_chars(input), expected, "input: {input:?}");
+        }
     }
 }
