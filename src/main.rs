@@ -233,48 +233,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_format_timestamp_none() {
-        assert_eq!(format_timestamp(None), "unknown");
+    fn test_format_timestamp() {
+        for (input, expected) in [
+            (None, "unknown"),
+            (Some(0), "1970-01-01"),
+            (Some(1709251200000), "2024-03-01"),
+            (Some(-date::MS_PER_DAY), "1969-12-31"),
+        ] {
+            assert_eq!(format_timestamp(input), expected, "input: {input:?}");
+        }
     }
 
     #[test]
-    fn test_format_timestamp_epoch() {
-        assert_eq!(format_timestamp(Some(0)), "1970-01-01");
-    }
-
-    #[test]
-    fn test_format_timestamp_known_date() {
-        // 2024-03-01 00:00:00 UTC = 1709251200000 ms
-        assert_eq!(format_timestamp(Some(1709251200000)), "2024-03-01");
-    }
-
-    #[test]
-    fn test_truncate_str_short() {
-        assert_eq!(truncate_str("hello", 10), "hello");
-    }
-
-    #[test]
-    fn test_truncate_str_exact() {
-        assert_eq!(truncate_str("hello", 5), "hello");
-    }
-
-    #[test]
-    fn test_truncate_str_ascii() {
-        assert_eq!(truncate_str("hello world", 5), "hello");
-    }
-
-    #[test]
-    fn test_truncate_str_multibyte() {
-        let s = "こんにちは"; // 15 bytes (3 per char)
-        let result = truncate_str(s, 10);
-        assert_eq!(result, "こんに"); // 9 bytes fits in 10
+    fn test_truncate_str() {
+        for (input, max, expected) in [
+            ("hello", 10, "hello"),
+            ("hello", 5, "hello"),
+            ("hello world", 5, "hello"),
+        ] {
+            assert_eq!(truncate_str(input, max), expected, "input: {input:?}, max: {max}");
+        }
+        // Multibyte: 3 bytes per char, 10 bytes fits 3 chars (9 bytes)
+        let result = truncate_str("こんにちは", 10);
+        assert_eq!(result, "こんに");
         assert!(result.len() <= 10);
-    }
-
-    #[test]
-    fn test_format_timestamp_negative() {
-        // 1969-12-31 (one day before epoch)
-        assert_eq!(format_timestamp(Some(-date::MS_PER_DAY)), "1969-12-31");
     }
 
     fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {

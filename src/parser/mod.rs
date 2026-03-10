@@ -273,97 +273,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_iso_timestamp_with_millis() {
-        let val = Value::String("2026-03-01T12:30:45.123Z".to_string());
-        let ts = parse_iso_timestamp(&val).unwrap();
-        let expected_days = date::days_from_civil(2026, 3, 1).unwrap();
-        let expected = expected_days * date::MS_PER_DAY + 12 * 3_600_000 + 30 * 60_000 + 45 * 1000 + 123;
-        assert_eq!(ts, expected);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_numeric() {
+    fn test_parse_iso_timestamp_basics() {
+        // Numeric passthrough
         let val = Value::Number(serde_json::Number::from(1709251200000_i64));
         assert_eq!(parse_iso_timestamp(&val), Some(1709251200000));
-    }
 
-    #[test]
-    fn test_parse_iso_timestamp_too_short() {
-        let val = Value::String("2026".to_string());
-        assert_eq!(parse_iso_timestamp(&val), None);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_null() {
+        // Rejection cases
         assert_eq!(parse_iso_timestamp(&Value::Null), None);
+        assert_eq!(parse_iso_timestamp(&Value::String("2026".into())), None);
+        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Ü".into())), None);
+        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T24:00:00Z".into())), None);
+        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T12:60:00Z".into())), None);
+        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T12:00:60Z".into())), None);
+
+        // No millis
+        let ts = parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Z".into())).unwrap();
+        let day_ms = date::days_from_civil(2026, 3, 1).unwrap() * date::MS_PER_DAY;
+        assert_eq!(ts, day_ms);
     }
 
     #[test]
-    fn test_parse_iso_timestamp_no_millis() {
-        let val = Value::String("2026-03-01T00:00:00Z".to_string());
-        let ts = parse_iso_timestamp(&val).unwrap();
-        let expected_days = date::days_from_civil(2026, 3, 1).unwrap();
-        assert_eq!(ts, expected_days * date::MS_PER_DAY);
+    fn test_parse_iso_timestamp_fractional_millis() {
+        let day_ms = date::days_from_civil(2026, 3, 1).unwrap() * date::MS_PER_DAY;
+        let base = day_ms + 12 * 3_600_000 + 30 * 60_000 + 45 * 1000;
+        for (frac, expected_ms) in [(".123", 123), (".5", 500), (".12", 120)] {
+            let s = format!("2026-03-01T12:30:45{frac}Z");
+            let ts = parse_iso_timestamp(&Value::String(s.clone())).unwrap();
+            assert_eq!(ts, base + expected_ms, "input: {s}");
+        }
     }
 
     #[test]
-    fn test_parse_iso_timestamp_non_ascii_rejected() {
-        let val = Value::String("2026-03-01T00:00:00Ü".to_string());
-        assert_eq!(parse_iso_timestamp(&val), None);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_invalid_time_rejected() {
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T24:00:00Z".to_string())), None);
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T12:60:00Z".to_string())), None);
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T12:00:60Z".to_string())), None);
-    }
-
-    #[test]
-    fn test_parse_fractional_millis_1digit() {
-        let val = Value::String("2026-03-01T12:30:45.5Z".to_string());
-        let ts = parse_iso_timestamp(&val).unwrap();
-        let expected_days = date::days_from_civil(2026, 3, 1).unwrap();
-        let expected = expected_days * date::MS_PER_DAY + 12 * 3_600_000 + 30 * 60_000 + 45 * 1000 + 500;
-        assert_eq!(ts, expected);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_applies_positive_offset() {
-        // +09:00 means local time is 9h ahead of UTC → subtract 9h
-        let utc = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00Z".to_string())).unwrap();
-        let with_offset = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00+09:00".to_string())).unwrap();
-        assert_eq!(utc - with_offset, 9 * 3_600_000);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_applies_negative_offset() {
-        // -05:00 means local time is 5h behind UTC → add 5h
-        let utc = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00Z".to_string())).unwrap();
-        let with_offset = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00-05:00".to_string())).unwrap();
-        assert_eq!(with_offset - utc, 5 * 3_600_000);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_offset_without_colon() {
-        let utc = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00Z".to_string())).unwrap();
-        let with_offset = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00+0900".to_string())).unwrap();
-        assert_eq!(utc - with_offset, 9 * 3_600_000);
-    }
-
-    #[test]
-    fn test_parse_iso_timestamp_offset_with_millis() {
-        let utc = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500Z".to_string())).unwrap();
-        let with_offset = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500+09:00".to_string())).unwrap();
-        assert_eq!(utc - with_offset, 9 * 3_600_000);
-    }
-
-    #[test]
-    fn test_parse_fractional_millis_2digit() {
-        let val = Value::String("2026-03-01T12:30:45.12Z".to_string());
-        let ts = parse_iso_timestamp(&val).unwrap();
-        let expected_days = date::days_from_civil(2026, 3, 1).unwrap();
-        let expected = expected_days * date::MS_PER_DAY + 12 * 3_600_000 + 30 * 60_000 + 45 * 1000 + 120;
-        assert_eq!(ts, expected);
+    fn test_parse_iso_timestamp_offsets() {
+        let utc = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00Z".into())).unwrap();
+        // (offset_str, expected_diff_ms): positive = UTC is ahead, negative = UTC is behind
+        for (offset_str, diff_ms) in [
+            ("+09:00", 9 * 3_600_000_i64),
+            ("+0900", 9 * 3_600_000),
+            ("-05:00", -5 * 3_600_000),
+        ] {
+            let s = format!("2026-03-01T12:00:00{offset_str}");
+            let with_offset = parse_iso_timestamp(&Value::String(s.clone())).unwrap();
+            assert_eq!(utc - with_offset, diff_ms, "input: {s}");
+        }
+        // Offset with millis
+        let utc_ms = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500Z".into())).unwrap();
+        let off_ms = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500+09:00".into())).unwrap();
+        assert_eq!(utc_ms - off_ms, 9 * 3_600_000);
     }
 }

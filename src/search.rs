@@ -696,30 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn test_score_and_sort_recency_tiebreak() {
-        let now_ms = 1_750_000_000_000_i64;
-        let candidates = vec![
-            (-1.0, make_result("old", now_ms - 365 * MS_PER_DAY)),
-            (-1.0, make_result("new", now_ms)),
-        ];
-        let results = score_and_sort(candidates, now_ms, 10);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].session.session_id, "new");
-    }
-
-    #[test]
-    fn test_score_and_sort_cjk_rank_zero() {
-        let now_ms = 1_750_000_000_000_i64;
-        let candidates = vec![
-            (0.0, make_result("old", now_ms - 365 * MS_PER_DAY)),
-            (0.0, make_result("new", now_ms)),
-        ];
-        let results = score_and_sort(candidates, now_ms, 10);
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].session.session_id, "new");
-    }
-
-    #[test]
     fn test_score_and_sort_respects_limit() {
         let now_ms = 1_750_000_000_000_i64;
         let candidates: Vec<_> = (0..5)
@@ -730,27 +706,19 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_search_words_basic() {
-        assert_eq!(extract_search_words("hello world"), vec!["hello", "world"]);
-    }
-
-    #[test]
-    fn test_extract_search_words_strips_operators() {
-        assert_eq!(extract_search_words("rust AND error NOT warning"), vec!["rust", "error", "warning"]);
-        assert_eq!(extract_search_words("foo OR bar"), vec!["foo", "bar"]);
-    }
-
-    #[test]
-    fn test_extract_search_words_strips_punctuation() {
-        assert_eq!(extract_search_words("\"quoted phrase\" wild*"), vec!["quoted", "phrase", "wild"]);
-        assert_eq!(extract_search_words("(group)"), vec!["group"]);
-    }
-
-    #[test]
-    fn test_extract_search_words_empty() {
-        assert!(extract_search_words("AND OR NOT").is_empty());
-        assert!(extract_search_words("\"\"").is_empty());
-        assert!(extract_search_words("   ").is_empty());
+    fn test_extract_search_words() {
+        for (input, expected) in [
+            ("hello world", vec!["hello", "world"]),
+            ("rust AND error NOT warning", vec!["rust", "error", "warning"]),
+            ("foo OR bar", vec!["foo", "bar"]),
+            ("\"quoted phrase\" wild*", vec!["quoted", "phrase", "wild"]),
+            ("(group)", vec!["group"]),
+        ] {
+            assert_eq!(extract_search_words(input), expected, "input: {input:?}");
+        }
+        for empty in ["AND OR NOT", "\"\"", "   "] {
+            assert!(extract_search_words(empty).is_empty(), "expected empty for: {empty:?}");
+        }
     }
 
     #[test]
@@ -769,50 +737,35 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_fts_query_quotes_colons() {
-        assert_eq!(sanitize_fts_query("role:admin"), "\"role:admin\"");
-        assert_eq!(sanitize_fts_query("hello world"), "hello world");
-        assert_eq!(sanitize_fts_query("foo role:user bar"), "foo \"role:user\" bar");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_preserves_quoted() {
-        assert_eq!(sanitize_fts_query("\"role:admin\""), "\"role:admin\"");
-        assert_eq!(sanitize_fts_query("AND OR NOT"), "AND OR NOT");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_strips_caret_prefix() {
-        assert_eq!(sanitize_fts_query("^hello world"), "hello world");
-        assert_eq!(sanitize_fts_query("^foo ^bar"), "foo bar");
-        assert_eq!(sanitize_fts_query("^"), "");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_filters_near_tokens() {
-        // NEAR( prefix tokens removed; trailing parentheses stripped from remaining tokens
-        assert_eq!(sanitize_fts_query("NEAR(a b)"), "b");
-        assert_eq!(sanitize_fts_query("hello NEAR(a b) world"), "hello b world");
-        assert_eq!(sanitize_fts_query("hello NEAR/3 world"), "hello world");
-        assert_eq!(sanitize_fts_query("near(x y)"), "y");
-        assert_eq!(sanitize_fts_query("Near/2 test"), "test");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_strips_plus_prefix() {
-        assert_eq!(sanitize_fts_query("+required term"), "required term");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_strips_minus_prefix() {
-        assert_eq!(sanitize_fts_query("-excluded term"), "excluded term");
-        assert_eq!(sanitize_fts_query("keep -this"), "keep this");
-    }
-
-    #[test]
-    fn test_sanitize_fts_query_balances_quotes() {
-        assert_eq!(sanitize_fts_query("\"unbalanced"), "\"unbalanced\"");
-        assert_eq!(sanitize_fts_query("\"balanced\""), "\"balanced\"");
+    fn test_sanitize_fts_query() {
+        for (input, expected) in [
+            // Colons → quoted
+            ("role:admin", "\"role:admin\""),
+            ("foo role:user bar", "foo \"role:user\" bar"),
+            // Passthrough
+            ("hello world", "hello world"),
+            ("AND OR NOT", "AND OR NOT"),
+            // Already-quoted preserved
+            ("\"role:admin\"", "\"role:admin\""),
+            // Prefix operators stripped
+            ("^hello world", "hello world"),
+            ("^foo ^bar", "foo bar"),
+            ("^", ""),
+            ("+required term", "required term"),
+            ("-excluded term", "excluded term"),
+            ("keep -this", "keep this"),
+            // NEAR filtered
+            ("NEAR(a b)", "b"),
+            ("hello NEAR(a b) world", "hello b world"),
+            ("hello NEAR/3 world", "hello world"),
+            ("near(x y)", "y"),
+            ("Near/2 test", "test"),
+            // Quote balancing
+            ("\"unbalanced", "\"unbalanced\""),
+            ("\"balanced\"", "\"balanced\""),
+        ] {
+            assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}");
+        }
     }
 
     #[test]

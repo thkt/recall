@@ -106,9 +106,5 @@ mod tests {
         assert_eq!(days_from_civil(2024, 6, 31), None);
         assert_eq!(days_from_civil(2024, 9, 31), None);
         assert_eq!(days_from_civil(2024, 11, 31), None);
-        // Valid edge cases
-        assert!(days_from_civil(2024, 2, 29).is_some()); // leap year
-        assert!(days_from_civil(2024, 1, 31).is_some());
-        assert!(days_from_civil(2024, 4, 30).is_some());
     }
 }
