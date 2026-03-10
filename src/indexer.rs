@@ -5,178 +5,336 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::parser::{Source, parse_claude_session, parse_codex_session};
+use crate::parser::{ParseResult, Source, parse_claude_session, parse_codex_session};
 
 pub struct IndexStats {
     pub indexed: usize,
-    pub skipped: usize,
-    pub total_sessions: i64,
-    pub total_messages: i64,
+    pub parse_errors: usize,
+    pub first_error: Option<String>,
+    pub total_sessions: usize,
+    pub total_messages: usize,
     pub elapsed_secs: f64,
 }
 
-pub fn index_sessions(conn: &Connection, force: bool, verbose: bool) -> Result<IndexStats> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
-    let claude_dir = home.join(".claude").join("projects");
-    let codex_dir = home.join(".codex").join("sessions");
-    index_from_dirs(conn, force, verbose, &claude_dir, &codex_dir)
+enum IndexOutcome {
+    Indexed,
+    Unchanged,
+    ParseError(String),
 }
 
-pub(crate) fn index_from_dirs(
-    conn: &Connection,
-    force: bool,
+struct IndexContext<'a> {
+    tx: &'a rusqlite::Transaction<'a>,
+    existing: &'a HashMap<String, (String, Option<f64>)>,
     verbose: bool,
-    claude_dir: &Path,
-    codex_dir: &Path,
-) -> Result<IndexStats> {
-    let start = Instant::now();
+}
 
-    if force {
-        conn.execute_batch("DELETE FROM sessions; DELETE FROM messages;")?;
+pub(crate) struct IndexOptions<'a> {
+    pub force: bool,
+    pub verbose: bool,
+    pub claude_dir: &'a Path,
+    pub codex_dir: &'a Path,
+}
+
+fn resolve_mtime(fpath: &Path, verbose: bool) -> Option<Option<f64>> {
+    let meta = match std::fs::metadata(fpath) {
+        Ok(m) => m,
+        Err(_) => {
+            if verbose {
+                eprintln!("Warning: cannot stat {}", fpath.display());
+            }
+            return None;
+        }
+    };
+    let mtime = match meta.modified() {
+        Ok(t) => t,
+        Err(e) => {
+            if verbose {
+                eprintln!("Warning: mtime unavailable for {}: {e}", fpath.display());
+            }
+            return Some(None);
+        }
+    };
+    match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Some(Some(d.as_secs_f64())),
+        Err(e) => {
+            if verbose {
+                eprintln!("Warning: mtime before epoch for {}: {e}", fpath.display());
+            }
+            Some(None)
+        }
+    }
+}
+
+fn upsert_session(
+    ctx: &IndexContext,
+    fpath_str: &str,
+    mtime: Option<f64>,
+    parsed: &ParseResult,
+) -> Result<()> {
+    let cached = ctx.existing.get(fpath_str);
+
+    if let Some((old_sid, _)) = cached {
+        ctx.tx
+            .execute("DELETE FROM sessions WHERE session_id = ?", [old_sid])?;
+        ctx.tx
+            .execute("DELETE FROM messages WHERE session_id = ?", [old_sid])?;
     }
 
-    let mut existing: HashMap<String, (String, f64)> = HashMap::new();
-    let mut stmt = conn.prepare("SELECT file_path, session_id, mtime FROM sessions")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (fp, sid, mt) = row?;
-        existing.insert(fp, (sid, mt));
+    // A different file may have the same session_id (e.g. file rename); clean up stale messages.
+    let same_session_id =
+        matches!(cached, Some((old_sid, _)) if *old_sid == parsed.metadata.session_id);
+    if !same_session_id {
+        ctx.tx.execute(
+            "DELETE FROM messages WHERE session_id = ?",
+            [&parsed.metadata.session_id],
+        )?;
     }
 
-    let mut sources: Vec<(PathBuf, Source)> = Vec::new();
-
-    if claude_dir.is_dir() {
-        collect_jsonl_files(claude_dir, &mut sources, Source::Claude);
-    }
-    if codex_dir.is_dir() {
-        collect_jsonl_files(codex_dir, &mut sources, Source::Codex);
-    }
-
-    if verbose {
-        eprintln!("Found {} source files", sources.len());
-    }
-
-    let tx = conn
-        .unchecked_transaction()
-        .context("Failed to begin transaction")?;
-
-    // Disable FTS5 auto-merge during bulk insert for performance.
-    // Inside tx so it rolls back if the transaction fails.
-    tx.execute(
-        "INSERT INTO messages(messages, rank) VALUES('automerge', 0)",
-        [],
+    ctx.tx.execute(
+        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        rusqlite::params![
+            parsed.metadata.session_id,
+            parsed.metadata.source.as_str(),
+            parsed.metadata.file_path,
+            parsed.metadata.project,
+            parsed.metadata.slug,
+            parsed.metadata.timestamp,
+            mtime,
+        ],
     )?;
 
-    let mut indexed = 0usize;
-    let mut skipped = 0usize;
-
-    for (fpath, source) in &sources {
-        let fpath_str = fpath.to_string_lossy().to_string();
-        let mtime = match std::fs::metadata(fpath) {
-            Ok(m) => m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0),
-            Err(_) => continue,
-        };
-
-        let cached = existing.get(&fpath_str);
-
-        if !force
-            && let Some((_, old_mtime)) = cached
-            && (*old_mtime - mtime).abs() < 0.001
-        {
-            continue;
-        }
-
-        if let Some((old_sid, _)) = cached {
-            tx.execute("DELETE FROM sessions WHERE session_id = ?", [old_sid])?;
-            tx.execute("DELETE FROM messages WHERE session_id = ?", [old_sid])?;
-        }
-
-        let result = match source {
-            Source::Claude => parse_claude_session(fpath),
-            Source::Codex => parse_codex_session(fpath),
-        };
-
-        let parsed = match result {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                skipped += 1;
-                continue;
-            }
-            Err(e) => {
-                eprintln!("Warning: {}: {e}", fpath.display());
-                skipped += 1;
-                continue;
-            }
-        };
-
-        tx.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            rusqlite::params![
-                parsed.metadata.session_id,
-                parsed.metadata.source.as_str(),
-                parsed.metadata.file_path,
-                parsed.metadata.project,
-                parsed.metadata.slug,
-                parsed.metadata.timestamp,
-                mtime,
-            ],
-        )?;
-
-        if verbose && parsed.skipped_lines > 0 {
-            eprintln!(
-                "Warning: {} skipped lines in {}",
-                parsed.skipped_lines,
-                fpath.display()
-            );
-        }
-
-        for msg in &parsed.messages {
-            tx.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
-                rusqlite::params![parsed.metadata.session_id, msg.role.as_str(), msg.text],
-            )?;
-        }
-
-        indexed += 1;
+    if ctx.verbose && parsed.skipped_lines > 0 {
+        eprintln!(
+            "Warning: {} skipped lines in {}",
+            parsed.skipped_lines,
+            fpath_str
+        );
     }
 
-    tx.commit().context("Failed to commit transaction")?;
+    let mut msg_stmt = ctx.tx.prepare_cached(
+        "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
+    )?;
+    for msg in &parsed.messages {
+        msg_stmt.execute(rusqlite::params![
+            parsed.metadata.session_id,
+            msg.role.as_str(),
+            msg.text
+        ])?;
+    }
 
-    if indexed > 0 {
+    Ok(())
+}
+
+fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f64>)> {
+    let fpath_str = match fpath.to_str() {
+        Some(s) => s.to_string(),
+        None => {
+            if ctx.verbose {
+                eprintln!("Warning: skipping non-UTF-8 path: {}", fpath.display());
+            }
+            return None;
+        }
+    };
+
+    let mtime = resolve_mtime(fpath, ctx.verbose)?;
+
+    // Epsilon 0.001s tolerates filesystem mtime rounding (HFS+ 1s, ext4 nano→f64).
+    if let Some(new_mt) = mtime
+        && let Some((_, Some(old_mt))) = ctx.existing.get(&fpath_str)
+        && (*old_mt - new_mt).abs() < 0.001
+    {
+        return None;
+    }
+
+    Some((fpath_str, mtime))
+}
+
+fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<IndexOutcome> {
+    let Some((fpath_str, mtime)) = check_freshness(ctx, fpath) else {
+        return Ok(IndexOutcome::Unchanged);
+    };
+
+    let result = match source {
+        Source::Claude => parse_claude_session(fpath),
+        Source::Codex => parse_codex_session(fpath),
+    };
+    let parsed = match result {
+        Ok(Some(p)) => p,
+        Ok(None) => return Ok(IndexOutcome::Unchanged),
+        Err(e) => {
+            if ctx.verbose {
+                eprintln!("Warning: {}: {e}", fpath.display());
+            }
+            return Ok(IndexOutcome::ParseError(
+                format!("{}: {e}", fpath.display()),
+            ));
+        }
+    };
+
+    upsert_session(ctx, &fpath_str, mtime, &parsed)?;
+    Ok(IndexOutcome::Indexed)
+}
+
+/// Scan Claude/Codex session directories and upsert changed files into the index.
+///
+/// Directories default to `~/.claude/projects` and `~/.codex/sessions`;
+/// override with `RECALL_CLAUDE_DIR` / `RECALL_CODEX_DIR` env vars.
+pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Result<IndexStats> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let claude_dir = std::env::var_os("RECALL_CLAUDE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".claude").join("projects"));
+    let codex_dir = std::env::var_os("RECALL_CODEX_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex").join("sessions"));
+    index_from_dirs(conn, &IndexOptions {
+        force,
+        verbose,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    })
+}
+
+fn collect_sources(opts: &IndexOptions) -> Vec<(PathBuf, Source)> {
+    let mut sources = Vec::new();
+    if opts.claude_dir.is_dir() {
+        collect_jsonl_files(opts.claude_dir, &mut sources, Source::Claude, opts.verbose);
+    }
+    if opts.codex_dir.is_dir() {
+        collect_jsonl_files(opts.codex_dir, &mut sources, Source::Codex, opts.verbose);
+    }
+    sources
+}
+
+fn index_all(
+    ctx: &IndexContext,
+    sources: &[(PathBuf, Source)],
+) -> Result<(usize, usize, Option<String>)> {
+    let mut indexed = 0;
+    let mut parse_errors = 0;
+    let mut first_error = None;
+
+    for (fpath, source) in sources {
+        match index_file(ctx, fpath, source)? {
+            IndexOutcome::Indexed => indexed += 1,
+            IndexOutcome::Unchanged => {}
+            IndexOutcome::ParseError(msg) => {
+                parse_errors += 1;
+                if first_error.is_none() {
+                    first_error = Some(msg);
+                }
+            }
+        }
+    }
+
+    Ok((indexed, parse_errors, first_error))
+}
+
+fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()> {
+    if force || indexed >= 500 {
         conn.execute("INSERT INTO messages(messages) VALUES('optimize')", [])?;
     }
     conn.execute(
         "INSERT INTO messages(messages, rank) VALUES('automerge', 4)",
         [],
     )?;
+    Ok(())
+}
 
-    let total_sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-    let total_messages: i64 = conn.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
+pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Result<IndexStats> {
+    let start = Instant::now();
+
+    let existing = if opts.force {
+        HashMap::new()
+    } else {
+        load_existing_sessions(conn)?
+    };
+    let sources = collect_sources(opts);
+
+    if opts.verbose {
+        eprintln!("Found {} source files", sources.len());
+    }
+
+    let tx = conn.transaction().context("Failed to begin transaction")?;
+    if opts.force {
+        tx.execute_batch("DELETE FROM sessions; DELETE FROM messages;")?;
+    }
+    tx.execute("INSERT INTO messages(messages, rank) VALUES('automerge', 0)", [])?;
+
+    let ctx = IndexContext { tx: &tx, existing: &existing, verbose: opts.verbose };
+    let (indexed, parse_errors, first_error) = index_all(&ctx, &sources)?;
+    cleanup_orphans(&tx, &existing, &sources, indexed)?;
+    tx.commit().context("Failed to commit transaction")?;
+
+    finalize_fts(conn, indexed, opts.force)?;
+
+    let (total_sessions, total_messages) = {
+        let (s, m): (i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        (s.max(0) as usize, m.max(0) as usize)
+    };
 
     Ok(IndexStats {
         indexed,
-        skipped,
+        parse_errors,
+        first_error,
         total_sessions,
         total_messages,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
 }
 
+fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, (String, Option<f64>)>> {
+    let mut stmt = conn.prepare("SELECT file_path, session_id, mtime FROM sessions")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<f64>>(2)?,
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (fp, sid, mt) = row?;
+        map.insert(fp, (sid, mt));
+    }
+    Ok(map)
+}
+
+fn cleanup_orphans(
+    tx: &rusqlite::Transaction,
+    existing: &HashMap<String, (String, Option<f64>)>,
+    sources: &[(PathBuf, Source)],
+    indexed: usize,
+) -> Result<()> {
+    if existing.is_empty() || (indexed == 0 && sources.len() == existing.len()) {
+        return Ok(());
+    }
+    let source_paths: std::collections::HashSet<&Path> = sources
+        .iter()
+        .map(|(p, _)| p.as_path())
+        .collect();
+    for (fp, (sid, _)) in existing {
+        if !source_paths.contains(Path::new(fp.as_str())) {
+            let deleted = tx.execute(
+                "DELETE FROM sessions WHERE session_id = ? AND file_path = ?",
+                rusqlite::params![sid, fp],
+            )?;
+            if deleted > 0 {
+                tx.execute("DELETE FROM messages WHERE session_id = ?", [sid])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 const MAX_DIR_DEPTH: usize = 10;
 
-fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source) {
-    collect_jsonl_files_inner(dir, out, source, 0);
+fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source, verbose: bool) {
+    collect_jsonl_files_inner(dir, out, source, 0, verbose);
 }
 
 fn collect_jsonl_files_inner(
@@ -184,8 +342,12 @@ fn collect_jsonl_files_inner(
     out: &mut Vec<(PathBuf, Source)>,
     source: Source,
     depth: usize,
+    verbose: bool,
 ) {
     if depth >= MAX_DIR_DEPTH {
+        if verbose {
+            eprintln!("Warning: depth limit ({MAX_DIR_DEPTH}) reached at {}", dir.display());
+        }
         return;
     }
     let entries = match std::fs::read_dir(dir) {
@@ -195,17 +357,30 @@ fn collect_jsonl_files_inner(
             return;
         }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Warning: cannot read entry in {}: {e}", dir.display());
+                continue;
+            }
+        };
         let ft = match entry.file_type() {
             Ok(ft) => ft,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Warning: cannot get file type for {}: {e}", entry.path().display());
+                continue;
+            }
         };
         if ft.is_symlink() {
+            if verbose {
+                eprintln!("Warning: skipping symlink {}", entry.path().display());
+            }
             continue;
         }
         let path = entry.path();
         if ft.is_dir() {
-            collect_jsonl_files_inner(&path, out, source, depth + 1);
+            collect_jsonl_files_inner(&path, out, source, depth + 1, verbose);
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
             out.push((path, source));
         }
@@ -215,21 +390,12 @@ fn collect_jsonl_files_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::open_db;
+    use crate::db::setup_test_db;
     use tempfile::TempDir;
-
-    fn setup_test_db() -> (TempDir, Connection) {
-        let dir = TempDir::new().unwrap();
-        let db_path = dir.path().join("test.db");
-        let conn = open_db(&db_path).unwrap();
-        (dir, conn)
-    }
-
-    // T-003: Incremental Indexing (integration tests via index_from_dirs)
 
     #[test]
     fn test_index_from_dirs_indexes_and_skips() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         let tmp = TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
@@ -241,20 +407,19 @@ mod tests {
 
         let codex_dir = tmp.path().join("codex_sessions");
 
-        let stats = index_from_dirs(&conn, false, false, &claude_dir, &codex_dir).unwrap();
+        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats.indexed, 1);
         assert_eq!(stats.total_sessions, 1);
         assert!(stats.total_messages >= 1);
 
-        // Second call should skip (mtime unchanged)
-        let stats2 = index_from_dirs(&conn, false, false, &claude_dir, &codex_dir).unwrap();
+        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 1);
     }
 
     #[test]
     fn test_index_from_dirs_force_reindexes() {
-        let (_dir, conn) = setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         let tmp = TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
@@ -266,11 +431,107 @@ mod tests {
 
         let codex_dir = tmp.path().join("codex_sessions");
 
-        let stats = index_from_dirs(&conn, false, false, &claude_dir, &codex_dir).unwrap();
+        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats.indexed, 1);
 
-        // Force reindex should re-process
-        let stats2 = index_from_dirs(&conn, true, false, &claude_dir, &codex_dir).unwrap();
+        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: true, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats2.indexed, 1);
+    }
+
+    #[test]
+    fn test_orphan_cleanup_removes_deleted_files() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+
+        let claude_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let f1 = claude_dir.join("session1.jsonl");
+        let f2 = claude_dir.join("session2.jsonl");
+        std::fs::write(&f1, r#"{"type":"user","message":{"role":"user","content":"one"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
+        std::fs::write(&f2, r#"{"type":"user","message":{"role":"user","content":"two"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
+
+        let codex_dir = tmp.path().join("codex_sessions");
+
+        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        assert_eq!(stats.indexed, 2);
+        assert_eq!(stats.total_sessions, 2);
+
+        std::fs::remove_file(&f2).unwrap();
+        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        assert_eq!(stats2.total_sessions, 1);
+    }
+
+    #[test]
+    fn test_session_id_collision_cleans_old_messages() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+
+        let dir_a = tmp.path().join("claude_a");
+        let dir_b = tmp.path().join("claude_b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(
+            dir_a.join("collision.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"from dir a"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        ).unwrap();
+        std::fs::write(
+            dir_b.join("collision.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"from dir b"},"timestamp":"2026-03-02T00:00:00Z"}"#,
+        ).unwrap();
+
+        let empty_dir = tmp.path().join("empty");
+
+        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &dir_a, codex_dir: &empty_dir }).unwrap();
+        assert_eq!(stats.indexed, 1);
+
+        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &dir_b, codex_dir: &empty_dir }).unwrap();
+        assert_eq!(stats2.indexed, 1);
+
+        let msg_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'collision'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg_count, 1);
+    }
+
+    #[test]
+    fn test_collect_depth_limit() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut deep = tmp.path().to_path_buf();
+        for i in 0..MAX_DIR_DEPTH {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("deep.jsonl"), "{}").unwrap();
+
+        std::fs::write(tmp.path().join("shallow.jsonl"), "{}").unwrap();
+
+        let mut files = Vec::new();
+        collect_jsonl_files(tmp.path(), &mut files, Source::Claude, false);
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.ends_with("shallow.jsonl"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_skips_symlinks() {
+        let tmp = TempDir::new().unwrap();
+
+        let real_file = tmp.path().join("real.jsonl");
+        std::fs::write(&real_file, "{}").unwrap();
+
+        let link = tmp.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+
+        let mut files = Vec::new();
+        collect_jsonl_files(tmp.path(), &mut files, Source::Claude, false);
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].0.ends_with("real.jsonl"));
     }
 }

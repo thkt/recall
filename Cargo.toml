@@ -9,7 +9,7 @@ repository = "https://github.com/thkt/recall"
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 rusqlite = { version = "0.34", features = ["bundled"] }
 serde_json = "1"
