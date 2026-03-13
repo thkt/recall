@@ -12,6 +12,10 @@ struct ClaudeParseState {
 }
 
 fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<Message> {
+    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+
     if state.project.is_empty()
         && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
         && !cwd.is_empty()
@@ -173,5 +177,17 @@ mod tests {
             r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#,
         ]);
         assert!(parse_claude_session(tmp.path()).unwrap().is_none());
+    }
+
+    // T-001: isMeta entries are skipped
+    #[test]
+    fn test_claude_is_meta_skipped() {
+        let tmp = write_jsonl(&[
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"real message"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        ]);
+        let result = parse_claude_session(tmp.path()).unwrap().unwrap();
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].text, "real message");
     }
 }

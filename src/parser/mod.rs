@@ -81,11 +81,40 @@ pub struct ParseResult {
 
 const TEXT_BLOCK_TYPES: &[&str] = &["text", "input_text", "output_text"];
 
+/// Remove noise tags from text while preserving valuable tags like `<local-command-stdout>`.
+///
+/// Noise tags are Claude Code system-injected XML markers with no search value.
+/// Review when upstream changes tag vocabulary (check Claude Code release notes).
+/// See also: `codex.rs` `CODEX_SKIP_MARKERS` for message-level boilerplate filtering.
+///
+/// Unclosed tags are left intact (safe skip).
+pub fn strip_noise_tags(mut result: String) -> String {
+    const NOISE_TAGS: &[(&str, &str)] = &[
+        ("<command-name>", "</command-name>"),
+        ("<local-command-caveat>", "</local-command-caveat>"),
+        ("<system-reminder>", "</system-reminder>"),
+    ];
+
+    for (open, close) in NOISE_TAGS {
+        loop {
+            let Some(start) = result.find(open) else {
+                break;
+            };
+            let Some(end_offset) = result[start..].find(close) else {
+                break; // unclosed tag — leave intact
+            };
+            let end = start + end_offset + close.len();
+            result.replace_range(start..end, "");
+        }
+    }
+    result
+}
+
 pub(super) fn extract_text(content: Option<&Value>) -> String {
     let Some(content) = content else {
         return String::new();
     };
-    match content {
+    let raw = match content {
         Value::String(s) => s.clone(),
         Value::Array(blocks) => {
             let mut result = String::new();
@@ -104,8 +133,9 @@ pub(super) fn extract_text(content: Option<&Value>) -> String {
             }
             result
         }
-        _ => String::new(),
-    }
+        _ => return String::new(),
+    };
+    strip_noise_tags(raw)
 }
 
 /// Byte offset where seconds end in `YYYY-MM-DDTHH:MM:SS` (position of '.' or tz).
@@ -271,6 +301,59 @@ pub(super) fn write_test_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- T-003..T-008: strip_noise_tags -----------------------------------------------
+
+    #[test]
+    fn test_strip_noise_tags_table() {
+        // Data-driven table: (label, input, expected)
+        let cases: &[(&str, &str, &str)] = &[
+            // T-003: command-name tag stripped
+            (
+                "T-003 command-name stripped",
+                "before<command-name>/clear</command-name>after",
+                "beforeafter",
+            ),
+            // T-004: local-command-caveat tag stripped
+            (
+                "T-004 local-command-caveat stripped",
+                "start<local-command-caveat>Caveat: some warning text</local-command-caveat>end",
+                "startend",
+            ),
+            // T-005: system-reminder tag stripped
+            (
+                "T-005 system-reminder stripped",
+                "hello<system-reminder>internal instructions here</system-reminder>world",
+                "helloworld",
+            ),
+            // T-006: local-command-stdout preserved
+            (
+                "T-006 local-command-stdout preserved",
+                "prefix<local-command-stdout>output data</local-command-stdout>suffix",
+                "prefix<local-command-stdout>output data</local-command-stdout>suffix",
+            ),
+            // T-007: plain text unchanged
+            (
+                "T-007 plain text unchanged",
+                "hello world",
+                "hello world",
+            ),
+            // T-008: unclosed tag left intact
+            (
+                "T-008 unclosed tag left intact",
+                "<command-name>no closing tag",
+                "<command-name>no closing tag",
+            ),
+        ];
+
+        for (label, input, expected) in cases {
+            assert_eq!(
+                strip_noise_tags(input.to_string()),
+                *expected,
+                "FAILED: {label} | input: {input:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_parse_iso_timestamp_basics() {

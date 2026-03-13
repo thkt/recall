@@ -7,6 +7,9 @@ use rusqlite::Connection;
 
 use crate::parser::{ParseResult, Source, parse_claude_session, parse_codex_session};
 
+/// Cached session entry: (session_id, mtime).
+type SessionEntry = (String, Option<f64>);
+
 pub struct IndexStats {
     pub indexed: usize,
     pub parse_errors: usize,
@@ -24,7 +27,7 @@ enum IndexOutcome {
 
 struct IndexContext<'a> {
     tx: &'a rusqlite::Transaction<'a>,
-    existing: &'a HashMap<String, (String, Option<f64>)>,
+    existing: &'a HashMap<String, SessionEntry>,
     verbose: bool,
 }
 
@@ -80,7 +83,8 @@ fn upsert_session(
             .execute("DELETE FROM messages WHERE session_id = ?", [old_sid])?;
     }
 
-    // A different file may have the same session_id (e.g. file rename); clean up stale messages.
+    // New session_id differs from cached — clean up any orphaned messages under the new ID
+    // (e.g. left over from a renamed file that previously used it).
     let same_session_id =
         matches!(cached, Some((old_sid, _)) if *old_sid == parsed.metadata.session_id);
     if !same_session_id {
@@ -175,15 +179,26 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
     Ok(IndexOutcome::Indexed)
 }
 
+/// Resolve the Claude projects directory from env vars.
+///
+/// Priority: `RECALL_CLAUDE_DIR` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`
+pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
+    if let Some(dir) = std::env::var_os("RECALL_CLAUDE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return PathBuf::from(dir).join("projects");
+    }
+    home.join(".claude").join("projects")
+}
+
 /// Scan Claude/Codex session directories and upsert changed files into the index.
 ///
 /// Directories default to `~/.claude/projects` and `~/.codex/sessions`;
 /// override with `RECALL_CLAUDE_DIR` / `RECALL_CODEX_DIR` env vars.
 pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Result<IndexStats> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
-    let claude_dir = std::env::var_os("RECALL_CLAUDE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".claude").join("projects"));
+    let claude_dir = resolve_claude_dir(&home);
     let codex_dir = std::env::var_os("RECALL_CODEX_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex").join("sessions"));
@@ -287,7 +302,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     })
 }
 
-fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, (String, Option<f64>)>> {
+fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEntry>> {
     let mut stmt = conn.prepare("SELECT file_path, session_id, mtime FROM sessions")?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -306,7 +321,7 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, (String, 
 
 fn cleanup_orphans(
     tx: &rusqlite::Transaction,
-    existing: &HashMap<String, (String, Option<f64>)>,
+    existing: &HashMap<String, SessionEntry>,
     sources: &[(PathBuf, Source)],
     indexed: usize,
 ) -> Result<()> {
@@ -533,5 +548,76 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files[0].0.ends_with("real.jsonl"));
+    }
+
+    // -- T-009, T-010: resolve_claude_dir env var priority -------------------------
+
+    /// Serialize env-var tests to avoid process-global race conditions.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Save, override, run closure, restore env vars.
+    /// SAFETY: caller must hold ENV_LOCK.
+    unsafe fn apply_env(key: &str, val: Option<&str>) {
+        match val {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn with_env_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var(*k).ok()))
+            .collect();
+        for (k, v) in vars {
+            // SAFETY: serialized by ENV_LOCK; no other threads access these env vars.
+            unsafe { apply_env(k, *v) };
+        }
+        f();
+        for (k, old) in &saved {
+            // SAFETY: restoring original values under the same lock.
+            unsafe { apply_env(k, old.as_deref()) };
+        }
+    }
+
+    // T-009: RECALL_CLAUDE_DIR overrides CLAUDE_CONFIG_DIR (FR-003)
+    #[test]
+    fn test_009_recall_claude_dir_overrides_claude_config_dir() {
+        let home = Path::new("/fake/home");
+        with_env_vars(
+            &[
+                ("RECALL_CLAUDE_DIR", Some("/custom/recall/dir")),
+                ("CLAUDE_CONFIG_DIR", Some("/custom/config/dir")),
+            ],
+            || {
+                let result = resolve_claude_dir(home);
+                assert_eq!(
+                    result,
+                    PathBuf::from("/custom/recall/dir"),
+                    "T-009: RECALL_CLAUDE_DIR should take priority over CLAUDE_CONFIG_DIR"
+                );
+            },
+        );
+    }
+
+    // T-010: CLAUDE_CONFIG_DIR used as fallback (FR-003)
+    #[test]
+    fn test_010_claude_config_dir_used_as_fallback() {
+        let home = Path::new("/fake/home");
+        with_env_vars(
+            &[
+                ("RECALL_CLAUDE_DIR", None),
+                ("CLAUDE_CONFIG_DIR", Some("/custom/config")),
+            ],
+            || {
+                let result = resolve_claude_dir(home);
+                assert_eq!(
+                    result,
+                    PathBuf::from("/custom/config/projects"),
+                    "T-010: CLAUDE_CONFIG_DIR/projects should be used when RECALL_CLAUDE_DIR is unset"
+                );
+            },
+        );
     }
 }

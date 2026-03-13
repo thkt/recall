@@ -13,6 +13,10 @@ use rusqlite::Connection;
 
 use crate::parser::Source;
 
+/// Error message markers for exit code classification.
+/// Keep in sync with bail! sites: main.rs `run()` and search.rs `search_sessions()`.
+const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
+
 #[derive(Parser)]
 #[command(name = "recall", about = "Search past Claude Code and Codex sessions")]
 struct Cli {
@@ -149,6 +153,17 @@ fn run() -> Result<()> {
     run_with_cli(Cli::parse())
 }
 
+/// Extract the parent session UUID from a subagent file path.
+///
+/// Path structure: `{...}/{parent-session-uuid}/subagents/{agent-id}.jsonl`
+/// Returns `None` for non-subagent paths.
+fn extract_parent_session(file_path: &str) -> Option<&str> {
+    let idx = file_path.find("/subagents/")?;
+    let prefix = &file_path[..idx];
+    let parent = prefix.rsplit('/').next()?;
+    if parent.is_empty() { None } else { Some(parent) }
+}
+
 fn format_result(w: &mut impl std::io::Write, i: usize, r: &search::SearchResult) -> std::io::Result<()> {
     let s = &r.session;
     let date = format_timestamp(s.timestamp);
@@ -169,6 +184,9 @@ fn format_result(w: &mut impl std::io::Write, i: usize, r: &search::SearchResult
     }
     let session_id = ansi::strip_control_chars(&s.session_id);
     writeln!(w, "    ID: {session_id}")?;
+    if let Some(parent) = extract_parent_session(&file_path) {
+        writeln!(w, "    Parent: {parent}")?;
+    }
     if !file_path.is_empty() {
         writeln!(w, "    File: {file_path}")?;
     }
@@ -191,6 +209,7 @@ fn print_result(i: usize, r: &search::SearchResult) {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
             std::process::exit(0);
         }
+        eprintln!("Warning: failed to write result: {e}");
     }
 }
 
@@ -217,9 +236,7 @@ fn main() {
     if let Err(e) = run() {
         let msg = format!("{e:#}");
         eprintln!("Error: {msg}");
-        let code = if msg.contains("search query is required")
-            || msg.contains("Invalid search query")
-        {
+        let code = if USER_ERROR_MARKERS.iter().any(|m| msg.contains(m)) {
             1
         } else {
             2
@@ -313,5 +330,42 @@ mod tests {
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("> "));
+    }
+
+    // T-011: Subagent file path shows parent session (FR-004)
+    #[test]
+    fn test_011_subagent_file_path_shows_parent_session() {
+        let r = search::SearchResult {
+            session: parser::SessionData {
+                session_id: "agent-a58c408".to_string(),
+                source: parser::Source::Claude,
+                file_path: "/home/.claude/projects/proj/abc-def-123/subagents/agent-a58c408.jsonl"
+                    .to_string(),
+                project: "/proj".to_string(),
+                slug: "agent-slug".to_string(),
+                timestamp: Some(1709251200000),
+            },
+            excerpt: "some text".to_string(),
+        };
+        let mut buf = Vec::new();
+        format_result(&mut buf, 0, &r).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("abc-def-123"),
+            "T-011: output should contain parent session UUID 'abc-def-123', got:\n{output}"
+        );
+    }
+
+    // T-012: Normal session path shows no parent (FR-004)
+    #[test]
+    fn test_012_normal_session_path_shows_no_parent() {
+        let r = make_search_result("s1", "/home/me/project", "excerpt");
+        let mut buf = Vec::new();
+        format_result(&mut buf, 0, &r).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains("Parent:"),
+            "T-012: normal session should not contain 'Parent:' info, got:\n{output}"
+        );
     }
 }
