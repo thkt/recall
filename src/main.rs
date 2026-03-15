@@ -13,8 +13,7 @@ use rusqlite::Connection;
 
 use crate::parser::Source;
 
-/// Error message markers for exit code classification.
-/// Keep in sync with bail! sites: main.rs `run()` and search.rs `search_sessions()`.
+/// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
 const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
 
 #[derive(Parser)]
@@ -144,7 +143,7 @@ fn run_with_cli(cli: Cli) -> Result<()> {
         },
     )?;
 
-    print_results(&results, &stats);
+    print_results(&results);
 
     Ok(())
 }
@@ -177,27 +176,24 @@ fn format_result(w: &mut impl std::io::Write, i: usize, r: &search::SearchResult
     };
     let slug = ansi::strip_control_chars(&s.slug);
     let project = ansi::strip_control_chars(&s.project);
-    let file_path = ansi::strip_control_chars(&s.file_path);
     writeln!(w, "[{}] {} | {} | {} [{}]", i + 1, date, slug, proj_name, s.source)?;
     if !project.is_empty() {
         writeln!(w, "    {project}")?;
     }
     let session_id = ansi::strip_control_chars(&s.session_id);
     writeln!(w, "    ID: {session_id}")?;
+    let file_path = ansi::strip_control_chars(&s.file_path);
     if let Some(parent) = extract_parent_session(&file_path) {
         writeln!(w, "    Parent: {parent}")?;
     }
-    if !file_path.is_empty() {
-        writeln!(w, "    File: {file_path}")?;
-    }
     if !r.excerpt.is_empty() {
-        let clean = r.excerpt.replace('\n', " ");
-        let clean = clean.trim();
+        let clean = r.excerpt.trim();
         let truncated = truncate_str(clean, EXCERPT_MAX_BYTES);
+        for line in truncated.lines() {
+            writeln!(w, "    > {line}")?;
+        }
         if truncated.len() < clean.len() {
-            writeln!(w, "    > {truncated}...")?;
-        } else {
-            writeln!(w, "    > {clean}")?;
+            writeln!(w, "    > ...")?;
         }
     }
     writeln!(w)?;
@@ -213,18 +209,13 @@ fn print_result(i: usize, r: &search::SearchResult) {
     }
 }
 
-fn print_results(results: &[search::SearchResult], stats: &indexer::IndexStats) {
+fn print_results(results: &[search::SearchResult]) {
     if results.is_empty() {
         println!("No matching sessions found.");
         return;
     }
 
-    println!(
-        "Found {} sessions (index: {} sessions, {} messages):\n",
-        results.len(),
-        stats.total_sessions,
-        stats.total_messages
-    );
+    println!("Found {} sessions:\n", results.len());
 
     for (i, r) in results.iter().enumerate() {
         print_result(i, r);

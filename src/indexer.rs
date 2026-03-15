@@ -15,7 +15,6 @@ pub struct IndexStats {
     pub parse_errors: usize,
     pub first_error: Option<String>,
     pub total_sessions: usize,
-    pub total_messages: usize,
     pub elapsed_secs: f64,
 }
 
@@ -283,13 +282,13 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
 
     finalize_fts(conn, indexed, opts.force)?;
 
-    let (total_sessions, total_messages) = {
-        let (s, m): (i64, i64) = conn.query_row(
-            "SELECT (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages)",
+    let total_sessions = {
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
-        (s.max(0) as usize, m.max(0) as usize)
+        n.max(0) as usize
     };
 
     Ok(IndexStats {
@@ -297,7 +296,6 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         parse_errors,
         first_error,
         total_sessions,
-        total_messages,
         elapsed_secs: start.elapsed().as_secs_f64(),
     })
 }
@@ -425,7 +423,6 @@ mod tests {
         let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats.indexed, 1);
         assert_eq!(stats.total_sessions, 1);
-        assert!(stats.total_messages >= 1);
 
         let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats2.indexed, 0);
@@ -555,7 +552,6 @@ mod tests {
     /// Serialize env-var tests to avoid process-global race conditions.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Save, override, run closure, restore env vars.
     /// SAFETY: caller must hold ENV_LOCK.
     unsafe fn apply_env(key: &str, val: Option<&str>) {
         match val {

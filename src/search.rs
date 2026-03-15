@@ -690,7 +690,6 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "hello world");
 
-        // Unbalanced quotes are now auto-balanced — graceful degradation instead of error
         let result = search(&conn, "\"hello", &SearchOptions::default());
         assert!(result.is_ok(), "auto-balanced quote should not cause FTS5 error");
     }
@@ -797,16 +796,13 @@ mod tests {
         }).unwrap();
         assert_eq!(stats.indexed, 2);
         assert_eq!(stats.total_sessions, 2);
-        assert!(stats.total_messages >= 3);
 
-        // Search for "authentication" — should find alpha only
         let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "sess-alpha");
         assert_eq!(results[0].session.project, "/home/me/alpha");
         assert!(!results[0].excerpt.is_empty());
 
-        // Search for "quicksort" — should find beta only
         let results = search(&conn, "quicksort", &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "sess-beta");
