@@ -2,7 +2,6 @@
 name = "recall"
 version = "0.2.2"
 edition = "2024"
-rust-version = "1.85"
 description = "Full-text search CLI for past Claude Code and Codex sessions"
 license = "MIT"
 repository = "https://github.com/thkt/recall"
@@ -11,7 +10,7 @@ repository = "https://github.com/thkt/recall"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
 serde_json = "1"
 
 [dev-dependencies]
