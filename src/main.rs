@@ -1,14 +1,17 @@
 mod ansi;
+mod chunker;
 mod date;
 mod db;
+mod embedder;
+mod hybrid;
 mod indexer;
 mod parser;
 mod search;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rusqlite::Connection;
 
 use crate::parser::Source;
@@ -16,39 +19,57 @@ use crate::parser::Source;
 /// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
 const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
 
+const HF_REPO: &str = "keitokei1994/ruri-v3-310m-onnx";
+const MODEL_FILES: &[&str] = &["model.onnx", "tokenizer.json"];
+
 #[derive(Parser)]
 #[command(name = "recall", about = "Search past Claude Code and Codex sessions")]
 struct Cli {
-    /// FTS5 search query (quotes for phrases, AND/OR/NOT)
-    query: Option<String>,
-
-    /// Filter to sessions from a specific project path (prefix match)
-    #[arg(long)]
-    project: Option<String>,
-
-    /// Only sessions from last N days
-    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-    days: Option<i64>,
-
-    /// Filter by source (claude or codex)
-    #[arg(long, value_enum)]
-    source: Option<Source>,
-
-    /// Max results (1..=100, default: 10)
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
-    limit: u16,
-
-    /// Force full rebuild of the index
-    #[arg(long)]
-    reindex: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
 
     /// Show diagnostic output
-    #[arg(long, short)]
+    #[arg(long, short, global = true)]
     verbose: bool,
 
     /// Database file path (default: ~/.recall.db, env: RECALL_DB)
-    #[arg(long, env = "RECALL_DB")]
-    db_path: Option<std::path::PathBuf>,
+    #[arg(long, env = "RECALL_DB", global = true)]
+    db_path: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Parse, chunk, and embed session logs
+    Index {
+        /// Force full rebuild
+        #[arg(long)]
+        force: bool,
+    },
+    /// Search indexed sessions (default when query is provided)
+    Search {
+        /// Search query
+        query: String,
+
+        /// Filter by project path (prefix match)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Only sessions from last N days
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+        days: Option<i64>,
+
+        /// Filter by source
+        #[arg(long, value_enum)]
+        source: Option<Source>,
+
+        /// Max results (1..=100)
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Download Ruri v3 ONNX model
+    Model,
+    /// Show index and embedding status
+    Status,
 }
 
 const EXCERPT_MAX_BYTES: usize = 200;
@@ -94,13 +115,22 @@ fn open_or_create_db(path: &Path) -> Result<Connection> {
     db::open_db(path).context("Failed to open database")
 }
 
-fn report_index_stats(stats: &indexer::IndexStats, reindex: bool, verbose: bool) {
+fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
+    match db_path {
+        Some(p) => Ok(p.clone()),
+        None => Ok(dirs::home_dir()
+            .context("Could not determine home directory")?
+            .join(".recall.db")),
+    }
+}
+
+fn report_index_stats(stats: &indexer::IndexStats, force: bool, verbose: bool) {
     if stats.indexed > 0 {
         eprintln!(
             "Indexed {} sessions in {:.1}s",
             stats.indexed, stats.elapsed_secs
         );
-    } else if reindex {
+    } else if force {
         eprintln!("Index is up to date ({} sessions)", stats.total_sessions);
     }
     if let Some(ref err) = stats.first_error {
@@ -111,46 +141,165 @@ fn report_index_stats(stats: &indexer::IndexStats, reindex: bool, verbose: bool)
     }
 }
 
-fn run_with_cli(cli: Cli) -> Result<()> {
-    let db_path = match cli.db_path {
-        Some(ref p) => p.clone(),
-        None => dirs::home_dir()
-            .context("Could not determine home directory")?
-            .join(".recall.db"),
-    };
+fn try_load_embedder() -> Option<embedder::Embedder> {
+    let dir = embedder::model_dir();
+    embedder::Embedder::new(&dir).ok()
+}
 
-    let mut conn = open_or_create_db(&db_path)?;
+// -- Subcommands --
 
-    let stats = indexer::index_sessions(&mut conn, cli.reindex, cli.verbose)?;
-    report_index_stats(&stats, cli.reindex, cli.verbose);
+fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+    let path = resolve_db_path(db_path)?;
+    let mut conn = open_or_create_db(&path)?;
 
-    let Some(query) = cli.query else {
-        if !cli.reindex {
-            anyhow::bail!("A search query is required (or use --reindex to rebuild the index)");
-        }
-        return Ok(());
-    };
+    // Phase 1: FTS5 index
+    let stats = indexer::index_sessions(&mut conn, force, verbose)?;
+    report_index_stats(&stats, force, verbose);
 
-    let results = search::search(
-        &conn,
-        &query,
-        &search::SearchOptions {
-            project: cli.project,
-            days: cli.days,
-            source: cli.source,
-            limit: cli.limit.into(),
-            now_ms: None,
-        },
-    )?;
-
-    print_results(&results);
+    // Phase 2: QA chunks (no bulk embedding — embeddings build up via search)
+    let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
+    if chunk_stats.chunks_created > 0 {
+        eprintln!("Created {} chunks", chunk_stats.chunks_created);
+    }
 
     Ok(())
 }
 
-fn run() -> Result<()> {
-    run_with_cli(Cli::parse())
+fn run_search(
+    query: &str,
+    project: Option<String>,
+    days: Option<i64>,
+    source: Option<Source>,
+    limit: u16,
+    verbose: bool,
+    db_path: &Option<PathBuf>,
+) -> Result<()> {
+    let path = resolve_db_path(db_path)?;
+    let mut conn = open_or_create_db(&path)?;
+
+    // Auto-index FTS5 + chunks (fast: skips scan if dirs unchanged)
+    let stats = indexer::index_sessions(&mut conn, false, verbose)?;
+    report_index_stats(&stats, false, verbose);
+    let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
+    if chunk_stats.chunks_created > 0 && verbose {
+        eprintln!("Created {} chunks", chunk_stats.chunks_created);
+    }
+
+    let mut embedder = try_load_embedder();
+
+    let results = search::search_with_embedder(
+        &conn,
+        query,
+        &search::SearchOptions {
+            project,
+            days,
+            source,
+            limit: limit.into(),
+            now_ms: None,
+        },
+        embedder.as_mut(),
+    )?;
+
+    print_results(&results);
+
+    // Post-search: embed chunks from result sessions (progressive enhancement)
+    if let Some(ref mut emb) = embedder {
+        let session_ids: Vec<String> = results.iter().map(|r| r.session.session_id.clone()).collect();
+        let budget = 20;
+        match indexer::embed_near_sessions(&mut conn, emb, &session_ids, budget) {
+            Ok(n) if n > 0 && verbose => eprintln!("Embedded {n} nearby chunks"),
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
+
+fn run_model(verbose: bool) -> Result<()> {
+    let dir = embedder::model_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create model directory: {}", dir.display()))?;
+
+    let mut all_present = true;
+    for filename in MODEL_FILES {
+        let path = dir.join(filename);
+        if path.exists() {
+            if verbose {
+                eprintln!("{filename}: already downloaded");
+            }
+        } else {
+            all_present = false;
+            let url = format!(
+                "https://huggingface.co/{HF_REPO}/resolve/main/{filename}"
+            );
+            eprintln!("Downloading {filename}...");
+            let status = std::process::Command::new("curl")
+                .args(["-fSL", "--progress-bar", "-o"])
+                .arg(&path)
+                .arg(&url)
+                .status()
+                .context("Failed to run curl — is it installed?")?;
+            if !status.success() {
+                // Clean up partial file
+                let _ = std::fs::remove_file(&path);
+                anyhow::bail!("Download failed for {filename}");
+            }
+        }
+    }
+
+    if all_present {
+        eprintln!("Model already downloaded at {}", dir.display());
+    } else {
+        eprintln!("Model downloaded to {}", dir.display());
+    }
+
+    // Verify model loads
+    match embedder::Embedder::new(&dir) {
+        Ok(_) => eprintln!("Model verified OK"),
+        Err(e) => eprintln!("Warning: model verification failed: {e}"),
+    }
+
+    Ok(())
+}
+
+fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+    let path = resolve_db_path(db_path)?;
+    if !path.exists() {
+        println!("Database not found at {}", path.display());
+        println!("Run `recall index` to create the index.");
+        return Ok(());
+    }
+
+    let conn = open_or_create_db(&path)?;
+
+    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
+    let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?;
+
+    println!("Sessions: {sessions}");
+    println!("QA chunks: {chunks}");
+    println!("Embedded: {embedded}/{chunks}");
+
+    let model_dir = embedder::model_dir();
+    let model_ok = embedder::Embedder::new(&model_dir).is_ok();
+    println!(
+        "Model: {}",
+        if model_ok {
+            "ready"
+        } else {
+            "not downloaded (run `recall model`)"
+        }
+    );
+
+    if verbose {
+        println!("DB: {}", path.display());
+        println!("Model dir: {}", model_dir.display());
+    }
+
+    Ok(())
+}
+
+// -- Output formatting --
 
 /// Extract the parent session UUID from a subagent file path.
 ///
@@ -219,6 +368,42 @@ fn print_results(results: &[search::SearchResult]) {
 
     for (i, r) in results.iter().enumerate() {
         print_result(i, r);
+    }
+}
+
+// -- Entry point --
+
+fn run() -> Result<()> {
+    // Backward compat: if first arg is not a subcommand, treat as `search <query>`
+    let args: Vec<String> = std::env::args().collect();
+    let known_commands = ["index", "search", "model", "status", "help"];
+
+    let cli = if args.len() > 1
+        && !args[1].starts_with('-')
+        && !known_commands.contains(&args[1].as_str())
+    {
+        // Legacy: `recall "query"` → `recall search "query"`
+        let mut patched = vec![args[0].clone(), "search".to_string()];
+        patched.extend_from_slice(&args[1..]);
+        Cli::parse_from(patched)
+    } else {
+        Cli::parse()
+    };
+
+    match cli.command {
+        Some(Command::Index { force }) => run_index(force, cli.verbose, &cli.db_path),
+        Some(Command::Search {
+            query,
+            project,
+            days,
+            source,
+            limit,
+        }) => run_search(&query, project, days, source, limit, cli.verbose, &cli.db_path),
+        Some(Command::Model) => run_model(cli.verbose),
+        Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
+        None => {
+            anyhow::bail!("A search query is required. Usage: recall search \"query\" or recall index")
+        }
     }
 }
 
@@ -323,9 +508,9 @@ mod tests {
         assert!(!output.contains("> "));
     }
 
-    // T-011: Subagent file path shows parent session (FR-004)
+    // Subagent file path shows parent session
     #[test]
-    fn test_011_subagent_file_path_shows_parent_session() {
+    fn test_subagent_file_path_shows_parent_session() {
         let r = search::SearchResult {
             session: parser::SessionData {
                 session_id: "agent-a58c408".to_string(),
@@ -341,22 +526,15 @@ mod tests {
         let mut buf = Vec::new();
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(
-            output.contains("abc-def-123"),
-            "T-011: output should contain parent session UUID 'abc-def-123', got:\n{output}"
-        );
+        assert!(output.contains("abc-def-123"));
     }
 
-    // T-012: Normal session path shows no parent (FR-004)
     #[test]
-    fn test_012_normal_session_path_shows_no_parent() {
+    fn test_normal_session_path_shows_no_parent() {
         let r = make_search_result("s1", "/home/me/project", "excerpt");
         let mut buf = Vec::new();
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(
-            !output.contains("Parent:"),
-            "T-012: normal session should not contain 'Parent:' info, got:\n{output}"
-        );
+        assert!(!output.contains("Parent:"));
     }
 }

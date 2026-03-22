@@ -4,6 +4,8 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::date::MS_PER_DAY;
+use crate::embedder::Embedder;
+use crate::hybrid::{self, RankedHit};
 use crate::parser::{SessionData, Source};
 
 const SNIPPET_CONTEXT_BEFORE: usize = 60;
@@ -186,7 +188,7 @@ fn build_candidate_sql(sq: &SearchQuery) -> String {
     if sq.use_instr {
         let instr_conds: Vec<&str> = sq.terms.iter().map(|_| "instr(text, ?) > 0").collect();
         format!(
-            "SELECT session_id, 0.0 as best_rank FROM messages WHERE {conds}{filter} GROUP BY session_id ORDER BY MIN(rowid) LIMIT ?",
+            "SELECT session_id, 0.0 as best_rank FROM messages WHERE {conds}{filter} GROUP BY session_id ORDER BY MAX(rowid) DESC LIMIT ?",
             conds = instr_conds.join(" AND "),
             filter = sq.session_filter
         )
@@ -372,33 +374,145 @@ fn fetch_snippets(
     }
 }
 
-/// Search indexed sessions. FTS5 MATCH for non-CJK, `instr()` fallback for CJK.
-/// Results ranked by BM25 blended with exponential recency boost.
-pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
-    if opts.limit == 0 {
-        return Ok(Vec::new());
-    }
-
-    let now_ms = match opts.now_ms {
-        Some(ms) => ms,
+fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
+    match opts.now_ms {
+        Some(ms) => Ok(ms),
         None => i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("system clock before UNIX epoch")?
                 .as_millis(),
         )
-        .context("timestamp overflow")?,
-    };
+        .context("timestamp overflow"),
+    }
+}
 
-    let sq = build_search_query(query, opts, now_ms);
-    let ranked = find_candidate_sessions(conn, &sq)?;
-    if ranked.is_empty() {
+fn has_vec_data(conn: &Connection) -> bool {
+    conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get::<_, i64>(0))
+        .unwrap_or(0)
+        > 0
+}
+
+/// Find sessions similar to query via vector search on vec_chunks.
+fn vec_search(
+    conn: &Connection,
+    embedder: &mut Embedder,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<RankedHit>> {
+    let embedding = embedder
+        .embed_query(query)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+
+    let mut stmt = conn.prepare(
+        "SELECT c.session_id \
+         FROM vec_chunks v \
+         JOIN qa_chunks c ON v.chunk_id = c.id \
+         WHERE v.embedding MATCH ? \
+         ORDER BY distance \
+         LIMIT ?",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![embedding_bytes, limit as i64], |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut hits = Vec::new();
+    for r in rows {
+        let sid = r?;
+        if seen.insert(sid.clone()) {
+            let rank = hits.len();
+            hits.push(RankedHit {
+                session_id: sid,
+                rank,
+            });
+        }
+    }
+    Ok(hits)
+}
+
+/// Search with FTS5 only (no embedder). Convenience wrapper for tests and backward compat.
+#[cfg(test)]
+pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
+    search_with_embedder(conn, query, opts, None)
+}
+
+/// Search with optional embedder for hybrid (FTS5 + vector) search.
+pub fn search_with_embedder(
+    conn: &Connection,
+    query: &str,
+    opts: &SearchOptions,
+    embedder: Option<&mut Embedder>,
+) -> Result<Vec<SearchResult>> {
+    if opts.limit == 0 {
         return Ok(Vec::new());
     }
 
-    let mut meta_map = fetch_session_metadata(conn, &ranked)?;
-    let candidates = fetch_snippets(conn, &sq, ranked, &mut meta_map)?;
-    Ok(score_and_sort(candidates, now_ms, opts.limit))
+    let now_ms = resolve_now_ms(opts)?;
+    let sq = build_search_query(query, opts, now_ms);
+    let fts_ranked = find_candidate_sessions(conn, &sq)?;
+
+    // Try hybrid search if embedder provided and vec data exists
+    let use_hybrid = embedder.is_some() && has_vec_data(conn);
+
+    if use_hybrid {
+        let embedder = embedder.unwrap();
+        let candidate_limit = opts.limit * 3;
+
+        // FTS5 ranked hits
+        let fts_hits: Vec<RankedHit> = fts_ranked
+            .iter()
+            .enumerate()
+            .map(|(rank, (sid, _))| RankedHit {
+                session_id: sid.clone(),
+                rank,
+            })
+            .collect();
+
+        // Vector search hits
+        let vec_hits = vec_search(conn, embedder, query, candidate_limit)
+            .unwrap_or_default();
+
+        // RRF merge
+        let mut merged = hybrid::rrf_merge(&fts_hits, &vec_hits);
+
+        // Fetch timestamps for recency boost
+        let all_sids: Vec<(String, f64)> = merged.iter().map(|(s, sc)| (s.clone(), *sc)).collect();
+        let meta_for_ts = fetch_session_metadata(conn, &all_sids.iter().map(|(s, sc)| (s.clone(), *sc)).collect::<Vec<_>>())?;
+        let timestamps: std::collections::HashMap<String, Option<i64>> = meta_for_ts
+            .iter()
+            .map(|(sid, sd)| (sid.clone(), sd.timestamp))
+            .collect();
+
+        hybrid::apply_recency_boost(&mut merged, &timestamps, now_ms);
+        merged.truncate(opts.limit);
+
+        // Convert to ranked format for snippet fetching
+        let ranked_for_snippets: Vec<(String, f64)> = merged;
+        if ranked_for_snippets.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut meta_map = fetch_session_metadata(conn, &ranked_for_snippets)?;
+        let candidates = fetch_snippets(conn, &sq, ranked_for_snippets, &mut meta_map)?;
+
+        // Already scored by RRF + recency, just collect in order
+        let results: Vec<SearchResult> = candidates
+            .into_iter()
+            .map(|(_, r)| r)
+            .take(opts.limit)
+            .collect();
+        Ok(results)
+    } else {
+        // FTS5-only path (original behavior)
+        if fts_ranked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
+        let candidates = fetch_snippets(conn, &sq, fts_ranked, &mut meta_map)?;
+        Ok(score_and_sort(candidates, now_ms, opts.limit))
+    }
 }
 
 #[cfg(test)]
@@ -673,6 +787,49 @@ mod tests {
     }
 
     #[test]
+    fn test_cjk_recency_with_candidate_overflow() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+        let limit = 5;
+        let candidate_limit = limit * 3; // 15
+
+        // Insert 20 old sessions (exceeds candidate_limit)
+        for i in 0..20 {
+            let sid = format!("old-{i:02}");
+            let ts = now_ms - (365 - i) * MS_PER_DAY;
+            insert_session(&conn, &sid, "claude", "/proj", ts);
+            insert_message(&conn, &sid, "user", &format!("型安全の議論 パート{i}"));
+        }
+
+        // Insert the newest session last (highest rowid)
+        insert_session(&conn, "newest", "claude", "/proj", now_ms);
+        insert_message(&conn, "newest", "user", "型安全の最新設計");
+
+        let results = search(
+            &conn,
+            "型安全",
+            &SearchOptions {
+                limit,
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            results.len() <= limit,
+            "should respect limit: got {} results",
+            results.len()
+        );
+        assert_eq!(
+            results[0].session.session_id, "newest",
+            "newest session must appear first despite {} candidates exceeding candidate_limit {}",
+            21,
+            candidate_limit
+        );
+    }
+
+    #[test]
     fn test_korean_search() {
         let (_dir, conn) = setup_test_db();
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
@@ -836,5 +993,40 @@ mod tests {
         // "role:user" should NOT act as a column filter — should search for the literal text
         let results = search(&conn, "role:user", &SearchOptions::default()).unwrap();
         assert!(results.is_empty(), "role:user should not match as column filter");
+    }
+
+    // T-012: graceful degradation — no embedder → FTS5 only, no error (FR-006)
+    #[test]
+    fn test_012_search_without_embedder_fts5_only() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // search_with_embedder with None → FTS5 only
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session.session_id, "s1");
+    }
+
+    // T-012 variant: vec_chunks empty → FTS5 only even if embedder were available
+    #[test]
+    fn test_012_no_vec_data_uses_fts5_only() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "rust compiler optimization");
+
+        // has_vec_data should be false
+        assert!(!has_vec_data(&conn));
+
+        // Regular search works (FTS5 path)
+        let results = search(&conn, "rust compiler", &SearchOptions::default()).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

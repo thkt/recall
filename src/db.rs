@@ -1,9 +1,25 @@
+use std::sync::Once;
+
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::embedder::EMBEDDING_DIMS;
+
 const FTS_TOKENIZER: &str = "porter unicode61";
 
+static SQLITE_VEC_INIT: Once = Once::new();
+
+/// Register sqlite-vec as an auto-extension (process-wide, once).
+fn ensure_sqlite_vec() {
+    SQLITE_VEC_INIT.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
+    });
+}
+
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {
+    ensure_sqlite_vec();
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
@@ -40,6 +56,35 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             tokenize='{FTS_TOKENIZER}'
         );"
     ))?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS recall_meta (
+            key TEXT PRIMARY KEY,
+            value REAL
+        );",
+    )?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qa_chunks (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            user_text TEXT NOT NULL,
+            assistant_text TEXT,
+            content TEXT NOT NULL,
+            timestamp INTEGER,
+            chunk_hash TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);
+        CREATE INDEX IF NOT EXISTS idx_qa_chunks_hash ON qa_chunks(chunk_hash);",
+    )?;
+
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+            chunk_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{EMBEDDING_DIMS}]
+        );"
+    ))?;
+
     Ok(())
 }
 
@@ -100,6 +145,17 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+
+        // qa_chunks and vec_chunks tables exist
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let version: String = conn
+            .query_row("SELECT vec_version()", [], |r| r.get(0))
+            .unwrap();
+        assert!(version.starts_with('v'), "sqlite-vec loaded: {version}");
     }
 
     #[test]

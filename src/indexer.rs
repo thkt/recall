@@ -5,7 +5,9 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 
-use crate::parser::{ParseResult, Source, parse_claude_session, parse_codex_session};
+use crate::chunker;
+use crate::embedder::Embedder;
+use crate::parser::{Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session};
 
 /// Cached session entry: (session_id, mtime).
 type SessionEntry = (String, Option<f64>);
@@ -80,6 +82,13 @@ fn upsert_session(
             .execute("DELETE FROM sessions WHERE session_id = ?", [old_sid])?;
         ctx.tx
             .execute("DELETE FROM messages WHERE session_id = ?", [old_sid])?;
+        // Clean up chunks so they get regenerated on next `recall index`
+        ctx.tx.execute(
+            "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)",
+            [old_sid],
+        )?;
+        ctx.tx
+            .execute("DELETE FROM qa_chunks WHERE session_id = ?", [old_sid])?;
     }
 
     // New session_id differs from cached — clean up any orphaned messages under the new ID
@@ -255,8 +264,84 @@ fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()
     Ok(())
 }
 
+fn dir_mtime_secs(path: &Path) -> Option<f64> {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+}
+
+fn dirs_changed_since(opts: &IndexOptions, last_scan: f64) -> bool {
+    for dir in [opts.claude_dir, opts.codex_dir] {
+        if !dir.is_dir() {
+            continue;
+        }
+        match dir_mtime_secs(dir) {
+            Some(mt) if mt > last_scan => return true,
+            None => return true, // Can't stat → assume changed
+            _ => {}
+        }
+        // Also check immediate subdirectories (new session folders)
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Some(mt) = dir_mtime_secs(&entry.path()) {
+                    if mt > last_scan {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn scan_key(opts: &IndexOptions) -> String {
+    format!(
+        "last_scan:{}:{}",
+        opts.claude_dir.display(),
+        opts.codex_dir.display()
+    )
+}
+
+fn get_last_scan(conn: &Connection, key: &str) -> Option<f64> {
+    conn.query_row(
+        "SELECT value FROM recall_meta WHERE key = ?",
+        [key],
+        |r| r.get::<_, f64>(0),
+    )
+    .ok()
+}
+
+fn set_last_scan(conn: &Connection, key: &str, ts: f64) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO recall_meta (key, value) VALUES (?, ?)",
+        rusqlite::params![key, ts],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Result<IndexStats> {
     let start = Instant::now();
+
+    // Quick check: skip full scan if directories haven't changed
+    let key = scan_key(opts);
+    if !opts.force {
+        if let Some(last_scan) = get_last_scan(conn, &key) {
+            if !dirs_changed_since(opts, last_scan) {
+                let total_sessions: usize = conn
+                    .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
+                    .max(0) as usize;
+                return Ok(IndexStats {
+                    indexed: 0,
+                    parse_errors: 0,
+                    first_error: None,
+                    total_sessions,
+                    elapsed_secs: start.elapsed().as_secs_f64(),
+                });
+            }
+        }
+    }
 
     let existing = if opts.force {
         HashMap::new()
@@ -290,6 +375,13 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         )?;
         n.max(0) as usize
     };
+
+    // Record scan timestamp for quick-skip on next run
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let _ = set_last_scan(conn, &key, now_secs);
 
     Ok(IndexStats {
         indexed,
@@ -398,6 +490,141 @@ fn collect_jsonl_files_inner(
             out.push((path, source));
         }
     }
+}
+
+pub(crate) struct ChunkStats {
+    pub chunks_created: usize,
+}
+
+/// Generate QA chunks for sessions that don't have them yet.
+pub(crate) fn index_chunks(
+    conn: &mut Connection,
+    verbose: bool,
+) -> Result<ChunkStats> {
+    let sessions: Vec<(String, Option<i64>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT s.session_id, s.timestamp FROM sessions s \
+             WHERE NOT EXISTS (SELECT 1 FROM qa_chunks c WHERE c.session_id = s.session_id)",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if sessions.is_empty() {
+        return Ok(ChunkStats { chunks_created: 0 });
+    }
+
+    if verbose {
+        eprintln!("Chunking {} sessions", sessions.len());
+    }
+
+    let tx = conn.transaction()?;
+    let mut chunks_created = 0;
+    for (session_id, timestamp) in &sessions {
+        let messages = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT role, text FROM messages WHERE session_id = ? ORDER BY rowid",
+            )?;
+            let rows = stmt.query_map([session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut msgs = Vec::new();
+            for r in rows {
+                let (role_str, text) = r?;
+                let role = match role_str.as_str() {
+                    "user" => Role::User,
+                    "assistant" => Role::Assistant,
+                    _ => continue,
+                };
+                msgs.push(Message { role, text });
+            }
+            msgs
+        };
+
+        let chunks = chunker::chunk_messages(session_id, &messages, *timestamp);
+
+        for chunk in &chunks {
+            tx.execute(
+                "INSERT INTO qa_chunks (session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    chunk.session_id,
+                    chunk.user_text,
+                    chunk.assistant_text,
+                    chunk.content,
+                    chunk.timestamp,
+                    chunk.chunk_hash,
+                ],
+            )?;
+            chunks_created += 1;
+        }
+    }
+
+    tx.commit()?;
+
+    Ok(ChunkStats { chunks_created })
+}
+
+/// Embed un-embedded chunks from the given sessions, up to `budget`.
+///
+/// Called after search to progressively build embedding coverage
+/// around content the user actually searches for.
+pub(crate) fn embed_near_sessions(
+    conn: &mut Connection,
+    embedder: &mut Embedder,
+    session_ids: &[String],
+    budget: usize,
+) -> Result<usize> {
+    if session_ids.is_empty() || budget == 0 {
+        return Ok(0);
+    }
+
+    let placeholders = session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT c.id, c.content FROM qa_chunks c \
+         WHERE c.session_id IN ({placeholders}) \
+         AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
+         ORDER BY c.id \
+         LIMIT ?"
+    );
+
+    let missing: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
+            session_ids.iter().map(|s| Box::new(s.clone()) as _).collect();
+        params.push(Box::new(budget as i64));
+        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| &**p).collect();
+        let rows = stmt.query_map(refs.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    let mut embedded = 0;
+
+    for (chunk_id, content) in &missing {
+        match embedder.embed_document(content) {
+            Ok(embedding) => {
+                let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+                tx.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![chunk_id, embedding_bytes],
+                )?;
+                embedded += 1;
+            }
+            Err(_) => break, // Stop on first failure
+        }
+    }
+
+    tx.commit()?;
+    Ok(embedded)
 }
 
 #[cfg(test)]
@@ -545,6 +772,46 @@ mod tests {
 
         assert_eq!(files.len(), 1);
         assert!(files[0].0.ends_with("real.jsonl"));
+    }
+
+    // T-011: incremental chunk index — unchanged sessions skip re-chunking (FR-004)
+    #[test]
+    fn test_011_index_chunks_incremental() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+
+        let claude_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":"hi there"}}"#,
+            ),
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+
+        // Index FTS5
+        index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+
+        // First chunk run — creates chunks
+        let stats1 = index_chunks(&mut conn, false).unwrap();
+        assert_eq!(stats1.chunks_created, 1);
+
+        // Second run — no new chunks (session unchanged)
+        let stats2 = index_chunks(&mut conn, false).unwrap();
+        assert_eq!(stats2.chunks_created, 0);
     }
 
     // -- T-009, T-010: resolve_claude_dir env var priority -------------------------
