@@ -40,20 +40,19 @@ pub(crate) fn rrf_merge(
 
 /// Apply exponential recency boost to RRF scores.
 ///
-/// boost = exp(-ln2 * age_days / half_life)
-/// final_score = rrf_score * (1 + boost)
+/// `get_timestamp` resolves a session_id to its epoch-ms timestamp.
 pub(crate) fn apply_recency_boost(
     results: &mut [(String, f64)],
-    timestamps: &HashMap<String, Option<i64>>,
+    get_timestamp: impl Fn(&str) -> Option<i64>,
     now_ms: i64,
 ) {
     for (session_id, score) in results.iter_mut() {
-        let boost = match timestamps.get(session_id.as_str()) {
-            Some(Some(ts)) => {
-                let age_days = ((now_ms as f64 - *ts as f64) / MS_PER_DAY as f64).max(0.0);
+        let boost = match get_timestamp(session_id) {
+            Some(ts) => {
+                let age_days = ((now_ms as f64 - ts as f64) / MS_PER_DAY as f64).max(0.0);
                 (-std::f64::consts::LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
             }
-            _ => 0.0,
+            None => 0.0,
         };
         *score *= 1.0 + boost;
     }
@@ -123,7 +122,7 @@ mod tests {
         timestamps.insert("old".to_string(), Some(now_ms - 365 * MS_PER_DAY));
         timestamps.insert("new".to_string(), Some(now_ms));
 
-        apply_recency_boost(&mut results, &timestamps, now_ms);
+        apply_recency_boost(&mut results, |sid| timestamps.get(sid).copied().flatten(), now_ms);
 
         // "new" should be first after boost
         assert_eq!(results[0].0, "new");
@@ -138,8 +137,7 @@ mod tests {
     #[test]
     fn test_recency_boost_no_timestamp() {
         let mut results = vec![("no-ts".to_string(), 0.5)];
-        let timestamps = HashMap::new(); // no entry
-        apply_recency_boost(&mut results, &timestamps, 1_000_000);
+        apply_recency_boost(&mut results, |_| None, 1_000_000);
 
         // boost = 0 → score * (1 + 0) = score unchanged
         assert!((results[0].1 - 0.5).abs() < 1e-10);

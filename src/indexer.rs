@@ -6,10 +6,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::chunker;
-use crate::embedder::Embedder;
+use crate::embedder::Embed;
 use crate::parser::{Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session};
 
-/// Cached session entry: (session_id, mtime).
 type SessionEntry = (String, Option<f64>);
 
 pub struct IndexStats {
@@ -39,14 +38,23 @@ pub(crate) struct IndexOptions<'a> {
     pub codex_dir: &'a Path,
 }
 
-fn resolve_mtime(fpath: &Path, verbose: bool) -> Option<Option<f64>> {
+enum Mtime {
+    /// File mtime resolved successfully.
+    Value(f64),
+    /// File exists but mtime unavailable — index without freshness check.
+    Unknown,
+    /// File cannot be stat'd — skip entirely.
+    Inaccessible,
+}
+
+fn resolve_mtime(fpath: &Path, verbose: bool) -> Mtime {
     let meta = match std::fs::metadata(fpath) {
         Ok(m) => m,
         Err(_) => {
             if verbose {
                 eprintln!("Warning: cannot stat {}", fpath.display());
             }
-            return None;
+            return Mtime::Inaccessible;
         }
     };
     let mtime = match meta.modified() {
@@ -55,16 +63,16 @@ fn resolve_mtime(fpath: &Path, verbose: bool) -> Option<Option<f64>> {
             if verbose {
                 eprintln!("Warning: mtime unavailable for {}: {e}", fpath.display());
             }
-            return Some(None);
+            return Mtime::Unknown;
         }
     };
     match mtime.duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => Some(Some(d.as_secs_f64())),
+        Ok(d) => Mtime::Value(d.as_secs_f64()),
         Err(e) => {
             if verbose {
                 eprintln!("Warning: mtime before epoch for {}: {e}", fpath.display());
             }
-            Some(None)
+            Mtime::Unknown
         }
     }
 }
@@ -148,7 +156,11 @@ fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f
         }
     };
 
-    let mtime = resolve_mtime(fpath, ctx.verbose)?;
+    let mtime = match resolve_mtime(fpath, ctx.verbose) {
+        Mtime::Value(v) => Some(v),
+        Mtime::Unknown => None,
+        Mtime::Inaccessible => return None,
+    };
 
     // Epsilon 0.001s tolerates filesystem mtime rounding (HFS+ 1s, ext4 nano→f64).
     if let Some(new_mt) = mtime
@@ -200,10 +212,6 @@ pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
     home.join(".claude").join("projects")
 }
 
-/// Scan Claude/Codex session directories and upsert changed files into the index.
-///
-/// Directories default to `~/.claude/projects` and `~/.codex/sessions`;
-/// override with `RECALL_CLAUDE_DIR` / `RECALL_CODEX_DIR` env vars.
 pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Result<IndexStats> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let claude_dir = resolve_claude_dir(&home);
@@ -324,7 +332,6 @@ fn set_last_scan(conn: &Connection, key: &str, ts: f64) -> Result<()> {
 pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Result<IndexStats> {
     let start = Instant::now();
 
-    // Quick check: skip full scan if directories haven't changed
     let key = scan_key(opts);
     if !opts.force {
         if let Some(last_scan) = get_last_scan(conn, &key) {
@@ -376,7 +383,6 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         n.max(0) as usize
     };
 
-    // Record scan timestamp for quick-skip on next run
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -496,7 +502,6 @@ pub(crate) struct ChunkStats {
     pub chunks_created: usize,
 }
 
-/// Generate QA chunks for sessions that don't have them yet.
 pub(crate) fn index_chunks(
     conn: &mut Connection,
     verbose: bool,
@@ -509,7 +514,7 @@ pub(crate) fn index_chunks(
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
         })?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
     if sessions.is_empty() {
@@ -567,13 +572,43 @@ pub(crate) fn index_chunks(
     Ok(ChunkStats { chunks_created })
 }
 
-/// Embed un-embedded chunks from the given sessions, up to `budget`.
-///
-/// Called after search to progressively build embedding coverage
-/// around content the user actually searches for.
+/// Stops on first embedding failure. Returns count of successfully embedded chunks.
+fn embed_chunks(
+    conn: &mut Connection,
+    embedder: &mut dyn Embed,
+    chunks: &[(i64, String)],
+) -> Result<usize> {
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    let mut embedded = 0;
+
+    for (chunk_id, content) in chunks {
+        match embedder.embed_document(content) {
+            Ok(embedding) => {
+                let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+                tx.execute(
+                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                    rusqlite::params![chunk_id, embedding_bytes],
+                )?;
+                embedded += 1;
+            }
+            Err(e) => {
+                eprintln!("Warning: embedding failed for chunk {chunk_id}: {e}");
+                break;
+            }
+        }
+    }
+
+    tx.commit()?;
+    Ok(embedded)
+}
+
 pub(crate) fn embed_near_sessions(
     conn: &mut Connection,
-    embedder: &mut Embedder,
+    embedder: &mut dyn Embed,
     session_ids: &[String],
     budget: usize,
 ) -> Result<usize> {
@@ -587,44 +622,45 @@ pub(crate) fn embed_near_sessions(
          WHERE c.session_id IN ({placeholders}) \
          AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
          ORDER BY c.id \
-         LIMIT ?"
+         LIMIT {budget}"
     );
 
     let missing: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-            session_ids.iter().map(|s| Box::new(s.clone()) as _).collect();
-        params.push(Box::new(budget as i64));
-        let refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| &**p).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> =
+            session_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
         let rows = stmt.query_map(refs.as_slice(), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
-        rows.filter_map(|r| r.ok()).collect()
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    if missing.is_empty() {
+    embed_chunks(conn, embedder, &missing)
+}
+
+pub(crate) fn embed_recent_chunks(
+    conn: &mut Connection,
+    embedder: &mut dyn Embed,
+    budget: usize,
+) -> Result<usize> {
+    if budget == 0 {
         return Ok(0);
     }
 
-    let tx = conn.transaction()?;
-    let mut embedded = 0;
+    let missing: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.content FROM qa_chunks c \
+             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
+             ORDER BY c.timestamp DESC NULLS LAST \
+             LIMIT ?",
+        )?;
+        let rows = stmt.query_map([budget as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
 
-    for (chunk_id, content) in &missing {
-        match embedder.embed_document(content) {
-            Ok(embedding) => {
-                let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
-                tx.execute(
-                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-                    rusqlite::params![chunk_id, embedding_bytes],
-                )?;
-                embedded += 1;
-            }
-            Err(_) => break, // Stop on first failure
-        }
-    }
-
-    tx.commit()?;
-    Ok(embedded)
+    embed_chunks(conn, embedder, &missing)
 }
 
 #[cfg(test)]
@@ -793,7 +829,6 @@ mod tests {
         .unwrap();
         let codex_dir = tmp.path().join("codex_sessions");
 
-        // Index FTS5
         index_from_dirs(
             &mut conn,
             &IndexOptions {
@@ -805,18 +840,15 @@ mod tests {
         )
         .unwrap();
 
-        // First chunk run — creates chunks
         let stats1 = index_chunks(&mut conn, false).unwrap();
         assert_eq!(stats1.chunks_created, 1);
 
-        // Second run — no new chunks (session unchanged)
         let stats2 = index_chunks(&mut conn, false).unwrap();
         assert_eq!(stats2.chunks_created, 0);
     }
 
     // -- T-009, T-010: resolve_claude_dir env var priority -------------------------
 
-    /// Serialize env-var tests to avoid process-global race conditions.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// SAFETY: caller must hold ENV_LOCK.

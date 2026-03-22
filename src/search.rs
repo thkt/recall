@@ -4,16 +4,14 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::date::MS_PER_DAY;
-use crate::embedder::Embedder;
+use crate::embedder::Embed;
 use crate::hybrid::{self, RankedHit};
 use crate::parser::{SessionData, Source};
 
 const SNIPPET_CONTEXT_BEFORE: usize = 60;
 const SNIPPET_MAX_LEN: usize = 200;
 
-/// Sessions older than 30 days lose half their recency boost — balances "recent" vs "ancient".
 const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
-/// Mild recency boost (0.2) avoids overriding strong BM25 matches while favoring newer sessions.
 const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
 pub struct SearchResult {
@@ -388,15 +386,13 @@ fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
 }
 
 fn has_vec_data(conn: &Connection) -> bool {
-    conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get::<_, i64>(0))
-        .unwrap_or(0)
-        > 0
+    conn.query_row("SELECT 1 FROM vec_chunks LIMIT 1", [], |_| Ok(true))
+        .unwrap_or(false)
 }
 
-/// Find sessions similar to query via vector search on vec_chunks.
 fn vec_search(
     conn: &Connection,
-    embedder: &mut Embedder,
+    embedder: &mut dyn Embed,
     query: &str,
     limit: usize,
 ) -> Result<Vec<RankedHit>> {
@@ -432,18 +428,16 @@ fn vec_search(
     Ok(hits)
 }
 
-/// Search with FTS5 only (no embedder). Convenience wrapper for tests and backward compat.
 #[cfg(test)]
 pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
     search_with_embedder(conn, query, opts, None)
 }
 
-/// Search with optional embedder for hybrid (FTS5 + vector) search.
 pub fn search_with_embedder(
     conn: &Connection,
     query: &str,
     opts: &SearchOptions,
-    embedder: Option<&mut Embedder>,
+    embedder: Option<&mut dyn Embed>,
 ) -> Result<Vec<SearchResult>> {
     if opts.limit == 0 {
         return Ok(Vec::new());
@@ -453,14 +447,12 @@ pub fn search_with_embedder(
     let sq = build_search_query(query, opts, now_ms);
     let fts_ranked = find_candidate_sessions(conn, &sq)?;
 
-    // Try hybrid search if embedder provided and vec data exists
     let use_hybrid = embedder.is_some() && has_vec_data(conn);
 
     if use_hybrid {
         let embedder = embedder.unwrap();
         let candidate_limit = opts.limit * 3;
 
-        // FTS5 ranked hits
         let fts_hits: Vec<RankedHit> = fts_ranked
             .iter()
             .enumerate()
@@ -470,42 +462,36 @@ pub fn search_with_embedder(
             })
             .collect();
 
-        // Vector search hits
         let vec_hits = vec_search(conn, embedder, query, candidate_limit)
             .unwrap_or_default();
 
-        // RRF merge
         let mut merged = hybrid::rrf_merge(&fts_hits, &vec_hits);
 
-        // Fetch timestamps for recency boost
-        let all_sids: Vec<(String, f64)> = merged.iter().map(|(s, sc)| (s.clone(), *sc)).collect();
-        let meta_for_ts = fetch_session_metadata(conn, &all_sids.iter().map(|(s, sc)| (s.clone(), *sc)).collect::<Vec<_>>())?;
-        let timestamps: std::collections::HashMap<String, Option<i64>> = meta_for_ts
-            .iter()
-            .map(|(sid, sd)| (sid.clone(), sd.timestamp))
-            .collect();
+        let all_ranked: Vec<(String, f64)> =
+            merged.iter().map(|(s, sc)| (s.clone(), *sc)).collect();
+        let mut meta_map = fetch_session_metadata(conn, &all_ranked)?;
 
-        hybrid::apply_recency_boost(&mut merged, &timestamps, now_ms);
+        hybrid::apply_recency_boost(
+            &mut merged,
+            |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
+            now_ms,
+        );
         merged.truncate(opts.limit);
 
-        // Convert to ranked format for snippet fetching
         let ranked_for_snippets: Vec<(String, f64)> = merged;
         if ranked_for_snippets.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut meta_map = fetch_session_metadata(conn, &ranked_for_snippets)?;
         let candidates = fetch_snippets(conn, &sq, ranked_for_snippets, &mut meta_map)?;
 
-        // Already scored by RRF + recency, just collect in order
         let results: Vec<SearchResult> = candidates
             .into_iter()
             .map(|(_, r)| r)
-            .take(opts.limit)
             .collect();
         Ok(results)
     } else {
-        // FTS5-only path (original behavior)
+        // FTS5-only path
         if fts_ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -972,14 +958,12 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.project, "/home/me/alpha");
 
-        // Re-index should skip (unchanged files)
         let stats2 = index_from_dirs(&mut conn, &IndexOptions {
             force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir,
         }).unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 2);
 
-        // Search still works after skip
         let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -1002,7 +986,6 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "authentication flow discussion");
 
-        // search_with_embedder with None → FTS5 only
         let results = search_with_embedder(
             &conn,
             "authentication",
@@ -1022,10 +1005,8 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "rust compiler optimization");
 
-        // has_vec_data should be false
         assert!(!has_vec_data(&conn));
 
-        // Regular search works (FTS5 path)
         let results = search(&conn, "rust compiler", &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
     }

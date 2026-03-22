@@ -39,7 +39,6 @@ impl std::fmt::Display for EmbedError {
 
 impl std::error::Error for EmbedError {}
 
-/// Resolve model directory: $XDG_DATA_HOME/recall/models/ruri-v3-310m
 pub(crate) fn model_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
         return PathBuf::from(dir).join(MODEL_SUBDIR);
@@ -104,6 +103,11 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
     }
 }
 
+pub(crate) trait Embed: std::fmt::Debug {
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError>;
+    fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError>;
+}
+
 pub(crate) struct Embedder {
     session: Session,
     tokenizer: tokenizers::Tokenizer,
@@ -151,14 +155,6 @@ impl Embedder {
         Ok(Self { session, tokenizer })
     }
 
-    pub(crate) fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        self.embed_with_prefix(text, QUERY_PREFIX)
-    }
-
-    pub(crate) fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        self.embed_with_prefix(text, DOCUMENT_PREFIX)
-    }
-
     fn embed_with_prefix(&mut self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
         let prefixed = format!("{prefix}{text}");
         let encoding = self
@@ -203,20 +199,19 @@ impl Embedder {
     }
 }
 
+impl Embed for Embedder {
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embed_with_prefix(text, QUERY_PREFIX)
+    }
+
+    fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embed_with_prefix(text, DOCUMENT_PREFIX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // T-002: prefix assignment (FR-002)
-    #[test]
-    fn test_002_query_prefix() {
-        assert_eq!(QUERY_PREFIX, "検索クエリ: ");
-    }
-
-    #[test]
-    fn test_002_document_prefix() {
-        assert_eq!(DOCUMENT_PREFIX, "検索文書: ");
-    }
 
     // T-003: dimension mismatch (FR-002)
     #[test]

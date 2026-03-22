@@ -9,7 +9,6 @@ const FTS_TOKENIZER: &str = "porter unicode61";
 
 static SQLITE_VEC_INIT: Once = Once::new();
 
-/// Register sqlite-vec as an auto-extension (process-wide, once).
 fn ensure_sqlite_vec() {
     SQLITE_VEC_INIT.call_once(|| unsafe {
         rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
@@ -146,7 +145,6 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
 
-        // qa_chunks and vec_chunks tables exist
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
             .unwrap();

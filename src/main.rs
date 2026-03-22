@@ -44,6 +44,10 @@ enum Command {
         /// Force full rebuild
         #[arg(long)]
         force: bool,
+
+        /// Embed all chunks (slow initial run, enables full hybrid search)
+        #[arg(long)]
+        embed: bool,
     },
     /// Search indexed sessions (default when query is provided)
     Search {
@@ -65,9 +69,11 @@ enum Command {
         /// Max results (1..=100)
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
+
+        /// Skip post-search embedding (faster for piped/scripted usage)
+        #[arg(long)]
+        no_embed: bool,
     },
-    /// Download Ruri v3 ONNX model
-    Model,
     /// Show index and embedding status
     Status,
 }
@@ -146,34 +152,91 @@ fn try_load_embedder() -> Option<embedder::Embedder> {
     embedder::Embedder::new(&dir).ok()
 }
 
+/// Download model files if missing. Returns true if all files are present.
+fn ensure_model(verbose: bool) -> Result<bool> {
+    let dir = embedder::model_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create model directory: {}", dir.display()))?;
+
+    let mut downloaded = false;
+    for filename in MODEL_FILES {
+        let path = dir.join(filename);
+        if path.exists() {
+            continue;
+        }
+        downloaded = true;
+        let url = format!("https://huggingface.co/{HF_REPO}/resolve/main/{filename}");
+        eprintln!("Downloading {filename}...");
+        let status = std::process::Command::new("curl")
+            .args(["-fSL", "--progress-bar", "-o"])
+            .arg(&path)
+            .arg(&url)
+            .status()
+            .context("Failed to run curl — is it installed?")?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&path);
+            anyhow::bail!("Download failed for {filename}");
+        }
+    }
+
+    if downloaded {
+        eprintln!("Model downloaded to {}", dir.display());
+    } else if verbose {
+        eprintln!("Model already downloaded");
+    }
+    Ok(true)
+}
+
 // -- Subcommands --
 
-fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
-    // Phase 1: FTS5 index
     let stats = indexer::index_sessions(&mut conn, force, verbose)?;
     report_index_stats(&stats, force, verbose);
 
-    // Phase 2: QA chunks (no bulk embedding — embeddings build up via search)
     let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
     if chunk_stats.chunks_created > 0 {
         eprintln!("Created {} chunks", chunk_stats.chunks_created);
     }
 
+    ensure_model(verbose)?;
+
+    if embed {
+        let mut embedder = try_load_embedder()
+            .context("Model not available for --embed")?;
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM qa_chunks c \
+             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
+            [],
+            |r| r.get(0),
+        )?;
+        if total > 0 {
+            eprintln!("Embedding {total} chunks (this may take a while)...");
+            let embedded = indexer::embed_recent_chunks(&mut conn, &mut embedder, total as usize)?;
+            eprintln!("Embedded {embedded} chunks");
+        } else {
+            eprintln!("All chunks already embedded");
+        }
+    }
+
     Ok(())
 }
 
-fn run_search(
-    query: &str,
-    project: Option<String>,
-    days: Option<i64>,
-    source: Option<Source>,
-    limit: u16,
-    verbose: bool,
-    db_path: &Option<PathBuf>,
-) -> Result<()> {
+fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+    let Command::Search {
+        query,
+        project,
+        days,
+        source,
+        limit,
+        no_embed,
+    } = cmd
+    else {
+        unreachable!()
+    };
+
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
@@ -189,7 +252,7 @@ fn run_search(
 
     let results = search::search_with_embedder(
         &conn,
-        query,
+        &query,
         &search::SearchOptions {
             project,
             days,
@@ -197,70 +260,29 @@ fn run_search(
             limit: limit.into(),
             now_ms: None,
         },
-        embedder.as_mut(),
+        embedder.as_mut().map(|e| e as &mut dyn embedder::Embed),
     )?;
 
     print_results(&results);
 
-    // Post-search: embed chunks from result sessions (progressive enhancement)
-    if let Some(ref mut emb) = embedder {
+    // Post-search: progressive embedding (search results + recent)
+    if !no_embed && let Some(emb) = embedder.as_mut() {
         let session_ids: Vec<String> = results.iter().map(|r| r.session.session_id.clone()).collect();
-        let budget = 20;
-        match indexer::embed_near_sessions(&mut conn, emb, &session_ids, budget) {
-            Ok(n) if n > 0 && verbose => eprintln!("Embedded {n} nearby chunks"),
-            _ => {}
+        let mut total = 0;
+        if let Ok(n) = indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10) {
+            total += n;
+        }
+        if let Ok(n) = indexer::embed_recent_chunks(&mut conn, emb, 10) {
+            total += n;
+        }
+        if total > 0 && verbose {
+            eprintln!("Embedded {total} chunks (nearby + recent)");
         }
     }
 
     Ok(())
 }
 
-fn run_model(verbose: bool) -> Result<()> {
-    let dir = embedder::model_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create model directory: {}", dir.display()))?;
-
-    let mut all_present = true;
-    for filename in MODEL_FILES {
-        let path = dir.join(filename);
-        if path.exists() {
-            if verbose {
-                eprintln!("{filename}: already downloaded");
-            }
-        } else {
-            all_present = false;
-            let url = format!(
-                "https://huggingface.co/{HF_REPO}/resolve/main/{filename}"
-            );
-            eprintln!("Downloading {filename}...");
-            let status = std::process::Command::new("curl")
-                .args(["-fSL", "--progress-bar", "-o"])
-                .arg(&path)
-                .arg(&url)
-                .status()
-                .context("Failed to run curl — is it installed?")?;
-            if !status.success() {
-                // Clean up partial file
-                let _ = std::fs::remove_file(&path);
-                anyhow::bail!("Download failed for {filename}");
-            }
-        }
-    }
-
-    if all_present {
-        eprintln!("Model already downloaded at {}", dir.display());
-    } else {
-        eprintln!("Model downloaded to {}", dir.display());
-    }
-
-    // Verify model loads
-    match embedder::Embedder::new(&dir) {
-        Ok(_) => eprintln!("Model verified OK"),
-        Err(e) => eprintln!("Warning: model verification failed: {e}"),
-    }
-
-    Ok(())
-}
 
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
@@ -376,7 +398,7 @@ fn print_results(results: &[search::SearchResult]) {
 fn run() -> Result<()> {
     // Backward compat: if first arg is not a subcommand, treat as `search <query>`
     let args: Vec<String> = std::env::args().collect();
-    let known_commands = ["index", "search", "model", "status", "help"];
+    let known_commands = ["index", "search", "status", "help"];
 
     let cli = if args.len() > 1
         && !args[1].starts_with('-')
@@ -391,15 +413,8 @@ fn run() -> Result<()> {
     };
 
     match cli.command {
-        Some(Command::Index { force }) => run_index(force, cli.verbose, &cli.db_path),
-        Some(Command::Search {
-            query,
-            project,
-            days,
-            source,
-            limit,
-        }) => run_search(&query, project, days, source, limit, cli.verbose, &cli.db_path),
-        Some(Command::Model) => run_model(cli.verbose),
+        Some(Command::Index { force, embed }) => run_index(force, embed, cli.verbose, &cli.db_path),
+        Some(cmd @ Command::Search { .. }) => run_search(cmd, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         None => {
             anyhow::bail!("A search query is required. Usage: recall search \"query\" or recall index")
