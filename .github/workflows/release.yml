@@ -148,7 +148,6 @@ jobs:
 
           # Calculate checksums
           SHA_AARCH64_DARWIN=$(sha256sum artifacts/recall-aarch64-apple-darwin/recall-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
-          SHA_X86_64_DARWIN=$(sha256sum artifacts/recall-x86_64-apple-darwin/recall-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
           SHA_AARCH64_LINUX=$(sha256sum artifacts/recall-aarch64-unknown-linux-gnu/recall-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           SHA_X86_64_LINUX=$(sha256sum artifacts/recall-x86_64-unknown-linux-gnu/recall-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 
@@ -159,7 +158,6 @@ jobs:
           sed -e "s/__VERSION__/$VERSION/g" \
               -e "s/__TAG__/$TAG/g" \
               -e "s/__SHA_AARCH64_DARWIN__/$SHA_AARCH64_DARWIN/g" \
-              -e "s/__SHA_X86_64_DARWIN__/$SHA_X86_64_DARWIN/g" \
               -e "s/__SHA_AARCH64_LINUX__/$SHA_AARCH64_LINUX/g" \
               -e "s/__SHA_X86_64_LINUX__/$SHA_X86_64_LINUX/g" \
               Formula/recall.rb.template > Formula/recall.rb
