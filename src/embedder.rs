@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "coreml")]
 use ort::ep;
 use ort::session::Session;
 use ort::value::Tensor;
@@ -133,17 +134,23 @@ impl Embedder {
             });
         }
 
-        let cache_dir = dir.join("coreml_cache");
-        let coreml = ep::CoreML::default()
-            .with_compute_units(ep::coreml::ComputeUnits::All)
-            .with_model_format(ep::coreml::ModelFormat::MLProgram)
-            .with_model_cache_dir(cache_dir.display().to_string())
-            .build();
+        let mut builder = Session::builder()
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
-        let session = Session::builder()
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .with_execution_providers([coreml])
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
+        #[cfg(feature = "coreml")]
+        {
+            let cache_dir = dir.join("coreml_cache");
+            let coreml = ep::CoreML::default()
+                .with_compute_units(ep::coreml::ComputeUnits::All)
+                .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                .with_model_cache_dir(cache_dir.display().to_string())
+                .build();
+            builder = builder
+                .with_execution_providers([coreml])
+                .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        }
+
+        let session = builder
             .with_intra_threads(1)
             .map_err(|e| EmbedError::Inference(e.to_string()))?
             .commit_from_file(&model_path)

@@ -1,0 +1,450 @@
+- generic [ref=e2]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - link "Hugging Face's logo Hugging Face" [ref=e7] [cursor=pointer]:
+          - /url: /
+          - img "Hugging Face's logo" [ref=e8]
+          - generic [ref=e9]: Hugging Face
+        - generic [ref=e10]:
+          - textbox "Search models, datasets, users..." [ref=e11]
+          - img [ref=e12]
+      - navigation "Main" [ref=e14]:
+        - list [ref=e15]:
+          - listitem [ref=e16]:
+            - link "Models" [ref=e17] [cursor=pointer]:
+              - /url: /models
+              - img [ref=e18]
+              - text: Models
+          - listitem [ref=e22]:
+            - link "Datasets" [ref=e23] [cursor=pointer]:
+              - /url: /datasets
+              - img [ref=e24]
+              - text: Datasets
+          - listitem [ref=e29]:
+            - link "Spaces" [ref=e30] [cursor=pointer]:
+              - /url: /spaces
+              - img [ref=e31]
+              - text: Spaces
+          - listitem [ref=e35]:
+            - link "Buckets new" [ref=e36] [cursor=pointer]:
+              - /url: /storage
+              - img [ref=e37]
+              - text: Buckets
+              - generic [ref=e41]: new
+          - listitem [ref=e42]:
+            - link "Docs" [ref=e43] [cursor=pointer]:
+              - /url: /docs
+              - img [ref=e44]
+              - text: Docs
+          - listitem [ref=e48]:
+            - link "Pricing" [ref=e49] [cursor=pointer]:
+              - /url: /pricing
+          - listitem [ref=e50]:
+            - button [ref=e52] [cursor=pointer]:
+              - img [ref=e53]
+          - listitem [ref=e58]:
+            - separator [ref=e59]
+          - listitem [ref=e60]:
+            - link "Log In" [ref=e61] [cursor=pointer]:
+              - /url: /login
+          - listitem [ref=e62]:
+            - link "Sign Up" [ref=e63] [cursor=pointer]:
+              - /url: /join
+  - main [ref=e64]:
+    - generic [ref=e67]:
+      - heading "keitokei1994 / ruri-v3-310m-onnx like 0" [level=1] [ref=e68]:
+        - generic [ref=e69]:
+          - link [ref=e73] [cursor=pointer]:
+            - /url: /keitokei1994
+          - link "keitokei1994" [ref=e77] [cursor=pointer]:
+            - /url: /keitokei1994
+          - generic [ref=e78]: /
+        - generic [ref=e79]:
+          - link "ruri-v3-310m-onnx" [ref=e80] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx
+          - button "Copy model name to clipboard" [ref=e81] [cursor=pointer]:
+            - img [ref=e82]
+        - generic [ref=e86]:
+          - button "like" [ref=e87] [cursor=pointer]:
+            - img [ref=e88]
+            - generic [ref=e90]: like
+          - button "0" [ref=e91] [cursor=pointer]
+      - generic [ref=e92]:
+        - link "Sentence Similarity" [ref=e93] [cursor=pointer]:
+          - /url: /models?pipeline_tag=sentence-similarity
+          - generic [ref=e94]:
+            - img [ref=e96]
+            - generic [ref=e102]: Sentence Similarity
+        - link "ONNX" [ref=e103] [cursor=pointer]:
+          - /url: /models?library=onnx
+          - generic [ref=e104]:
+            - img [ref=e105]
+            - generic [ref=e115]: ONNX
+        - link "Safetensors" [ref=e116] [cursor=pointer]:
+          - /url: /models?library=safetensors
+          - generic [ref=e117]:
+            - img [ref=e118]
+            - generic [ref=e120]: Safetensors
+        - button "cl-nagoya/ruri-v3-dataset-ft" [ref=e122] [cursor=pointer]:
+          - generic [ref=e124]:
+            - img [ref=e125]
+            - generic [ref=e130]: cl-nagoya/ruri-v3-dataset-ft
+        - link "Japanese" [ref=e132] [cursor=pointer]:
+          - /url: /models?language=ja
+          - generic [ref=e133]:
+            - img [ref=e134]
+            - generic [ref=e136]: Japanese
+        - link "modernbert" [ref=e137] [cursor=pointer]:
+          - /url: /models?other=modernbert
+          - generic [ref=e139]: modernbert
+        - link "feature-extraction" [ref=e140] [cursor=pointer]:
+          - /url: /models?other=feature-extraction
+          - generic [ref=e142]: feature-extraction
+        - 'button "arxiv: 2409.07737" [ref=e144] [cursor=pointer]':
+          - generic [ref=e146]:
+            - img [ref=e147]
+            - generic [ref=e150]: "arxiv:"
+            - generic [ref=e151]: "2409.07737"
+        - 'button "License: apache-2.0" [ref=e154] [cursor=pointer]':
+          - generic [ref=e156]:
+            - img [ref=e157]
+            - generic [ref=e159]: "License:"
+            - generic [ref=e160]: apache-2.0
+      - generic [ref=e162]:
+        - generic [ref=e163]:
+          - link "Model card" [ref=e164] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx
+            - img [ref=e165]
+            - text: Model card
+          - link "Files and versions xet" [ref=e169] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/tree/main
+            - img [ref=e170]
+            - generic [ref=e173]: Files and versions
+            - generic [ref=e176]:
+              - img [ref=e177]
+              - generic [ref=e180]: xet
+          - link "Community" [ref=e181] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/discussions
+            - img [ref=e182]
+            - text: Community
+        - button [ref=e188] [cursor=pointer]:
+          - img [ref=e189]
+    - generic [ref=e194]:
+      - generic [ref=e196]:
+        - generic [ref=e198]:
+          - button "main" [ref=e200] [cursor=pointer]:
+            - img [ref=e201]
+            - text: main
+            - img [ref=e203]
+          - link "ruri-v3-310m-onnx" [ref=e206] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/tree/main
+          - generic [ref=e207]: 2.53 GB
+        - generic [ref=e208]:
+          - generic [ref=e210]:
+            - searchbox "Go to file" [ref=e211]
+            - img [ref=e212]
+            - generic: ⌘ K
+          - link "1 contributor" [ref=e214] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commits/main
+            - list [ref=e215]:
+              - listitem "keitokei1994" [ref=e216]
+              - listitem [ref=e217]: 1 contributor
+          - 'link "History: 4 commits" [ref=e218] [cursor=pointer]':
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commits/main
+            - img [ref=e219]
+            - generic [ref=e221]: "History:"
+            - generic [ref=e222]: 4 commits
+      - generic [ref=e224]:
+        - img "keitokei1994's picture" [ref=e225]
+        - link "keitokei1994" [ref=e227] [cursor=pointer]:
+          - /url: /keitokei1994
+        - generic [ref=e228]: Update README.md
+        - link "9d6e843" [ref=e229] [cursor=pointer]:
+          - /url: /keitokei1994/ruri-v3-310m-onnx/commit/9d6e8436207b69885e558cdd16735bdd85011ea9
+        - generic "This commit is signed and the signature is verified" [ref=e230]: verified
+        - time [ref=e231]: 9 months ago
+      - list [ref=e233]:
+        - listitem [ref=e234]:
+          - link "1_Pooling" [ref=e235] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/tree/main/1_Pooling
+            - img [ref=e236]
+            - generic [ref=e238]: 1_Pooling
+          - link "Upload 14 files" [ref=e240] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e241]: Upload 14 files
+          - link "9 months ago" [ref=e242] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e243]: 9 months ago
+        - listitem [ref=e244]:
+          - generic [ref=e245]:
+            - link ".gitattributes" [ref=e246] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/.gitattributes
+              - img [ref=e247]
+              - generic [ref=e249]: .gitattributes
+            - button [ref=e251] [cursor=pointer]:
+              - img [ref=e252]
+          - link "153 Bytes" [ref=e255] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/.gitattributes?download=true
+            - generic [ref=e256]: 153 Bytes
+            - img [ref=e258]
+          - link "Upload 14 files" [ref=e260] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e261]: Upload 14 files
+          - link "9 months ago" [ref=e262] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e263]: 9 months ago
+        - listitem [ref=e264]:
+          - generic [ref=e265]:
+            - link "CONVERSION_SUMMARY.md" [ref=e266] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/CONVERSION_SUMMARY.md
+              - img [ref=e267]
+              - generic [ref=e269]: CONVERSION_SUMMARY.md
+            - button [ref=e271] [cursor=pointer]:
+              - img [ref=e272]
+          - link "1.12 kB" [ref=e275] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/CONVERSION_SUMMARY.md?download=true
+            - generic [ref=e276]: 1.12 kB
+            - img [ref=e278]
+          - link "Upload 14 files" [ref=e280] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e281]: Upload 14 files
+          - link "9 months ago" [ref=e282] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e283]: 9 months ago
+        - listitem [ref=e284]:
+          - generic [ref=e285]:
+            - link "README.md" [ref=e286] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/README.md
+              - img [ref=e287]
+              - generic [ref=e289]: README.md
+            - button [ref=e291] [cursor=pointer]:
+              - img [ref=e292]
+          - link "8.03 kB" [ref=e295] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/README.md?download=true
+            - generic [ref=e296]: 8.03 kB
+            - img [ref=e298]
+          - link "Update README.md" [ref=e300] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/9d6e8436207b69885e558cdd16735bdd85011ea9
+            - generic [ref=e301]: Update README.md
+          - link "9 months ago" [ref=e302] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/9d6e8436207b69885e558cdd16735bdd85011ea9
+            - time [ref=e303]: 9 months ago
+        - listitem [ref=e304]:
+          - generic [ref=e305]:
+            - link "config.json" [ref=e306] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/config.json
+              - img [ref=e307]
+              - generic [ref=e309]: config.json
+            - button [ref=e311] [cursor=pointer]:
+              - img [ref=e312]
+          - link "1.19 kB" [ref=e315] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/config.json?download=true
+            - generic [ref=e316]: 1.19 kB
+            - img [ref=e318]
+          - link "Upload 14 files" [ref=e320] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e321]: Upload 14 files
+          - link "9 months ago" [ref=e322] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e323]: 9 months ago
+        - listitem [ref=e324]:
+          - generic [ref=e325]:
+            - link "config_sentence_transformers.json" [ref=e326] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/config_sentence_transformers.json
+              - img [ref=e327]
+              - generic [ref=e329]: config_sentence_transformers.json
+            - button "Safe" [ref=e331] [cursor=pointer]:
+              - img [ref=e332]
+              - generic [ref=e336]: Safe
+          - link "205 Bytes" [ref=e337] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/config_sentence_transformers.json?download=true
+            - generic [ref=e338]: 205 Bytes
+            - img [ref=e340]
+          - link "Upload 14 files" [ref=e342] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e343]: Upload 14 files
+          - link "9 months ago" [ref=e344] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e345]: 9 months ago
+        - listitem [ref=e346]:
+          - generic [ref=e347]:
+            - link "conversion_report.json" [ref=e348] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/conversion_report.json
+              - img [ref=e349]
+              - generic [ref=e351]: conversion_report.json
+            - button [ref=e353] [cursor=pointer]:
+              - img [ref=e354]
+          - link "1.16 kB" [ref=e357] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/conversion_report.json?download=true
+            - generic [ref=e358]: 1.16 kB
+            - img [ref=e360]
+          - link "Upload 14 files" [ref=e362] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e363]: Upload 14 files
+          - link "9 months ago" [ref=e364] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e365]: 9 months ago
+        - listitem [ref=e366]:
+          - generic [ref=e367]:
+            - link "model.onnx" [ref=e368] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/model.onnx
+              - img [ref=e369]
+              - generic [ref=e371]: model.onnx
+            - button [ref=e373] [cursor=pointer]:
+              - img [ref=e374]
+          - link "1.26 GB xet" [ref=e377] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/model.onnx?download=true
+            - generic [ref=e378]: 1.26 GB
+            - generic [ref=e379]:
+              - img [ref=e380]
+              - text: xet
+            - img [ref=e384]
+          - link "Upload 14 files" [ref=e386] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e387]: Upload 14 files
+          - link "9 months ago" [ref=e388] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e389]: 9 months ago
+        - listitem [ref=e390]:
+          - generic [ref=e391]:
+            - link "model.safetensors" [ref=e392] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/model.safetensors
+              - img [ref=e393]
+              - generic [ref=e395]: model.safetensors
+            - button "Safe" [ref=e397] [cursor=pointer]:
+              - img [ref=e398]
+              - generic [ref=e402]: Safe
+            - button [ref=e403] [cursor=pointer]:
+              - img [ref=e404]
+              - img [ref=e406]
+          - link "1.26 GB xet" [ref=e408] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/model.safetensors?download=true
+            - generic [ref=e409]: 1.26 GB
+            - generic [ref=e410]:
+              - img [ref=e411]
+              - text: xet
+            - img [ref=e415]
+          - link "Upload 14 files" [ref=e417] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e418]: Upload 14 files
+          - link "9 months ago" [ref=e419] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e420]: 9 months ago
+        - listitem [ref=e421]:
+          - generic [ref=e422]:
+            - link "modules.json" [ref=e423] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/modules.json
+              - img [ref=e424]
+              - generic [ref=e426]: modules.json
+            - button "Safe" [ref=e428] [cursor=pointer]:
+              - img [ref=e429]
+              - generic [ref=e433]: Safe
+          - link "229 Bytes" [ref=e434] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/modules.json?download=true
+            - generic [ref=e435]: 229 Bytes
+            - img [ref=e437]
+          - link "Upload 14 files" [ref=e439] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e440]: Upload 14 files
+          - link "9 months ago" [ref=e441] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e442]: 9 months ago
+        - listitem [ref=e443]:
+          - generic [ref=e444]:
+            - link "sentence_bert_config.json" [ref=e445] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/sentence_bert_config.json
+              - img [ref=e446]
+              - generic [ref=e448]: sentence_bert_config.json
+            - button "Safe" [ref=e450] [cursor=pointer]:
+              - img [ref=e451]
+              - generic [ref=e455]: Safe
+          - link "54 Bytes" [ref=e456] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/sentence_bert_config.json?download=true
+            - generic [ref=e457]: 54 Bytes
+            - img [ref=e459]
+          - link "Upload 14 files" [ref=e461] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e462]: Upload 14 files
+          - link "9 months ago" [ref=e463] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e464]: 9 months ago
+        - listitem [ref=e465]:
+          - generic [ref=e466]:
+            - link "special_tokens_map.json" [ref=e467] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/special_tokens_map.json
+              - img [ref=e468]
+              - generic [ref=e470]: special_tokens_map.json
+            - button "Safe" [ref=e472] [cursor=pointer]:
+              - img [ref=e473]
+              - generic [ref=e477]: Safe
+          - link "968 Bytes" [ref=e478] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/special_tokens_map.json?download=true
+            - generic [ref=e479]: 968 Bytes
+            - img [ref=e481]
+          - link "Upload 14 files" [ref=e483] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e484]: Upload 14 files
+          - link "9 months ago" [ref=e485] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e486]: 9 months ago
+        - listitem [ref=e487]:
+          - generic [ref=e488]:
+            - link "tokenizer.json" [ref=e489] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/tokenizer.json
+              - img [ref=e490]
+              - generic [ref=e492]: tokenizer.json
+            - button "Safe" [ref=e494] [cursor=pointer]:
+              - img [ref=e495]
+              - generic [ref=e499]: Safe
+          - link "6.73 MB" [ref=e500] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/tokenizer.json?download=true
+            - generic [ref=e501]: 6.73 MB
+            - img [ref=e503]
+          - link "Upload 14 files" [ref=e505] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e506]: Upload 14 files
+          - link "9 months ago" [ref=e507] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e508]: 9 months ago
+        - listitem [ref=e509]:
+          - generic [ref=e510]:
+            - link "tokenizer.model" [ref=e511] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/tokenizer.model
+              - img [ref=e512]
+              - generic [ref=e514]: tokenizer.model
+            - button "Safe" [ref=e516] [cursor=pointer]:
+              - img [ref=e517]
+              - generic [ref=e521]: Safe
+          - link "1.83 MB xet" [ref=e522] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/tokenizer.model?download=true
+            - generic [ref=e523]: 1.83 MB
+            - generic [ref=e524]:
+              - img [ref=e525]
+              - text: xet
+            - img [ref=e529]
+          - link "Upload 14 files" [ref=e531] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e532]: Upload 14 files
+          - link "9 months ago" [ref=e533] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e534]: 9 months ago
+        - listitem [ref=e535]:
+          - generic [ref=e536]:
+            - link "tokenizer_config.json" [ref=e537] [cursor=pointer]:
+              - /url: /keitokei1994/ruri-v3-310m-onnx/blob/main/tokenizer_config.json
+              - img [ref=e538]
+              - generic [ref=e540]: tokenizer_config.json
+            - button "Safe" [ref=e542] [cursor=pointer]:
+              - img [ref=e543]
+              - generic [ref=e547]: Safe
+          - link "3.78 kB" [ref=e548] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/resolve/main/tokenizer_config.json?download=true
+            - generic [ref=e549]: 3.78 kB
+            - img [ref=e551]
+          - link "Upload 14 files" [ref=e553] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - generic [ref=e554]: Upload 14 files
+          - link "9 months ago" [ref=e555] [cursor=pointer]:
+            - /url: /keitokei1994/ruri-v3-310m-onnx/commit/29fbdf5a220be34489a22db70979f8583ed465da
+            - time [ref=e556]: 9 months ago

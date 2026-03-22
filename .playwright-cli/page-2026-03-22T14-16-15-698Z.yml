@@ -1,0 +1,188 @@
+- generic [ref=e2]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - link "Hugging Face's logo Hugging Face" [ref=e7] [cursor=pointer]:
+          - /url: /
+          - img "Hugging Face's logo" [ref=e8]
+          - generic [ref=e9]: Hugging Face
+        - generic [ref=e10]:
+          - textbox "Search models, datasets, users..." [ref=e11]
+          - img [ref=e12]
+      - navigation "Main" [ref=e14]:
+        - list [ref=e15]:
+          - listitem [ref=e16]:
+            - link "Models" [ref=e17] [cursor=pointer]:
+              - /url: /models
+              - img [ref=e18]
+              - text: Models
+          - listitem [ref=e22]:
+            - link "Datasets" [ref=e23] [cursor=pointer]:
+              - /url: /datasets
+              - img [ref=e24]
+              - text: Datasets
+          - listitem [ref=e29]:
+            - link "Spaces" [ref=e30] [cursor=pointer]:
+              - /url: /spaces
+              - img [ref=e31]
+              - text: Spaces
+          - listitem [ref=e35]:
+            - link "Buckets new" [ref=e36] [cursor=pointer]:
+              - /url: /storage
+              - img [ref=e37]
+              - text: Buckets
+              - generic [ref=e41]: new
+          - listitem [ref=e42]:
+            - link "Docs" [ref=e43] [cursor=pointer]:
+              - /url: /docs
+              - img [ref=e44]
+              - text: Docs
+          - listitem [ref=e48]:
+            - link "Pricing" [ref=e49] [cursor=pointer]:
+              - /url: /pricing
+          - listitem [ref=e50]:
+            - button [ref=e52] [cursor=pointer]:
+              - img [ref=e53]
+          - listitem [ref=e58]:
+            - separator [ref=e59]
+          - listitem [ref=e60]:
+            - link "Log In" [ref=e61] [cursor=pointer]:
+              - /url: /login
+          - listitem [ref=e62]:
+            - link "Sign Up" [ref=e63] [cursor=pointer]:
+              - /url: /join
+  - main [ref=e64]:
+    - generic [ref=e67]:
+      - heading "mochiya98 / ruri-v3-310m-onnx like 2" [level=1] [ref=e68]:
+        - generic [ref=e69]:
+          - link [ref=e73] [cursor=pointer]:
+            - /url: /mochiya98
+          - link "mochiya98" [ref=e77] [cursor=pointer]:
+            - /url: /mochiya98
+          - generic [ref=e78]: /
+        - generic [ref=e79]:
+          - link "ruri-v3-310m-onnx" [ref=e80] [cursor=pointer]:
+            - /url: /mochiya98/ruri-v3-310m-onnx
+          - button "Copy model name to clipboard" [ref=e81] [cursor=pointer]:
+            - img [ref=e82]
+        - generic [ref=e86]:
+          - button "like" [ref=e87] [cursor=pointer]:
+            - img [ref=e88]
+            - generic [ref=e90]: like
+          - button "2" [ref=e91] [cursor=pointer]
+      - generic [ref=e92]:
+        - link "ONNX" [ref=e93] [cursor=pointer]:
+          - /url: /models?library=onnx
+          - generic [ref=e94]:
+            - img [ref=e95]
+            - generic [ref=e105]: ONNX
+        - link "modernbert" [ref=e106] [cursor=pointer]:
+          - /url: /models?other=modernbert
+          - generic [ref=e108]: modernbert
+        - 'button "License: apache-2.0" [ref=e110] [cursor=pointer]':
+          - generic [ref=e112]:
+            - img [ref=e113]
+            - generic [ref=e115]: "License:"
+            - generic [ref=e116]: apache-2.0
+      - generic [ref=e118]:
+        - generic [ref=e119]:
+          - link "Model card" [ref=e120] [cursor=pointer]:
+            - /url: /mochiya98/ruri-v3-310m-onnx
+            - img [ref=e121]
+            - text: Model card
+          - link "Files and versions xet" [ref=e125] [cursor=pointer]:
+            - /url: /mochiya98/ruri-v3-310m-onnx/tree/main
+            - img [ref=e126]
+            - generic [ref=e129]: Files and versions
+            - generic [ref=e132]:
+              - img [ref=e133]
+              - generic [ref=e136]: xet
+          - link "Community" [ref=e137] [cursor=pointer]:
+            - /url: /mochiya98/ruri-v3-310m-onnx/discussions
+            - img [ref=e138]
+            - text: Community
+        - button [ref=e144] [cursor=pointer]:
+          - img [ref=e145]
+    - generic [ref=e149]:
+      - generic [ref=e153]: README.md exists but content is empty.
+      - generic [ref=e154]:
+        - generic [ref=e155]:
+          - generic [ref=e156]:
+            - term [ref=e157]: Downloads last month
+            - definition [ref=e158]: "7"
+          - img [ref=e160]
+        - generic [ref=e166]:
+          - generic [ref=e167]:
+            - img [ref=e168]
+            - generic [ref=e170]: Inference Providers
+            - link "NEW" [ref=e171] [cursor=pointer]:
+              - /url: https://huggingface.co/docs/inference-providers
+          - generic [ref=e172]:
+            - generic [ref=e173]: This model isn't deployed by any Inference Provider.
+            - link "🙋 Ask for provider support" [ref=e174] [cursor=pointer]:
+              - /url: /spaces/huggingface/InferenceSupport/discussions/new?title=mochiya98/ruri-v3-310m-onnx&description=React%20to%20this%20comment%20with%20an%20emoji%20to%20vote%20for%20%5Bmochiya98%2Fruri-v3-310m-onnx%5D(%2Fmochiya98%2Fruri-v3-310m-onnx)%20to%20be%20supported%20by%20Inference%20Providers.%0A%0A(optional)%20Which%20providers%20are%20you%20interested%20in%3F%20(Novita%2C%20Hyperbolic%2C%20Together%E2%80%A6)%0A
+              - generic [ref=e176]: 🙋
+              - generic [ref=e177]: Ask for provider support
+        - heading "Model tree for mochiya98/ruri-v3-310m-onnx" [level=2] [ref=e179]:
+          - img [ref=e180]
+          - text: Model tree for
+          - generic [ref=e183]: mochiya98/ruri-v3-310m-onnx
+          - link [ref=e184] [cursor=pointer]:
+            - /url: /docs/hub/model-cards#specifying-a-base-model
+            - img [ref=e185]
+        - generic [ref=e189]:
+          - generic [ref=e190]:
+            - paragraph [ref=e191]: Base model
+            - link "sbintuitions/modernbert-ja-310m" [ref=e193] [cursor=pointer]:
+              - /url: /sbintuitions/modernbert-ja-310m
+          - generic [ref=e194]:
+            - img [ref=e196]
+            - generic [ref=e198]:
+              - img [ref=e199]
+              - text: Finetuned
+            - link "cl-nagoya/ruri-v3-pt-310m" [ref=e207] [cursor=pointer]:
+              - /url: /cl-nagoya/ruri-v3-pt-310m
+          - generic [ref=e208]:
+            - img [ref=e210]
+            - generic [ref=e212]:
+              - img [ref=e213]
+              - text: Finetuned
+            - link "cl-nagoya/ruri-v3-310m" [ref=e221] [cursor=pointer]:
+              - /url: /cl-nagoya/ruri-v3-310m
+          - generic [ref=e222]:
+            - img [ref=e224]
+            - generic [ref=e226]:
+              - img [ref=e227]
+              - text: Quantized
+            - generic [ref=e234]:
+              - text: (
+              - link "9" [ref=e235] [cursor=pointer]:
+                - /url: /models?other=base_model:quantized:cl-nagoya/ruri-v3-310m
+              - text: )
+            - generic "mochiya98/ruri-v3-310m-onnx" [ref=e237]: this model
+  - contentinfo [ref=e238]:
+    - navigation [ref=e239]:
+      - button "System theme" [ref=e242] [cursor=pointer]:
+        - img [ref=e243]
+        - text: System theme
+      - link "TOS" [ref=e248] [cursor=pointer]:
+        - /url: /terms-of-service
+      - link "Privacy" [ref=e249] [cursor=pointer]:
+        - /url: /privacy
+      - link "About" [ref=e250] [cursor=pointer]:
+        - /url: /huggingface
+      - link "Careers" [ref=e251] [cursor=pointer]:
+        - /url: https://apply.workable.com/huggingface/
+      - link "Hugging Face" [ref=e252] [cursor=pointer]:
+        - /url: /
+        - img [ref=e253]
+      - link "Models" [ref=e267] [cursor=pointer]:
+        - /url: /models
+      - link "Datasets" [ref=e268] [cursor=pointer]:
+        - /url: /datasets
+      - link "Spaces" [ref=e269] [cursor=pointer]:
+        - /url: /spaces
+      - link "Pricing" [ref=e270] [cursor=pointer]:
+        - /url: /pricing
+      - link "Docs" [ref=e271] [cursor=pointer]:
+        - /url: /docs

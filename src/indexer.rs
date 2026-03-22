@@ -286,15 +286,14 @@ fn dirs_changed_since(opts: &IndexOptions, last_scan: f64) -> bool {
             continue;
         }
         match dir_mtime_secs(dir) {
-            Some(mt) if mt > last_scan => return true,
-            None => return true, // Can't stat → assume changed
+            Some(mt) if mt >= last_scan => return true,
+            None => return true,
             _ => {}
         }
-        // Also check immediate subdirectories (new session folders)
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if let Some(mt) = dir_mtime_secs(&entry.path()) {
-                    if mt > last_scan {
+                    if mt >= last_scan {
                         return true;
                     }
                 }

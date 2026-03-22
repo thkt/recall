@@ -1,0 +1,208 @@
+- generic [ref=e2]:
+  - banner [ref=e4]:
+    - generic [ref=e5]:
+      - generic [ref=e6]:
+        - link "Hugging Face's logo Hugging Face" [ref=e7] [cursor=pointer]:
+          - /url: /
+          - img "Hugging Face's logo" [ref=e8]
+          - generic [ref=e9]: Hugging Face
+        - generic [ref=e10]:
+          - textbox "Search models, datasets, users..." [ref=e11]
+          - img [ref=e12]
+      - navigation "Main" [ref=e14]:
+        - list [ref=e15]:
+          - listitem [ref=e16]:
+            - link "Models" [ref=e17] [cursor=pointer]:
+              - /url: /models
+              - img [ref=e18]
+              - text: Models
+          - listitem [ref=e22]:
+            - link "Datasets" [ref=e23] [cursor=pointer]:
+              - /url: /datasets
+              - img [ref=e24]
+              - text: Datasets
+          - listitem [ref=e29]:
+            - link "Spaces" [ref=e30] [cursor=pointer]:
+              - /url: /spaces
+              - img [ref=e31]
+              - text: Spaces
+          - listitem [ref=e35]:
+            - link "Buckets new" [ref=e36] [cursor=pointer]:
+              - /url: /storage
+              - img [ref=e37]
+              - text: Buckets
+              - generic [ref=e41]: new
+          - listitem [ref=e42]:
+            - link "Docs" [ref=e43] [cursor=pointer]:
+              - /url: /docs
+              - img [ref=e44]
+              - text: Docs
+          - listitem [ref=e48]:
+            - link "Pricing" [ref=e49] [cursor=pointer]:
+              - /url: /pricing
+          - listitem [ref=e50]:
+            - button [ref=e52] [cursor=pointer]:
+              - img [ref=e53]
+          - listitem [ref=e58]:
+            - separator [ref=e59]
+          - listitem [ref=e60]:
+            - link "Log In" [ref=e61] [cursor=pointer]:
+              - /url: /login
+          - listitem [ref=e62]:
+            - link "Sign Up" [ref=e63] [cursor=pointer]:
+              - /url: /join
+  - main [ref=e64]:
+    - generic [ref=e67]:
+      - heading "keisuke-miyako / ruri-v3-310m-onnx-int8 like 0" [level=1] [ref=e68]:
+        - generic [ref=e69]:
+          - link [ref=e73] [cursor=pointer]:
+            - /url: /keisuke-miyako
+          - link "keisuke-miyako" [ref=e77] [cursor=pointer]:
+            - /url: /keisuke-miyako
+          - generic [ref=e78]: /
+        - generic [ref=e79]:
+          - link "ruri-v3-310m-onnx-int8" [ref=e80] [cursor=pointer]:
+            - /url: /keisuke-miyako/ruri-v3-310m-onnx-int8
+          - button "Copy model name to clipboard" [ref=e81] [cursor=pointer]:
+            - img [ref=e82]
+        - generic [ref=e86]:
+          - button "like" [ref=e87] [cursor=pointer]:
+            - img [ref=e88]
+            - generic [ref=e90]: like
+          - button "0" [ref=e91] [cursor=pointer]
+      - generic [ref=e92]:
+        - link "ONNX" [ref=e93] [cursor=pointer]:
+          - /url: /models?library=onnx
+          - generic [ref=e94]:
+            - img [ref=e95]
+            - generic [ref=e105]: ONNX
+        - link "Japanese" [ref=e106] [cursor=pointer]:
+          - /url: /models?language=ja
+          - generic [ref=e107]:
+            - img [ref=e108]
+            - generic [ref=e110]: Japanese
+        - link "modernbert" [ref=e111] [cursor=pointer]:
+          - /url: /models?other=modernbert
+          - generic [ref=e113]: modernbert
+      - generic [ref=e114]:
+        - generic [ref=e115]:
+          - link "Model card" [ref=e116] [cursor=pointer]:
+            - /url: /keisuke-miyako/ruri-v3-310m-onnx-int8
+            - img [ref=e117]
+            - text: Model card
+          - link "Files and versions xet" [ref=e121] [cursor=pointer]:
+            - /url: /keisuke-miyako/ruri-v3-310m-onnx-int8/tree/main
+            - img [ref=e122]
+            - generic [ref=e125]: Files and versions
+            - generic [ref=e128]:
+              - img [ref=e129]
+              - generic [ref=e132]: xet
+          - link "Community" [ref=e133] [cursor=pointer]:
+            - /url: /keisuke-miyako/ruri-v3-310m-onnx-int8/discussions
+            - img [ref=e134]
+            - text: Community
+        - button [ref=e140] [cursor=pointer]:
+          - img [ref=e141]
+    - generic [ref=e145]:
+      - generic [ref=e149]: README.md exists but content is empty.
+      - generic [ref=e150]:
+        - generic [ref=e151]:
+          - generic [ref=e152]:
+            - term [ref=e153]: Downloads last month
+            - definition [ref=e154]: "349"
+          - img [ref=e156]
+        - generic [ref=e162]:
+          - generic [ref=e163]:
+            - img [ref=e164]
+            - generic [ref=e166]: Inference Providers
+            - link "NEW" [ref=e167] [cursor=pointer]:
+              - /url: https://huggingface.co/docs/inference-providers
+          - generic [ref=e168]:
+            - generic [ref=e169]: This model isn't deployed by any Inference Provider.
+            - link "🙋 Ask for provider support" [ref=e170] [cursor=pointer]:
+              - /url: /spaces/huggingface/InferenceSupport/discussions/new?title=keisuke-miyako/ruri-v3-310m-onnx-int8&description=React%20to%20this%20comment%20with%20an%20emoji%20to%20vote%20for%20%5Bkeisuke-miyako%2Fruri-v3-310m-onnx-int8%5D(%2Fkeisuke-miyako%2Fruri-v3-310m-onnx-int8)%20to%20be%20supported%20by%20Inference%20Providers.%0A%0A(optional)%20Which%20providers%20are%20you%20interested%20in%3F%20(Novita%2C%20Hyperbolic%2C%20Together%E2%80%A6)%0A
+              - generic [ref=e172]: 🙋
+              - generic [ref=e173]: Ask for provider support
+        - heading "Model tree for keisuke-miyako/ruri-v3-310m-onnx-int8" [level=2] [ref=e175]:
+          - img [ref=e176]
+          - text: Model tree for
+          - generic [ref=e179]: keisuke-miyako/ruri-v3-310m-onnx-int8
+          - link [ref=e180] [cursor=pointer]:
+            - /url: /docs/hub/model-cards#specifying-a-base-model
+            - img [ref=e181]
+        - generic [ref=e185]:
+          - generic [ref=e186]:
+            - paragraph [ref=e187]: Base model
+            - link "sbintuitions/modernbert-ja-310m" [ref=e189] [cursor=pointer]:
+              - /url: /sbintuitions/modernbert-ja-310m
+          - generic [ref=e190]:
+            - img [ref=e192]
+            - generic [ref=e194]:
+              - img [ref=e195]
+              - text: Finetuned
+            - link "cl-nagoya/ruri-v3-pt-310m" [ref=e203] [cursor=pointer]:
+              - /url: /cl-nagoya/ruri-v3-pt-310m
+          - generic [ref=e204]:
+            - img [ref=e206]
+            - generic [ref=e208]:
+              - img [ref=e209]
+              - text: Finetuned
+            - link "cl-nagoya/ruri-v3-310m" [ref=e217] [cursor=pointer]:
+              - /url: /cl-nagoya/ruri-v3-310m
+          - generic [ref=e218]:
+            - img [ref=e220]
+            - generic [ref=e222]:
+              - img [ref=e223]
+              - text: Quantized
+            - generic [ref=e230]:
+              - text: (
+              - link "9" [ref=e231] [cursor=pointer]:
+                - /url: /models?other=base_model:quantized:cl-nagoya/ruri-v3-310m
+              - text: )
+            - generic "keisuke-miyako/ruri-v3-310m-onnx-int8" [ref=e233]: this model
+        - heading "Collection including keisuke-miyako/ruri-v3-310m-onnx-int8" [level=2] [ref=e235]:
+          - img [ref=e236]
+          - text: Collection including
+          - generic [ref=e240]: keisuke-miyako/ruri-v3-310m-onnx-int8
+        - article [ref=e243]:
+          - link "ONNX Fail Collection Protobuf parsing failed • 8 items • Updated 9 days ago" [ref=e244] [cursor=pointer]:
+            - /url: /collections/keisuke-miyako/onnx-fail
+            - generic "ONNX Fail" [ref=e245]:
+              - heading "ONNX Fail" [level=4] [ref=e246]
+              - generic [ref=e247]:
+                - img [ref=e248]
+                - text: Collection
+            - generic [ref=e252]:
+              - generic [ref=e253]: Protobuf parsing failed
+              - generic [ref=e254]: •
+              - generic [ref=e255]: 8 items
+              - generic [ref=e256]: •
+              - generic [ref=e257]:
+                - text: Updated
+                - time [ref=e258]: 9 days ago
+  - contentinfo [ref=e260]:
+    - navigation [ref=e261]:
+      - button "System theme" [ref=e264] [cursor=pointer]:
+        - img [ref=e265]
+        - text: System theme
+      - link "TOS" [ref=e270] [cursor=pointer]:
+        - /url: /terms-of-service
+      - link "Privacy" [ref=e271] [cursor=pointer]:
+        - /url: /privacy
+      - link "About" [ref=e272] [cursor=pointer]:
+        - /url: /huggingface
+      - link "Careers" [ref=e273] [cursor=pointer]:
+        - /url: https://apply.workable.com/huggingface/
+      - link "Hugging Face" [ref=e274] [cursor=pointer]:
+        - /url: /
+        - img [ref=e275]
+      - link "Models" [ref=e289] [cursor=pointer]:
+        - /url: /models
+      - link "Datasets" [ref=e290] [cursor=pointer]:
+        - /url: /datasets
+      - link "Spaces" [ref=e291] [cursor=pointer]:
+        - /url: /spaces
+      - link "Pricing" [ref=e292] [cursor=pointer]:
+        - /url: /pricing
+      - link "Docs" [ref=e293] [cursor=pointer]:
+        - /url: /docs
