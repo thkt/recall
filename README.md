@@ -2,7 +2,7 @@
 
 # recall
 
-Your past Claude Code and Codex sessions, searchable.
+Your past Claude Code and Codex sessions, searchable. Gets smarter every time you search.
 
 ## The problem
 
@@ -15,9 +15,6 @@ find ~/.claude -name "*.jsonl" | wc -l
   3,851
 
 grep -r "authentication" ~/.claude/projects/ | head
-  {"type":"user","message":{"role":"user","content":[{"type":"text","text":"I need to
-  {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"H
-  {"type":"user","message":{"role":"user","content":[{"type":"text","text":"Now let's a
   ...12,000+ lines of raw JSONL
 ```
 
@@ -28,129 +25,136 @@ recall "authentication"
 
 [1] 2026-02-27 | stateful-sleeping-cosmos | kagami [claude]
     /Users/me/GitHub/kagami
-    > Enable API keys Allow users and/or organizations to **authenticate**
+    > Enable API keys Allow users and/or organizations to authenticate
       with your API programmatically...
 
 [2] 2026-02-08 | fluffy-rolling-lampson | kai [claude]
     /Users/me/GitHub/kai/main
-    > **authenticator** / isAuthenticated path: ...NID OAuth2 + PKCE
-      **authentication** with nonce...
-
-[3] 2026-02-08 | frolicking-juggling-storm | kizalas [claude]
-    /Users/me/GitHub/kizalas/dev
-    > ...全 57 エンドポイント を 15 グループに分類 — **Authentication** (4),
-      Administrator (5), Tenant (5)...
+    > authenticator / isAuthenticated path: ...NID OAuth2 + PKCE
+      authentication with nonce...
 ```
 
-3,851 sessions, 52,000 messages — searched in under a second.
+6,000+ sessions, 27,000+ Q&A pairs — searched in under 2 seconds.
 
-## When to use recall (and when not to)
-
-**Use recall when:**
-
-- "How did I set up ESLint in that project?" — you remember the topic, not the session
-- "Show me everything about database migrations from the last week" — time + topic filtering
-- "What did Claude suggest for error handling in myapp?" — project-scoped search
-
-**Use grep when:**
-
-- You know the exact file path
-- You need regex matching over raw JSONL
-
-recall doesn't replace grep. It covers the case grep can't: finding sessions by what you talked about.
-
-## Setup
-
-### Install
-
-**Homebrew (macOS):**
+## Quick start
 
 ```sh
+# Install
 brew install thkt/tap/recall
+# or: cargo install --path .
+
+# Index your sessions (downloads embedding model on first run)
+recall index
+
+# Search
+recall search "authentication"
 ```
 
-**Build from source** (requires Rust 1.85+):
+## How search gets smarter
 
-```sh
-cargo install --path .
+recall starts with keyword search (FTS5). Each time you search, it quietly embeds nearby chunks using a local AI model. Over time, this enables **semantic search** — finding sessions by meaning, not just keywords.
+
+```
+First search:   FTS5 keyword match only
+After search:   Result sessions get embedded (10 nearby + 10 recent)
+Next search:    Hybrid ranking (FTS5 + vector similarity via RRF)
+Over time:      More sessions embedded → better semantic results
 ```
 
-No API keys. No configuration. No runtime dependencies. Just a 2.4 MB binary.
-
-### Claude Code integration
-
-Add to your project's `CLAUDE.md`:
-
-```markdown
-## Tools
-
-- `recall "query"` — search past sessions
-- `recall "query" --project /path/to/project` — filter by project
-- `recall "query" --days 7` — only recent sessions
-- `recall "query" --source codex` — filter by source
-```
+No API keys. No data leaves your machine. The embedding model (Ruri v3) runs locally via CoreML on Apple Silicon.
 
 ## Usage
 
+### Search
+
 ```sh
-recall "error handling"                                    # basic search
-recall "database migration" --project /Users/me/GitHub/app # filter by project
-recall "React Router" --days 7                             # last 7 days only
-recall "async runtime" --source codex                      # Codex sessions only
-recall "auth AND middleware"                                # boolean operators
+recall search "error handling"                                   # keyword search
+recall search "database migration" --project /Users/me/GitHub/app  # filter by project
+recall search "React Router" --days 7                            # last 7 days
+recall search "async runtime" --source codex                     # Codex sessions only
+recall search "auth AND middleware"                               # boolean operators
+recall search "auth" --no-embed                                  # skip post-search embedding
 ```
+
+Backward compatible: `recall "query"` works as shorthand for `recall search "query"`.
+
+| Flag         | Description                               |
+| ------------ | ----------------------------------------- |
+| `--project`  | Filter by project path (prefix match)     |
+| `--days`     | Only sessions from the last N days        |
+| `--source`   | `claude` or `codex`                       |
+| `--limit`    | Max results, 1-100 (default: 10)          |
+| `--no-embed` | Skip post-search embedding                |
+| `-v`         | Verbose output                            |
 
 Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
 
-| Flag        | Description                                 |
-| ----------- | ------------------------------------------- |
-| `--project` | Filter by project path (prefix match)       |
-| `--days`    | Only sessions from the last N days          |
-| `--source`  | `claude` or `codex`                         |
-| `--limit`   | Max results, 1–100 (default: 10)            |
-| `--reindex` | Force full rebuild of the index             |
-| `-v`        | Verbose output (index stats, skipped files) |
+### Index
+
+```sh
+recall index            # parse + chunk + download model
+recall index --force    # full rebuild
+recall index --embed    # embed all chunks (slow, enables full hybrid search)
+```
+
+### Status
+
+```sh
+recall status           # sessions, chunks, embedding coverage, model status
+```
 
 ## How it works
 
 ```text
 ~/.claude/projects/**/*.jsonl  ─┐
-                                ├─→ Parse → SQLite FTS5 index → Search
+                                ├─→ Parse → FTS5 + Q&A chunks → Progressive embedding
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-**Indexing** — First run scans `~/.claude/projects/` and `~/.codex/sessions/`, parses JSONL files, and builds a full-text index at `~/.recall.db`. Subsequent runs are incremental — only changed files are re-indexed.
+**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — only changed files are re-indexed. Directory mtime checking skips the scan entirely when nothing changed.
 
-**Parsing** — Claude Code and Codex JSONL formats are both handled. Tool-use blocks and system prompts are filtered out — only user/assistant text is indexed.
+**Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via ONNX Runtime with CoreML acceleration (~100ms/chunk on M3). Model auto-downloads on first `recall index`.
 
-**Ranking** — BM25 relevance with a recency boost. Recent sessions rank higher when relevance scores are close.
+**Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close.
 
 ## Architecture
 
 ```text
 src/
-├── main.rs       CLI entry point, display formatting
-├── parser.rs     JSONL parsers for Claude Code and Codex formats
-├── indexer.rs    Incremental session indexer with mtime tracking
-├── search.rs     FTS5 search with BM25 + recency boost
-├── db.rs         SQLite schema (WAL mode, FTS5 with Porter stemmer)
-└── date.rs       Civil calendar date utilities (Howard Hinnant algorithm)
+├── main.rs       CLI subcommands (index, search, status)
+├── parser/       JSONL parsers for Claude Code and Codex formats
+├── indexer.rs    Incremental indexer with mtime tracking + chunk generation
+├── search.rs     FTS5 + hybrid vector search with graceful degradation
+├── hybrid.rs     RRF merge + recency boost
+├── embedder.rs   ort + Ruri v3 ONNX embedder (CoreML EP, mean pooling)
+├── chunker.rs    Q&A pair chunker with SHA256 change detection
+├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
+└── date.rs       Civil calendar date utilities
 ```
 
-Single binary, zero runtime dependencies. SQLite is statically linked.
+Single binary. SQLite, ONNX Runtime, and sqlite-vec are statically linked.
+
+## Performance
+
+| Operation                  | Time          |
+| -------------------------- | ------------- |
+| `recall index` (6k files)  | ~0.5s (incremental), ~4min (full rebuild) |
+| `recall search`            | ~2s (with embedding), instant (--no-embed) |
+| Embedding per chunk        | ~100ms (M3 + CoreML)                      |
+| Initial model download     | ~30s (1.3 GB)                              |
 
 ## Limitations
 
-| Limitation          | Details                                                                                                      |
-| ------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync                                      |
-| Text only           | Images, tool results, and binary content are not indexed                                                     |
-| Unix DB permissions | The database file is created with `0600` permissions on Unix. Other platforms use default permissions         |
-| No export           | Search results show excerpts. To view full sessions, open the JSONL file directly                            |
+| Limitation          | Details                                                                   |
+| ------------------- | ------------------------------------------------------------------------- |
+| Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync   |
+| Text only           | Images, tool results, and binary content are not indexed                  |
+| Apple Silicon focus | CoreML acceleration requires Apple Silicon. CPU fallback available but slower |
+| No export           | Search results show excerpts. Open the JSONL file directly for full sessions |
 
 ## Acknowledgements
 
-This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/recall). The original idea of making past Claude Code sessions searchable came from there. This is a Rust reimplementation — single binary, no runtime dependencies, fast startup, and CJK (Japanese, Chinese, Korean) search support.
+This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/recall). The original idea of making past Claude Code sessions searchable came from there. This is a Rust reimplementation with semantic search — single binary, local embeddings, and CJK support.
 
 ## License
 
