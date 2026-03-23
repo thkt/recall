@@ -102,7 +102,7 @@ fn sanitize_fts_query(query: &str) -> String {
         .map(|w| {
             let w = w.trim_start_matches(['^', '+', '-']);
             let w = w.trim_matches(['(', ')']);
-            if w.contains(':') && !w.starts_with('"') {
+            if (w.contains(':') || w.contains('-')) && !w.starts_with('"') {
                 let clean = w.replace('"', "");
                 format!("\"{clean}\"")
             } else {
@@ -484,7 +484,13 @@ pub fn search_with_embedder(
             })
             .collect();
 
-        let vec_hits = vec_search(conn, embedder, query, candidate_limit).unwrap_or_default();
+        let vec_hits = match vec_search(conn, embedder, query, candidate_limit) {
+            Ok(hits) => hits,
+            Err(e) => {
+                eprintln!("Warning: vector search failed, using text search only: {e}");
+                Vec::new()
+            }
+        };
 
         let mut merged = hybrid::rrf_merge(&fts_hits, &vec_hits);
 
@@ -931,6 +937,10 @@ mod tests {
             ("hello NEAR/3 world", "hello world"),
             ("near(x y)", "y"),
             ("Near/2 test", "test"),
+            // Internal hyphens → quoted (prevents FTS5 NOT interpretation)
+            ("mlx-rs embedding", "\"mlx-rs\" embedding"),
+            ("state-of-the-art", "\"state-of-the-art\""),
+            ("\"mlx-rs\"", "\"mlx-rs\""),
             // Quote balancing
             ("\"unbalanced", "\"unbalanced\""),
             ("\"balanced\"", "\"balanced\""),

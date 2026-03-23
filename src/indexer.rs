@@ -597,7 +597,10 @@ impl EmbedResult {
     }
 }
 
-/// Stops on first embedding failure. Commits successfully embedded chunks.
+const EMBED_BATCH_SIZE: usize = 64;
+
+/// Embeds chunks in batches, committing each batch separately.
+/// Stops on first batch failure; previously committed batches are preserved.
 fn embed_chunks(
     conn: &mut Connection,
     embedder: &mut dyn Embed,
@@ -610,28 +613,31 @@ fn embed_chunks(
         });
     }
 
-    let tx = conn.transaction()?;
     let mut embedded = 0;
     let mut stopped_at_error = None;
 
-    for (chunk_id, content) in chunks {
-        match embedder.embed_document(content) {
-            Ok(embedding) => {
-                let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
-                tx.execute(
-                    "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-                    rusqlite::params![chunk_id, embedding_bytes],
-                )?;
-                embedded += 1;
+    for batch in chunks.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
+        match embedder.embed_documents_batch(&texts) {
+            Ok(embeddings) => {
+                let tx = conn.transaction()?;
+                for (embedding, (chunk_id, _)) in embeddings.iter().zip(batch) {
+                    let embedding_bytes: &[u8] = bytemuck::cast_slice(embedding);
+                    tx.execute(
+                        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                        rusqlite::params![chunk_id, embedding_bytes],
+                    )?;
+                }
+                tx.commit()?;
+                embedded += embeddings.len();
             }
             Err(e) => {
-                stopped_at_error = Some(format!("chunk {chunk_id}: {e}"));
+                stopped_at_error = Some(format!("batch: {e}"));
                 break;
             }
         }
     }
 
-    tx.commit()?;
     Ok(EmbedResult {
         embedded,
         stopped_at_error,

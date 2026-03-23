@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "candle")]
 use candle_core::{DType, Device, Tensor};
+#[cfg(feature = "candle")]
 use candle_nn::VarBuilder;
+#[cfg(feature = "candle")]
 use candle_transformers::models::modernbert;
 
 pub(crate) const EMBEDDING_DIMS: usize = 768;
@@ -25,6 +28,15 @@ impl ModelPaths {
             config: dir.join("config.json"),
             tokenizer: dir.join("tokenizer.json"),
         }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), EmbedError> {
+        for path in [&self.model, &self.config, &self.tokenizer] {
+            if !path.exists() {
+                return Err(EmbedError::ModelNotFound { path: path.clone() });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -54,18 +66,6 @@ impl std::fmt::Display for EmbedError {
 }
 
 impl std::error::Error for EmbedError {}
-
-/// Select the best available device: Metal GPU if available, otherwise CPU.
-pub(crate) fn select_device() -> Device {
-    #[cfg(feature = "metal")]
-    {
-        if let Ok(device) = Device::new_metal(0) {
-            return device;
-        }
-        eprintln!("Warning: Metal unavailable, using CPU");
-    }
-    Device::Cpu
-}
 
 #[cfg(test)]
 pub(crate) fn validate_dims(embedding: &[f32]) -> Result<(), EmbedError> {
@@ -123,38 +123,36 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
 pub(crate) trait Embed: std::fmt::Debug {
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError>;
     fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError>;
+    fn embed_documents_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        texts.iter().map(|t| self.embed_document(t)).collect()
+    }
 }
 
+// --- candle backend ---
+
+#[cfg(feature = "candle")]
+pub(crate) fn select_device() -> Device {
+    Device::Cpu
+}
+
+#[cfg(feature = "candle")]
 pub(crate) struct Embedder {
     model: modernbert::ModernBert,
     tokenizer: tokenizers::Tokenizer,
     device: Device,
 }
 
+#[cfg(feature = "candle")]
 impl std::fmt::Debug for Embedder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Embedder").finish_non_exhaustive()
     }
 }
 
+#[cfg(feature = "candle")]
 impl Embedder {
     pub(crate) fn new(paths: &ModelPaths) -> Result<Self, EmbedError> {
-        if !paths.model.exists() {
-            return Err(EmbedError::ModelNotFound {
-                path: paths.model.clone(),
-            });
-        }
-        if !paths.config.exists() {
-            return Err(EmbedError::ModelNotFound {
-                path: paths.config.clone(),
-            });
-        }
-        if !paths.tokenizer.exists() {
-            return Err(EmbedError::ModelNotFound {
-                path: paths.tokenizer.clone(),
-            });
-        }
-
+        paths.validate()?;
         let device = select_device();
 
         let config_text = std::fs::read_to_string(&paths.config)
@@ -174,11 +172,7 @@ impl Embedder {
         // ruri-v3-310m keys: "embeddings.tok_embeddings.weight"
         // candle expects: "model.embeddings.tok_embeddings.weight"
         // Strip the "model." prefix candle prepends.
-        let vb = vb.rename_f(|name| {
-            name.strip_prefix("model.")
-                .unwrap_or(name)
-                .to_string()
-        });
+        let vb = vb.rename_f(|name| name.strip_prefix("model.").unwrap_or(name).to_string());
 
         let model = modernbert::ModernBert::load(vb, &config)
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
@@ -200,12 +194,10 @@ impl Embedder {
             .encode(prefixed, true)
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
 
-        // Retain attention mask as Vec<u32> for mean pooling (DA: must not lose this)
         let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().to_vec();
         let input_ids: Vec<u32> = encoding.get_ids().to_vec();
         let seq_len = input_ids.len();
 
-        // Create candle tensors (u32, shape [1, seq_len])
         let input_ids_tensor = Tensor::new(input_ids.as_slice(), &self.device)
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
@@ -213,18 +205,15 @@ impl Embedder {
             .and_then(|t| t.unsqueeze(0))
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
-        // Forward pass: output shape [1, seq_len, hidden_size]
         let output = self
             .model
             .forward(&input_ids_tensor, &attention_mask_tensor)
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
-        // Move to CPU and extract flat f32 data for mean_pooling
         let output_cpu = output
             .to_device(&Device::Cpu)
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
-        // [1, seq_len, hidden_size] -> [seq_len * hidden_size]
         let flat: Vec<f32> = output_cpu
             .squeeze(0)
             .and_then(|t| t.flatten_all())
@@ -246,6 +235,7 @@ impl Embedder {
     }
 }
 
+#[cfg(feature = "candle")]
 impl Embed for Embedder {
     fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
         self.embed_with_prefix(text, QUERY_PREFIX)
@@ -253,6 +243,143 @@ impl Embed for Embedder {
 
     fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
         self.embed_with_prefix(text, DOCUMENT_PREFIX)
+    }
+}
+
+// --- mlx backend ---
+
+#[cfg(feature = "mlx")]
+pub(crate) struct Embedder {
+    model: crate::modernbert::ModernBert,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+#[cfg(feature = "mlx")]
+impl std::fmt::Debug for Embedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedder").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "mlx")]
+impl Embedder {
+    pub(crate) fn new(paths: &ModelPaths) -> Result<Self, EmbedError> {
+        paths.validate()?;
+        let config_text = std::fs::read_to_string(&paths.config)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let config: crate::modernbert::Config = serde_json::from_str(&config_text)
+            .map_err(|e| EmbedError::Inference(format!("config.json parse error: {e}")))?;
+
+        let model = crate::modernbert::ModernBert::load(&paths.model, &config)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&paths.tokenizer)
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+
+        Ok(Self { model, tokenizer })
+    }
+
+    fn embed_with_prefix(&mut self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
+        let prefixed = format!("{prefix}{text}");
+        let encoding = self
+            .tokenizer
+            .encode(prefixed, true)
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+
+        let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().to_vec();
+        let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let seq_len = input_ids.len();
+
+        let output = self
+            .model
+            .forward(&input_ids, &attention_mask_u32, 1, seq_len as i32)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+
+        output
+            .eval()
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let flat: &[f32] = output.as_slice();
+
+        let hidden_size = flat.len() / seq_len;
+        if hidden_size != EMBEDDING_DIMS {
+            return Err(EmbedError::DimensionMismatch {
+                expected: EMBEDDING_DIMS,
+                actual: hidden_size,
+            });
+        }
+
+        let mut pooled = mean_pooling(flat, seq_len, hidden_size, &attention_mask_u32);
+        l2_normalize(&mut pooled);
+
+        Ok(pooled)
+    }
+}
+
+#[cfg(feature = "mlx")]
+impl Embed for Embedder {
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embed_with_prefix(text, QUERY_PREFIX)
+    }
+
+    fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embed_with_prefix(text, DOCUMENT_PREFIX)
+    }
+
+    fn embed_documents_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let encodings: Vec<_> = texts
+            .iter()
+            .map(|t| {
+                let prefixed = format!("{DOCUMENT_PREFIX}{t}");
+                self.tokenizer
+                    .encode(prefixed, true)
+                    .map_err(|e| EmbedError::Tokenizer(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let batch_size = encodings.len();
+        let max_seq_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap();
+
+        let mut input_ids = vec![0u32; batch_size * max_seq_len];
+        let mut attention_mask = vec![0u32; batch_size * max_seq_len];
+        for (i, enc) in encodings.iter().enumerate() {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let offset = i * max_seq_len;
+            input_ids[offset..offset + ids.len()].copy_from_slice(ids);
+            attention_mask[offset..offset + mask.len()].copy_from_slice(mask);
+        }
+
+        let output = self
+            .model
+            .forward(
+                &input_ids,
+                &attention_mask,
+                batch_size as i32,
+                max_seq_len as i32,
+            )
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+
+        output
+            .eval()
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let flat: &[f32] = output.as_slice();
+
+        let hidden_size = EMBEDDING_DIMS;
+        let stride = max_seq_len * hidden_size;
+        let mut results = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let seq_data = &flat[i * stride..(i + 1) * stride];
+            let mask_slice = &attention_mask[i * max_seq_len..(i + 1) * max_seq_len];
+            let mut pooled = mean_pooling(seq_data, max_seq_len, hidden_size, mask_slice);
+            l2_normalize(&mut pooled);
+            results.push(pooled);
+        }
+
+        Ok(results)
     }
 }
 
@@ -322,23 +449,12 @@ mod tests {
         assert_eq!(v, vec![0.0, 0.0]);
     }
 
-    // T-007: select_device returns CPU when Metal unavailable (FR-002)
+    // T-007: select_device returns CPU (candle backend only)
+    #[cfg(feature = "candle")]
     #[test]
-    fn test_007_select_device_returns_cpu_without_metal() {
+    fn test_007_select_device_returns_cpu() {
         let device = select_device();
-        #[cfg(not(feature = "metal"))]
-        assert!(
-            matches!(device, Device::Cpu),
-            "expected Device::Cpu without metal feature"
-        );
-        #[cfg(feature = "metal")]
-        {
-            // On Apple Silicon: Metal. On CI/other: CPU fallback.
-            assert!(
-                matches!(device, Device::Cpu | Device::Metal(_)),
-                "expected Device::Cpu or Device::Metal"
-            );
-        }
+        assert!(matches!(device, Device::Cpu), "expected Device::Cpu");
     }
 
     // T-008: model not found (FR-003)
@@ -368,6 +484,137 @@ mod tests {
         assert_eq!(
             paths.tokenizer,
             PathBuf::from("/tmp/test-models/tokenizer.json")
+        );
+    }
+
+    // Benchmark: measure per-chunk embedding latency
+    #[test]
+    #[ignore]
+    #[cfg_attr(feature = "mlx", serial_test::serial)]
+    fn bench_embed_latency() {
+        let api = hf_hub::api::sync::Api::new().unwrap();
+        let repo = api.model("cl-nagoya/ruri-v3-310m".to_string());
+        let paths = ModelPaths {
+            model: repo.get("model.safetensors").unwrap(),
+            config: repo.get("config.json").unwrap(),
+            tokenizer: repo.get("tokenizer.json").unwrap(),
+        };
+
+        let load_start = std::time::Instant::now();
+        let mut embedder = Embedder::new(&paths).expect("load model");
+        eprintln!("Model load: {:.1}s", load_start.elapsed().as_secs_f64());
+
+        let texts = [
+            "Rustでの認証実装方法について教えてください",
+            "How to implement authentication in Rust using argon2",
+            "クイックソートアルゴリズムの説明",
+            "The quick brown fox jumps over the lazy dog",
+            "mlx unified memory embedding backend migration plan",
+            "candle Metal per-op GPU transfer overhead causes slowness",
+            "ModernBERT transformer layers alternating local global attention",
+            "SQLite FTS5 full text search with Japanese tokenization support",
+            "GitHub Actions CI workflow for macOS and Linux compilation",
+            "Progressive embedding strategy for search result improvement",
+        ];
+
+        // Warmup
+        let _ = embedder.embed_document("warmup text");
+
+        let mut times = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            let start = std::time::Instant::now();
+            let result = embedder.embed_document(text).expect("embed");
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            times.push(ms);
+            eprintln!("  [{:2}] {:6.1}ms ({}d)", i + 1, ms, result.len());
+        }
+
+        let avg = times.iter().sum::<f64>() / times.len() as f64;
+        let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = times.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!("\nSequential ({} chunks):", texts.len());
+        eprintln!("  Avg: {avg:.0}ms  Min: {min:.0}ms  Max: {max:.0}ms");
+
+        for batch_size in [8, 10, 16, 32] {
+            let mut batch_texts: Vec<&str> = Vec::new();
+            for i in 0..batch_size {
+                batch_texts.push(texts[i % texts.len()]);
+            }
+            let batch_start = std::time::Instant::now();
+            let batch_results = embedder.embed_documents_batch(&batch_texts).expect("batch");
+            let batch_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+            let batch_per_chunk = batch_ms / batch_results.len() as f64;
+            eprintln!(
+                "\nBatch ({} chunks): {batch_ms:.1}ms total, {batch_per_chunk:.1}ms/chunk, {:.1}x speedup",
+                batch_results.len(),
+                avg / batch_per_chunk
+            );
+        }
+
+        // Verify batch correctness (use batch=10)
+        let verify_texts: Vec<&str> = texts.iter().copied().collect();
+        let verify_results = embedder
+            .embed_documents_batch(&verify_texts)
+            .expect("verify");
+        for (i, result) in verify_results.iter().enumerate() {
+            assert_eq!(result.len(), EMBEDDING_DIMS, "batch[{i}] should be 768d");
+            let norm: f32 = result.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-4,
+                "batch[{i}] should be L2 normalized, got norm={norm}"
+            );
+        }
+    }
+
+    // RC-002: verify batch embedding matches sequential embedding
+    #[test]
+    #[ignore] // requires model download
+    #[cfg_attr(feature = "mlx", serial_test::serial)]
+    fn test_embed_documents_batch_matches_sequential() {
+        let api = hf_hub::api::sync::Api::new().unwrap();
+        let repo = api.model("cl-nagoya/ruri-v3-310m".to_string());
+        let paths = ModelPaths {
+            model: repo.get("model.safetensors").unwrap(),
+            config: repo.get("config.json").unwrap(),
+            tokenizer: repo.get("tokenizer.json").unwrap(),
+        };
+        let mut embedder = Embedder::new(&paths).expect("load model");
+
+        let texts = [
+            "Rustでの認証実装方法",
+            "How to implement auth",
+            "クイックソートの説明",
+        ];
+
+        // Sequential
+        let sequential: Vec<Vec<f32>> = texts
+            .iter()
+            .map(|t| embedder.embed_document(t).expect("embed"))
+            .collect();
+
+        // Batch
+        let text_refs: Vec<&str> = texts.iter().copied().collect();
+        let batch = embedder.embed_documents_batch(&text_refs).expect("batch");
+
+        assert_eq!(batch.len(), sequential.len());
+
+        // Cosine similarity > 0.999 for each pair
+        for (i, (b, s)) in batch.iter().zip(sequential.iter()).enumerate() {
+            assert_eq!(b.len(), EMBEDDING_DIMS, "batch[{i}] dims");
+            let cosine: f32 = b.iter().zip(s.iter()).map(|(a, b)| a * b).sum();
+            assert!(
+                cosine > 0.999,
+                "batch[{i}] vs sequential cosine={cosine}, expected >0.999"
+            );
+        }
+
+        // Empty input
+        let empty: Vec<&str> = Vec::new();
+        assert!(
+            embedder
+                .embed_documents_batch(&empty)
+                .expect("empty")
+                .is_empty()
         );
     }
 }

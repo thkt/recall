@@ -44,11 +44,11 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          FEATURES=""
           if [ "$TARGET" = "aarch64-apple-darwin" ]; then
-            FEATURES="--features metal"
+            cargo build --release --target "$TARGET" --no-default-features --features mlx
+          else
+            cargo build --release --target "$TARGET" --no-default-features --features candle
           fi
-          cargo build --release --target "$TARGET" $FEATURES
 
       - name: Package
         env:

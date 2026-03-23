@@ -5,6 +5,8 @@ mod db;
 mod embedder;
 mod hybrid;
 mod indexer;
+#[cfg(feature = "mlx")]
+mod modernbert;
 mod parser;
 mod search;
 
@@ -203,14 +205,15 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
     }
 
     let paths = ensure_model(verbose)?;
-    match embedder::Embedder::new(&paths) {
+    let embedder_result = embedder::Embedder::new(&paths);
+    match &embedder_result {
         Ok(_) => eprintln!("Model: ready"),
         Err(e) => eprintln!("Model: failed to load ({e})"),
     }
 
     if embed {
-        let mut embedder = embedder::Embedder::new(&paths)
-            .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
+        let mut embedder =
+            embedder_result.map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM qa_chunks c \
              WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
@@ -278,13 +281,21 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             .map(|r| r.session.session_id.clone())
             .collect();
         let mut total = 0;
-        if let Ok(r) = indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10) {
-            r.warn_if_stopped();
-            total += r.embedded;
+        match indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10) {
+            Ok(r) => {
+                r.warn_if_stopped();
+                total += r.embedded;
+            }
+            Err(e) if verbose => eprintln!("Warning: post-search embedding failed: {e:#}"),
+            Err(_) => {}
         }
-        if let Ok(r) = indexer::embed_recent_chunks(&mut conn, emb, 10) {
-            r.warn_if_stopped();
-            total += r.embedded;
+        match indexer::embed_recent_chunks(&mut conn, emb, 10) {
+            Ok(r) => {
+                r.warn_if_stopped();
+                total += r.embedded;
+            }
+            Err(e) if verbose => eprintln!("Warning: post-search embedding failed: {e:#}"),
+            Err(_) => {}
         }
         if total > 0 && verbose {
             eprintln!("Embedded {total} chunks (nearby + recent)");
