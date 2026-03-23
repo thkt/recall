@@ -1,17 +1,32 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-#[cfg(feature = "coreml")]
-use ort::ep;
-use ort::session::Session;
-use ort::value::Tensor;
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::modernbert;
 
 pub(crate) const EMBEDDING_DIMS: usize = 768;
 pub(crate) const QUERY_PREFIX: &str = "検索クエリ: ";
 pub(crate) const DOCUMENT_PREFIX: &str = "検索文書: ";
 
-const MODEL_SUBDIR: &str = "recall/models/ruri-v3-310m";
-const MODEL_FILENAME: &str = "model.onnx";
-const TOKENIZER_FILENAME: &str = "tokenizer.json";
+/// Paths to model files (SafeTensors + config + tokenizer).
+#[derive(Debug, Clone)]
+pub(crate) struct ModelPaths {
+    pub model: PathBuf,
+    pub config: PathBuf,
+    pub tokenizer: PathBuf,
+}
+
+impl ModelPaths {
+    /// Construct paths assuming all files are in a single directory.
+    #[cfg(test)]
+    pub(crate) fn from_dir(dir: &std::path::Path) -> Self {
+        Self {
+            model: dir.join("model.safetensors"),
+            config: dir.join("config.json"),
+            tokenizer: dir.join("tokenizer.json"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum EmbedError {
@@ -26,13 +41,13 @@ impl std::fmt::Display for EmbedError {
         match self {
             EmbedError::ModelNotFound { path } => write!(
                 f,
-                "Model not found at {}. Run `recall model` to download.",
+                "Model not found at {}. Run `recall index` to download.",
                 path.display()
             ),
             EmbedError::DimensionMismatch { expected, actual } => {
                 write!(f, "Dimension mismatch: expected {expected}, got {actual}")
             }
-            EmbedError::Inference(msg) => write!(f, "ONNX inference error: {msg}"),
+            EmbedError::Inference(msg) => write!(f, "Inference error: {msg}"),
             EmbedError::Tokenizer(msg) => write!(f, "Tokenizer error: {msg}"),
         }
     }
@@ -40,14 +55,16 @@ impl std::fmt::Display for EmbedError {
 
 impl std::error::Error for EmbedError {}
 
-pub(crate) fn model_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
-        return PathBuf::from(dir).join(MODEL_SUBDIR);
+/// Select the best available device: Metal GPU if available, otherwise CPU.
+pub(crate) fn select_device() -> Device {
+    #[cfg(feature = "metal")]
+    {
+        if let Ok(device) = Device::new_metal(0) {
+            return device;
+        }
+        eprintln!("Warning: Metal unavailable, using CPU");
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/share")
-        .join(MODEL_SUBDIR)
+    Device::Cpu
 }
 
 #[cfg(test)]
@@ -109,8 +126,9 @@ pub(crate) trait Embed: std::fmt::Debug {
 }
 
 pub(crate) struct Embedder {
-    session: Session,
+    model: modernbert::ModernBert,
     tokenizer: tokenizers::Tokenizer,
+    device: Device,
 }
 
 impl std::fmt::Debug for Embedder {
@@ -120,73 +138,59 @@ impl std::fmt::Debug for Embedder {
 }
 
 impl Embedder {
-    pub(crate) fn new(dir: &Path) -> Result<Self, EmbedError> {
-        let model_path = dir.join(MODEL_FILENAME);
-        let tokenizer_path = dir.join(TOKENIZER_FILENAME);
-
-        if !model_path.exists() {
-            return Err(EmbedError::ModelNotFound { path: model_path });
-        }
-        if !tokenizer_path.exists() {
+    pub(crate) fn new(paths: &ModelPaths) -> Result<Self, EmbedError> {
+        if !paths.model.exists() {
             return Err(EmbedError::ModelNotFound {
-                path: tokenizer_path,
+                path: paths.model.clone(),
+            });
+        }
+        if !paths.config.exists() {
+            return Err(EmbedError::ModelNotFound {
+                path: paths.config.clone(),
+            });
+        }
+        if !paths.tokenizer.exists() {
+            return Err(EmbedError::ModelNotFound {
+                path: paths.tokenizer.clone(),
             });
         }
 
-        let session = Self::build_session(dir, &model_path)?;
+        let device = select_device();
 
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        let config_text = std::fs::read_to_string(&paths.config)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let config: modernbert::Config = serde_json::from_str(&config_text)
+            .map_err(|e| EmbedError::Inference(format!("config.json parse error: {e}")))?;
+
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(
+                std::slice::from_ref(&paths.model),
+                DType::F32,
+                &device,
+            )
+            .map_err(|e| EmbedError::Inference(e.to_string()))?
+        };
+
+        // ruri-v3-310m keys: "embeddings.tok_embeddings.weight"
+        // candle expects: "model.embeddings.tok_embeddings.weight"
+        // Strip the "model." prefix candle prepends.
+        let vb = vb.rename_f(|name| {
+            name.strip_prefix("model.")
+                .unwrap_or(name)
+                .to_string()
+        });
+
+        let model = modernbert::ModernBert::load(vb, &config)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&paths.tokenizer)
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
 
-        Ok(Self { session, tokenizer })
-    }
-
-    fn build_session(
-        #[allow(unused)] dir: &Path,
-        model_path: &Path,
-    ) -> Result<Session, EmbedError> {
-        #[cfg(feature = "coreml")]
-        {
-            if let Ok(session) = Self::try_coreml(dir, model_path) {
-                return Ok(session);
-            }
-            // Stale cache — clear and retry
-            let cache_dir = dir.join("coreml_cache");
-            if cache_dir.exists() {
-                eprintln!("Warning: CoreML cache invalid, rebuilding...");
-                let _ = std::fs::remove_dir_all(&cache_dir);
-                if let Ok(session) = Self::try_coreml(dir, model_path) {
-                    return Ok(session);
-                }
-            }
-            eprintln!("Warning: CoreML unavailable, using CPU");
-        }
-        Self::try_cpu(model_path)
-    }
-
-    #[cfg(feature = "coreml")]
-    fn try_coreml(dir: &Path, model_path: &Path) -> Result<Session, EmbedError> {
-        let cache_dir = dir.join("coreml_cache");
-        Session::builder()
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .with_execution_providers([ep::CoreML::default()
-                .with_compute_units(ep::coreml::ComputeUnits::All)
-                .with_model_cache_dir(cache_dir.display().to_string())
-                .build()])
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .with_intra_threads(1)
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .commit_from_file(model_path)
-            .map_err(|e| EmbedError::Inference(e.to_string()))
-    }
-
-    fn try_cpu(model_path: &Path) -> Result<Session, EmbedError> {
-        Session::builder()
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .with_intra_threads(1)
-            .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .commit_from_file(model_path)
-            .map_err(|e| EmbedError::Inference(e.to_string()))
+        Ok(Self {
+            model,
+            tokenizer,
+            device,
+        })
     }
 
     fn embed_with_prefix(&mut self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
@@ -196,31 +200,38 @@ impl Embedder {
             .encode(prefixed, true)
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
 
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let attention_mask_i64: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&m| m as i64)
-            .collect();
+        // Retain attention mask as Vec<u32> for mean pooling (DA: must not lose this)
+        let attention_mask_u32: Vec<u32> = encoding.get_attention_mask().to_vec();
+        let input_ids: Vec<u32> = encoding.get_ids().to_vec();
         let seq_len = input_ids.len();
-        let shape = [1i64, seq_len as i64];
 
-        let input_ids_tensor = Tensor::from_array((shape, input_ids))
+        // Create candle tensors (u32, shape [1, seq_len])
+        let input_ids_tensor = Tensor::new(input_ids.as_slice(), &self.device)
+            .and_then(|t| t.unsqueeze(0))
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
-        let attention_mask_tensor = Tensor::from_array((shape, attention_mask_i64))
-            .map_err(|e| EmbedError::Inference(e.to_string()))?;
-
-        let outputs = self
-            .session
-            .run(ort::inputs![input_ids_tensor, attention_mask_tensor])
+        let attention_mask_tensor = Tensor::new(attention_mask_u32.as_slice(), &self.device)
+            .and_then(|t| t.unsqueeze(0))
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
-        let (out_shape, data) = outputs[0]
-            .try_extract_tensor::<f32>()
+        // Forward pass: output shape [1, seq_len, hidden_size]
+        let output = self
+            .model
+            .forward(&input_ids_tensor, &attention_mask_tensor)
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
-        // Shape: [1, seq_len, hidden_size]
-        let hidden_size = out_shape[2] as usize;
+        // Move to CPU and extract flat f32 data for mean_pooling
+        let output_cpu = output
+            .to_device(&Device::Cpu)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+
+        // [1, seq_len, hidden_size] -> [seq_len * hidden_size]
+        let flat: Vec<f32> = output_cpu
+            .squeeze(0)
+            .and_then(|t| t.flatten_all())
+            .and_then(|t| t.to_vec1())
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+
+        let hidden_size = flat.len() / seq_len;
         if hidden_size != EMBEDDING_DIMS {
             return Err(EmbedError::DimensionMismatch {
                 expected: EMBEDDING_DIMS,
@@ -228,7 +239,7 @@ impl Embedder {
             });
         }
 
-        let mut pooled = mean_pooling(data, seq_len, hidden_size, encoding.get_attention_mask());
+        let mut pooled = mean_pooling(&flat, seq_len, hidden_size, &attention_mask_u32);
         l2_normalize(&mut pooled);
 
         Ok(pooled)
@@ -247,11 +258,13 @@ impl Embed for Embedder {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
-    // T-003: dimension mismatch (FR-002)
+    // T-001: dimension mismatch (FR-001)
     #[test]
-    fn test_003_validate_dims_rejects_wrong_size() {
+    fn test_001_validate_dims_rejects_wrong_size() {
         let wrong = vec![0.0f32; 256];
         let err = validate_dims(&wrong).unwrap_err();
         assert!(
@@ -260,30 +273,16 @@ mod tests {
         );
     }
 
+    // T-002: correct dims accepted (FR-001)
     #[test]
-    fn test_003_validate_dims_accepts_correct_size() {
+    fn test_002_validate_dims_accepts_correct_size() {
         let correct = vec![0.0f32; EMBEDDING_DIMS];
         assert!(validate_dims(&correct).is_ok());
     }
 
-    // T-014: model not found (FR-001)
+    // T-003: mean pooling excludes mask=0 tokens (FR-001)
     #[test]
-    fn test_014_embedder_new_model_not_found() {
-        let err = Embedder::new(Path::new("/nonexistent/path")).unwrap_err();
-        assert!(
-            matches!(err, EmbedError::ModelNotFound { .. }),
-            "expected ModelNotFound, got: {err}"
-        );
-        assert!(
-            err.to_string().contains("recall model"),
-            "error message should mention `recall model`: {err}"
-        );
-    }
-
-    // T-016: mean pooling excludes mask=0 tokens (FR-002)
-    #[test]
-    fn test_016_mean_pooling_excludes_masked_tokens() {
-        // 3 tokens, 4 dims. Flat row-major: [t0d0, t0d1, ..., t2d3]
+    fn test_003_mean_pooling_excludes_masked_tokens() {
         #[rustfmt::skip]
         let data: Vec<f32> = vec![
             1.0, 2.0, 3.0, 4.0,       // token 0, mask=1
@@ -292,21 +291,21 @@ mod tests {
         ];
         let mask = vec![1u32, 1, 0];
         let result = mean_pooling(&data, 3, 4, &mask);
-        // Mean of tokens 0,1: (1+5)/2=3, (2+6)/2=4, (3+7)/2=5, (4+8)/2=6
         assert_eq!(result, vec![3.0, 4.0, 5.0, 6.0]);
     }
 
+    // T-004: all masked returns zero vector (FR-001)
     #[test]
-    fn test_016_mean_pooling_all_masked() {
+    fn test_004_mean_pooling_all_masked() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         let mask = vec![0u32, 0];
         let result = mean_pooling(&data, 2, 2, &mask);
         assert_eq!(result, vec![0.0, 0.0]);
     }
 
-    // T-017: L2 normalize produces unit norm (FR-002)
+    // T-005: L2 normalize produces unit norm (FR-001)
     #[test]
-    fn test_017_l2_normalize_produces_unit_norm() {
+    fn test_005_l2_normalize_produces_unit_norm() {
         let mut v = vec![3.0f32, 4.0];
         l2_normalize(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -315,27 +314,60 @@ mod tests {
         assert!((v[1] - 0.8).abs() < 1e-6);
     }
 
+    // T-006: zero vector stays zero (FR-001)
     #[test]
-    fn test_017_l2_normalize_zero_vector() {
+    fn test_006_l2_normalize_zero_vector() {
         let mut v = vec![0.0f32, 0.0];
         l2_normalize(&mut v);
         assert_eq!(v, vec![0.0, 0.0]);
     }
 
-    // model_dir resolution
+    // T-007: select_device returns CPU when Metal unavailable (FR-002)
     #[test]
-    fn test_model_dir_with_xdg() {
-        let key = "XDG_DATA_HOME";
-        let saved = std::env::var(key).ok();
-        unsafe { std::env::set_var(key, "/tmp/test-xdg") };
-        let dir = model_dir();
-        match saved {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
+    fn test_007_select_device_returns_cpu_without_metal() {
+        let device = select_device();
+        #[cfg(not(feature = "metal"))]
+        assert!(
+            matches!(device, Device::Cpu),
+            "expected Device::Cpu without metal feature"
+        );
+        #[cfg(feature = "metal")]
+        {
+            // On Apple Silicon: Metal. On CI/other: CPU fallback.
+            assert!(
+                matches!(device, Device::Cpu | Device::Metal(_)),
+                "expected Device::Cpu or Device::Metal"
+            );
         }
+    }
+
+    // T-008: model not found (FR-003)
+    #[test]
+    fn test_008_embedder_new_model_not_found() {
+        let paths = ModelPaths::from_dir(Path::new("/nonexistent/path"));
+        let err = Embedder::new(&paths).unwrap_err();
+        assert!(
+            matches!(err, EmbedError::ModelNotFound { .. }),
+            "expected ModelNotFound, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("recall index"),
+            "error message should mention `recall index`: {err}"
+        );
+    }
+
+    // T-009: ModelPaths::from_dir constructs correct paths
+    #[test]
+    fn test_009_model_paths_from_dir() {
+        let paths = ModelPaths::from_dir(Path::new("/tmp/test-models"));
         assert_eq!(
-            dir,
-            PathBuf::from("/tmp/test-xdg/recall/models/ruri-v3-310m")
+            paths.model,
+            PathBuf::from("/tmp/test-models/model.safetensors")
+        );
+        assert_eq!(paths.config, PathBuf::from("/tmp/test-models/config.json"));
+        assert_eq!(
+            paths.tokenizer,
+            PathBuf::from("/tmp/test-models/tokenizer.json")
         );
     }
 }

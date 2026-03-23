@@ -19,8 +19,7 @@ use crate::parser::Source;
 /// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
 const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
 
-const HF_REPO: &str = "keitokei1994/ruri-v3-310m-onnx";
-const MODEL_FILES: &[&str] = &["model.onnx", "tokenizer.json"];
+const HF_REPO: &str = "cl-nagoya/ruri-v3-310m";
 
 #[derive(Parser)]
 #[command(name = "recall", about = "Search past Claude Code and Codex sessions")]
@@ -148,43 +147,45 @@ fn report_index_stats(stats: &indexer::IndexStats, force: bool, verbose: bool) {
 }
 
 fn try_load_embedder() -> Option<embedder::Embedder> {
-    let dir = embedder::model_dir();
-    embedder::Embedder::new(&dir).ok()
+    let paths = cached_model_paths()?;
+    embedder::Embedder::new(&paths).ok()
 }
 
-/// Download model files if missing. Returns true if all files are present.
-fn ensure_model(verbose: bool) -> Result<bool> {
-    let dir = embedder::model_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create model directory: {}", dir.display()))?;
+/// Check if model files are already in the hf-hub cache.
+fn cached_model_paths() -> Option<embedder::ModelPaths> {
+    let cache = hf_hub::Cache::default();
+    let repo = cache.repo(hf_hub::Repo::model(HF_REPO.to_string()));
+    Some(embedder::ModelPaths {
+        model: repo.get("model.safetensors")?,
+        config: repo.get("config.json")?,
+        tokenizer: repo.get("tokenizer.json")?,
+    })
+}
 
-    let mut downloaded = false;
-    for filename in MODEL_FILES {
-        let path = dir.join(filename);
-        if path.exists() {
-            continue;
-        }
-        downloaded = true;
-        let url = format!("https://huggingface.co/{HF_REPO}/resolve/main/{filename}");
-        eprintln!("Downloading {filename}...");
-        let status = std::process::Command::new("curl")
-            .args(["-fSL", "--progress-bar", "-o"])
-            .arg(&path)
-            .arg(&url)
-            .status()
-            .context("Failed to run curl — is it installed?")?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&path);
-            anyhow::bail!("Download failed for {filename}");
-        }
+/// Download model files via hf-hub if not cached.
+fn ensure_model(verbose: bool) -> Result<embedder::ModelPaths> {
+    let api = hf_hub::api::sync::Api::new().context("Failed to initialize HuggingFace Hub API")?;
+    let repo = api.model(HF_REPO.to_string());
+
+    if verbose {
+        eprintln!("Checking model files...");
     }
 
-    if downloaded {
-        eprintln!("Model downloaded to {}", dir.display());
-    } else if verbose {
-        eprintln!("Model already downloaded");
-    }
-    Ok(true)
+    let model = repo
+        .get("model.safetensors")
+        .context("Failed to download model.safetensors")?;
+    let config = repo
+        .get("config.json")
+        .context("Failed to download config.json")?;
+    let tokenizer = repo
+        .get("tokenizer.json")
+        .context("Failed to download tokenizer.json")?;
+
+    Ok(embedder::ModelPaths {
+        model,
+        config,
+        tokenizer,
+    })
 }
 
 // -- Subcommands --
@@ -201,16 +202,14 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
         eprintln!("Created {} chunks", chunk_stats.chunks_created);
     }
 
-    ensure_model(verbose)?;
-
-    let dir = embedder::model_dir();
-    match embedder::Embedder::new(&dir) {
+    let paths = ensure_model(verbose)?;
+    match embedder::Embedder::new(&paths) {
         Ok(_) => eprintln!("Model: ready"),
         Err(e) => eprintln!("Model: failed to load ({e})"),
     }
 
     if embed {
-        let mut embedder = embedder::Embedder::new(&dir)
+        let mut embedder = embedder::Embedder::new(&paths)
             .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM qa_chunks c \
@@ -313,20 +312,18 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     println!("QA chunks: {chunks}");
     println!("Embedded: {embedded}/{chunks}");
 
-    let model_dir = embedder::model_dir();
-    let model_ok = embedder::Embedder::new(&model_dir).is_ok();
+    let model_ok = try_load_embedder().is_some();
     println!(
         "Model: {}",
         if model_ok {
             "ready"
         } else {
-            "not downloaded (run `recall model`)"
+            "not downloaded (run `recall index`)"
         }
     );
 
     if verbose {
         println!("DB: {}", path.display());
-        println!("Model dir: {}", model_dir.display());
     }
 
     Ok(())

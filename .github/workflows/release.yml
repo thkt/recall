@@ -46,7 +46,7 @@ jobs:
         run: |
           FEATURES=""
           if [ "$TARGET" = "aarch64-apple-darwin" ]; then
-            FEATURES="--features coreml"
+            FEATURES="--features metal"
           fi
           cargo build --release --target "$TARGET" $FEATURES
 
