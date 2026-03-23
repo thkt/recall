@@ -61,7 +61,7 @@ Next search:    Hybrid ranking (FTS5 + vector similarity via RRF)
 Over time:      More sessions embedded → better semantic results
 ```
 
-No API keys. No data leaves your machine. The embedding model (Ruri v3) runs locally via CoreML on Apple Silicon.
+No API keys. No data leaves your machine. The embedding model (Ruri v3) runs locally via MLX on Apple Silicon.
 
 ## Usage
 
@@ -113,7 +113,7 @@ recall status           # sessions, chunks, embedding coverage, model status
 
 **Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — only changed files are re-indexed. Directory mtime checking skips the scan entirely when nothing changed.
 
-**Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via ONNX Runtime with CoreML acceleration (~100ms/chunk on M3). Model auto-downloads on first `recall index`.
+**Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=32) with length-sorted padding minimization. Model auto-downloads on first `recall index`.
 
 **Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close.
 
@@ -126,22 +126,24 @@ src/
 ├── indexer.rs    Incremental indexer with mtime tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
-├── embedder.rs   ort + Ruri v3 ONNX embedder (CoreML EP, mean pooling)
-├── chunker.rs    Q&A pair chunker with SHA256 change detection
+├── modernbert.rs ModernBERT model implementation (mlx-rs)
+├── embedder.rs   Ruri v3 embedder (mlx-rs default / candle fallback, mean pooling)
+├── chunker.rs    Q&A pair chunker with size splitting + SHA256 change detection
 ├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
 └── date.rs       Civil calendar date utilities
 ```
 
-Single binary. SQLite, ONNX Runtime, and sqlite-vec are statically linked.
+Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 
 ## Performance
 
-| Operation                  | Time          |
-| -------------------------- | ------------- |
-| `recall index` (6k files)  | ~0.5s (incremental), ~4min (full rebuild) |
-| `recall search`            | ~2s (with embedding), instant (--no-embed) |
-| Embedding per chunk        | ~100ms (M3 + CoreML)                      |
-| Initial model download     | ~30s (1.3 GB)                              |
+| Operation                           | Time                                       |
+| ----------------------------------- | ------------------------------------------ |
+| `recall index` (6k files)           | ~0.5s (incremental), ~4min (full rebuild)  |
+| `recall search`                     | ~2s (with embedding), instant (--no-embed) |
+| `recall index --embed` (28k chunks) | ~11 min (M3, batch=32)                     |
+| Embedding throughput                | ~45 chunks/sec (M3 + MLX)                  |
+| Initial model download              | ~1.2 GB                                    |
 
 ## Limitations
 
@@ -149,7 +151,7 @@ Single binary. SQLite, ONNX Runtime, and sqlite-vec are statically linked.
 | ------------------- | ------------------------------------------------------------------------- |
 | Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync   |
 | Text only           | Images, tool results, and binary content are not indexed                  |
-| Apple Silicon focus | CoreML acceleration requires Apple Silicon. CPU fallback available but slower |
+| Apple Silicon focus | MLX acceleration requires Apple Silicon. candle (CPU) fallback available for Linux |
 | No export           | Search results show excerpts. Open the JSONL file directly for full sessions |
 
 ## Acknowledgements
