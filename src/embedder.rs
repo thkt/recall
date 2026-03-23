@@ -134,8 +134,7 @@ impl Embedder {
         }
 
         #[allow(unused_mut)] // mut needed when coreml feature is enabled
-        let mut builder = Session::builder()
-            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let mut builder = Session::builder().map_err(|e| EmbedError::Inference(e.to_string()))?;
 
         #[cfg(feature = "coreml")]
         {
@@ -170,15 +169,18 @@ impl Embedder {
             .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
 
         let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
-        let attention_mask_i64: Vec<i64> =
-            encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
+        let attention_mask_i64: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect();
         let seq_len = input_ids.len();
         let shape = [1i64, seq_len as i64];
 
-        let input_ids_tensor =
-            Tensor::from_array((shape, input_ids)).map_err(|e| EmbedError::Inference(e.to_string()))?;
-        let attention_mask_tensor =
-            Tensor::from_array((shape, attention_mask_i64)).map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let input_ids_tensor = Tensor::from_array((shape, input_ids))
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+        let attention_mask_tensor = Tensor::from_array((shape, attention_mask_i64))
+            .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
         let outputs = self
             .session
@@ -280,10 +282,7 @@ mod tests {
         let mut v = vec![3.0f32, 4.0];
         l2_normalize(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!(
-            (norm - 1.0).abs() < 1e-6,
-            "norm should be 1.0, got {norm}"
-        );
+        assert!((norm - 1.0).abs() < 1e-6, "norm should be 1.0, got {norm}");
         assert!((v[0] - 0.6).abs() < 1e-6);
         assert!((v[1] - 0.8).abs() < 1e-6);
     }

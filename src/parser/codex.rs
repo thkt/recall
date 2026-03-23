@@ -3,7 +3,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{extract_text, parse_iso_timestamp, parse_jsonl_entries, session_id_from_path, update_earliest, Message, ParseResult, Role, SessionData, Source};
+use super::{
+    Message, ParseResult, Role, SessionData, Source, extract_text, parse_iso_timestamp,
+    parse_jsonl_entries, session_id_from_path, update_earliest,
+};
 
 const CODEX_SKIP_MARKERS: &[&str] = &[
     "<user_instructions>",
@@ -44,7 +47,11 @@ struct CodexParseState {
     earliest_ts: Option<i64>,
 }
 
-fn process_codex_entry(entry: &Value, entry_type: &str, state: &mut CodexParseState) -> Option<Message> {
+fn process_codex_entry(
+    entry: &Value,
+    entry_type: &str,
+    state: &mut CodexParseState,
+) -> Option<Message> {
     if let Some(ts_val) = entry.get("timestamp")
         && let Some(ts) = parse_iso_timestamp(ts_val)
     {
@@ -79,9 +86,10 @@ fn process_codex_entry(entry: &Value, entry_type: &str, state: &mut CodexParseSt
                 _ => return None,
             }
             if state.project.is_empty()
-                && let Some(cwd) = extract_cwd_from_content(entry.get("content")) {
-                    state.project = cwd;
-                }
+                && let Some(cwd) = extract_cwd_from_content(entry.get("content"))
+            {
+                state.project = cwd;
+            }
             extract_codex_message(entry)
         }
     }
@@ -255,7 +263,9 @@ mod tests {
         assert_eq!(extract_date_from_path("/some/other/path/file.jsonl"), None);
         // Windows-style backslash path
         assert_eq!(
-            extract_date_from_path("C:\\Users\\me\\.codex\\sessions\\2026\\01\\18\\rollout-xxx.jsonl"),
+            extract_date_from_path(
+                "C:\\Users\\me\\.codex\\sessions\\2026\\01\\18\\rollout-xxx.jsonl"
+            ),
             Some("2026-01-18".to_string())
         );
     }

@@ -29,19 +29,14 @@ pub(crate) struct RankedHit {
 ///
 /// Sessions appearing in both lists receive scores from both.
 /// Score = sum(1 / (k + rank)) across lists.
-pub(crate) fn rrf_merge(
-    fts_hits: &[RankedHit],
-    vec_hits: &[RankedHit],
-) -> Vec<(String, f64)> {
+pub(crate) fn rrf_merge(fts_hits: &[RankedHit], vec_hits: &[RankedHit]) -> Vec<(String, f64)> {
     let mut scores: HashMap<String, f64> = HashMap::new();
 
     for hit in fts_hits {
-        *scores.entry(hit.session_id.clone()).or_default() +=
-            1.0 / (RRF_K + hit.rank as f64);
+        *scores.entry(hit.session_id.clone()).or_default() += 1.0 / (RRF_K + hit.rank as f64);
     }
     for hit in vec_hits {
-        *scores.entry(hit.session_id.clone()).or_default() +=
-            1.0 / (RRF_K + hit.rank as f64);
+        *scores.entry(hit.session_id.clone()).or_default() += 1.0 / (RRF_K + hit.rank as f64);
     }
 
     let mut results: Vec<(String, f64)> = scores.into_iter().collect();
@@ -118,16 +113,17 @@ mod tests {
         let now_ms = 1_750_000_000_000_i64;
 
         // Same RRF score but different timestamps
-        let mut results = vec![
-            ("old".to_string(), 0.01),
-            ("new".to_string(), 0.01),
-        ];
+        let mut results = vec![("old".to_string(), 0.01), ("new".to_string(), 0.01)];
 
         let mut timestamps = HashMap::new();
         timestamps.insert("old".to_string(), Some(now_ms - 365 * MS_PER_DAY));
         timestamps.insert("new".to_string(), Some(now_ms));
 
-        apply_recency_boost(&mut results, |sid| timestamps.get(sid).copied().flatten(), now_ms);
+        apply_recency_boost(
+            &mut results,
+            |sid| timestamps.get(sid).copied().flatten(),
+            now_ms,
+        );
 
         // "new" should be first after boost
         assert_eq!(results[0].0, "new");

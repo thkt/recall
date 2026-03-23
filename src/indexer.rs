@@ -7,7 +7,9 @@ use rusqlite::Connection;
 
 use crate::chunker;
 use crate::embedder::Embed;
-use crate::parser::{Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session};
+use crate::parser::{
+    Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session,
+};
 
 type SessionEntry = (String, Option<f64>);
 
@@ -126,14 +128,13 @@ fn upsert_session(
     if ctx.verbose && parsed.skipped_lines > 0 {
         eprintln!(
             "Warning: {} skipped lines in {}",
-            parsed.skipped_lines,
-            fpath_str
+            parsed.skipped_lines, fpath_str
         );
     }
 
-    let mut msg_stmt = ctx.tx.prepare_cached(
-        "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
-    )?;
+    let mut msg_stmt = ctx
+        .tx
+        .prepare_cached("INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)")?;
     for msg in &parsed.messages {
         msg_stmt.execute(rusqlite::params![
             parsed.metadata.session_id,
@@ -189,9 +190,10 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
             if ctx.verbose {
                 eprintln!("Warning: {}: {e}", fpath.display());
             }
-            return Ok(IndexOutcome::ParseError(
-                format!("{}: {e}", fpath.display()),
-            ));
+            return Ok(IndexOutcome::ParseError(format!(
+                "{}: {e}",
+                fpath.display()
+            )));
         }
     };
 
@@ -218,12 +220,15 @@ pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Resu
     let codex_dir = std::env::var_os("RECALL_CODEX_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex").join("sessions"));
-    index_from_dirs(conn, &IndexOptions {
-        force,
-        verbose,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-    })
+    index_from_dirs(
+        conn,
+        &IndexOptions {
+            force,
+            verbose,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+    )
 }
 
 fn collect_sources(opts: &IndexOptions) -> Vec<(PathBuf, Source)> {
@@ -293,9 +298,10 @@ fn dirs_changed_since(opts: &IndexOptions, last_scan: f64) -> bool {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if let Some(mt) = dir_mtime_secs(&entry.path())
-                    && mt >= last_scan {
-                        return true;
-                    }
+                    && mt >= last_scan
+                {
+                    return true;
+                }
             }
         }
     }
@@ -311,11 +317,9 @@ fn scan_key(opts: &IndexOptions) -> String {
 }
 
 fn get_last_scan(conn: &Connection, key: &str) -> Option<f64> {
-    conn.query_row(
-        "SELECT value FROM recall_meta WHERE key = ?",
-        [key],
-        |r| r.get::<_, f64>(0),
-    )
+    conn.query_row("SELECT value FROM recall_meta WHERE key = ?", [key], |r| {
+        r.get::<_, f64>(0)
+    })
     .ok()
 }
 
@@ -333,18 +337,19 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     let key = scan_key(opts);
     if !opts.force
         && let Some(last_scan) = get_last_scan(conn, &key)
-            && !dirs_changed_since(opts, last_scan) {
-                let total_sessions: usize = conn
-                    .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
-                    .max(0) as usize;
-                return Ok(IndexStats {
-                    indexed: 0,
-                    parse_errors: 0,
-                    first_error: None,
-                    total_sessions,
-                    elapsed_secs: start.elapsed().as_secs_f64(),
-                });
-            }
+        && !dirs_changed_since(opts, last_scan)
+    {
+        let total_sessions: usize = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
+            .max(0) as usize;
+        return Ok(IndexStats {
+            indexed: 0,
+            parse_errors: 0,
+            first_error: None,
+            total_sessions,
+            elapsed_secs: start.elapsed().as_secs_f64(),
+        });
+    }
 
     let existing = if opts.force {
         HashMap::new()
@@ -361,9 +366,16 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     if opts.force {
         tx.execute_batch("DELETE FROM sessions; DELETE FROM messages;")?;
     }
-    tx.execute("INSERT INTO messages(messages, rank) VALUES('automerge', 0)", [])?;
+    tx.execute(
+        "INSERT INTO messages(messages, rank) VALUES('automerge', 0)",
+        [],
+    )?;
 
-    let ctx = IndexContext { tx: &tx, existing: &existing, verbose: opts.verbose };
+    let ctx = IndexContext {
+        tx: &tx,
+        existing: &existing,
+        verbose: opts.verbose,
+    };
     let (indexed, parse_errors, first_error) = index_all(&ctx, &sources)?;
     cleanup_orphans(&tx, &existing, &sources, indexed)?;
     tx.commit().context("Failed to commit transaction")?;
@@ -371,11 +383,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     finalize_fts(conn, indexed, opts.force)?;
 
     let total_sessions = {
-        let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions",
-            [],
-            |r| r.get(0),
-        )?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         n.max(0) as usize
     };
 
@@ -422,10 +430,8 @@ fn cleanup_orphans(
     if existing.is_empty() || (indexed == 0 && sources.len() == existing.len()) {
         return Ok(());
     }
-    let source_paths: std::collections::HashSet<&Path> = sources
-        .iter()
-        .map(|(p, _)| p.as_path())
-        .collect();
+    let source_paths: std::collections::HashSet<&Path> =
+        sources.iter().map(|(p, _)| p.as_path()).collect();
     for (fp, (sid, _)) in existing {
         if !source_paths.contains(Path::new(fp.as_str())) {
             let deleted = tx.execute(
@@ -442,7 +448,12 @@ fn cleanup_orphans(
 
 const MAX_DIR_DEPTH: usize = 10;
 
-fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source, verbose: bool) {
+fn collect_jsonl_files(
+    dir: &Path,
+    out: &mut Vec<(PathBuf, Source)>,
+    source: Source,
+    verbose: bool,
+) {
     collect_jsonl_files_inner(dir, out, source, 0, verbose);
 }
 
@@ -455,7 +466,10 @@ fn collect_jsonl_files_inner(
 ) {
     if depth >= MAX_DIR_DEPTH {
         if verbose {
-            eprintln!("Warning: depth limit ({MAX_DIR_DEPTH}) reached at {}", dir.display());
+            eprintln!(
+                "Warning: depth limit ({MAX_DIR_DEPTH}) reached at {}",
+                dir.display()
+            );
         }
         return;
     }
@@ -477,7 +491,10 @@ fn collect_jsonl_files_inner(
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) => {
-                eprintln!("Warning: cannot get file type for {}: {e}", entry.path().display());
+                eprintln!(
+                    "Warning: cannot get file type for {}: {e}",
+                    entry.path().display()
+                );
                 continue;
             }
         };
@@ -500,10 +517,7 @@ pub(crate) struct ChunkStats {
     pub chunks_created: usize,
 }
 
-pub(crate) fn index_chunks(
-    conn: &mut Connection,
-    verbose: bool,
-) -> Result<ChunkStats> {
+pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<ChunkStats> {
     let sessions: Vec<(String, Option<i64>)> = {
         let mut stmt = conn.prepare(
             "SELECT s.session_id, s.timestamp FROM sessions s \
@@ -590,7 +604,10 @@ fn embed_chunks(
     chunks: &[(i64, String)],
 ) -> Result<EmbedResult> {
     if chunks.is_empty() {
-        return Ok(EmbedResult { embedded: 0, stopped_at_error: None });
+        return Ok(EmbedResult {
+            embedded: 0,
+            stopped_at_error: None,
+        });
     }
 
     let tx = conn.transaction()?;
@@ -615,7 +632,10 @@ fn embed_chunks(
     }
 
     tx.commit()?;
-    Ok(EmbedResult { embedded, stopped_at_error })
+    Ok(EmbedResult {
+        embedded,
+        stopped_at_error,
+    })
 }
 
 pub(crate) fn embed_near_sessions(
@@ -625,10 +645,17 @@ pub(crate) fn embed_near_sessions(
     budget: usize,
 ) -> Result<EmbedResult> {
     if session_ids.is_empty() || budget == 0 {
-        return Ok(EmbedResult { embedded: 0, stopped_at_error: None });
+        return Ok(EmbedResult {
+            embedded: 0,
+            stopped_at_error: None,
+        });
     }
 
-    let placeholders = session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = session_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
     let sql = format!(
         "SELECT c.id, c.content FROM qa_chunks c \
          WHERE c.session_id IN ({placeholders}) \
@@ -639,8 +666,10 @@ pub(crate) fn embed_near_sessions(
 
     let missing: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> =
-            session_ids.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+        let refs: Vec<&dyn rusqlite::types::ToSql> = session_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(refs.as_slice(), |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -656,7 +685,10 @@ pub(crate) fn embed_recent_chunks(
     budget: usize,
 ) -> Result<EmbedResult> {
     if budget == 0 {
-        return Ok(EmbedResult { embedded: 0, stopped_at_error: None });
+        return Ok(EmbedResult {
+            embedded: 0,
+            stopped_at_error: None,
+        });
     }
 
     let missing: Vec<(i64, String)> = {
@@ -695,11 +727,29 @@ mod tests {
 
         let codex_dir = tmp.path().join("codex_sessions");
 
-        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats.indexed, 1);
         assert_eq!(stats.total_sessions, 1);
 
-        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats2 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 1);
     }
@@ -718,10 +768,28 @@ mod tests {
 
         let codex_dir = tmp.path().join("codex_sessions");
 
-        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats.indexed, 1);
 
-        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: true, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats2 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: true,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats2.indexed, 1);
     }
 
@@ -739,12 +807,30 @@ mod tests {
 
         let codex_dir = tmp.path().join("codex_sessions");
 
-        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats.indexed, 2);
         assert_eq!(stats.total_sessions, 2);
 
         std::fs::remove_file(&f2).unwrap();
-        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: true, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats2 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: true,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats2.total_sessions, 1);
     }
 
@@ -768,10 +854,28 @@ mod tests {
 
         let empty_dir = tmp.path().join("empty");
 
-        let stats = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &dir_a, codex_dir: &empty_dir }).unwrap();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &dir_a,
+                codex_dir: &empty_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats.indexed, 1);
 
-        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &dir_b, codex_dir: &empty_dir }).unwrap();
+        let stats2 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &dir_b,
+                codex_dir: &empty_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats2.indexed, 1);
 
         let msg_count: i64 = conn

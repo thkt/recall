@@ -3,7 +3,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::{extract_text, parse_iso_timestamp, parse_jsonl_entries, session_id_from_path, update_earliest, Message, ParseResult, Role, SessionData, Source};
+use super::{
+    Message, ParseResult, Role, SessionData, Source, extract_text, parse_iso_timestamp,
+    parse_jsonl_entries, session_id_from_path, update_earliest,
+};
 
 struct ClaudeParseState {
     project: String,
@@ -12,7 +15,11 @@ struct ClaudeParseState {
 }
 
 fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<Message> {
-    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if entry
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
 
@@ -74,9 +81,8 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
         earliest_ts: None,
     };
 
-    let (messages, skipped_lines) = parse_jsonl_entries(path, |entry| {
-        process_claude_entry(entry, &mut state)
-    })?;
+    let (messages, skipped_lines) =
+        parse_jsonl_entries(path, |entry| process_claude_entry(entry, &mut state))?;
 
     if messages.is_empty() {
         return Ok(None);

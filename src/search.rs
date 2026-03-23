@@ -120,11 +120,7 @@ fn sanitize_fts_query(query: &str) -> String {
     }
 }
 
-fn build_session_filter(
-    opts: &SearchOptions,
-    now_ms: i64,
-    params: &mut Vec<Param>,
-) -> String {
+fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Param>) -> String {
     let mut conditions = Vec::new();
     if let Some(ref project) = opts.project {
         let escaped = project
@@ -199,13 +195,19 @@ fn build_candidate_sql(sq: &SearchQuery) -> String {
 
 fn find_candidate_sessions(conn: &Connection, sq: &SearchQuery) -> Result<Vec<(String, f64)>> {
     let sql = build_candidate_sql(sq);
-    let refs: Vec<&dyn rusqlite::types::ToSql> = sq.params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = sq
+        .params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
     debug_assert_eq!(
         refs.len(),
         sql.matches('?').count(),
         "param count must match SQL placeholder count"
     );
-    let mut stmt = conn.prepare(&sql).context("Failed to prepare search query")?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare search query")?;
     let rows = stmt
         .query_map(refs.as_slice(), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
@@ -219,7 +221,9 @@ fn find_candidate_sessions(conn: &Connection, sq: &SearchQuery) -> Result<Vec<(S
         match r {
             Ok(row) => ranked.push(row),
             Err(e) => {
-                if first_error.is_none() { first_error = Some(e.to_string()); }
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
                 skipped += 1;
             }
         }
@@ -244,8 +248,10 @@ fn fetch_session_metadata(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id IN ({placeholders})"
     );
-    let refs: Vec<&dyn rusqlite::types::ToSql> =
-        ranked.iter().map(|(sid, _)| sid as &dyn rusqlite::types::ToSql).collect();
+    let refs: Vec<&dyn rusqlite::types::ToSql> = ranked
+        .iter()
+        .map(|(sid, _)| sid as &dyn rusqlite::types::ToSql)
+        .collect();
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(refs.as_slice(), |row| {
@@ -267,21 +273,35 @@ fn fetch_session_metadata(
                 let source = match Source::from_db(&source_str) {
                     Some(s) => s,
                     None => {
-                        eprintln!("Warning: unknown source {source_str:?} for session {session_id}");
+                        eprintln!(
+                            "Warning: unknown source {source_str:?} for session {session_id}"
+                        );
                         continue;
                     }
                 };
-                map.insert(session_id.clone(), SessionData {
-                    session_id, source, file_path, project, slug, timestamp,
-                });
+                map.insert(
+                    session_id.clone(),
+                    SessionData {
+                        session_id,
+                        source,
+                        file_path,
+                        project,
+                        slug,
+                        timestamp,
+                    },
+                );
             }
             Err(e) => {
-                if db_errors == 0 { eprintln!("Warning: metadata query error: {e}"); }
+                if db_errors == 0 {
+                    eprintln!("Warning: metadata query error: {e}");
+                }
                 db_errors += 1;
             }
         }
     }
-    if db_errors > 1 { eprintln!("Warning: {db_errors} metadata row(s) failed"); }
+    if db_errors > 1 {
+        eprintln!("Warning: {db_errors} metadata row(s) failed");
+    }
     Ok(map)
 }
 
@@ -295,7 +315,13 @@ fn build_candidates(
         .filter_map(|(session_id, rank)| {
             let session = meta_map.remove(&session_id)?;
             let snippet = get_snippet(&session_id);
-            Some((rank, SearchResult { session, excerpt: snippet }))
+            Some((
+                rank,
+                SearchResult {
+                    session,
+                    excerpt: snippet,
+                },
+            ))
         })
         .collect()
 }
@@ -340,7 +366,9 @@ fn fetch_snippets(
     meta_map: &mut HashMap<String, SessionData>,
 ) -> Result<Vec<(f64, SearchResult)>> {
     if sq.use_instr {
-        let sql = &format!("SELECT substr(text, max(1, instr(text, ?1) - {SNIPPET_CONTEXT_BEFORE}), {SNIPPET_MAX_LEN}) FROM messages WHERE instr(text, ?1) > 0 AND session_id = ?2 LIMIT 1");
+        let sql = &format!(
+            "SELECT substr(text, max(1, instr(text, ?1) - {SNIPPET_CONTEXT_BEFORE}), {SNIPPET_MAX_LEN}) FROM messages WHERE instr(text, ?1) > 0 AND session_id = ?2 LIMIT 1"
+        );
         let mut stmt = conn.prepare(sql)?;
         Ok(build_candidates(ranked, meta_map, |sid| {
             sq.terms
@@ -456,8 +484,7 @@ pub fn search_with_embedder(
             })
             .collect();
 
-        let vec_hits = vec_search(conn, embedder, query, candidate_limit)
-            .unwrap_or_default();
+        let vec_hits = vec_search(conn, embedder, query, candidate_limit).unwrap_or_default();
 
         let mut merged = hybrid::rrf_merge(&fts_hits, &vec_hits);
 
@@ -479,10 +506,7 @@ pub fn search_with_embedder(
 
         let candidates = fetch_snippets(conn, &sq, ranked_for_snippets, &mut meta_map)?;
 
-        let results: Vec<SearchResult> = candidates
-            .into_iter()
-            .map(|(_, r)| r)
-            .collect();
+        let results: Vec<SearchResult> = candidates.into_iter().map(|(_, r)| r).collect();
         Ok(results)
     } else {
         // FTS5-only path
@@ -804,8 +828,7 @@ mod tests {
         assert_eq!(
             results[0].session.session_id, "newest",
             "newest session must appear first despite {} candidates exceeding candidate_limit {}",
-            21,
-            candidate_limit
+            21, candidate_limit
         );
     }
 
@@ -828,7 +851,10 @@ mod tests {
         insert_message(&conn, "s1", "user", "hello world");
 
         let result = search(&conn, "\"hello", &SearchOptions::default());
-        assert!(result.is_ok(), "auto-balanced quote should not cause FTS5 error");
+        assert!(
+            result.is_ok(),
+            "auto-balanced quote should not cause FTS5 error"
+        );
     }
 
     #[test]
@@ -845,7 +871,10 @@ mod tests {
     fn test_extract_search_words() {
         for (input, expected) in [
             ("hello world", vec!["hello", "world"]),
-            ("rust AND error NOT warning", vec!["rust", "error", "warning"]),
+            (
+                "rust AND error NOT warning",
+                vec!["rust", "error", "warning"],
+            ),
             ("foo OR bar", vec!["foo", "bar"]),
             ("\"quoted phrase\" wild*", vec!["quoted", "phrase", "wild"]),
             ("(group)", vec!["group"]),
@@ -853,7 +882,10 @@ mod tests {
             assert_eq!(extract_search_words(input), expected, "input: {input:?}");
         }
         for empty in ["AND OR NOT", "\"\"", "   "] {
-            assert!(extract_search_words(empty).is_empty(), "expected empty for: {empty:?}");
+            assert!(
+                extract_search_words(empty).is_empty(),
+                "expected empty for: {empty:?}"
+            );
         }
     }
 
@@ -866,7 +898,10 @@ mod tests {
         let results = search(
             &conn,
             "hello",
-            &SearchOptions { limit: 0, ..Default::default() },
+            &SearchOptions {
+                limit: 0,
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(results.is_empty());
@@ -928,9 +963,16 @@ mod tests {
 
         let codex_dir = tmp.path().join("codex_sessions");
 
-        let stats = index_from_dirs(&mut conn, &IndexOptions {
-            force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir,
-        }).unwrap();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats.indexed, 2);
         assert_eq!(stats.total_sessions, 2);
 
@@ -945,16 +987,28 @@ mod tests {
         assert_eq!(results[0].session.session_id, "sess-beta");
 
         // Project filter — only alpha
-        let results = search(&conn, "algorithm OR authentication", &SearchOptions {
-            project: Some("/home/me/alpha".to_string()),
-            ..Default::default()
-        }).unwrap();
+        let results = search(
+            &conn,
+            "algorithm OR authentication",
+            &SearchOptions {
+                project: Some("/home/me/alpha".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.project, "/home/me/alpha");
 
-        let stats2 = index_from_dirs(&mut conn, &IndexOptions {
-            force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir,
-        }).unwrap();
+        let stats2 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 2);
 
@@ -970,7 +1024,10 @@ mod tests {
 
         // "role:user" should NOT act as a column filter — should search for the literal text
         let results = search(&conn, "role:user", &SearchOptions::default()).unwrap();
-        assert!(results.is_empty(), "role:user should not match as column filter");
+        assert!(
+            results.is_empty(),
+            "role:user should not match as column filter"
+        );
     }
 
     // T-012: graceful degradation — no embedder → FTS5 only, no error (FR-006)
@@ -980,13 +1037,8 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "authentication flow discussion");
 
-        let results = search_with_embedder(
-            &conn,
-            "authentication",
-            &SearchOptions::default(),
-            None,
-        )
-        .unwrap();
+        let results =
+            search_with_embedder(&conn, "authentication", &SearchOptions::default(), None).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");

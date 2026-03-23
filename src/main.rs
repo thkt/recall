@@ -204,8 +204,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
     ensure_model(verbose)?;
 
     if embed {
-        let mut embedder = try_load_embedder()
-            .context("Model not available for --embed")?;
+        let mut embedder = try_load_embedder().context("Model not available for --embed")?;
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM qa_chunks c \
              WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
@@ -268,7 +267,10 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
 
     // Post-search: progressive embedding (search results + recent)
     if !no_embed && let Some(emb) = embedder.as_mut() {
-        let session_ids: Vec<String> = results.iter().map(|r| r.session.session_id.clone()).collect();
+        let session_ids: Vec<String> = results
+            .iter()
+            .map(|r| r.session.session_id.clone())
+            .collect();
         let mut total = 0;
         if let Ok(r) = indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10) {
             r.warn_if_stopped();
@@ -285,7 +287,6 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
 
     Ok(())
 }
-
 
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
@@ -334,10 +335,18 @@ fn extract_parent_session(file_path: &str) -> Option<&str> {
     let idx = file_path.find("/subagents/")?;
     let prefix = &file_path[..idx];
     let parent = prefix.rsplit('/').next()?;
-    if parent.is_empty() { None } else { Some(parent) }
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
 }
 
-fn format_result(w: &mut impl std::io::Write, i: usize, r: &search::SearchResult) -> std::io::Result<()> {
+fn format_result(
+    w: &mut impl std::io::Write,
+    i: usize,
+    r: &search::SearchResult,
+) -> std::io::Result<()> {
     let s = &r.session;
     let date = format_timestamp(s.timestamp);
     let proj_name = if s.project.is_empty() {
@@ -350,7 +359,15 @@ fn format_result(w: &mut impl std::io::Write, i: usize, r: &search::SearchResult
     };
     let slug = ansi::strip_control_chars(&s.slug);
     let project = ansi::strip_control_chars(&s.project);
-    writeln!(w, "[{}] {} | {} | {} [{}]", i + 1, date, slug, proj_name, s.source)?;
+    writeln!(
+        w,
+        "[{}] {} | {} | {} [{}]",
+        i + 1,
+        date,
+        slug,
+        proj_name,
+        s.source
+    )?;
     if !project.is_empty() {
         writeln!(w, "    {project}")?;
     }
@@ -420,7 +437,9 @@ fn run() -> Result<()> {
         Some(cmd @ Command::Search { .. }) => run_search(cmd, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         None => {
-            anyhow::bail!("A search query is required. Usage: recall search \"query\" or recall index")
+            anyhow::bail!(
+                "A search query is required. Usage: recall search \"query\" or recall index"
+            )
         }
     }
 }
@@ -462,7 +481,11 @@ mod tests {
             ("hello", 5, "hello"),
             ("hello world", 5, "hello"),
         ] {
-            assert_eq!(truncate_str(input, max), expected, "input: {input:?}, max: {max}");
+            assert_eq!(
+                truncate_str(input, max),
+                expected,
+                "input: {input:?}, max: {max}"
+            );
         }
         // Multibyte: 3 bytes per char, 10 bytes fits 3 chars (9 bytes)
         let result = truncate_str("こんにちは", 10);

@@ -182,15 +182,18 @@ mod tests {
             CREATE VIRTUAL TABLE messages USING fts5(
                 session_id UNINDEXED, role, text, tokenize='unicode61'
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -200,14 +203,18 @@ mod tests {
 
         let conn = open_db(tmp.path()).unwrap();
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 0);
 
-        let sql: String = conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'",
-            [],
-            |r| r.get(0),
-        ).unwrap();
+        let sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert!(sql.contains(FTS_TOKENIZER));
     }
 
@@ -224,20 +231,29 @@ mod tests {
                 user_text TEXT NOT NULL, assistant_text TEXT,
                 content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO qa_chunks VALUES (1, 's1', 'q', 'a', 'content', 0, 'hash1')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         // Re-open triggers migration (tokenizer changed unicode61 → porter unicode61)
         let conn = open_db(tmp.path()).unwrap();
 
-        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(sessions, 0, "sessions should be cleared by migration");
 
-        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0)).unwrap();
-        assert_eq!(chunks, 0, "qa_chunks should be cleared by migration cascade");
+        let chunks: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            chunks, 0,
+            "qa_chunks should be cleared by migration cascade"
+        );
     }
 }

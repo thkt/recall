@@ -29,8 +29,14 @@ pub fn strip_control_chars(s: &str) -> Cow<'_, str> {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             match chars.peek() {
-                Some(&'[') => { chars.next(); skip_csi(&mut chars); }
-                Some(&']') => { chars.next(); skip_osc(&mut chars); }
+                Some(&'[') => {
+                    chars.next();
+                    skip_csi(&mut chars);
+                }
+                Some(&']') => {
+                    chars.next();
+                    skip_osc(&mut chars);
+                }
                 _ => {}
             }
         } else if !c.is_control() || c == '\n' {
@@ -52,8 +58,8 @@ mod tests {
             ("hello \x1b[31mred\x1b[0m world", "hello red world"),
             ("before\x1b]0;title\x07after", "beforeafter"),
             ("before\x1b]0;title\x1b\\after", "beforeafter"),
-            ("before\x1b]0;title", "before"),   // unterminated OSC
-            ("before\x1b[31", "before"),         // unterminated CSI
+            ("before\x1b]0;title", "before"), // unterminated OSC
+            ("before\x1b[31", "before"),      // unterminated CSI
         ] {
             assert_eq!(strip_control_chars(input), expected, "input: {input:?}");
         }

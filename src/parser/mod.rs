@@ -222,7 +222,10 @@ pub(super) fn parse_iso_timestamp(val: &Value) -> Option<i64> {
             let millis = parse_fractional_millis(s, b);
             let tz_offset = parse_tz_offset_ms(s, b);
             let days = date::days_from_civil(year, month, day)?;
-            Some(days * date::MS_PER_DAY + hour * 3_600_000 + min * 60_000 + sec * 1000 + millis - tz_offset)
+            Some(
+                days * date::MS_PER_DAY + hour * 3_600_000 + min * 60_000 + sec * 1000 + millis
+                    - tz_offset,
+            )
         }
         Value::Number(n) => n.as_i64(),
         _ => None,
@@ -249,8 +252,7 @@ pub(super) fn parse_jsonl_entries(
                 continue;
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("I/O error reading {}", path.display()));
+                return Err(e).with_context(|| format!("I/O error reading {}", path.display()));
             }
         };
         let line = raw_line.trim();
@@ -333,11 +335,7 @@ mod tests {
                 "prefix<local-command-stdout>output data</local-command-stdout>suffix",
             ),
             // T-007: plain text unchanged
-            (
-                "T-007 plain text unchanged",
-                "hello world",
-                "hello world",
-            ),
+            ("T-007 plain text unchanged", "hello world", "hello world"),
             // T-008: unclosed tag left intact
             (
                 "T-008 unclosed tag left intact",
@@ -364,10 +362,22 @@ mod tests {
         // Rejection cases
         assert_eq!(parse_iso_timestamp(&Value::Null), None);
         assert_eq!(parse_iso_timestamp(&Value::String("2026".into())), None);
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Ü".into())), None);
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T24:00:00Z".into())), None);
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T12:60:00Z".into())), None);
-        assert_eq!(parse_iso_timestamp(&Value::String("2026-03-01T12:00:60Z".into())), None);
+        assert_eq!(
+            parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Ü".into())),
+            None
+        );
+        assert_eq!(
+            parse_iso_timestamp(&Value::String("2026-03-01T24:00:00Z".into())),
+            None
+        );
+        assert_eq!(
+            parse_iso_timestamp(&Value::String("2026-03-01T12:60:00Z".into())),
+            None
+        );
+        assert_eq!(
+            parse_iso_timestamp(&Value::String("2026-03-01T12:00:60Z".into())),
+            None
+        );
 
         // No millis
         let ts = parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Z".into())).unwrap();
@@ -400,8 +410,10 @@ mod tests {
             assert_eq!(utc - with_offset, diff_ms, "input: {s}");
         }
         // Offset with millis
-        let utc_ms = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500Z".into())).unwrap();
-        let off_ms = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500+09:00".into())).unwrap();
+        let utc_ms =
+            parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500Z".into())).unwrap();
+        let off_ms =
+            parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500+09:00".into())).unwrap();
         assert_eq!(utc_ms - off_ms, 9 * 3_600_000);
     }
 }

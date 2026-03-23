@@ -117,10 +117,7 @@ mod tests {
     // T-005: user without assistant → user-only chunk (FR-003)
     #[test]
     fn test_005_user_without_assistant() {
-        let messages = vec![
-            msg(Role::User, "最初の質問"),
-            msg(Role::User, "次の質問"),
-        ];
+        let messages = vec![msg(Role::User, "最初の質問"), msg(Role::User, "次の質問")];
         let chunks = chunk_messages("s1", &messages, None);
 
         assert_eq!(chunks.len(), 2);
@@ -178,6 +175,9 @@ mod tests {
         let messages = vec![msg(Role::User, "same question")];
         let c1 = chunk_messages("s1", &messages, None);
         let c2 = chunk_messages("s2", &messages, None);
-        assert_eq!(c1[0].chunk_hash, c2[0].chunk_hash, "same content → same hash");
+        assert_eq!(
+            c1[0].chunk_hash, c2[0].chunk_hash,
+            "same content → same hash"
+        );
     }
 }
