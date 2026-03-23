@@ -57,7 +57,18 @@ jobs:
         run: |
           cp "target/$TARGET/release/recall" recall
           chmod +x recall
-          tar czf "$NAME.tar.gz" recall
+          if [ "$TARGET" = "aarch64-apple-darwin" ]; then
+            METALLIB=$(find "target/$TARGET/release/build" -path "*/mlx-sys-*/out/build/lib/mlx.metallib" | head -1)
+            if [ -z "$METALLIB" ]; then
+              echo "::error::mlx.metallib not found in build artifacts"
+              exit 1
+            fi
+            cp "$METALLIB" mlx.metallib
+            echo "Bundling mlx.metallib ($(du -h mlx.metallib | cut -f1))"
+            tar czf "$NAME.tar.gz" recall mlx.metallib
+          else
+            tar czf "$NAME.tar.gz" recall
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -137,6 +148,10 @@ jobs:
           # Calculate checksums
           SHA_AARCH64_DARWIN=$(sha256sum artifacts/recall-aarch64-apple-darwin/recall-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
           SHA_X86_64_LINUX=$(sha256sum artifacts/recall-x86_64-unknown-linux-gnu/recall-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+
+          # Verify macOS archive contains mlx.metallib
+          tar tzf artifacts/recall-aarch64-apple-darwin/recall-aarch64-apple-darwin.tar.gz | grep -q mlx.metallib \
+            || { echo "::error::mlx.metallib missing from macOS archive"; exit 1; }
 
           # Ensure Formula directory exists
           mkdir -p Formula
