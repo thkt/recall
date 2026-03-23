@@ -23,9 +23,6 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: recall-x86_64-unknown-linux-gnu
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            name: recall-aarch64-unknown-linux-gnu
 
     runs-on: ${{ matrix.os }}
 
@@ -43,19 +40,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-
       - name: Build
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          if [ "$TARGET" = "aarch64-unknown-linux-gnu" ]; then
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-          fi
           FEATURES=""
           if [ "$TARGET" = "aarch64-apple-darwin" ]; then
             FEATURES="--features coreml"
@@ -148,7 +136,6 @@ jobs:
 
           # Calculate checksums
           SHA_AARCH64_DARWIN=$(sha256sum artifacts/recall-aarch64-apple-darwin/recall-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
-          SHA_AARCH64_LINUX=$(sha256sum artifacts/recall-aarch64-unknown-linux-gnu/recall-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
           SHA_X86_64_LINUX=$(sha256sum artifacts/recall-x86_64-unknown-linux-gnu/recall-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 
           # Ensure Formula directory exists
@@ -158,7 +145,6 @@ jobs:
           sed -e "s/__VERSION__/$VERSION/g" \
               -e "s/__TAG__/$TAG/g" \
               -e "s/__SHA_AARCH64_DARWIN__/$SHA_AARCH64_DARWIN/g" \
-              -e "s/__SHA_AARCH64_LINUX__/$SHA_AARCH64_LINUX/g" \
               -e "s/__SHA_X86_64_LINUX__/$SHA_X86_64_LINUX/g" \
               Formula/recall.rb.template > Formula/recall.rb
 
