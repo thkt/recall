@@ -813,7 +813,10 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
         assert!(qa_before > 0, "should have qa_chunks before force reindex");
-        assert!(vec_before > 0, "should have vec_chunks before force reindex");
+        assert!(
+            vec_before > 0,
+            "should have vec_chunks before force reindex"
+        );
 
         let stats2 = index_from_dirs(
             &mut conn,
@@ -879,7 +882,10 @@ mod tests {
         let vecs_before: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
-        assert!(vecs_before > 0, "should have vec_chunks before orphan cleanup");
+        assert!(
+            vecs_before > 0,
+            "should have vec_chunks before orphan cleanup"
+        );
 
         std::fs::remove_file(&f2).unwrap();
         // force: false exercises cleanup_orphans (force: true bulk-deletes everything,
@@ -1195,16 +1201,19 @@ mod tests {
         let mut embedder = MockEmbedder::failing_after(EMBED_BATCH_SIZE);
         let result = embed_recent_chunks(&mut conn, &mut embedder, chunk_count as usize).unwrap();
 
-        assert_eq!(result.embedded, EMBED_BATCH_SIZE, "first batch should succeed");
-        assert!(
-            result.stopped_at_error.is_some(),
-            "should report the error"
+        assert_eq!(
+            result.embedded, EMBED_BATCH_SIZE,
+            "first batch should succeed"
         );
+        assert!(result.stopped_at_error.is_some(), "should report the error");
 
         let vec_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(vec_count, EMBED_BATCH_SIZE as i64, "committed batch should survive");
+        assert_eq!(
+            vec_count, EMBED_BATCH_SIZE as i64,
+            "committed batch should survive"
+        );
     }
 
     #[test]

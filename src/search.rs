@@ -1072,9 +1072,18 @@ mod tests {
         .unwrap();
 
         // Both sessions should appear: s1 from FTS, s2 from vector search
-        let ids: Vec<&str> = results.iter().map(|r| r.session.session_id.as_str()).collect();
-        assert!(ids.contains(&"s1"), "s1 should appear (FTS match), got: {ids:?}");
-        assert!(ids.contains(&"s2"), "s2 should appear (vector match), got: {ids:?}");
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"s1"),
+            "s1 should appear (FTS match), got: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"s2"),
+            "s2 should appear (vector match), got: {ids:?}"
+        );
     }
 
     #[test]

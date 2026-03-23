@@ -297,7 +297,12 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
                 }
             }
         };
-        handle(indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10));
+        handle(indexer::embed_near_sessions(
+            &mut conn,
+            emb,
+            &session_ids,
+            10,
+        ));
         handle(indexer::embed_recent_chunks(&mut conn, emb, 10));
         if total > 0 && verbose {
             eprintln!("Embedded {total} chunks (nearby + recent)");
