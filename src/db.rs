@@ -10,10 +10,14 @@ const FTS_TOKENIZER: &str = "porter unicode61";
 static SQLITE_VEC_INIT: Once = Once::new();
 
 fn ensure_sqlite_vec() {
-    SQLITE_VEC_INIT.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+    SQLITE_VEC_INIT.call_once(|| {
+        // SAFETY: sqlite3_vec_init is a C extern fn matching sqlite3_auto_extension's
+        // callback signature. Pinned to sqlite-vec 0.1.6; re-verify ABI on version bumps.
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
     });
 }
 
@@ -110,7 +114,10 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
             "recall: Index schema changed — rebuilding {session_count} sessions (source files are unaffected)"
         );
         let tx = conn.transaction()?;
-        tx.execute_batch("DROP TABLE messages; DELETE FROM sessions;")?;
+        tx.execute_batch(
+            "DROP TABLE messages; DELETE FROM sessions; \
+             DROP TABLE IF EXISTS qa_chunks; DROP TABLE IF EXISTS vec_chunks;",
+        )?;
         tx.commit()?;
     }
 
@@ -163,11 +170,9 @@ mod tests {
         let _conn2 = open_db(tmp.path()).unwrap();
     }
 
-    #[test]
-    fn test_fts_migration_rebuilds_on_schema_change() {
-        let tmp = NamedTempFile::new().unwrap();
-
-        let conn = Connection::open(tmp.path()).unwrap();
+    /// Create a DB with the old tokenizer ('unicode61') and one session+message.
+    fn create_old_schema_db(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "CREATE TABLE sessions (
                 session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
@@ -185,7 +190,12 @@ mod tests {
             "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
             [],
         ).unwrap();
-        drop(conn);
+    }
+
+    #[test]
+    fn test_fts_migration_rebuilds_on_schema_change() {
+        let tmp = NamedTempFile::new().unwrap();
+        create_old_schema_db(tmp.path());
 
         let conn = open_db(tmp.path()).unwrap();
 
@@ -198,5 +208,35 @@ mod tests {
             |r| r.get(0),
         ).unwrap();
         assert!(sql.contains(FTS_TOKENIZER));
+    }
+
+    #[test]
+    fn test_fts_migration_cascades_to_embedding_tables() {
+        let tmp = NamedTempFile::new().unwrap();
+        create_old_schema_db(tmp.path());
+
+        // Add qa_chunks table with data (not created by create_old_schema_db)
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE qa_chunks (
+                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                user_text TEXT NOT NULL, assistant_text TEXT,
+                content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
+            );",
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks VALUES (1, 's1', 'q', 'a', 'content', 0, 'hash1')",
+            [],
+        ).unwrap();
+        drop(conn);
+
+        // Re-open triggers migration (tokenizer changed unicode61 → porter unicode61)
+        let conn = open_db(tmp.path()).unwrap();
+
+        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(sessions, 0, "sessions should be cleared by migration");
+
+        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0)).unwrap();
+        assert_eq!(chunks, 0, "qa_chunks should be cleared by migration cascade");
     }
 }

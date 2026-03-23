@@ -386,7 +386,9 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    let _ = set_last_scan(conn, &key, now_secs);
+    if let Err(e) = set_last_scan(conn, &key, now_secs) {
+        eprintln!("Warning: failed to save scan timestamp: {e}");
+    }
 
     Ok(IndexStats {
         indexed,
@@ -571,18 +573,32 @@ pub(crate) fn index_chunks(
     Ok(ChunkStats { chunks_created })
 }
 
-/// Stops on first embedding failure. Returns count of successfully embedded chunks.
+pub(crate) struct EmbedResult {
+    pub embedded: usize,
+    pub stopped_at_error: Option<String>,
+}
+
+impl EmbedResult {
+    pub(crate) fn warn_if_stopped(&self) {
+        if let Some(ref err) = self.stopped_at_error {
+            eprintln!("Warning: embedding stopped early: {err}");
+        }
+    }
+}
+
+/// Stops on first embedding failure. Commits successfully embedded chunks.
 fn embed_chunks(
     conn: &mut Connection,
     embedder: &mut dyn Embed,
     chunks: &[(i64, String)],
-) -> Result<usize> {
+) -> Result<EmbedResult> {
     if chunks.is_empty() {
-        return Ok(0);
+        return Ok(EmbedResult { embedded: 0, stopped_at_error: None });
     }
 
     let tx = conn.transaction()?;
     let mut embedded = 0;
+    let mut stopped_at_error = None;
 
     for (chunk_id, content) in chunks {
         match embedder.embed_document(content) {
@@ -595,14 +611,14 @@ fn embed_chunks(
                 embedded += 1;
             }
             Err(e) => {
-                eprintln!("Warning: embedding failed for chunk {chunk_id}: {e}");
+                stopped_at_error = Some(format!("chunk {chunk_id}: {e}"));
                 break;
             }
         }
     }
 
     tx.commit()?;
-    Ok(embedded)
+    Ok(EmbedResult { embedded, stopped_at_error })
 }
 
 pub(crate) fn embed_near_sessions(
@@ -610,9 +626,9 @@ pub(crate) fn embed_near_sessions(
     embedder: &mut dyn Embed,
     session_ids: &[String],
     budget: usize,
-) -> Result<usize> {
+) -> Result<EmbedResult> {
     if session_ids.is_empty() || budget == 0 {
-        return Ok(0);
+        return Ok(EmbedResult { embedded: 0, stopped_at_error: None });
     }
 
     let placeholders = session_ids.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
@@ -641,9 +657,9 @@ pub(crate) fn embed_recent_chunks(
     conn: &mut Connection,
     embedder: &mut dyn Embed,
     budget: usize,
-) -> Result<usize> {
+) -> Result<EmbedResult> {
     if budget == 0 {
-        return Ok(0);
+        return Ok(EmbedResult { embedded: 0, stopped_at_error: None });
     }
 
     let missing: Vec<(i64, String)> = {

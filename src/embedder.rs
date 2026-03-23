@@ -134,6 +134,7 @@ impl Embedder {
             });
         }
 
+        #[allow(unused_mut)] // mut needed when coreml feature is enabled
         let mut builder = Session::builder()
             .map_err(|e| EmbedError::Inference(e.to_string()))?;
 
@@ -198,8 +199,7 @@ impl Embedder {
             });
         }
 
-        let mask: Vec<u32> = encoding.get_attention_mask().to_vec();
-        let mut pooled = mean_pooling(data, seq_len, hidden_size, &mask);
+        let mut pooled = mean_pooling(data, seq_len, hidden_size, encoding.get_attention_mask());
         l2_normalize(&mut pooled);
 
         Ok(pooled)

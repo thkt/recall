@@ -5,7 +5,18 @@ use crate::date::MS_PER_DAY;
 /// RRF parameter. Higher k reduces the influence of high rankings.
 const RRF_K: f64 = 60.0;
 /// Sessions older than 30 days lose half their recency boost.
-const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
+pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
+
+/// Exponential recency decay: 1.0 for now, 0.5 at half-life, approaching 0.0.
+pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
+    match ts {
+        Some(ts) => {
+            let age_days = ((now_ms as f64 - ts as f64) / MS_PER_DAY as f64).max(0.0);
+            (-std::f64::consts::LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
+        }
+        None => 0.0,
+    }
+}
 
 /// A scored candidate from one retrieval source (FTS5 or vector).
 pub(crate) struct RankedHit {
@@ -47,13 +58,7 @@ pub(crate) fn apply_recency_boost(
     now_ms: i64,
 ) {
     for (session_id, score) in results.iter_mut() {
-        let boost = match get_timestamp(session_id) {
-            Some(ts) => {
-                let age_days = ((now_ms as f64 - ts as f64) / MS_PER_DAY as f64).max(0.0);
-                (-std::f64::consts::LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
-            }
-            None => 0.0,
-        };
+        let boost = recency_decay(now_ms, get_timestamp(session_id));
         *score *= 1.0 + boost;
     }
     results.sort_by(|a, b| b.1.total_cmp(&a.1));

@@ -11,7 +11,6 @@ use crate::parser::{SessionData, Source};
 const SNIPPET_CONTEXT_BEFORE: usize = 60;
 const SNIPPET_MAX_LEN: usize = 200;
 
-const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
 pub struct SearchResult {
@@ -309,12 +308,7 @@ fn score_and_sort(
     let mut results: Vec<(SearchResult, f64)> = candidates
         .into_iter()
         .map(|(rank, result)| {
-            let recency_boost = if let Some(ts) = result.session.timestamp {
-                let age_days = ((now_ms as f64 - ts as f64) / MS_PER_DAY as f64).max(0.0);
-                (-std::f64::consts::LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
-            } else {
-                0.0
-            };
+            let recency_boost = hybrid::recency_decay(now_ms, result.session.timestamp);
             let blended_rank = if rank == 0.0 {
                 -recency_boost
             } else {
