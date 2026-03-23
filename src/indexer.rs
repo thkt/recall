@@ -597,7 +597,7 @@ impl EmbedResult {
     }
 }
 
-const EMBED_BATCH_SIZE: usize = 64;
+const EMBED_BATCH_SIZE: usize = 32;
 
 /// Embeds chunks in batches, committing each batch separately.
 /// Stops on first batch failure; previously committed batches are preserved.
@@ -613,19 +613,23 @@ fn embed_chunks(
         });
     }
 
+    // Sort by content length to minimize padding waste within each batch
+    let mut sorted: Vec<usize> = (0..chunks.len()).collect();
+    sorted.sort_by_key(|&i| chunks[i].1.len());
+
     let mut embedded = 0;
     let mut stopped_at_error = None;
 
-    for batch in chunks.chunks(EMBED_BATCH_SIZE) {
-        let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
+    for batch_idx in sorted.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<&str> = batch_idx.iter().map(|&i| chunks[i].1.as_str()).collect();
         match embedder.embed_documents_batch(&texts) {
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
-                for (embedding, (chunk_id, _)) in embeddings.iter().zip(batch) {
+                for (embedding, &i) in embeddings.iter().zip(batch_idx) {
                     let embedding_bytes: &[u8] = bytemuck::cast_slice(embedding);
                     tx.execute(
                         "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![chunk_id, embedding_bytes],
+                        rusqlite::params![chunks[i].0, embedding_bytes],
                     )?;
                 }
                 tx.commit()?;

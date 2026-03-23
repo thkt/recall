@@ -1,22 +1,82 @@
 use sha2::{Digest, Sha256};
 
-use crate::embedder::DOCUMENT_PREFIX;
 use crate::parser::{Message, Role};
 
 pub(crate) struct QAChunk {
     pub session_id: String,
     pub user_text: String,
     pub assistant_text: Option<String>,
-    /// "検索文書: " + user_text + "\n" + assistant_text
+    /// Embedding content: user_text [+ "\n" + assistant_text]. Prefix added by embedder.
     pub content: String,
     pub timestamp: Option<i64>,
     pub chunk_hash: String,
 }
 
-fn build_content(user_text: &str, assistant_text: Option<&str>) -> String {
+/// Max content bytes per chunk (~4000-5000 tokens, well under model's 8192 limit).
+/// Prevents O(seq_len²) attention explosion from oversized QA pairs.
+const MAX_CHUNK_BYTES: usize = 16_000;
+
+fn split_text(text: &str, max_bytes: usize) -> Vec<String> {
+    if text.len() <= max_bytes {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let split_at = find_split_boundary(remaining, max_bytes);
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..];
+        remaining = remaining.trim_start_matches('\n');
+    }
+    chunks
+}
+
+fn build_content(user_text: &str, assistant_text: Option<&str>) -> Vec<String> {
     match assistant_text {
-        Some(a) => format!("{DOCUMENT_PREFIX}{user_text}\n{a}"),
-        None => format!("{DOCUMENT_PREFIX}{user_text}"),
+        None => split_text(user_text, MAX_CHUNK_BYTES),
+        Some(a) => {
+            let header = format!("{user_text}\n");
+            if header.len() + a.len() <= MAX_CHUNK_BYTES {
+                return vec![format!("{header}{a}")];
+            }
+            // Split assistant text with user_text as prefix per sub-chunk
+            let available = MAX_CHUNK_BYTES.saturating_sub(header.len());
+            if available > 0 {
+                let mut chunks = Vec::new();
+                let mut remaining = a;
+                while !remaining.is_empty() {
+                    let split_at = find_split_boundary(remaining, available);
+                    chunks.push(format!("{header}{}", &remaining[..split_at]));
+                    remaining = &remaining[split_at..];
+                    remaining = remaining.trim_start_matches('\n');
+                }
+                return chunks;
+            }
+            // user_text alone exceeds limit; split both independently
+            let mut chunks = split_text(user_text, MAX_CHUNK_BYTES);
+            chunks.extend(split_text(a, MAX_CHUNK_BYTES));
+            chunks
+        }
+    }
+}
+
+/// Find a byte position to split text, preferring line boundaries.
+fn find_split_boundary(text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return text.len();
+    }
+    // Find char boundary at or before max_bytes
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    // Prefer paragraph boundary, then line boundary
+    if let Some(pos) = text[..end].rfind("\n\n") {
+        return pos + 2;
+    }
+    match text[..end].rfind('\n') {
+        Some(pos) => pos + 1,
+        None => end,
     }
 }
 
@@ -57,22 +117,24 @@ pub(crate) fn chunk_messages(
 
         let assistant_text = if i + 1 < messages.len() && messages[i + 1].role == Role::Assistant {
             i += 1;
-            Some(messages[i].text.as_str())
+            let text = messages[i].text.as_str();
+            if text.is_empty() { None } else { Some(text) }
         } else {
             None
         };
 
-        let content = build_content(&msg.text, assistant_text);
-        let chunk_hash = sha256_hex(&content);
-
-        chunks.push(QAChunk {
-            session_id: session_id.to_string(),
-            user_text: msg.text.clone(),
-            assistant_text: assistant_text.map(String::from),
-            content,
-            timestamp,
-            chunk_hash,
-        });
+        let contents = build_content(&msg.text, assistant_text);
+        for content in contents {
+            let chunk_hash = sha256_hex(&content);
+            chunks.push(QAChunk {
+                session_id: session_id.to_string(),
+                user_text: msg.text.clone(),
+                assistant_text: assistant_text.map(String::from),
+                content,
+                timestamp,
+                chunk_hash,
+            });
+        }
 
         i += 1;
     }
@@ -106,7 +168,6 @@ mod tests {
             chunks[0].assistant_text.as_deref(),
             Some("OAuth2を使う方法があります")
         );
-        assert!(chunks[0].content.starts_with(DOCUMENT_PREFIX));
         assert!(chunks[0].content.contains("認証フロー"));
         assert!(chunks[0].content.contains("OAuth2"));
         assert_eq!(chunks[0].session_id, "s1");
@@ -179,5 +240,43 @@ mod tests {
             c1[0].chunk_hash, c2[0].chunk_hash,
             "same content → same hash"
         );
+    }
+
+    #[test]
+    fn test_long_assistant_splits_into_sub_chunks() {
+        let long_text = "line\n".repeat(5000); // ~25,000 bytes > MAX_CHUNK_BYTES
+        let messages = vec![msg(Role::User, "質問"), msg(Role::Assistant, &long_text)];
+        let chunks = chunk_messages("s1", &messages, None);
+
+        assert!(
+            chunks.len() > 1,
+            "should split into multiple chunks, got {}",
+            chunks.len()
+        );
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.content.len() <= super::MAX_CHUNK_BYTES,
+                "chunk[{i}] is {} bytes, exceeds limit {}",
+                chunk.content.len(),
+                super::MAX_CHUNK_BYTES
+            );
+            assert!(
+                chunk.content.contains("質問"),
+                "chunk[{i}] should contain user question for search context"
+            );
+        }
+        // All assistant text should be preserved across sub-chunks
+        let total_content: usize = chunks.iter().map(|c| c.content.len()).sum();
+        assert!(total_content > long_text.len(), "no content should be lost");
+    }
+
+    #[test]
+    fn test_short_content_not_split() {
+        let messages = vec![
+            msg(Role::User, "短い質問"),
+            msg(Role::Assistant, "短い回答"),
+        ];
+        let chunks = chunk_messages("s1", &messages, None);
+        assert_eq!(chunks.len(), 1);
     }
 }

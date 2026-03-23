@@ -330,15 +330,14 @@ impl Embed for Embedder {
             return Ok(Vec::new());
         }
 
-        let encodings: Vec<_> = texts
+        let prefixed: Vec<String> = texts
             .iter()
-            .map(|t| {
-                let prefixed = format!("{DOCUMENT_PREFIX}{t}");
-                self.tokenizer
-                    .encode(prefixed, true)
-                    .map_err(|e| EmbedError::Tokenizer(e.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|t| format!("{DOCUMENT_PREFIX}{t}"))
+            .collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(prefixed, true)
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
 
         let batch_size = encodings.len();
         let max_seq_len = encodings.iter().map(|e| e.get_ids().len()).max().unwrap();
