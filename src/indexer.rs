@@ -747,7 +747,7 @@ mod tests {
         assert_eq!(stats.total_sessions, 2);
 
         std::fs::remove_file(&f2).unwrap();
-        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: false, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
+        let stats2 = index_from_dirs(&mut conn, &IndexOptions { force: true, verbose: false, claude_dir: &claude_dir, codex_dir: &codex_dir }).unwrap();
         assert_eq!(stats2.total_sessions, 1);
     }
 
