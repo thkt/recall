@@ -141,43 +141,48 @@ impl Embedder {
         Ok(Self { session, tokenizer })
     }
 
-    fn build_session(dir: &Path, model_path: &Path) -> Result<Session, EmbedError> {
-        match Self::try_commit_session(dir, model_path) {
-            Ok(session) => Ok(session),
-            Err(first_err) => {
-                #[cfg(feature = "coreml")]
-                {
-                    let cache_dir = dir.join("coreml_cache");
-                    if cache_dir.exists() {
-                        eprintln!("Warning: CoreML cache invalid, rebuilding...");
-                        let _ = std::fs::remove_dir_all(&cache_dir);
-                        return Self::try_commit_session(dir, model_path);
-                    }
-                }
-                Err(first_err)
-            }
-        }
-    }
-
-    fn try_commit_session(dir: &Path, model_path: &Path) -> Result<Session, EmbedError> {
-        #[allow(unused_mut)]
-        let mut builder = Session::builder().map_err(|e| EmbedError::Inference(e.to_string()))?;
-
+    fn build_session(
+        #[allow(unused)] dir: &Path,
+        model_path: &Path,
+    ) -> Result<Session, EmbedError> {
         #[cfg(feature = "coreml")]
         {
+            if let Ok(session) = Self::try_coreml(dir, model_path) {
+                return Ok(session);
+            }
+            // Stale cache — clear and retry
             let cache_dir = dir.join("coreml_cache");
-            let coreml = ep::CoreML::default()
-                .with_compute_units(ep::coreml::ComputeUnits::All)
-                .with_model_format(ep::coreml::ModelFormat::MLProgram)
-                .with_model_cache_dir(cache_dir.display().to_string())
-                .build();
-            builder = builder
-                .with_execution_providers([coreml])
-                .map_err(|e| EmbedError::Inference(e.to_string()))?;
+            if cache_dir.exists() {
+                eprintln!("Warning: CoreML cache invalid, rebuilding...");
+                let _ = std::fs::remove_dir_all(&cache_dir);
+                if let Ok(session) = Self::try_coreml(dir, model_path) {
+                    return Ok(session);
+                }
+            }
+            eprintln!("Warning: CoreML unavailable, using CPU");
         }
-        let _ = dir;
+        Self::try_cpu(model_path)
+    }
 
-        builder
+    #[cfg(feature = "coreml")]
+    fn try_coreml(dir: &Path, model_path: &Path) -> Result<Session, EmbedError> {
+        let cache_dir = dir.join("coreml_cache");
+        Session::builder()
+            .map_err(|e| EmbedError::Inference(e.to_string()))?
+            .with_execution_providers([ep::CoreML::default()
+                .with_compute_units(ep::coreml::ComputeUnits::All)
+                .with_model_cache_dir(cache_dir.display().to_string())
+                .build()])
+            .map_err(|e| EmbedError::Inference(e.to_string()))?
+            .with_intra_threads(1)
+            .map_err(|e| EmbedError::Inference(e.to_string()))?
+            .commit_from_file(model_path)
+            .map_err(|e| EmbedError::Inference(e.to_string()))
+    }
+
+    fn try_cpu(model_path: &Path) -> Result<Session, EmbedError> {
+        Session::builder()
+            .map_err(|e| EmbedError::Inference(e.to_string()))?
             .with_intra_threads(1)
             .map_err(|e| EmbedError::Inference(e.to_string()))?
             .commit_from_file(model_path)

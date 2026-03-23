@@ -203,8 +203,13 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
 
     ensure_model(verbose)?;
 
+    let dir = embedder::model_dir();
+    match embedder::Embedder::new(&dir) {
+        Ok(_) => eprintln!("Model: ready"),
+        Err(e) => eprintln!("Model: failed to load ({e})"),
+    }
+
     if embed {
-        let dir = embedder::model_dir();
         let mut embedder = embedder::Embedder::new(&dir)
             .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         let total: i64 = conn.query_row(
