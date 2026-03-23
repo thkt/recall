@@ -74,8 +74,7 @@ pub(crate) fn mean_pooling(
     let mut result = vec![0.0f32; hidden_size];
     let mut mask_sum = 0.0f32;
 
-    for t in 0..seq_len {
-        let m = attention_mask[t];
+    for (t, &m) in attention_mask.iter().enumerate().take(seq_len) {
         if m > 0 {
             let mf = m as f32;
             let offset = t * hidden_size;

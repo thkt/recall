@@ -14,6 +14,7 @@ fn ensure_sqlite_vec() {
         // SAFETY: sqlite3_vec_init is a C extern fn matching sqlite3_auto_extension's
         // callback signature. Pinned to sqlite-vec 0.1.6; re-verify ABI on version bumps.
         unsafe {
+            #[allow(clippy::missing_transmute_annotations)]
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
                 sqlite_vec::sqlite3_vec_init as *const (),
             )));

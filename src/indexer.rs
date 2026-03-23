@@ -292,11 +292,10 @@ fn dirs_changed_since(opts: &IndexOptions, last_scan: f64) -> bool {
         }
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                if let Some(mt) = dir_mtime_secs(&entry.path()) {
-                    if mt >= last_scan {
+                if let Some(mt) = dir_mtime_secs(&entry.path())
+                    && mt >= last_scan {
                         return true;
                     }
-                }
             }
         }
     }
@@ -332,9 +331,9 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     let start = Instant::now();
 
     let key = scan_key(opts);
-    if !opts.force {
-        if let Some(last_scan) = get_last_scan(conn, &key) {
-            if !dirs_changed_since(opts, last_scan) {
+    if !opts.force
+        && let Some(last_scan) = get_last_scan(conn, &key)
+            && !dirs_changed_since(opts, last_scan) {
                 let total_sessions: usize = conn
                     .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
                     .max(0) as usize;
@@ -346,8 +345,6 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
                     elapsed_secs: start.elapsed().as_secs_f64(),
                 });
             }
-        }
-    }
 
     let existing = if opts.force {
         HashMap::new()

@@ -78,11 +78,10 @@ fn process_codex_entry(entry: &Value, entry_type: &str, state: &mut CodexParseSt
                 Some("user" | "assistant") => {}
                 _ => return None,
             }
-            if state.project.is_empty() {
-                if let Some(cwd) = extract_cwd_from_content(entry.get("content")) {
+            if state.project.is_empty()
+                && let Some(cwd) = extract_cwd_from_content(entry.get("content")) {
                     state.project = cwd;
                 }
-            }
             extract_codex_message(entry)
         }
     }
