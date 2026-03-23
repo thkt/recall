@@ -133,7 +133,16 @@ impl Embedder {
             });
         }
 
-        #[allow(unused_mut)] // mut needed when coreml feature is enabled
+        let session = Self::build_session(dir, &model_path)?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
+
+        Ok(Self { session, tokenizer })
+    }
+
+    fn build_session(dir: &Path, model_path: &Path) -> Result<Session, EmbedError> {
+        #[allow(unused_mut)]
         let mut builder = Session::builder().map_err(|e| EmbedError::Inference(e.to_string()))?;
 
         #[cfg(feature = "coreml")]
@@ -148,17 +157,41 @@ impl Embedder {
                 .with_execution_providers([coreml])
                 .map_err(|e| EmbedError::Inference(e.to_string()))?;
         }
+        let _ = dir; // used only with coreml feature
 
-        let session = builder
+        match builder
             .with_intra_threads(1)
             .map_err(|e| EmbedError::Inference(e.to_string()))?
-            .commit_from_file(&model_path)
-            .map_err(|e| EmbedError::Inference(e.to_string()))?;
-
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| EmbedError::Tokenizer(e.to_string()))?;
-
-        Ok(Self { session, tokenizer })
+            .commit_from_file(model_path)
+        {
+            Ok(session) => Ok(session),
+            Err(_first_err) => {
+                // CoreML cache may be stale — clear and retry
+                #[cfg(feature = "coreml")]
+                {
+                    let cache_dir = dir.join("coreml_cache");
+                    if cache_dir.exists() {
+                        eprintln!("Warning: CoreML cache invalid, rebuilding...");
+                        let _ = std::fs::remove_dir_all(&cache_dir);
+                        let coreml = ep::CoreML::default()
+                            .with_compute_units(ep::coreml::ComputeUnits::All)
+                            .with_model_format(ep::coreml::ModelFormat::MLProgram)
+                            .with_model_cache_dir(cache_dir.display().to_string())
+                            .build();
+                        let retry_builder = Session::builder()
+                            .map_err(|e| EmbedError::Inference(e.to_string()))?
+                            .with_execution_providers([coreml])
+                            .map_err(|e| EmbedError::Inference(e.to_string()))?
+                            .with_intra_threads(1)
+                            .map_err(|e| EmbedError::Inference(e.to_string()))?;
+                        return retry_builder
+                            .commit_from_file(model_path)
+                            .map_err(|e| EmbedError::Inference(e.to_string()));
+                    }
+                }
+                Err(EmbedError::Inference(_first_err.to_string()))
+            }
+        }
     }
 
     fn embed_with_prefix(&mut self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {

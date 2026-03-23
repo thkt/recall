@@ -204,7 +204,9 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
     ensure_model(verbose)?;
 
     if embed {
-        let mut embedder = try_load_embedder().context("Model not available for --embed")?;
+        let dir = embedder::model_dir();
+        let mut embedder = embedder::Embedder::new(&dir)
+            .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM qa_chunks c \
              WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
