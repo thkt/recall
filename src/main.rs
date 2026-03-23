@@ -103,14 +103,7 @@ fn format_timestamp(ts_ms: Option<i64>) -> String {
 }
 
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
+    &s[..s.floor_char_boundary(max_bytes)]
 }
 
 fn open_or_create_db(path: &Path) -> Result<Connection> {
@@ -150,7 +143,13 @@ fn report_index_stats(stats: &indexer::IndexStats, force: bool, verbose: bool) {
 
 fn try_load_embedder() -> Option<embedder::Embedder> {
     let paths = cached_model_paths()?;
-    embedder::Embedder::new(&paths).ok()
+    match embedder::Embedder::new(&paths) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            eprintln!("Warning: failed to load embedding model: {e}");
+            None
+        }
+    }
 }
 
 /// Check if model files are already in the hf-hub cache.
@@ -204,16 +203,11 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
         eprintln!("Created {} chunks", chunk_stats.chunks_created);
     }
 
-    let paths = ensure_model(verbose)?;
-    let embedder_result = embedder::Embedder::new(&paths);
-    match &embedder_result {
-        Ok(_) => eprintln!("Model: ready"),
-        Err(e) => eprintln!("Model: failed to load ({e})"),
-    }
-
     if embed {
-        let mut embedder =
-            embedder_result.map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
+        let paths = ensure_model(verbose)?;
+        let mut embedder = embedder::Embedder::new(&paths)
+            .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
+        eprintln!("Model: ready");
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM qa_chunks c \
              WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
@@ -228,6 +222,16 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
         } else {
             eprintln!("All chunks already embedded");
         }
+    } else {
+        let model_cached = cached_model_paths().is_some();
+        eprintln!(
+            "Model: {}",
+            if model_cached {
+                "ready (use --embed to run embedding)"
+            } else {
+                "not downloaded (use --embed to download and run)"
+            }
+        );
     }
 
     Ok(())
@@ -281,22 +285,20 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             .map(|r| r.session.session_id.clone())
             .collect();
         let mut total = 0;
-        match indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10) {
+        let mut handle = |result: anyhow::Result<indexer::EmbedResult>| match result {
             Ok(r) => {
                 r.warn_if_stopped();
                 total += r.embedded;
             }
-            Err(e) if verbose => eprintln!("Warning: post-search embedding failed: {e:#}"),
-            Err(_) => {}
-        }
-        match indexer::embed_recent_chunks(&mut conn, emb, 10) {
-            Ok(r) => {
-                r.warn_if_stopped();
-                total += r.embedded;
+            Err(e) => {
+                eprintln!("Warning: post-search embedding skipped");
+                if verbose {
+                    eprintln!("  {e:#}");
+                }
             }
-            Err(e) if verbose => eprintln!("Warning: post-search embedding failed: {e:#}"),
-            Err(_) => {}
-        }
+        };
+        handle(indexer::embed_near_sessions(&mut conn, emb, &session_ids, 10));
+        handle(indexer::embed_recent_chunks(&mut conn, emb, 10));
         if total > 0 && verbose {
             eprintln!("Embedded {total} chunks (nearby + recent)");
         }
@@ -342,10 +344,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
 
 // -- Output formatting --
 
-/// Extract the parent session UUID from a subagent file path.
-///
 /// Path structure: `{...}/{parent-session-uuid}/subagents/{agent-id}.jsonl`
-/// Returns `None` for non-subagent paths.
 fn extract_parent_session(file_path: &str) -> Option<&str> {
     let idx = file_path.find("/subagents/")?;
     let prefix = &file_path[..idx];
@@ -564,7 +563,6 @@ mod tests {
         assert!(!output.contains("> "));
     }
 
-    // Subagent file path shows parent session
     #[test]
     fn test_subagent_file_path_shows_parent_session() {
         let r = search::SearchResult {

@@ -1,3 +1,6 @@
+#[cfg(all(feature = "candle", feature = "mlx"))]
+compile_error!("features `candle` and `mlx` are mutually exclusive — enable only one");
+
 use std::path::PathBuf;
 
 #[cfg(feature = "candle")]
@@ -11,7 +14,6 @@ pub(crate) const EMBEDDING_DIMS: usize = 768;
 pub(crate) const QUERY_PREFIX: &str = "検索クエリ: ";
 pub(crate) const DOCUMENT_PREFIX: &str = "検索文書: ";
 
-/// Paths to model files (SafeTensors + config + tokenizer).
 #[derive(Debug, Clone)]
 pub(crate) struct ModelPaths {
     pub model: PathBuf,
@@ -20,7 +22,6 @@ pub(crate) struct ModelPaths {
 }
 
 impl ModelPaths {
-    /// Construct paths assuming all files are in a single directory.
     #[cfg(test)]
     pub(crate) fn from_dir(dir: &std::path::Path) -> Self {
         Self {
@@ -66,17 +67,6 @@ impl std::fmt::Display for EmbedError {
 }
 
 impl std::error::Error for EmbedError {}
-
-#[cfg(test)]
-pub(crate) fn validate_dims(embedding: &[f32]) -> Result<(), EmbedError> {
-    if embedding.len() != EMBEDDING_DIMS {
-        return Err(EmbedError::DimensionMismatch {
-            expected: EMBEDDING_DIMS,
-            actual: embedding.len(),
-        });
-    }
-    Ok(())
-}
 
 /// Mean pooling over token embeddings with attention mask.
 ///
@@ -382,31 +372,63 @@ impl Embed for Embedder {
     }
 }
 
+/// Returns deterministic 768-dim vectors derived from text bytes.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct MockEmbedder {
+    call_count: usize,
+    fail_after: Option<usize>,
+}
+
+#[cfg(test)]
+impl MockEmbedder {
+    pub(crate) fn new() -> Self {
+        Self {
+            call_count: 0,
+            fail_after: None,
+        }
+    }
+
+    pub(crate) fn failing_after(n: usize) -> Self {
+        Self {
+            call_count: 0,
+            fail_after: Some(n),
+        }
+    }
+
+    pub(crate) fn deterministic_vector(text: &str) -> Vec<f32> {
+        let mut v = vec![0.0f32; EMBEDDING_DIMS];
+        for (i, b) in text.bytes().enumerate() {
+            v[i % EMBEDDING_DIMS] += b as f32;
+        }
+        l2_normalize(&mut v);
+        v
+    }
+}
+
+#[cfg(test)]
+impl Embed for MockEmbedder {
+    fn embed_query(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        self.embed_document(text)
+    }
+
+    fn embed_document(&mut self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        if let Some(limit) = self.fail_after {
+            if self.call_count >= limit {
+                return Err(EmbedError::Inference("mock failure".to_string()));
+            }
+        }
+        self.call_count += 1;
+        Ok(Self::deterministic_vector(text))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
     use super::*;
 
-    // T-001: dimension mismatch (FR-001)
-    #[test]
-    fn test_001_validate_dims_rejects_wrong_size() {
-        let wrong = vec![0.0f32; 256];
-        let err = validate_dims(&wrong).unwrap_err();
-        assert!(
-            matches!(err, EmbedError::DimensionMismatch { actual: 256, .. }),
-            "expected DimensionMismatch, got: {err}"
-        );
-    }
-
-    // T-002: correct dims accepted (FR-001)
-    #[test]
-    fn test_002_validate_dims_accepts_correct_size() {
-        let correct = vec![0.0f32; EMBEDDING_DIMS];
-        assert!(validate_dims(&correct).is_ok());
-    }
-
-    // T-003: mean pooling excludes mask=0 tokens (FR-001)
     #[test]
     fn test_003_mean_pooling_excludes_masked_tokens() {
         #[rustfmt::skip]
@@ -420,7 +442,6 @@ mod tests {
         assert_eq!(result, vec![3.0, 4.0, 5.0, 6.0]);
     }
 
-    // T-004: all masked returns zero vector (FR-001)
     #[test]
     fn test_004_mean_pooling_all_masked() {
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -429,7 +450,6 @@ mod tests {
         assert_eq!(result, vec![0.0, 0.0]);
     }
 
-    // T-005: L2 normalize produces unit norm (FR-001)
     #[test]
     fn test_005_l2_normalize_produces_unit_norm() {
         let mut v = vec![3.0f32, 4.0];
@@ -440,7 +460,6 @@ mod tests {
         assert!((v[1] - 0.8).abs() < 1e-6);
     }
 
-    // T-006: zero vector stays zero (FR-001)
     #[test]
     fn test_006_l2_normalize_zero_vector() {
         let mut v = vec![0.0f32, 0.0];
@@ -448,7 +467,6 @@ mod tests {
         assert_eq!(v, vec![0.0, 0.0]);
     }
 
-    // T-007: select_device returns CPU (candle backend only)
     #[cfg(feature = "candle")]
     #[test]
     fn test_007_select_device_returns_cpu() {
@@ -456,7 +474,6 @@ mod tests {
         assert!(matches!(device, Device::Cpu), "expected Device::Cpu");
     }
 
-    // T-008: model not found (FR-003)
     #[test]
     fn test_008_embedder_new_model_not_found() {
         let paths = ModelPaths::from_dir(Path::new("/nonexistent/path"));
@@ -468,21 +485,6 @@ mod tests {
         assert!(
             err.to_string().contains("recall index"),
             "error message should mention `recall index`: {err}"
-        );
-    }
-
-    // T-009: ModelPaths::from_dir constructs correct paths
-    #[test]
-    fn test_009_model_paths_from_dir() {
-        let paths = ModelPaths::from_dir(Path::new("/tmp/test-models"));
-        assert_eq!(
-            paths.model,
-            PathBuf::from("/tmp/test-models/model.safetensors")
-        );
-        assert_eq!(paths.config, PathBuf::from("/tmp/test-models/config.json"));
-        assert_eq!(
-            paths.tokenizer,
-            PathBuf::from("/tmp/test-models/tokenizer.json")
         );
     }
 
@@ -565,7 +567,6 @@ mod tests {
         }
     }
 
-    // RC-002: verify batch embedding matches sequential embedding
     #[test]
     #[ignore] // requires model download
     #[cfg_attr(feature = "mlx", serial_test::serial)]

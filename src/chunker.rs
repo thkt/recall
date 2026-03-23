@@ -65,11 +65,7 @@ fn find_split_boundary(text: &str, max_bytes: usize) -> usize {
     if text.len() <= max_bytes {
         return text.len();
     }
-    // Find char boundary at or before max_bytes
-    let mut end = max_bytes;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(max_bytes);
     // Prefer paragraph boundary, then line boundary
     if let Some(pos) = text[..end].rfind("\n\n") {
         return pos + 2;
@@ -153,7 +149,6 @@ mod tests {
         }
     }
 
-    // T-004: user + assistant pair → QAChunk with both texts (FR-003)
     #[test]
     fn test_004_user_assistant_pair() {
         let messages = vec![
@@ -175,7 +170,6 @@ mod tests {
         assert!(!chunks[0].chunk_hash.is_empty());
     }
 
-    // T-005: user without assistant → user-only chunk (FR-003)
     #[test]
     fn test_005_user_without_assistant() {
         let messages = vec![msg(Role::User, "最初の質問"), msg(Role::User, "次の質問")];
@@ -187,7 +181,6 @@ mod tests {
         assert_eq!(chunks[1].user_text, "次の質問");
     }
 
-    // T-006: assistant only → skip (FR-003)
     #[test]
     fn test_006_assistant_only_skipped() {
         let messages = vec![msg(Role::Assistant, "unsolicited answer")];
@@ -196,7 +189,6 @@ mod tests {
         assert!(chunks.is_empty());
     }
 
-    // T-007: empty messages → empty list (FR-003)
     #[test]
     fn test_007_empty_messages() {
         let chunks = chunk_messages("s1", &[], None);

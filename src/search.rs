@@ -8,14 +8,11 @@ use crate::embedder::Embed;
 use crate::hybrid::{self, RankedHit};
 use crate::parser::{SessionData, Source};
 
-const SNIPPET_CONTEXT_BEFORE: usize = 60;
-const SNIPPET_MAX_LEN: usize = 200;
-
 const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
 pub struct SearchResult {
     pub session: SessionData,
-    /// Snippet with `**` highlight markers (FTS5) or a raw substring window (CJK instr).
+    /// Snippet with `**` highlight markers from FTS5.
     pub excerpt: String,
 }
 
@@ -40,33 +37,6 @@ impl Default for SearchOptions {
     }
 }
 
-fn extract_search_words(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .filter(|w| !matches!(w.to_ascii_uppercase().as_str(), "AND" | "OR" | "NOT"))
-        .map(|w| {
-            w.trim_matches(|c: char| c == '"' || c == '*' || c == '(' || c == ')')
-                .to_string()
-        })
-        .filter(|w| !w.is_empty())
-        .collect()
-}
-
-fn has_cjk(s: &str) -> bool {
-    s.chars().any(|c| {
-        matches!(c,
-            '\u{1100}'..='\u{11FF}'     // Hangul Jamo
-            | '\u{2E80}'..='\u{9FFF}'   // CJK Radicals .. Unified Ideographs
-            | '\u{A960}'..='\u{A97F}'   // Hangul Jamo Extended-A
-            | '\u{AC00}'..='\u{D7FF}'   // Hangul Syllables + Jamo Extended-B
-            | '\u{F900}'..='\u{FAFF}'   // CJK Compatibility Ideographs
-            | '\u{FE30}'..='\u{FE4F}'   // CJK Compatibility Forms
-            | '\u{FF00}'..='\u{FFEF}'   // Halfwidth and Fullwidth Forms
-            | '\u{20000}'..='\u{2FA1F}' // CJK Extensions B..
-        )
-    })
-}
-
 enum Param {
     Str(String),
     Int(i64),
@@ -82,9 +52,7 @@ impl rusqlite::types::ToSql for Param {
 }
 
 struct SearchQuery {
-    raw_query: String,
-    use_instr: bool,
-    terms: Vec<String>,
+    fts_query: String,
     session_filter: String,
     params: Vec<Param>,
 }
@@ -149,19 +117,59 @@ fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Para
     }
 }
 
-fn build_search_query(query: &str, opts: &SearchOptions, now_ms: i64) -> SearchQuery {
-    let terms = extract_search_words(query);
-    let use_instr = terms.iter().any(|t| has_cjk(t));
-
-    let mut params = Vec::new();
-    let sanitized_query = sanitize_fts_query(query);
-    if use_instr {
-        for term in &terms {
-            params.push(Param::Str(term.clone()));
+/// Trigram tokenizer requires 3+ chars; short terms are expanded to matching trigrams
+/// joined with OR so FTS5 MATCH can find them.
+fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
+    let mut parts = Vec::new();
+    for token in sanitized_query.split_whitespace() {
+        let upper = token.to_ascii_uppercase();
+        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
+            parts.push(token.to_string());
+            continue;
         }
-    } else {
-        params.push(Param::Str(sanitized_query.clone()));
+        let unquoted = token.trim_matches('"');
+        if unquoted.is_empty() {
+            continue;
+        }
+        if unquoted.chars().count() >= 3 {
+            parts.push(token.to_string());
+            continue;
+        }
+        // Expand <3 char term via fts5vocab prefix match.
+        // Escape LIKE metacharacters to prevent unintended wildcard expansion.
+        let escaped = unquoted
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let expanded: Option<String> = conn
+            .query_row(
+                "SELECT GROUP_CONCAT(term, ' OR ') FROM \
+                 (SELECT term FROM messages_vocab \
+                  WHERE term LIKE ?1 ESCAPE '\\' \
+                  ORDER BY cnt DESC LIMIT 25)",
+                [&pattern],
+                |row| row.get(0),
+            )
+            .unwrap_or(None);
+        match expanded {
+            Some(exp) if !exp.is_empty() => parts.push(format!("({exp})")),
+            _ => parts.push(token.to_string()),
+        }
     }
+    parts.join(" ")
+}
+
+fn build_search_query(
+    conn: &Connection,
+    query: &str,
+    opts: &SearchOptions,
+    now_ms: i64,
+) -> SearchQuery {
+    let mut params = Vec::new();
+    let sanitized = sanitize_fts_query(query);
+    let expanded = expand_short_terms(conn, &sanitized);
+    params.push(Param::Str(expanded.clone()));
 
     let session_filter = build_session_filter(opts, now_ms, &mut params);
 
@@ -169,28 +177,19 @@ fn build_search_query(query: &str, opts: &SearchOptions, now_ms: i64) -> SearchQ
     params.push(Param::Int(candidate_limit as i64));
 
     SearchQuery {
-        raw_query: sanitized_query,
-        use_instr,
-        terms,
+        fts_query: expanded,
         session_filter,
         params,
     }
 }
 
 fn build_candidate_sql(sq: &SearchQuery) -> String {
-    if sq.use_instr {
-        let instr_conds: Vec<&str> = sq.terms.iter().map(|_| "instr(text, ?) > 0").collect();
-        format!(
-            "SELECT session_id, 0.0 as best_rank FROM messages WHERE {conds}{filter} GROUP BY session_id ORDER BY MAX(rowid) DESC LIMIT ?",
-            conds = instr_conds.join(" AND "),
-            filter = sq.session_filter
-        )
-    } else {
-        format!(
-            "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?{filter} GROUP BY session_id ORDER BY best_rank LIMIT ?",
-            filter = sq.session_filter
-        )
-    }
+    format!(
+        "SELECT session_id, MIN(rank) as best_rank FROM messages \
+         WHERE messages MATCH ?{filter} \
+         GROUP BY session_id ORDER BY best_rank LIMIT ?",
+        filter = sq.session_filter
+    )
 }
 
 fn find_candidate_sessions(conn: &Connection, sq: &SearchQuery) -> Result<Vec<(String, f64)>> {
@@ -365,33 +364,16 @@ fn fetch_snippets(
     ranked: Vec<(String, f64)>,
     meta_map: &mut HashMap<String, SessionData>,
 ) -> Result<Vec<(f64, SearchResult)>> {
-    if sq.use_instr {
-        let sql = &format!(
-            "SELECT substr(text, max(1, instr(text, ?1) - {SNIPPET_CONTEXT_BEFORE}), {SNIPPET_MAX_LEN}) FROM messages WHERE instr(text, ?1) > 0 AND session_id = ?2 LIMIT 1"
-        );
-        let mut stmt = conn.prepare(sql)?;
-        Ok(build_candidates(ranked, meta_map, |sid| {
-            sq.terms
-                .iter()
-                .find_map(|t| {
-                    snippet_or_default(
-                        stmt.query_row(rusqlite::params![t, sid], |row| row.get(0)),
-                        sid,
-                    )
-                })
-                .unwrap_or_default()
-        }))
-    } else {
-        let sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) FROM messages WHERE messages MATCH ?1 AND session_id = ?2 LIMIT 1";
-        let mut stmt = conn.prepare(sql)?;
-        Ok(build_candidates(ranked, meta_map, |sid| {
-            snippet_or_default(
-                stmt.query_row(rusqlite::params![&sq.raw_query, sid], |row| row.get(0)),
-                sid,
-            )
-            .unwrap_or_default()
-        }))
-    }
+    let sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
+               FROM messages WHERE messages MATCH ?1 AND session_id = ?2 LIMIT 1";
+    let mut stmt = conn.prepare(sql)?;
+    Ok(build_candidates(ranked, meta_map, |sid| {
+        snippet_or_default(
+            stmt.query_row(rusqlite::params![&sq.fts_query, sid], |row| row.get(0)),
+            sid,
+        )
+        .unwrap_or_default()
+    }))
 }
 
 fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
@@ -423,29 +405,32 @@ fn vec_search(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
 
+    // Subquery pushes the knn LIMIT down to the vec0 virtual table.
+    // GROUP BY deduplicates sessions; ORDER BY MIN(distance) preserves rank.
     let mut stmt = conn.prepare(
         "SELECT c.session_id \
-         FROM vec_chunks v \
-         JOIN qa_chunks c ON v.chunk_id = c.id \
-         WHERE v.embedding MATCH ? \
-         ORDER BY distance \
-         LIMIT ?",
+         FROM qa_chunks c \
+         JOIN ( \
+             SELECT chunk_id, distance FROM vec_chunks \
+             WHERE embedding MATCH ? \
+             ORDER BY distance \
+             LIMIT ? \
+         ) v ON c.id = v.chunk_id \
+         GROUP BY c.session_id \
+         ORDER BY MIN(v.distance)",
     )?;
     let rows = stmt.query_map(rusqlite::params![embedding_bytes, limit as i64], |row| {
         row.get::<_, String>(0)
     })?;
 
-    let mut seen = std::collections::HashSet::new();
     let mut hits = Vec::new();
     for r in rows {
         let sid = r?;
-        if seen.insert(sid.clone()) {
-            let rank = hits.len();
-            hits.push(RankedHit {
-                session_id: sid,
-                rank,
-            });
-        }
+        let rank = hits.len();
+        hits.push(RankedHit {
+            session_id: sid,
+            rank,
+        });
     }
     Ok(hits)
 }
@@ -466,7 +451,7 @@ pub fn search_with_embedder(
     }
 
     let now_ms = resolve_now_ms(opts)?;
-    let sq = build_search_query(query, opts, now_ms);
+    let sq = build_search_query(conn, query, opts, now_ms);
     let fts_ranked = find_candidate_sessions(conn, &sq)?;
 
     let use_hybrid = embedder.is_some() && has_vec_data(conn);
@@ -529,6 +514,7 @@ pub fn search_with_embedder(
 mod tests {
     use super::*;
     use crate::db::setup_test_db;
+    use crate::embedder::MockEmbedder;
 
     fn make_result(sid: &str, ts: i64) -> SearchResult {
         SearchResult {
@@ -874,28 +860,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_search_words() {
-        for (input, expected) in [
-            ("hello world", vec!["hello", "world"]),
-            (
-                "rust AND error NOT warning",
-                vec!["rust", "error", "warning"],
-            ),
-            ("foo OR bar", vec!["foo", "bar"]),
-            ("\"quoted phrase\" wild*", vec!["quoted", "phrase", "wild"]),
-            ("(group)", vec!["group"]),
-        ] {
-            assert_eq!(extract_search_words(input), expected, "input: {input:?}");
-        }
-        for empty in ["AND OR NOT", "\"\"", "   "] {
-            assert!(
-                extract_search_words(empty).is_empty(),
-                "expected empty for: {empty:?}"
-            );
-        }
-    }
-
-    #[test]
     fn test_search_limit_zero_returns_empty() {
         let (_dir, conn) = setup_test_db();
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
@@ -1040,7 +1004,6 @@ mod tests {
         );
     }
 
-    // T-012: graceful degradation — no embedder → FTS5 only, no error (FR-006)
     #[test]
     fn test_012_search_without_embedder_fts5_only() {
         let (_dir, conn) = setup_test_db();
@@ -1054,7 +1017,6 @@ mod tests {
         assert_eq!(results[0].session.session_id, "s1");
     }
 
-    // T-012 variant: vec_chunks empty → FTS5 only even if embedder were available
     #[test]
     fn test_012_no_vec_data_uses_fts5_only() {
         let (_dir, conn) = setup_test_db();
@@ -1065,5 +1027,94 @@ mod tests {
 
         let results = search(&conn, "rust compiler", &SearchOptions::default()).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_hybrid_search_merges_fts_and_vector() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        // s1: matches FTS for "authentication"
+        insert_session(&conn, "s1", "claude", "/proj", now_ms);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // s2: no FTS match, but has a vec_chunk with embedding close to query
+        insert_session(&conn, "s2", "claude", "/proj", now_ms);
+        insert_message(&conn, "s2", "user", "unrelated topic about weather");
+
+        // Insert qa_chunk + vec_chunk for s2 with query-similar embedding
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
+             VALUES (1, 's2', 'q', 'a', 'authentication implementation details', ?1, 'hash1')",
+            [now_ms],
+        )
+        .unwrap();
+        let embedding = MockEmbedder::deterministic_vector("authentication");
+        let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+        conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
+            [embedding_bytes],
+        )
+        .unwrap();
+
+        assert!(has_vec_data(&conn));
+
+        let mut embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&mut embedder),
+        )
+        .unwrap();
+
+        // Both sessions should appear: s1 from FTS, s2 from vector search
+        let ids: Vec<&str> = results.iter().map(|r| r.session.session_id.as_str()).collect();
+        assert!(ids.contains(&"s1"), "s1 should appear (FTS match), got: {ids:?}");
+        assert!(ids.contains(&"s2"), "s2 should appear (vector match), got: {ids:?}");
+    }
+
+    #[test]
+    fn test_hybrid_search_falls_back_on_vector_error() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        insert_session(&conn, "s1", "claude", "/proj", now_ms);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // Need vec_chunks to trigger hybrid path
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
+             VALUES (1, 's1', 'q', 'a', 'content', ?1, 'hash1')",
+            [now_ms],
+        )
+        .unwrap();
+        let embedding = MockEmbedder::deterministic_vector("content");
+        let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+        conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
+            [embedding_bytes],
+        )
+        .unwrap();
+
+        // Embedder that fails immediately on query
+        let mut embedder = MockEmbedder::failing_after(0);
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&mut embedder),
+        )
+        .unwrap();
+
+        // Should still return FTS results despite vector failure
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session.session_id, "s1");
     }
 }

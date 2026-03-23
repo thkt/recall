@@ -5,14 +5,14 @@ use rusqlite::Connection;
 
 use crate::embedder::EMBEDDING_DIMS;
 
-const FTS_TOKENIZER: &str = "porter unicode61";
+const FTS_TOKENIZER: &str = "trigram";
 
 static SQLITE_VEC_INIT: Once = Once::new();
 
 fn ensure_sqlite_vec() {
     SQLITE_VEC_INIT.call_once(|| {
         // SAFETY: sqlite3_vec_init is a C extern fn matching sqlite3_auto_extension's
-        // callback signature. Pinned to sqlite-vec 0.1.6; re-verify ABI on version bumps.
+        // callback signature. Pinned to sqlite-vec 0.1.7; re-verify ABI on version bumps.
         unsafe {
             #[allow(clippy::missing_transmute_annotations)]
             rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
@@ -89,6 +89,10 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         );"
     ))?;
 
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
+    )?;
+
     Ok(())
 }
 
@@ -109,8 +113,7 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
 
     if !sql.contains(FTS_TOKENIZER) {
         let session_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-            .unwrap_or(0);
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         eprintln!(
             "recall: Index schema changed — rebuilding {session_count} sessions (source files are unaffected)"
         );
@@ -143,25 +146,29 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let conn = open_db(tmp.path()).unwrap();
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
+        for table in ["sessions", "messages", "qa_chunks", "messages_vocab"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "table {table} should be empty");
+        }
+    }
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
+    /// Verify sqlite-vec ABI version matches the pinned dependency.
+    /// If this test fails after a version bump, re-verify the transmute
+    /// in `ensure_sqlite_vec` against the new C ABI before updating.
+    #[test]
+    fn test_sqlite_vec_version_matches_pinned() {
+        let tmp = NamedTempFile::new().unwrap();
+        let conn = open_db(tmp.path()).unwrap();
 
         let version: String = conn
             .query_row("SELECT vec_version()", [], |r| r.get(0))
             .unwrap();
-        assert!(version.starts_with('v'), "sqlite-vec loaded: {version}");
+        assert_eq!(
+            version, "v0.1.7",
+            "sqlite-vec version changed — re-verify unsafe transmute ABI in ensure_sqlite_vec()"
+        );
     }
 
     #[test]
@@ -171,7 +178,7 @@ mod tests {
         let _conn2 = open_db(tmp.path()).unwrap();
     }
 
-    /// Create a DB with the old tokenizer ('unicode61') and one session+message.
+    /// Create a DB with a pre-trigram tokenizer and one session+message.
     fn create_old_schema_db(path: &std::path::Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(

@@ -41,7 +41,6 @@ pub(crate) struct IndexOptions<'a> {
 }
 
 enum Mtime {
-    /// File mtime resolved successfully.
     Value(f64),
     /// File exists but mtime unavailable — index without freshness check.
     Unknown,
@@ -79,6 +78,17 @@ fn resolve_mtime(fpath: &Path, verbose: bool) -> Mtime {
     }
 }
 
+/// Delete all dependent data for a session (messages, chunks, embeddings).
+fn delete_session_dependents(tx: &rusqlite::Transaction, session_id: &str) -> Result<()> {
+    tx.execute("DELETE FROM messages WHERE session_id = ?", [session_id])?;
+    tx.execute(
+        "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)",
+        [session_id],
+    )?;
+    tx.execute("DELETE FROM qa_chunks WHERE session_id = ?", [session_id])?;
+    Ok(())
+}
+
 fn upsert_session(
     ctx: &IndexContext,
     fpath_str: &str,
@@ -90,15 +100,7 @@ fn upsert_session(
     if let Some((old_sid, _)) = cached {
         ctx.tx
             .execute("DELETE FROM sessions WHERE session_id = ?", [old_sid])?;
-        ctx.tx
-            .execute("DELETE FROM messages WHERE session_id = ?", [old_sid])?;
-        // Clean up chunks so they get regenerated on next `recall index`
-        ctx.tx.execute(
-            "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)",
-            [old_sid],
-        )?;
-        ctx.tx
-            .execute("DELETE FROM qa_chunks WHERE session_id = ?", [old_sid])?;
+        delete_session_dependents(ctx.tx, old_sid)?;
     }
 
     // New session_id differs from cached — clean up any orphaned messages under the new ID
@@ -201,8 +203,6 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
     Ok(IndexOutcome::Indexed)
 }
 
-/// Resolve the Claude projects directory from env vars.
-///
 /// Priority: `RECALL_CLAUDE_DIR` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`
 pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
     if let Some(dir) = std::env::var_os("RECALL_CLAUDE_DIR") {
@@ -364,7 +364,10 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
 
     let tx = conn.transaction().context("Failed to begin transaction")?;
     if opts.force {
-        tx.execute_batch("DELETE FROM sessions; DELETE FROM messages;")?;
+        tx.execute_batch(
+            "DELETE FROM vec_chunks; DELETE FROM qa_chunks; \
+             DELETE FROM sessions; DELETE FROM messages;",
+        )?;
     }
     tx.execute(
         "INSERT INTO messages(messages, rank) VALUES('automerge', 0)",
@@ -439,7 +442,7 @@ fn cleanup_orphans(
                 rusqlite::params![sid, fp],
             )?;
             if deleted > 0 {
-                tx.execute("DELETE FROM messages WHERE session_id = ?", [sid])?;
+                delete_session_dependents(tx, sid)?;
             }
         }
     }
@@ -584,6 +587,7 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
     Ok(ChunkStats { chunks_created })
 }
 
+#[derive(Default)]
 pub(crate) struct EmbedResult {
     pub embedded: usize,
     pub stopped_at_error: Option<String>,
@@ -599,7 +603,6 @@ impl EmbedResult {
 
 const EMBED_BATCH_SIZE: usize = 32;
 
-/// Embeds chunks in batches, committing each batch separately.
 /// Stops on first batch failure; previously committed batches are preserved.
 fn embed_chunks(
     conn: &mut Connection,
@@ -607,10 +610,7 @@ fn embed_chunks(
     chunks: &[(i64, String)],
 ) -> Result<EmbedResult> {
     if chunks.is_empty() {
-        return Ok(EmbedResult {
-            embedded: 0,
-            stopped_at_error: None,
-        });
+        return Ok(EmbedResult::default());
     }
 
     // Sort by content length to minimize padding waste within each batch
@@ -638,6 +638,7 @@ fn embed_chunks(
                 embedded += embeddings.len();
                 if show_progress {
                     eprint!("\r  {embedded}/{total} chunks embedded");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
                 }
             }
             Err(e) => {
@@ -656,6 +657,23 @@ fn embed_chunks(
     })
 }
 
+fn query_and_embed(
+    conn: &mut Connection,
+    embedder: &mut dyn Embed,
+    sql: &str,
+    params: &[&dyn rusqlite::types::ToSql],
+) -> Result<EmbedResult> {
+    let missing: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    embed_chunks(conn, embedder, &missing)
+}
+
 pub(crate) fn embed_near_sessions(
     conn: &mut Connection,
     embedder: &mut dyn Embed,
@@ -663,10 +681,7 @@ pub(crate) fn embed_near_sessions(
     budget: usize,
 ) -> Result<EmbedResult> {
     if session_ids.is_empty() || budget == 0 {
-        return Ok(EmbedResult {
-            embedded: 0,
-            stopped_at_error: None,
-        });
+        return Ok(EmbedResult::default());
     }
 
     let placeholders = session_ids
@@ -679,22 +694,17 @@ pub(crate) fn embed_near_sessions(
          WHERE c.session_id IN ({placeholders}) \
          AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
          ORDER BY c.id \
-         LIMIT {budget}"
+         LIMIT ?"
     );
 
-    let missing: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(&sql)?;
-        let refs: Vec<&dyn rusqlite::types::ToSql> = session_ids
-            .iter()
-            .map(|s| s as &dyn rusqlite::types::ToSql)
-            .collect();
-        let rows = stmt.query_map(refs.as_slice(), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
+    let budget_i64 = budget as i64;
+    let mut refs: Vec<&dyn rusqlite::types::ToSql> = session_ids
+        .iter()
+        .map(|s| s as &dyn rusqlite::types::ToSql)
+        .collect();
+    refs.push(&budget_i64);
 
-    embed_chunks(conn, embedder, &missing)
+    query_and_embed(conn, embedder, &sql, &refs)
 }
 
 pub(crate) fn embed_recent_chunks(
@@ -703,32 +713,26 @@ pub(crate) fn embed_recent_chunks(
     budget: usize,
 ) -> Result<EmbedResult> {
     if budget == 0 {
-        return Ok(EmbedResult {
-            embedded: 0,
-            stopped_at_error: None,
-        });
+        return Ok(EmbedResult::default());
     }
 
-    let missing: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.content FROM qa_chunks c \
-             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
-             ORDER BY c.timestamp DESC NULLS LAST \
-             LIMIT ?",
-        )?;
-        let rows = stmt.query_map([budget as i64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    embed_chunks(conn, embedder, &missing)
+    let budget_i64 = budget as i64;
+    query_and_embed(
+        conn,
+        embedder,
+        "SELECT c.id, c.content FROM qa_chunks c \
+         WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
+         ORDER BY c.timestamp DESC NULLS LAST \
+         LIMIT ?",
+        &[&budget_i64 as &dyn rusqlite::types::ToSql],
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::setup_test_db;
+    use crate::embedder::MockEmbedder;
     use tempfile::TempDir;
 
     #[test]
@@ -798,6 +802,19 @@ mod tests {
         .unwrap();
         assert_eq!(stats.indexed, 1);
 
+        // Populate qa_chunks + vec_chunks before force reindex
+        index_chunks(&mut conn, false).unwrap();
+        let mut embedder = crate::embedder::MockEmbedder::new();
+        embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        let qa_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        let vec_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(qa_before > 0, "should have qa_chunks before force reindex");
+        assert!(vec_before > 0, "should have vec_chunks before force reindex");
+
         let stats2 = index_from_dirs(
             &mut conn,
             &IndexOptions {
@@ -809,6 +826,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats2.indexed, 1);
+
+        let qa_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        let vec_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(qa_after, 0, "force reindex should clear qa_chunks");
+        assert_eq!(vec_after, 0, "force reindex should clear vec_chunks");
     }
 
     #[test]
@@ -838,11 +864,30 @@ mod tests {
         assert_eq!(stats.indexed, 2);
         assert_eq!(stats.total_sessions, 2);
 
+        // Create chunks + embeddings for session2 before deleting the file
+        index_chunks(&mut conn, false).unwrap();
+        let mut embedder = crate::embedder::MockEmbedder::new();
+        embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        let chunks_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(chunks_before > 0, "session2 should have chunks");
+        let vecs_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(vecs_before > 0, "should have vec_chunks before orphan cleanup");
+
         std::fs::remove_file(&f2).unwrap();
+        // force: false exercises cleanup_orphans (force: true bulk-deletes everything,
+        // which would make the cascade assertion a false pass)
         let stats2 = index_from_dirs(
             &mut conn,
             &IndexOptions {
-                force: true,
+                force: false,
                 verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
@@ -850,6 +895,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats2.total_sessions, 1);
+
+        let chunks_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            chunks_after, 0,
+            "orphan cleanup should cascade to qa_chunks"
+        );
+
+        let vecs_for_session1: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        // session1 still exists, so its vec_chunks should remain; session2's should be gone
+        assert!(
+            vecs_for_session1 < vecs_before,
+            "orphan cleanup should remove session2 vec_chunks: before={vecs_before}, after={vecs_for_session1}"
+        );
     }
 
     #[test]
@@ -944,7 +1010,6 @@ mod tests {
         assert!(files[0].0.ends_with("real.jsonl"));
     }
 
-    // T-011: incremental chunk index — unchanged sessions skip re-chunking (FR-004)
     #[test]
     fn test_011_index_chunks_incremental() {
         let (_dir, mut conn) = setup_test_db();
@@ -981,8 +1046,6 @@ mod tests {
         assert_eq!(stats2.chunks_created, 0);
     }
 
-    // -- T-009, T-010: resolve_claude_dir env var priority -------------------------
-
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// SAFETY: caller must hold ENV_LOCK.
@@ -1010,7 +1073,6 @@ mod tests {
         }
     }
 
-    // T-009: RECALL_CLAUDE_DIR overrides CLAUDE_CONFIG_DIR (FR-003)
     #[test]
     fn test_009_recall_claude_dir_overrides_claude_config_dir() {
         let home = Path::new("/fake/home");
@@ -1024,13 +1086,12 @@ mod tests {
                 assert_eq!(
                     result,
                     PathBuf::from("/custom/recall/dir"),
-                    "T-009: RECALL_CLAUDE_DIR should take priority over CLAUDE_CONFIG_DIR"
+                    "RECALL_CLAUDE_DIR should take priority over CLAUDE_CONFIG_DIR"
                 );
             },
         );
     }
 
-    // T-010: CLAUDE_CONFIG_DIR used as fallback (FR-003)
     #[test]
     fn test_010_claude_config_dir_used_as_fallback() {
         let home = Path::new("/fake/home");
@@ -1044,9 +1105,170 @@ mod tests {
                 assert_eq!(
                     result,
                     PathBuf::from("/custom/config/projects"),
-                    "T-010: CLAUDE_CONFIG_DIR/projects should be used when RECALL_CLAUDE_DIR is unset"
+                    "CLAUDE_CONFIG_DIR/projects should be used when RECALL_CLAUDE_DIR is unset"
                 );
             },
         );
+    }
+
+    #[test]
+    fn test_embed_recent_chunks_populates_vec_chunks() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":"hi there"}}"#,
+            ),
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+
+        index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+        index_chunks(&mut conn, false).unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunk_count > 0, "should have chunks to embed");
+
+        let mut embedder = MockEmbedder::new();
+        let result = embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+
+        assert_eq!(result.embedded, chunk_count as usize);
+        assert!(result.stopped_at_error.is_none());
+
+        let vec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, chunk_count, "all chunks should be embedded");
+
+        // Re-embed should be no-op
+        let result2 = embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        assert_eq!(result2.embedded, 0);
+    }
+
+    #[test]
+    fn test_embed_chunks_stops_on_error_preserves_progress() {
+        let (_dir, mut conn) = setup_test_db();
+
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
+                [format!("question number {i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'assistant', ?1)",
+                [format!("answer number {i}")],
+            )
+            .unwrap();
+        }
+        index_chunks(&mut conn, false).unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            chunk_count > EMBED_BATCH_SIZE as i64,
+            "need enough chunks for multiple batches, got {chunk_count}"
+        );
+
+        let mut embedder = MockEmbedder::failing_after(EMBED_BATCH_SIZE);
+        let result = embed_recent_chunks(&mut conn, &mut embedder, chunk_count as usize).unwrap();
+
+        assert_eq!(result.embedded, EMBED_BATCH_SIZE, "first batch should succeed");
+        assert!(
+            result.stopped_at_error.is_some(),
+            "should report the error"
+        );
+
+        let vec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, EMBED_BATCH_SIZE as i64, "committed batch should survive");
+    }
+
+    #[test]
+    fn test_embed_near_sessions_populates_vec_chunks() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":"hi there"}}"#,
+            ),
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+
+        index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                verbose: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+        index_chunks(&mut conn, false).unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunk_count > 0, "should have chunks to embed");
+
+        let mut embedder = MockEmbedder::new();
+        let result =
+            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 100).unwrap();
+
+        assert_eq!(result.embedded, chunk_count as usize);
+        assert!(result.stopped_at_error.is_none());
+
+        let vec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vec_count, chunk_count, "all chunks should be embedded");
+
+        // Re-embed should be no-op
+        let result2 =
+            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 100).unwrap();
+        assert_eq!(result2.embedded, 0);
+    }
+
+    #[test]
+    fn test_embed_near_sessions_empty_input() {
+        let (_dir, mut conn) = setup_test_db();
+        let mut embedder = MockEmbedder::new();
+
+        let result = embed_near_sessions(&mut conn, &mut embedder, &[], 100).unwrap();
+        assert_eq!(result.embedded, 0);
+
+        let result2 =
+            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 0).unwrap();
+        assert_eq!(result2.embedded, 0);
     }
 }
