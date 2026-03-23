@@ -617,6 +617,8 @@ fn embed_chunks(
     let mut sorted: Vec<usize> = (0..chunks.len()).collect();
     sorted.sort_by_key(|&i| chunks[i].1.len());
 
+    let total = chunks.len();
+    let show_progress = total >= 100;
     let mut embedded = 0;
     let mut stopped_at_error = None;
 
@@ -634,12 +636,18 @@ fn embed_chunks(
                 }
                 tx.commit()?;
                 embedded += embeddings.len();
+                if show_progress {
+                    eprint!("\r  {embedded}/{total} chunks embedded");
+                }
             }
             Err(e) => {
                 stopped_at_error = Some(format!("batch: {e}"));
                 break;
             }
         }
+    }
+    if show_progress {
+        eprintln!();
     }
 
     Ok(EmbedResult {
