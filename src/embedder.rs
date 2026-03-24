@@ -393,11 +393,11 @@ impl EmbedResult {
 
 pub(crate) const EMBED_BATCH_SIZE: usize = 32;
 
-/// Stops on first batch failure; previously committed batches are preserved.
 fn embed_chunks(
     conn: &mut Connection,
     embedder: &mut dyn Embed,
     chunks: &[(i64, String)],
+    on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
     if chunks.is_empty() {
         return Ok(EmbedResult::default());
@@ -408,7 +408,6 @@ fn embed_chunks(
     sorted.sort_by_key(|&i| chunks[i].1.len());
 
     let total = chunks.len();
-    let show_progress = total >= 100;
     let mut embedded = 0;
     let mut stopped_at_error = None;
 
@@ -426,9 +425,8 @@ fn embed_chunks(
                 }
                 tx.commit()?;
                 embedded += embeddings.len();
-                if show_progress {
-                    eprint!("\r  {embedded}/{total} chunks embedded");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                if let Some(cb) = &on_progress {
+                    cb(embedded, total);
                 }
             }
             Err(e) => {
@@ -436,9 +434,6 @@ fn embed_chunks(
                 break;
             }
         }
-    }
-    if show_progress {
-        eprintln!();
     }
 
     Ok(EmbedResult {
@@ -452,6 +447,7 @@ fn query_and_embed(
     embedder: &mut dyn Embed,
     sql: &str,
     params: &[&dyn rusqlite::types::ToSql],
+    on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
     let missing: Vec<(i64, String)> = {
         let mut stmt = conn.prepare(sql)?;
@@ -461,7 +457,7 @@ fn query_and_embed(
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
 
-    embed_chunks(conn, embedder, &missing)
+    embed_chunks(conn, embedder, &missing, on_progress)
 }
 
 pub(crate) fn embed_near_sessions(
@@ -469,6 +465,7 @@ pub(crate) fn embed_near_sessions(
     embedder: &mut dyn Embed,
     session_ids: &[String],
     budget: usize,
+    on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
     if session_ids.is_empty() || budget == 0 {
         return Ok(EmbedResult::default());
@@ -494,13 +491,14 @@ pub(crate) fn embed_near_sessions(
         .collect();
     refs.push(&budget_i64);
 
-    query_and_embed(conn, embedder, &sql, &refs)
+    query_and_embed(conn, embedder, &sql, &refs, on_progress)
 }
 
 pub(crate) fn embed_recent_chunks(
     conn: &mut Connection,
     embedder: &mut dyn Embed,
     budget: usize,
+    on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
     if budget == 0 {
         return Ok(EmbedResult::default());
@@ -515,6 +513,7 @@ pub(crate) fn embed_recent_chunks(
          ORDER BY c.timestamp DESC NULLS LAST \
          LIMIT ?",
         &[&budget_i64 as &dyn rusqlite::types::ToSql],
+        on_progress,
     )
 }
 

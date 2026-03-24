@@ -8,6 +8,7 @@ mod indexer;
 #[cfg(feature = "mlx")]
 mod modernbert;
 mod parser;
+mod progress;
 mod search;
 
 use std::path::{Path, PathBuf};
@@ -124,23 +125,6 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn report_index_stats(stats: &indexer::IndexStats, force: bool, verbose: bool) {
-    if stats.indexed > 0 {
-        eprintln!(
-            "Indexed {} sessions in {:.1}s",
-            stats.indexed, stats.elapsed_secs
-        );
-    } else if force {
-        eprintln!("Index is up to date ({} sessions)", stats.total_sessions);
-    }
-    if let Some(ref err) = stats.first_error {
-        eprintln!("Failed to parse {} files — {err}", stats.parse_errors);
-        if stats.parse_errors > 1 && !verbose {
-            eprintln!("  (use --verbose for all errors)");
-        }
-    }
-}
-
 fn try_load_embedder() -> Option<embedder::Embedder> {
     let paths = cached_model_paths()?;
     match embedder::Embedder::new(&paths) {
@@ -195,19 +179,35 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
+    let sp = progress::Spinner::new("Indexing sessions...");
     let stats = indexer::index_sessions(&mut conn, force, verbose)?;
-    report_index_stats(&stats, force, verbose);
+    if stats.indexed > 0 {
+        sp.finish(&format!(
+            "Indexed {} sessions in {:.1}s",
+            stats.indexed, stats.elapsed_secs
+        ));
+    } else {
+        sp.finish(&format!("{} sessions up to date", stats.total_sessions));
+    }
+    if let Some(ref err) = stats.first_error {
+        eprintln!("  Failed to parse {} files — {err}", stats.parse_errors);
+    }
 
+    let sp = progress::Spinner::new("Creating chunks...");
     let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
     if chunk_stats.chunks_created > 0 {
-        eprintln!("Created {} chunks", chunk_stats.chunks_created);
+        sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
+    } else {
+        sp.finish("Chunks up to date");
     }
 
     if embed {
+        let sp = progress::Spinner::new("Loading model...");
         let paths = ensure_model(verbose)?;
         let mut embedder = embedder::Embedder::new(&paths)
             .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
-        eprintln!("Model: ready");
+        sp.finish("Model ready");
+
         let total: i64 = conn.query_row(
             "SELECT COUNT(*) FROM qa_chunks c \
              WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
@@ -215,17 +215,24 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
             |r| r.get(0),
         )?;
         if total > 0 {
-            eprintln!("Embedding {total} chunks (this may take a while)...");
-            let result = embedder::embed_recent_chunks(&mut conn, &mut embedder, total as usize)?;
-            eprintln!("Embedded {} chunks", result.embedded);
+            let sp = progress::Spinner::new(&format!("Embedding {total} chunks..."));
+            let result = embedder::embed_recent_chunks(
+                &mut conn,
+                &mut embedder,
+                total as usize,
+                Some(&|done, all| {
+                    sp.set_message(&format!("Embedding chunks... {done}/{all}"));
+                }),
+            )?;
+            sp.finish(&format!("Embedded {} chunks", result.embedded));
             result.warn_if_stopped();
         } else {
-            eprintln!("All chunks already embedded");
+            progress::done("All chunks already embedded");
         }
     } else {
         let model_cached = cached_model_paths().is_some();
         eprintln!(
-            "Model: {}",
+            "  Model: {}",
             if model_cached {
                 "ready (use --embed to run embedding)"
             } else {
@@ -254,11 +261,16 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
     let mut conn = open_or_create_db(&path)?;
 
     // Auto-index FTS5 + chunks (fast: skips scan if dirs unchanged)
+    let sp = progress::Spinner::new("Indexing...");
     let stats = indexer::index_sessions(&mut conn, false, verbose)?;
-    report_index_stats(&stats, false, verbose);
     let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
-    if chunk_stats.chunks_created > 0 && verbose {
-        eprintln!("Created {} chunks", chunk_stats.chunks_created);
+    if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
+        sp.finish(&format!(
+            "Indexed {} sessions, {} chunks",
+            stats.indexed, chunk_stats.chunks_created
+        ));
+    } else {
+        sp.finish(&format!("{} sessions", stats.total_sessions));
     }
 
     let mut embedder = try_load_embedder();
@@ -302,8 +314,9 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             emb,
             &session_ids,
             10,
+            None,
         ));
-        handle(embedder::embed_recent_chunks(&mut conn, emb, 10));
+        handle(embedder::embed_recent_chunks(&mut conn, emb, 10, None));
         if total > 0 && verbose {
             eprintln!("Embedded {total} chunks (nearby + recent)");
         }

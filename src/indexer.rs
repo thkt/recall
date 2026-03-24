@@ -665,7 +665,7 @@ mod tests {
         // Populate qa_chunks + vec_chunks before force reindex
         index_chunks(&mut conn, false).unwrap();
         let mut embedder = crate::embedder::MockEmbedder::new();
-        embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        embed_recent_chunks(&mut conn, &mut embedder, 100, None).unwrap();
         let qa_before: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
             .unwrap();
@@ -730,7 +730,7 @@ mod tests {
         // Create chunks + embeddings for session2 before deleting the file
         index_chunks(&mut conn, false).unwrap();
         let mut embedder = crate::embedder::MockEmbedder::new();
-        embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        embed_recent_chunks(&mut conn, &mut embedder, 100, None).unwrap();
         let chunks_before: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
@@ -1012,7 +1012,7 @@ mod tests {
         assert!(chunk_count > 0, "should have chunks to embed");
 
         let mut embedder = MockEmbedder::new();
-        let result = embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        let result = embed_recent_chunks(&mut conn, &mut embedder, 100, None).unwrap();
 
         assert_eq!(result.embedded, chunk_count as usize);
         assert!(result.stopped_at_error.is_none());
@@ -1023,7 +1023,7 @@ mod tests {
         assert_eq!(vec_count, chunk_count, "all chunks should be embedded");
 
         // Re-embed should be no-op
-        let result2 = embed_recent_chunks(&mut conn, &mut embedder, 100).unwrap();
+        let result2 = embed_recent_chunks(&mut conn, &mut embedder, 100, None).unwrap();
         assert_eq!(result2.embedded, 0);
     }
 
@@ -1059,7 +1059,8 @@ mod tests {
         );
 
         let mut embedder = MockEmbedder::failing_after(EMBED_BATCH_SIZE);
-        let result = embed_recent_chunks(&mut conn, &mut embedder, chunk_count as usize).unwrap();
+        let result =
+            embed_recent_chunks(&mut conn, &mut embedder, chunk_count as usize, None).unwrap();
 
         assert_eq!(
             result.embedded, EMBED_BATCH_SIZE,
@@ -1112,7 +1113,7 @@ mod tests {
 
         let mut embedder = MockEmbedder::new();
         let result =
-            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 100).unwrap();
+            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 100, None).unwrap();
 
         assert_eq!(result.embedded, chunk_count as usize);
         assert!(result.stopped_at_error.is_none());
@@ -1124,7 +1125,7 @@ mod tests {
 
         // Re-embed should be no-op
         let result2 =
-            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 100).unwrap();
+            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 100, None).unwrap();
         assert_eq!(result2.embedded, 0);
     }
 
@@ -1133,11 +1134,11 @@ mod tests {
         let (_dir, mut conn) = setup_test_db();
         let mut embedder = MockEmbedder::new();
 
-        let result = embed_near_sessions(&mut conn, &mut embedder, &[], 100).unwrap();
+        let result = embed_near_sessions(&mut conn, &mut embedder, &[], 100, None).unwrap();
         assert_eq!(result.embedded, 0);
 
         let result2 =
-            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 0).unwrap();
+            embed_near_sessions(&mut conn, &mut embedder, &["s1".to_string()], 0, None).unwrap();
         assert_eq!(result2.embedded, 0);
     }
 }
