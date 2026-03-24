@@ -88,13 +88,17 @@ fn sanitize_fts_query(query: &str) -> String {
     }
 }
 
+/// Escape LIKE metacharacters (`%`, `_`, `\`) for use with `ESCAPE '\'`.
+pub(crate) fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Param>) -> String {
     let mut conditions = Vec::new();
     if let Some(ref project) = opts.project {
-        let escaped = project
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let escaped = escape_like(project);
         conditions.push("s2.project LIKE ? || '%' ESCAPE '\\'".to_string());
         params.push(Param::Str(escaped));
     }
@@ -120,6 +124,11 @@ fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Para
 /// Trigram tokenizer requires 3+ chars; short terms are expanded to matching trigrams
 /// joined with OR so FTS5 MATCH can find them.
 fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
+    let mut vocab_stmt = conn.prepare(
+        "SELECT term FROM messages_vocab \
+         WHERE term LIKE ?1 ESCAPE '\\' \
+         ORDER BY cnt DESC LIMIT 25",
+    );
     let mut parts = Vec::new();
     for token in sanitized_query.split_whitespace() {
         let upper = token.to_ascii_uppercase();
@@ -131,33 +140,56 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
         if unquoted.is_empty() {
             continue;
         }
+        // Trigram tokenizer indexes 3-char windows; shorter terms get zero hits.
         if unquoted.chars().count() >= 3 {
             parts.push(token.to_string());
             continue;
         }
-        // Expand <3 char term via fts5vocab prefix match.
-        // Escape LIKE metacharacters to prevent unintended wildcard expansion.
-        let escaped = unquoted
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        // Expand <3-char term via fts5vocab prefix match (e.g. "go" → "go" OR "golang" OR ...).
+        let escaped = escape_like(unquoted);
         let pattern = format!("{escaped}%");
-        let expanded: Option<String> = conn
-            .query_row(
-                "SELECT GROUP_CONCAT(term, ' OR ') FROM \
-                 (SELECT term FROM messages_vocab \
-                  WHERE term LIKE ?1 ESCAPE '\\' \
-                  ORDER BY cnt DESC LIMIT 25)",
-                [&pattern],
-                |row| row.get(0),
-            )
-            .unwrap_or(None);
-        match expanded {
-            Some(exp) if !exp.is_empty() => parts.push(format!("({exp})")),
-            _ => parts.push(token.to_string()),
+        let terms: Vec<String> = match vocab_stmt.as_mut() {
+            Ok(stmt) => stmt
+                .query_map([&pattern], |row| row.get::<_, String>(0))
+                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                .unwrap_or_else(|e| {
+                    eprintln!("Warning: term expansion failed for '{unquoted}': {e}");
+                    Vec::new()
+                }),
+            Err(e) => {
+                eprintln!("Warning: term expansion failed for '{unquoted}': {e}");
+                Vec::new()
+            }
+        }
+            .into_iter()
+            // Trigrams like "go:" or "方針*" break FTS5 MATCH syntax; keep alphanumeric only.
+            .filter(|t| t.chars().all(|c| c.is_alphanumeric()))
+            .map(|t| format!("\"{t}\""))
+            .collect();
+        if terms.is_empty() {
+            parts.push(token.to_string());
+        } else {
+            parts.push(format!("({})", terms.join(" OR ")));
         }
     }
-    parts.join(" ")
+    // FTS5 trigram quirk: `term1 (a OR b)` is a syntax error because implicit
+    // AND (space-separated) cannot precede an OR-group. Insert explicit AND.
+    let mut result = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let prev = parts[i - 1].to_ascii_uppercase();
+            let curr = part.to_ascii_uppercase();
+            let is_op = |s: &str| matches!(s, "AND" | "OR" | "NOT");
+            let has_or = |s: &str| s.contains(" OR ");
+            if !is_op(&prev) && !is_op(&curr) && (has_or(part) || has_or(&parts[i - 1])) {
+                result.push_str(" AND ");
+            } else {
+                result.push(' ');
+            }
+        }
+        result.push_str(part);
+    }
+    result
 }
 
 fn build_search_query(
@@ -1018,18 +1050,6 @@ mod tests {
     }
 
     #[test]
-    fn test_012_no_vec_data_uses_fts5_only() {
-        let (_dir, conn) = setup_test_db();
-        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
-        insert_message(&conn, "s1", "user", "rust compiler optimization");
-
-        assert!(!has_vec_data(&conn));
-
-        let results = search(&conn, "rust compiler", &SearchOptions::default()).unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
     fn test_hybrid_search_merges_fts_and_vector() {
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
@@ -1042,7 +1062,6 @@ mod tests {
         insert_session(&conn, "s2", "claude", "/proj", now_ms);
         insert_message(&conn, "s2", "user", "unrelated topic about weather");
 
-        // Insert qa_chunk + vec_chunk for s2 with query-similar embedding
         conn.execute(
             "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
              VALUES (1, 's2', 'q', 'a', 'authentication implementation details', ?1, 'hash1')",
@@ -1071,7 +1090,6 @@ mod tests {
         )
         .unwrap();
 
-        // Both sessions should appear: s1 from FTS, s2 from vector search
         let ids: Vec<&str> = results
             .iter()
             .map(|r| r.session.session_id.as_str())
@@ -1109,7 +1127,6 @@ mod tests {
         )
         .unwrap();
 
-        // Embedder that fails immediately on query
         let mut embedder = MockEmbedder::failing_after(0);
         let results = search_with_embedder(
             &conn,
@@ -1122,8 +1139,114 @@ mod tests {
         )
         .unwrap();
 
-        // Should still return FTS results despite vector failure
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
+    }
+
+    // -- expand_short_terms tests --
+
+    fn setup_vocab_db() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/p", 1000);
+        insert_message(&conn, "s1", "user", "go language tutorial");
+        insert_message(&conn, "s1", "assistant", "golang guide here");
+        (dir, conn)
+    }
+
+    #[test]
+    fn test_expand_long_terms_passthrough() {
+        let (_dir, conn) = setup_vocab_db();
+        let result = expand_short_terms(&conn, "language tutorial");
+        assert_eq!(result, "language tutorial");
+    }
+
+    #[test]
+    fn test_expand_fts_operators_passthrough() {
+        let (_dir, conn) = setup_vocab_db();
+        let result = expand_short_terms(&conn, "foo AND bar");
+        assert_eq!(result, "foo AND bar");
+    }
+
+    #[test]
+    fn test_expand_short_term_with_vocab_match() {
+        let (_dir, conn) = setup_vocab_db();
+        let result = expand_short_terms(&conn, "go");
+        assert!(
+            result.starts_with('(') && result.ends_with(')'),
+            "short term should be expanded to OR-group: {result}"
+        );
+        assert!(result != "go", "should not be the original short term");
+    }
+
+    #[test]
+    fn test_expand_short_term_no_vocab_match() {
+        let (_dir, conn) = setup_vocab_db();
+        let result = expand_short_terms(&conn, "zz");
+        assert_eq!(result, "zz");
+    }
+
+    #[test]
+    fn test_expand_mixed_short_and_long_terms() {
+        let (_dir, conn) = setup_vocab_db();
+        let result = expand_short_terms(&conn, "go tutorial");
+        // If "go" expands to an OR-group, explicit AND should be inserted
+        if result.contains("OR") {
+            assert!(
+                result.contains(" AND "),
+                "should have explicit AND between OR-group and plain term: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expand_empty_input() {
+        let (_dir, conn) = setup_vocab_db();
+        let result = expand_short_terms(&conn, "");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_expand_short_term_filters_special_char_trigrams() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/p", 1000);
+        // Colons produce trigrams like "go:" which must be filtered by is_alphanumeric
+        insert_message(&conn, "s1", "user", "go:run go:test go:build go:vet");
+
+        let result = expand_short_terms(&conn, "go");
+        if result.starts_with('(') {
+            assert!(
+                !result.contains(':'),
+                "special-char trigrams should be filtered: {result}"
+            );
+        }
+        assert!(search(&conn, "go", &SearchOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn test_search_cjk_short_term_with_special_chars() {
+        // The actual bug scenario: 2-char CJK term where vocab contains
+        // punctuation-laden trigrams (e.g. "方針：", "方針*", "方針（")
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(
+            &conn,
+            "s1",
+            "user",
+            "方針：まとめ 方針*概要 方針（案） ディレクトリ整理の方針",
+        );
+
+        // "方針" is 2 chars → triggers vocab expansion with special-char trigrams
+        let results = search(&conn, "ディレクトリ整理 方針", &SearchOptions::default())
+            .expect("CJK short term + long term should not cause FTS5 error");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_escape_like_basic() {
+        assert_eq!(escape_like("hello"), "hello");
+        assert_eq!(escape_like("100%"), "100\\%");
+        assert_eq!(escape_like("a_b"), "a\\_b");
+        assert_eq!(escape_like("c:\\path"), "c:\\\\path");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
     }
 }

@@ -11,6 +11,7 @@ mod parser;
 mod progress;
 mod search;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -75,6 +76,11 @@ enum Command {
         /// Skip post-search embedding (faster for piped/scripted usage)
         #[arg(long)]
         no_embed: bool,
+    },
+    /// Show full conversation of a session
+    Show {
+        /// Session ID (prefix match supported)
+        session_id: String,
     },
     /// Show index and embedding status
     Status,
@@ -325,6 +331,93 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
     Ok(())
 }
 
+fn show_session(
+    conn: &Connection,
+    session_id: &str,
+    verbose: bool,
+    w: &mut impl Write,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, source, file_path, project, slug, timestamp \
+         FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\' ORDER BY session_id",
+    )?;
+    let pattern = format!("{}%", search::escape_like(session_id));
+    let matches: Vec<parser::SessionData> = stmt
+        .query_map([&pattern], |row| {
+            let source_str: String = row.get(1)?;
+            Ok(parser::SessionData {
+                session_id: row.get(0)?,
+                source: Source::from_db(&source_str).unwrap_or_else(|| {
+                    eprintln!("Warning: unknown source '{source_str}', defaulting to claude");
+                    Source::Claude
+                }),
+                file_path: row.get(2)?,
+                project: row.get(3)?,
+                slug: row.get(4)?,
+                timestamp: row.get(5)?,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+
+    if matches.is_empty() {
+        anyhow::bail!("No session found matching '{session_id}'");
+    }
+    if matches.len() > 1 {
+        let mut msg = format!("Multiple sessions match '{session_id}':\n");
+        for s in &matches {
+            msg.push_str(&format!("  {}  {}\n", s.session_id, s.slug));
+        }
+        msg.push_str("Narrow the session ID prefix to match exactly one session");
+        anyhow::bail!(msg);
+    }
+
+    let session = &matches[0];
+
+    let mut msg_stmt = conn.prepare(
+        "SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid",
+    )?;
+    let messages: Vec<(String, String)> = msg_stmt
+        .query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<_, _>>()?;
+
+    writeln!(w, "# {}", session.slug)?;
+    writeln!(w, "- session_id: {}", session.session_id)?;
+    writeln!(w, "- date: {}", format_timestamp(session.timestamp))?;
+    writeln!(w, "- project: {}", session.project)?;
+    writeln!(w, "- source: {}", session.source)?;
+    if verbose {
+        writeln!(w, "- file: {}", session.file_path)?;
+    }
+    writeln!(w)?;
+
+    for (role, text) in &messages {
+        writeln!(w, "## [{role}]")?;
+        writeln!(w, "{text}")?;
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+    let path = resolve_db_path(db_path)?;
+    if !path.exists() {
+        anyhow::bail!("Database not found. Run `recall index` first.");
+    }
+
+    let conn = open_or_create_db(&path)?;
+    let mut w = std::io::stdout().lock();
+
+    if let Err(e) = show_session(&conn, session_id, verbose, &mut w) {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::BrokenPipe
+        {
+            std::process::exit(0);
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
@@ -450,13 +543,12 @@ fn print_results(results: &[search::SearchResult]) {
 fn run() -> Result<()> {
     // Backward compat: if first arg is not a subcommand, treat as `search <query>`
     let args: Vec<String> = std::env::args().collect();
-    let known_commands = ["index", "search", "status", "help"];
+    let known_commands = ["index", "search", "show", "status", "help"];
 
     let cli = if args.len() > 1
         && !args[1].starts_with('-')
         && !known_commands.contains(&args[1].as_str())
     {
-        // Legacy: `recall "query"` → `recall search "query"`
         let mut patched = vec![args[0].clone(), "search".to_string()];
         patched.extend_from_slice(&args[1..]);
         Cli::parse_from(patched)
@@ -467,6 +559,7 @@ fn run() -> Result<()> {
     match cli.command {
         Some(Command::Index { force, embed }) => run_index(force, embed, cli.verbose, &cli.db_path),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, cli.verbose, &cli.db_path),
+        Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         None => {
             anyhow::bail!(
@@ -608,5 +701,90 @@ mod tests {
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("Parent:"));
+    }
+
+    // -- show_session tests --
+
+    fn setup_show_db() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = db::setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('abc-123', 'user', 'hello world')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('abc-123', 'assistant', 'hi there')",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn test_show_session_exact_match() {
+        let (_dir, conn) = setup_show_db();
+        let mut buf = Vec::new();
+        show_session(&conn, "abc-123", false, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("# my-slug"));
+        assert!(output.contains("- session_id: abc-123"));
+        assert!(output.contains("- date: 2024-03-01"));
+        assert!(output.contains("## [user]\nhello world"));
+        assert!(output.contains("## [assistant]\nhi there"));
+    }
+
+    #[test]
+    fn test_show_session_prefix_match() {
+        let (_dir, conn) = setup_show_db();
+        let mut buf = Vec::new();
+        show_session(&conn, "abc-1", false, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("- session_id: abc-123"));
+    }
+
+    #[test]
+    fn test_show_session_ambiguous_prefix() {
+        let (_dir, conn) = setup_show_db();
+        let mut buf = Vec::new();
+        let err = show_session(&conn, "abc", false, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("Multiple sessions match"));
+    }
+
+    #[test]
+    fn test_show_session_not_found() {
+        let (_dir, conn) = setup_show_db();
+        let mut buf = Vec::new();
+        let err = show_session(&conn, "zzz", false, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("No session found matching"));
+    }
+
+    #[test]
+    fn test_show_session_verbose_includes_file() {
+        let (_dir, conn) = setup_show_db();
+        let mut buf = Vec::new();
+        show_session(&conn, "abc-123", true, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("- file: /path/f.jsonl"));
+    }
+
+    #[test]
+    fn test_show_session_message_order() {
+        let (_dir, conn) = setup_show_db();
+        let mut buf = Vec::new();
+        show_session(&conn, "abc-123", false, &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        let user_pos = output.find("## [user]").unwrap();
+        let assistant_pos = output.find("## [assistant]").unwrap();
+        assert!(user_pos < assistant_pos, "user message should come before assistant");
     }
 }
