@@ -373,9 +373,8 @@ fn show_session(
 
     let session = &matches[0];
 
-    let mut msg_stmt = conn.prepare(
-        "SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid",
-    )?;
+    let mut msg_stmt =
+        conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
     let messages: Vec<(String, String)> = msg_stmt
         .query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
@@ -785,6 +784,9 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         let user_pos = output.find("## [user]").unwrap();
         let assistant_pos = output.find("## [assistant]").unwrap();
-        assert!(user_pos < assistant_pos, "user message should come before assistant");
+        assert!(
+            user_pos < assistant_pos,
+            "user message should come before assistant"
+        );
     }
 }

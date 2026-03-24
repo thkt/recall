@@ -161,11 +161,11 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
                 Vec::new()
             }
         }
-            .into_iter()
-            // Trigrams like "go:" or "方針*" break FTS5 MATCH syntax; keep alphanumeric only.
-            .filter(|t| t.chars().all(|c| c.is_alphanumeric()))
-            .map(|t| format!("\"{t}\""))
-            .collect();
+        .into_iter()
+        // Trigrams like "go:" or "方針*" break FTS5 MATCH syntax; keep alphanumeric only.
+        .filter(|t| t.chars().all(|c| c.is_alphanumeric()))
+        .map(|t| format!("\"{t}\""))
+        .collect();
         if terms.is_empty() {
             parts.push(token.to_string());
         } else {
