@@ -95,6 +95,12 @@ recall index --force    # 全件再構築
 recall index --embed    # 全チャンクを一括 embedding（初回は時間がかかります）
 ```
 
+### セッション表示
+
+```sh
+recall show abc-123     # セッションの会話全文を表示（ID前方一致）
+```
+
 ### ステータス
 
 ```sh
@@ -119,7 +125,7 @@ recall status           # セッション数、チャンク数、embeddingカバ
 
 ```text
 src/
-├── main.rs       CLIサブコマンド（index, search, status）
+├── main.rs       CLIサブコマンド（index, search, show, status）
 ├── parser/       Claude Code / Codex の JSONL パーサー
 ├── indexer.rs    mtime追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
@@ -148,7 +154,7 @@ src/
 - `~/.claude/projects/` と `~/.codex/sessions/` のローカルセッションのみ対応。クラウド同期なし
 - 画像、ツール結果、バイナリコンテンツはインデックスしない
 - MLXアクセラレーションはApple Siliconが必要。Linux向けにcandle（CPU）フォールバックあり
-- 検索結果は抜粋表示。完全なセッションを見るにはJSONLファイルを直接開く
+- 検索結果は抜粋表示。完全な会話は `recall show <id>` で表示可能
 
 ## 謝辞
 

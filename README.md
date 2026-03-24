@@ -97,6 +97,12 @@ recall index --force    # full rebuild
 recall index --embed    # embed all chunks (slow, enables full hybrid search)
 ```
 
+### Show
+
+```sh
+recall show abc-123     # show full conversation of a session (prefix match)
+```
+
 ### Status
 
 ```sh
@@ -121,7 +127,7 @@ recall status           # sessions, chunks, embedding coverage, model status
 
 ```text
 src/
-├── main.rs       CLI subcommands (index, search, status)
+├── main.rs       CLI subcommands (index, search, show, status)
 ├── parser/       JSONL parsers for Claude Code and Codex formats
 ├── indexer.rs    Incremental indexer with mtime tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
@@ -152,7 +158,7 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 | Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync   |
 | Text only           | Images, tool results, and binary content are not indexed                  |
 | Apple Silicon focus | MLX acceleration requires Apple Silicon. candle (CPU) fallback available for Linux |
-| No export           | Search results show excerpts. Open the JSONL file directly for full sessions |
+| Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations  |
 
 ## Acknowledgements
 
