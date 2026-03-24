@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::chunker;
-use crate::embedder::Embed;
 use crate::parser::{
     Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session,
 };
@@ -587,152 +586,13 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
     Ok(ChunkStats { chunks_created })
 }
 
-#[derive(Default)]
-pub(crate) struct EmbedResult {
-    pub embedded: usize,
-    pub stopped_at_error: Option<String>,
-}
-
-impl EmbedResult {
-    pub(crate) fn warn_if_stopped(&self) {
-        if let Some(ref err) = self.stopped_at_error {
-            eprintln!("Warning: embedding stopped early: {err}");
-        }
-    }
-}
-
-const EMBED_BATCH_SIZE: usize = 32;
-
-/// Stops on first batch failure; previously committed batches are preserved.
-fn embed_chunks(
-    conn: &mut Connection,
-    embedder: &mut dyn Embed,
-    chunks: &[(i64, String)],
-) -> Result<EmbedResult> {
-    if chunks.is_empty() {
-        return Ok(EmbedResult::default());
-    }
-
-    // Sort by content length to minimize padding waste within each batch
-    let mut sorted: Vec<usize> = (0..chunks.len()).collect();
-    sorted.sort_by_key(|&i| chunks[i].1.len());
-
-    let total = chunks.len();
-    let show_progress = total >= 100;
-    let mut embedded = 0;
-    let mut stopped_at_error = None;
-
-    for batch_idx in sorted.chunks(EMBED_BATCH_SIZE) {
-        let texts: Vec<&str> = batch_idx.iter().map(|&i| chunks[i].1.as_str()).collect();
-        match embedder.embed_documents_batch(&texts) {
-            Ok(embeddings) => {
-                let tx = conn.transaction()?;
-                for (embedding, &i) in embeddings.iter().zip(batch_idx) {
-                    let embedding_bytes: &[u8] = bytemuck::cast_slice(embedding);
-                    tx.execute(
-                        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![chunks[i].0, embedding_bytes],
-                    )?;
-                }
-                tx.commit()?;
-                embedded += embeddings.len();
-                if show_progress {
-                    eprint!("\r  {embedded}/{total} chunks embedded");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
-            }
-            Err(e) => {
-                stopped_at_error = Some(format!("batch: {e}"));
-                break;
-            }
-        }
-    }
-    if show_progress {
-        eprintln!();
-    }
-
-    Ok(EmbedResult {
-        embedded,
-        stopped_at_error,
-    })
-}
-
-fn query_and_embed(
-    conn: &mut Connection,
-    embedder: &mut dyn Embed,
-    sql: &str,
-    params: &[&dyn rusqlite::types::ToSql],
-) -> Result<EmbedResult> {
-    let missing: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params, |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
-    };
-
-    embed_chunks(conn, embedder, &missing)
-}
-
-pub(crate) fn embed_near_sessions(
-    conn: &mut Connection,
-    embedder: &mut dyn Embed,
-    session_ids: &[String],
-    budget: usize,
-) -> Result<EmbedResult> {
-    if session_ids.is_empty() || budget == 0 {
-        return Ok(EmbedResult::default());
-    }
-
-    let placeholders = session_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT c.id, c.content FROM qa_chunks c \
-         WHERE c.session_id IN ({placeholders}) \
-         AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
-         ORDER BY c.id \
-         LIMIT ?"
-    );
-
-    let budget_i64 = budget as i64;
-    let mut refs: Vec<&dyn rusqlite::types::ToSql> = session_ids
-        .iter()
-        .map(|s| s as &dyn rusqlite::types::ToSql)
-        .collect();
-    refs.push(&budget_i64);
-
-    query_and_embed(conn, embedder, &sql, &refs)
-}
-
-pub(crate) fn embed_recent_chunks(
-    conn: &mut Connection,
-    embedder: &mut dyn Embed,
-    budget: usize,
-) -> Result<EmbedResult> {
-    if budget == 0 {
-        return Ok(EmbedResult::default());
-    }
-
-    let budget_i64 = budget as i64;
-    query_and_embed(
-        conn,
-        embedder,
-        "SELECT c.id, c.content FROM qa_chunks c \
-         WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
-         ORDER BY c.timestamp DESC NULLS LAST \
-         LIMIT ?",
-        &[&budget_i64 as &dyn rusqlite::types::ToSql],
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::setup_test_db;
-    use crate::embedder::MockEmbedder;
+    use crate::embedder::{
+        EMBED_BATCH_SIZE, MockEmbedder, embed_near_sessions, embed_recent_chunks,
+    };
     use tempfile::TempDir;
 
     #[test]

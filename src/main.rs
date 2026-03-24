@@ -216,7 +216,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
         )?;
         if total > 0 {
             eprintln!("Embedding {total} chunks (this may take a while)...");
-            let result = indexer::embed_recent_chunks(&mut conn, &mut embedder, total as usize)?;
+            let result = embedder::embed_recent_chunks(&mut conn, &mut embedder, total as usize)?;
             eprintln!("Embedded {} chunks", result.embedded);
             result.warn_if_stopped();
         } else {
@@ -285,7 +285,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             .map(|r| r.session.session_id.clone())
             .collect();
         let mut total = 0;
-        let mut handle = |result: anyhow::Result<indexer::EmbedResult>| match result {
+        let mut handle = |result: anyhow::Result<embedder::EmbedResult>| match result {
             Ok(r) => {
                 r.warn_if_stopped();
                 total += r.embedded;
@@ -297,13 +297,13 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
                 }
             }
         };
-        handle(indexer::embed_near_sessions(
+        handle(embedder::embed_near_sessions(
             &mut conn,
             emb,
             &session_ids,
             10,
         ));
-        handle(indexer::embed_recent_chunks(&mut conn, emb, 10));
+        handle(embedder::embed_recent_chunks(&mut conn, emb, 10));
         if total > 0 && verbose {
             eprintln!("Embedded {total} chunks (nearby + recent)");
         }
