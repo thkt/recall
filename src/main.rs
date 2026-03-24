@@ -144,7 +144,7 @@ fn try_load_embedder() -> Option<embedder::Embedder> {
 
 /// Check if model files are already in the hf-hub cache.
 fn cached_model_paths() -> Option<embedder::ModelPaths> {
-    let cache = hf_hub::Cache::default();
+    let cache = hf_hub::Cache::from_env();
     let repo = cache.repo(hf_hub::Repo::model(HF_REPO.to_string()));
     Some(embedder::ModelPaths {
         model: repo.get("model.safetensors")?,
