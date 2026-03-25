@@ -1,29 +1,11 @@
-use std::sync::Once;
-
 use anyhow::Result;
 use rusqlite::Connection;
-
-use crate::embedder::EMBEDDING_DIMS;
+use rurico::embed::EMBEDDING_DIMS;
 
 const FTS_TOKENIZER: &str = "trigram";
 
-static SQLITE_VEC_INIT: Once = Once::new();
-
-fn ensure_sqlite_vec() {
-    SQLITE_VEC_INIT.call_once(|| {
-        // SAFETY: sqlite3_vec_init is a C extern fn matching sqlite3_auto_extension's
-        // callback signature. Pinned to sqlite-vec 0.1.7; re-verify ABI on version bumps.
-        unsafe {
-            #[allow(clippy::missing_transmute_annotations)]
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
-    });
-}
-
 pub fn open_db(path: &std::path::Path) -> Result<Connection> {
-    ensure_sqlite_vec();
+    rurico::storage::ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;

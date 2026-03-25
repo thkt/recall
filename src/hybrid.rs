@@ -1,10 +1,5 @@
-use std::collections::HashMap;
-
 use crate::date::MS_PER_DAY;
 
-/// RRF parameter. Higher k reduces the influence of high rankings.
-const RRF_K: f64 = 60.0;
-/// Sessions older than 30 days lose half their recency boost.
 pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 
 /// Exponential recency decay: 1.0 for now, 0.5 at half-life, approaching 0.0.
@@ -16,32 +11,6 @@ pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
         }
         None => 0.0,
     }
-}
-
-/// A scored candidate from one retrieval source (FTS5 or vector).
-pub(crate) struct RankedHit {
-    pub session_id: String,
-    /// 0-based rank within its source list (0 = best).
-    pub rank: usize,
-}
-
-/// Merge FTS5 and vector results using Reciprocal Rank Fusion.
-///
-/// Sessions appearing in both lists receive scores from both.
-/// Score = sum(1 / (k + rank)) across lists.
-pub(crate) fn rrf_merge(fts_hits: &[RankedHit], vec_hits: &[RankedHit]) -> Vec<(String, f64)> {
-    let mut scores: HashMap<String, f64> = HashMap::new();
-
-    for hit in fts_hits {
-        *scores.entry(hit.session_id.clone()).or_default() += 1.0 / (RRF_K + hit.rank as f64);
-    }
-    for hit in vec_hits {
-        *scores.entry(hit.session_id.clone()).or_default() += 1.0 / (RRF_K + hit.rank as f64);
-    }
-
-    let mut results: Vec<(String, f64)> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.total_cmp(&a.1)); // descending by score
-    results
 }
 
 /// Apply exponential recency boost to RRF scores.
@@ -61,27 +30,23 @@ pub(crate) fn apply_recency_boost(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
 
-    fn hit(session_id: &str, rank: usize) -> RankedHit {
-        RankedHit {
-            session_id: session_id.to_string(),
-            rank,
-        }
-    }
+    use super::*;
 
     // T-008: FTS5 + vec results merged by RRF (FR-005)
     #[test]
     fn test_008_rrf_merge_both_lists() {
-        let fts = vec![hit("A", 0), hit("B", 2)];
-        let vec = vec![hit("B", 0), hit("C", 1)];
+        let fts: Vec<(String, f64)> = vec![("A".into(), 0.0), ("B".into(), 0.0)];
+        // B at position 0 in vec list (rank=0), C at position 1 (rank=1)
+        let vec: Vec<(String, f64)> = vec![("B".into(), 0.0), ("C".into(), 0.0)];
 
-        let merged = rrf_merge(&fts, &vec);
+        let merged = rurico::storage::rrf_merge(&fts, &vec);
 
         // B appears in both lists → highest score
         assert_eq!(merged[0].0, "B");
-        // B's score = 1/(60+2) + 1/(60+0) = 1/62 + 1/60
-        let b_expected = 1.0 / 62.0 + 1.0 / 60.0;
+        // B: fts rank=1 (position 1), vec rank=0 → 1/(60+1) + 1/(60+0)
+        let b_expected = 1.0 / 61.0 + 1.0 / 60.0;
         assert!(
             (merged[0].1 - b_expected).abs() < 1e-10,
             "B score: expected {b_expected}, got {}",
@@ -92,10 +57,10 @@ mod tests {
     // T-010: single-list hit scoring (FR-005)
     #[test]
     fn test_010_rrf_single_list_hit() {
-        let fts = vec![hit("A", 0)];
-        let vec: Vec<RankedHit> = vec![];
+        let fts: Vec<(String, f64)> = vec![("A".into(), 0.0)];
+        let vec: Vec<(String, f64)> = vec![];
 
-        let merged = rrf_merge(&fts, &vec);
+        let merged = rurico::storage::rrf_merge(&fts, &vec);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].0, "A");
@@ -125,7 +90,6 @@ mod tests {
             now_ms,
         );
 
-        // "new" should be first after boost
         assert_eq!(results[0].0, "new");
         assert!(
             results[0].1 > results[1].1,
@@ -140,13 +104,14 @@ mod tests {
         let mut results = vec![("no-ts".to_string(), 0.5)];
         apply_recency_boost(&mut results, |_| None, 1_000_000);
 
-        // boost = 0 → score * (1 + 0) = score unchanged
         assert!((results[0].1 - 0.5).abs() < 1e-10);
     }
 
     #[test]
     fn test_rrf_empty_inputs() {
-        let merged = rrf_merge(&[], &[]);
+        let fts: Vec<(String, f64)> = vec![];
+        let vec: Vec<(String, f64)> = vec![];
+        let merged = rurico::storage::rrf_merge(&fts, &vec);
         assert!(merged.is_empty());
     }
 }

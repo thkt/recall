@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::date::MS_PER_DAY;
-use crate::embedder::Embed;
-use crate::hybrid::{self, RankedHit};
+use rurico::embed::Embed;
+use crate::hybrid;
 use crate::parser::{SessionData, Source};
 
 const RECENCY_BOOST_WEIGHT: f64 = 0.2;
@@ -140,7 +140,6 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
         if unquoted.is_empty() {
             continue;
         }
-        // Trigram tokenizer indexes 3-char windows; shorter terms get zero hits.
         if unquoted.chars().count() >= 3 {
             parts.push(token.to_string());
             continue;
@@ -428,14 +427,14 @@ fn has_vec_data(conn: &Connection) -> bool {
 
 fn vec_search(
     conn: &Connection,
-    embedder: &mut dyn Embed,
+    embedder: &dyn Embed,
     query: &str,
     limit: usize,
-) -> Result<Vec<RankedHit>> {
+) -> Result<Vec<(String, f64)>> {
     let embedding = embedder
         .embed_query(query)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+    let embedding_bytes: &[u8] = rurico::storage::f32_as_bytes(&embedding);
 
     // Subquery pushes the knn LIMIT down to the vec0 virtual table.
     // GROUP BY deduplicates sessions; ORDER BY MIN(distance) preserves rank.
@@ -457,12 +456,7 @@ fn vec_search(
 
     let mut hits = Vec::new();
     for r in rows {
-        let sid = r?;
-        let rank = hits.len();
-        hits.push(RankedHit {
-            session_id: sid,
-            rank,
-        });
+        hits.push((r?, 0.0));
     }
     Ok(hits)
 }
@@ -476,7 +470,7 @@ pub fn search_with_embedder(
     conn: &Connection,
     query: &str,
     opts: &SearchOptions,
-    embedder: Option<&mut dyn Embed>,
+    embedder: Option<&dyn Embed>,
 ) -> Result<Vec<SearchResult>> {
     if opts.limit == 0 {
         return Ok(Vec::new());
@@ -492,13 +486,9 @@ pub fn search_with_embedder(
         let embedder = embedder.unwrap();
         let candidate_limit = opts.limit * 3;
 
-        let fts_hits: Vec<RankedHit> = fts_ranked
+        let fts_hits: Vec<(String, f64)> = fts_ranked
             .iter()
-            .enumerate()
-            .map(|(rank, (sid, _))| RankedHit {
-                session_id: sid.clone(),
-                rank,
-            })
+            .map(|(sid, _)| (sid.clone(), 0.0))
             .collect();
 
         let vec_hits = match vec_search(conn, embedder, query, candidate_limit) {
@@ -509,11 +499,9 @@ pub fn search_with_embedder(
             }
         };
 
-        let mut merged = hybrid::rrf_merge(&fts_hits, &vec_hits);
+        let mut merged = rurico::storage::rrf_merge(&fts_hits, &vec_hits);
 
-        let all_ranked: Vec<(String, f64)> =
-            merged.iter().map(|(s, sc)| (s.clone(), *sc)).collect();
-        let mut meta_map = fetch_session_metadata(conn, &all_ranked)?;
+        let mut meta_map = fetch_session_metadata(conn, &merged)?;
 
         hybrid::apply_recency_boost(
             &mut merged,
@@ -522,17 +510,13 @@ pub fn search_with_embedder(
         );
         merged.truncate(opts.limit);
 
-        let ranked_for_snippets: Vec<(String, f64)> = merged;
-        if ranked_for_snippets.is_empty() {
+        if merged.is_empty() {
             return Ok(Vec::new());
         }
 
-        let candidates = fetch_snippets(conn, &sq, ranked_for_snippets, &mut meta_map)?;
-
-        let results: Vec<SearchResult> = candidates.into_iter().map(|(_, r)| r).collect();
-        Ok(results)
+        let candidates = fetch_snippets(conn, &sq, merged, &mut meta_map)?;
+        Ok(candidates.into_iter().map(|(_, r)| r).collect())
     } else {
-        // FTS5-only path
         if fts_ranked.is_empty() {
             return Ok(Vec::new());
         }
@@ -1028,7 +1012,6 @@ mod tests {
         insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
         insert_message(&conn, "s1", "user", "some content about admin");
 
-        // "role:user" should NOT act as a column filter — should search for the literal text
         let results = search(&conn, "role:user", &SearchOptions::default()).unwrap();
         assert!(
             results.is_empty(),
@@ -1069,7 +1052,7 @@ mod tests {
         )
         .unwrap();
         let embedding = MockEmbedder::deterministic_vector("authentication");
-        let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+        let embedding_bytes: &[u8] = rurico::storage::f32_as_bytes(&embedding);
         conn.execute(
             "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
             [embedding_bytes],
@@ -1078,7 +1061,7 @@ mod tests {
 
         assert!(has_vec_data(&conn));
 
-        let mut embedder = MockEmbedder::new();
+        let embedder = MockEmbedder::new();
         let results = search_with_embedder(
             &conn,
             "authentication",
@@ -1086,7 +1069,7 @@ mod tests {
                 now_ms: Some(now_ms),
                 ..Default::default()
             },
-            Some(&mut embedder),
+            Some(&embedder),
         )
         .unwrap();
 
@@ -1120,14 +1103,14 @@ mod tests {
         )
         .unwrap();
         let embedding = MockEmbedder::deterministic_vector("content");
-        let embedding_bytes: &[u8] = bytemuck::cast_slice(&embedding);
+        let embedding_bytes: &[u8] = rurico::storage::f32_as_bytes(&embedding);
         conn.execute(
             "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
             [embedding_bytes],
         )
         .unwrap();
 
-        let mut embedder = MockEmbedder::failing_after(0);
+        let embedder = MockEmbedder::failing_after(0);
         let results = search_with_embedder(
             &conn,
             "authentication",
@@ -1135,15 +1118,13 @@ mod tests {
                 now_ms: Some(now_ms),
                 ..Default::default()
             },
-            Some(&mut embedder),
+            Some(&embedder),
         )
         .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
     }
-
-    // -- expand_short_terms tests --
 
     fn setup_vocab_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = setup_test_db();

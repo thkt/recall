@@ -8,27 +8,21 @@ repository = "https://github.com/thkt/recall"
 
 [features]
 default = ["mlx"]
-mlx = ["dep:mlx-rs"]
-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+mlx = ["rurico/mlx"]
+test-support = ["rurico/test-support"]
 
 [dependencies]
 anyhow = "1"
-bytemuck = "1"
-candle-core = { version = "0.9", optional = true }
-candle-nn = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
-hf-hub = "0.5"
+rurico = { git = "https://github.com/thkt/rurico", rev = "56320e3" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sqlite-vec = "0.1.6"
-mlx-rs = { version = "0.25", optional = true }
-tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
+rurico = { git = "https://github.com/thkt/rurico", rev = "56320e3", features = ["test-support"] }
 serial_test = "3"
 tempfile = "3"
 

@@ -5,8 +5,6 @@ mod db;
 mod embedder;
 mod hybrid;
 mod indexer;
-#[cfg(feature = "mlx")]
-mod modernbert;
 mod parser;
 mod progress;
 mod search;
@@ -22,8 +20,6 @@ use crate::parser::Source;
 
 /// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
 const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
-
-const HF_REPO: &str = "cl-nagoya/ruri-v3-310m";
 
 #[derive(Parser)]
 #[command(name = "recall", about = "Search past Claude Code and Codex sessions")]
@@ -131,52 +127,21 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn try_load_embedder() -> Option<embedder::Embedder> {
-    let paths = cached_model_paths()?;
-    match embedder::Embedder::new(&paths) {
+fn try_load_embedder() -> Option<rurico::embed::Embedder> {
+    let paths = match rurico::embed::download_model() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Warning: model download failed: {e}");
+            return None;
+        }
+    };
+    match rurico::embed::Embedder::new(&paths) {
         Ok(e) => Some(e),
         Err(e) => {
-            eprintln!("Warning: failed to load embedding model: {e}");
+            eprintln!("Warning: model load failed: {e}");
             None
         }
     }
-}
-
-/// Check if model files are already in the hf-hub cache.
-fn cached_model_paths() -> Option<embedder::ModelPaths> {
-    let cache = hf_hub::Cache::from_env();
-    let repo = cache.repo(hf_hub::Repo::model(HF_REPO.to_string()));
-    Some(embedder::ModelPaths {
-        model: repo.get("model.safetensors")?,
-        config: repo.get("config.json")?,
-        tokenizer: repo.get("tokenizer.json")?,
-    })
-}
-
-/// Download model files via hf-hub if not cached.
-fn ensure_model(verbose: bool) -> Result<embedder::ModelPaths> {
-    let api = hf_hub::api::sync::Api::new().context("Failed to initialize HuggingFace Hub API")?;
-    let repo = api.model(HF_REPO.to_string());
-
-    if verbose {
-        eprintln!("Checking model files...");
-    }
-
-    let model = repo
-        .get("model.safetensors")
-        .context("Failed to download model.safetensors")?;
-    let config = repo
-        .get("config.json")
-        .context("Failed to download config.json")?;
-    let tokenizer = repo
-        .get("tokenizer.json")
-        .context("Failed to download tokenizer.json")?;
-
-    Ok(embedder::ModelPaths {
-        model,
-        config,
-        tokenizer,
-    })
 }
 
 // -- Subcommands --
@@ -209,8 +174,9 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
 
     if embed {
         let sp = progress::Spinner::new("Loading model...");
-        let paths = ensure_model(verbose)?;
-        let mut embedder = embedder::Embedder::new(&paths)
+        let paths = rurico::embed::download_model()
+            .map_err(|e| anyhow::anyhow!("Failed to download model: {e}"))?;
+        let embedder = rurico::embed::Embedder::new(&paths)
             .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         sp.finish("Model ready");
 
@@ -224,7 +190,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
             let sp = progress::Spinner::new(&format!("Embedding {total} chunks..."));
             let result = embedder::embed_recent_chunks(
                 &mut conn,
-                &mut embedder,
+                &embedder,
                 total as usize,
                 Some(&|done, all| {
                     sp.set_message(&format!("Embedding chunks... {done}/{all}"));
@@ -236,7 +202,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
             progress::done("All chunks already embedded");
         }
     } else {
-        let model_cached = cached_model_paths().is_some();
+        let model_cached = rurico::embed::download_model().is_ok();
         eprintln!(
             "  Model: {}",
             if model_cached {
@@ -279,7 +245,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
         sp.finish(&format!("{} sessions", stats.total_sessions));
     }
 
-    let mut embedder = try_load_embedder();
+    let embedder = try_load_embedder();
 
     let results = search::search_with_embedder(
         &conn,
@@ -291,13 +257,13 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             limit: limit.into(),
             now_ms: None,
         },
-        embedder.as_mut().map(|e| e as &mut dyn embedder::Embed),
+        embedder.as_ref().map(|e| e as &dyn rurico::embed::Embed),
     )?;
 
     print_results(&results);
 
     // Post-search: progressive embedding (search results + recent)
-    if !no_embed && let Some(emb) = embedder.as_mut() {
+    if !no_embed && let Some(emb) = embedder.as_ref() {
         let session_ids: Vec<String> = results
             .iter()
             .map(|r| r.session.session_id.clone())
@@ -309,7 +275,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
                 total += r.embedded;
             }
             Err(e) => {
-                eprintln!("Warning: post-search embedding skipped");
+                eprintln!("Warning: post-search embedding skipped: {e}");
                 if verbose {
                     eprintln!("  {e:#}");
                 }
@@ -435,7 +401,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     println!("QA chunks: {chunks}");
     println!("Embedded: {embedded}/{chunks}");
 
-    let model_ok = try_load_embedder().is_some();
+    let model_ok = rurico::embed::download_model().is_ok();
     println!(
         "Model: {}",
         if model_ok {
@@ -701,8 +667,6 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("Parent:"));
     }
-
-    // -- show_session tests --
 
     fn setup_show_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
