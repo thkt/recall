@@ -1,6 +1,6 @@
 [package]
 name = "recall"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 description = "Full-text search CLI for past Claude Code and Codex sessions"
 license = "MIT"
