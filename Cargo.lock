@@ -1991,11 +1991,12 @@ dependencies = [
 
 [[package]]
 name = "rurico"
-version = "0.1.0"
-source = "git+https://github.com/thkt/rurico?rev=56320e3#56320e30f0c9c639ece68ecd292338a853820cd6"
+version = "0.2.0"
+source = "git+https://github.com/thkt/rurico?rev=cd4f2ad#cd4f2ad796e4814ae15dd50063813356718b4a88"
 dependencies = [
  "bytemuck",
  "hf-hub",
+ "log",
  "mlx-rs",
  "rusqlite",
  "serde",
