@@ -4,9 +4,9 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 use crate::date::MS_PER_DAY;
-use rurico::embed::Embed;
 use crate::hybrid;
 use crate::parser::{SessionData, Source};
+use rurico::embed::Embed;
 
 const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 

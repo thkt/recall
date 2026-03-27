@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rusqlite::Connection;
 use rurico::embed::EMBEDDING_DIMS;
+use rusqlite::Connection;
 
 const FTS_TOKENIZER: &str = "trigram";
 

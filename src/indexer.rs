@@ -1058,8 +1058,7 @@ mod tests {
         );
 
         let embedder = MockEmbedder::failing_after(EMBED_BATCH_SIZE);
-        let result =
-            embed_recent_chunks(&mut conn, &embedder, chunk_count as usize, None).unwrap();
+        let result = embed_recent_chunks(&mut conn, &embedder, chunk_count as usize, None).unwrap();
 
         assert_eq!(
             result.embedded, EMBED_BATCH_SIZE,

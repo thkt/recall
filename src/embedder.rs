@@ -1,8 +1,8 @@
 use anyhow::Result;
-use rusqlite::Connection;
 use rurico::embed::Embed;
 #[cfg(test)]
-use rurico::embed::{EmbedError, EMBEDDING_DIMS};
+use rurico::embed::{EMBEDDING_DIMS, EmbedError};
+use rusqlite::Connection;
 
 #[derive(Default)]
 pub(crate) struct EmbedResult {
