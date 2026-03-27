@@ -11,37 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test-candle:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
-
-      - name: Check
-        run: cargo check --no-default-features --features candle
-
-      - name: Test
-        run: cargo test --no-default-features --features candle
-
-      - name: Clippy
-        run: cargo clippy --no-default-features --features candle -- -D warnings
-
-      - name: Format check
-        run: cargo fmt -- --check
-
-  test-mlx:
+  test:
     runs-on: macos-latest
     timeout-minutes: 15
     permissions:
@@ -60,13 +30,13 @@ jobs:
         uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
 
       - name: Check
-        run: cargo check --no-default-features --features mlx
+        run: cargo check
 
       - name: Test
-        run: cargo test --no-default-features --features mlx
+        run: cargo test
 
       - name: Clippy
-        run: cargo clippy --no-default-features --features mlx -- -D warnings
+        run: cargo clippy -- -D warnings
 
       - name: Format check
         run: cargo fmt -- --check
