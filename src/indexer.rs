@@ -917,8 +917,8 @@ mod tests {
     /// SAFETY: caller must hold ENV_LOCK.
     unsafe fn apply_env(key: &str, val: Option<&str>) {
         match val {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
         }
     }
 

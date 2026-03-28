@@ -173,7 +173,12 @@ impl MockEmbedder {
         for (i, b) in text.bytes().enumerate() {
             v[i % dims] += b as f32;
         }
-        rurico::embed::l2_normalize(&mut v);
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            for x in &mut v {
+                *x /= norm;
+            }
+        }
         v
     }
 }
