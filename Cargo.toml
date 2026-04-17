@@ -2,6 +2,7 @@
 name = "recall"
 version = "0.7.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Full-text search CLI for past Claude Code and Codex sessions"
 license = "MIT"
 repository = "https://github.com/thkt/recall"
@@ -14,14 +15,14 @@ anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 dirs = "6.0.0"
 hex = "0.4.3"
-rurico = { git = "https://github.com/thkt/rurico", rev = "dd1ad45" }
+rurico = { git = "https://github.com/thkt/rurico", rev = "0de6526" }
 rusqlite = { version = "0.39.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
 
 [dev-dependencies]
-rurico = { git = "https://github.com/thkt/rurico", rev = "dd1ad45", features = ["test-support"] }
+rurico = { git = "https://github.com/thkt/rurico", rev = "0de6526", features = ["test-support"] }
 serial_test = "3"
 tempfile = "3"
 
@@ -29,21 +30,21 @@ tempfile = "3"
 unsafe_code = "deny"
 
 [lints.clippy]
-# フルパス使用検出
+# absolute paths
 absolute_paths = "deny"
-# Rustイディオム (RUST.md idioms table)
+# idiomatic iterators
 cast_possible_truncation = "deny"
 redundant_closure_for_method_calls = "deny"
 filter_map_next = "deny"
 flat_map_option = "deny"
 manual_filter_map = "deny"
 manual_find_map = "deny"
-# インポート
+# imports
 wildcard_imports = "deny"
 enum_glob_use = "deny"
-# 文字列
+# strings
 str_to_string = "deny"
-# 引数
+# arguments
 needless_pass_by_value = "deny"
 
 [profile.release]

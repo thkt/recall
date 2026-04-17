@@ -2005,18 +2005,28 @@ dependencies = [
 [[package]]
 name = "rurico"
 version = "0.2.0"
-source = "git+https://github.com/thkt/rurico?rev=dd1ad45#dd1ad45c6007c3e1114034a435eef8424f977e48"
+source = "git+https://github.com/thkt/rurico?rev=e5f4fb5#e5f4fb50c1ad13807513033047bd215413ec6ccb"
 dependencies = [
  "bytemuck",
  "hf-hub",
  "log",
  "mlx-rs",
+ "rurico-ffi",
  "rusqlite",
  "serde",
  "serde_json",
- "sqlite-vec",
  "thiserror",
  "tokenizers",
+]
+
+[[package]]
+name = "rurico-ffi"
+version = "0.1.0"
+source = "git+https://github.com/thkt/rurico?rev=e5f4fb5#e5f4fb50c1ad13807513033047bd215413ec6ccb"
+dependencies = [
+ "mlx-sys",
+ "rusqlite",
+ "sqlite-vec",
 ]
 
 [[package]]
