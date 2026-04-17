@@ -6,18 +6,23 @@ mod embedder;
 mod hybrid;
 mod indexer;
 mod parser;
-mod progress;
 mod search;
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 
+use amici::cli::{Spinner, done, embed_with_spinners, try_expand_shorthand};
+use amici::model::download_and_verify_model;
+use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rurico::embed::{Embed, Embedder, ModelId, download_model};
+use rurico::embed::{Embed, ModelId, cached_artifacts};
+use rurico::model_probe::handle_probe_if_needed;
 use rusqlite::Connection;
 
 use crate::parser::Source;
@@ -42,16 +47,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse, chunk, and embed session logs
+    /// Parse and chunk session logs. No model calls.
     Index {
         /// Force full rebuild
         #[arg(long)]
         force: bool,
-
-        /// Embed all chunks (slow initial run, enables full hybrid search)
-        #[arg(long)]
-        embed: bool,
     },
+    /// Embed pending chunks for semantic search.
+    Embed,
+    /// Manage the embedding model.
+    #[command(subcommand)]
+    Model(ModelCommand),
     /// Search indexed sessions (default when query is provided)
     Search {
         /// Search query
@@ -84,6 +90,12 @@ enum Command {
     },
     /// Show index and embedding status
     Status,
+}
+
+#[derive(Subcommand)]
+enum ModelCommand {
+    /// Download the embedding model and verify it loads.
+    Download,
 }
 
 const EXCERPT_MAX_BYTES: usize = 200;
@@ -131,18 +143,21 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn try_load_embedder() -> Option<Embedder> {
-    let paths = match download_model(ModelId::default()) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Warning: model download failed: {e}");
-            return None;
-        }
-    };
-    match Embedder::new(&paths) {
+fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
+    match try_load_embedder_with(
+        || cached_artifacts(ModelId::default()),
+        |e| eprintln!("Warning: failed to delete corrupt model files: {e}"),
+        |e| eprintln!("Warning: embedder probe failed: {e}"),
+    ) {
         Ok(e) => Some(e),
-        Err(e) => {
-            eprintln!("Warning: model load failed: {e}");
+        Err(DegradedReason::NotInstalled) => {
+            eprintln!(
+                "Note: embedding model not installed; using text search only. Run `recall model download` to enable semantic search."
+            );
+            None
+        }
+        Err(reason) => {
+            eprintln!("Warning: embedder unavailable ({reason}); using text search only");
             None
         }
     }
@@ -150,11 +165,11 @@ fn try_load_embedder() -> Option<Embedder> {
 
 // -- Subcommands --
 
-fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
-    let sp = progress::Spinner::new("Indexing sessions...");
+    let sp = Spinner::new("Indexing sessions...");
     let stats = indexer::index_sessions(&mut conn, force, verbose)?;
     if stats.indexed > 0 {
         sp.finish(&format!(
@@ -168,7 +183,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
         eprintln!("  Failed to parse {} files — {err}", stats.parse_errors);
     }
 
-    let sp = progress::Spinner::new("Creating chunks...");
+    let sp = Spinner::new("Creating chunks...");
     let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
     if chunk_stats.chunks_created > 0 {
         sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
@@ -176,48 +191,81 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
         sp.finish("Chunks up to date");
     }
 
-    if embed {
-        let sp = progress::Spinner::new("Loading model...");
-        let paths = download_model(ModelId::default())
-            .map_err(|e| anyhow::anyhow!("Failed to download model: {e}"))?;
-        let embedder =
-            Embedder::new(&paths).map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
-        sp.finish("Model ready");
-
-        let total: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM qa_chunks c \
-             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
-            [],
-            |r| r.get(0),
-        )?;
-        if total > 0 {
-            let sp = progress::Spinner::new(&format!("Embedding {total} chunks..."));
-            let result = embedder::embed_recent_chunks(
-                &mut conn,
-                &embedder,
-                usize::try_from(total).expect("chunk count fits in usize"),
-                Some(&|done, all| {
-                    sp.set_message(&format!("Embedding chunks... {done}/{all}"));
-                }),
-            )?;
-            sp.finish(&format!("Embedded {} chunks", result.embedded));
-            result.warn_if_stopped();
+    let model_cached = cached_artifacts(ModelId::default())
+        .map(|opt| opt.is_some())
+        .unwrap_or(false);
+    eprintln!(
+        "  Model: {}",
+        if model_cached {
+            "ready (run `recall embed` to embed chunks)"
         } else {
-            progress::done("All chunks already embedded");
+            "not installed (run `recall model download`)"
         }
-    } else {
-        let model_cached = download_model(ModelId::default()).is_ok();
-        eprintln!(
-            "  Model: {}",
-            if model_cached {
-                "ready (use --embed to run embedding)"
-            } else {
-                "not downloaded (use --embed to download and run)"
-            }
-        );
-    }
+    );
 
     Ok(())
+}
+
+fn run_embed(_verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+    let path = resolve_db_path(db_path)?;
+    let mut conn = open_or_create_db(&path)?;
+
+    let pending: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM qa_chunks c \
+         WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
+        [],
+        |r| r.get(0),
+    )?;
+
+    if pending == 0 {
+        done("All chunks already embedded");
+        return Ok(());
+    }
+
+    let pending_u32 = u32::try_from(pending).unwrap_or(u32::MAX);
+    let pending_usize = usize::try_from(pending).expect("chunk count fits in usize");
+
+    let result = embed_with_spinners(
+        pending_u32,
+        |_| load_cached_embedder(),
+        |r: &embedder::EmbedResult| format!("Embedded {} chunks", r.embedded),
+        |emb, update| {
+            embedder::embed_recent_chunks(
+                &mut conn,
+                emb.as_ref(),
+                pending_usize,
+                Some(&|n, _| update(&format!("Embedding... {n}/{pending} chunks"))),
+            )
+        },
+    )?;
+
+    if let Some(r) = result {
+        r.warn_if_stopped();
+    }
+    Ok(())
+}
+
+fn load_cached_embedder() -> Result<Arc<dyn Embed>> {
+    try_load_embedder_with(
+        || cached_artifacts(ModelId::default()),
+        |e| eprintln!("Warning: failed to delete corrupt model files: {e}"),
+        |e| eprintln!("Warning: embedder probe failed: {e}"),
+    )
+    .map_err(|reason| {
+        let hint = match reason {
+            DegradedReason::NotInstalled => {
+                "embedding model not installed; run `recall model download`"
+            }
+            DegradedReason::BackendUnavailable => "MLX backend unavailable",
+            DegradedReason::ProbeFailed => "embedding model probe failed",
+            DegradedReason::Disabled => "embedder disabled",
+        };
+        anyhow::anyhow!("{hint}")
+    })
+}
+
+fn run_model_download() -> Result<()> {
+    download_and_verify_model().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
@@ -237,7 +285,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
     let mut conn = open_or_create_db(&path)?;
 
     // Auto-index FTS5 + chunks (fast: skips scan if dirs unchanged)
-    let sp = progress::Spinner::new("Indexing...");
+    let sp = Spinner::new("Indexing...");
     let stats = indexer::index_sessions(&mut conn, false, verbose)?;
     let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
     if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
@@ -249,7 +297,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
         sp.finish(&format!("{} sessions", stats.total_sessions));
     }
 
-    let embedder = try_load_embedder();
+    let embedder = try_load_embedder_cached();
 
     let results = search::search_with_embedder(
         &conn,
@@ -261,13 +309,13 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             limit: limit.into(),
             now_ms: None,
         },
-        embedder.as_ref().map(|e| e as &dyn Embed),
+        embedder.as_deref(),
     )?;
 
     print_results(&results);
 
     // Post-search: progressive embedding (search results + recent)
-    if !no_embed && let Some(emb) = embedder.as_ref() {
+    if !no_embed && let Some(emb) = embedder.as_deref() {
         let session_ids: Vec<String> = results
             .iter()
             .map(|r| r.session.session_id.clone())
@@ -405,13 +453,15 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     println!("QA chunks: {chunks}");
     println!("Embedded: {embedded}/{chunks}");
 
-    let model_ok = download_model(ModelId::default()).is_ok();
+    let model_ok = cached_artifacts(ModelId::default())
+        .map(|opt| opt.is_some())
+        .unwrap_or(false);
     println!(
         "Model: {}",
         if model_ok {
             "ready"
         } else {
-            "not downloaded (run `recall index`)"
+            "not installed (run `recall model download`)"
         }
     );
 
@@ -505,24 +555,22 @@ fn print_results(results: &[search::SearchResult]) {
 
 // -- Entry point --
 
-fn run() -> Result<()> {
-    // Backward compat: if first arg is not a subcommand, treat as `search <query>`
-    let args: Vec<String> = env::args().collect();
-    let known_commands = ["index", "search", "show", "status", "help"];
+const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "index", "embed", "model", "search", "show", "status", "help",
+];
+const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v"];
 
-    let cli = if args.len() > 1
-        && !args[1].starts_with('-')
-        && !known_commands.contains(&args[1].as_str())
-    {
-        let mut patched = vec![args[0].clone(), "search".to_owned()];
-        patched.extend_from_slice(&args[1..]);
-        Cli::parse_from(patched)
-    } else {
-        Cli::parse()
+fn run() -> Result<()> {
+    let args: Vec<OsString> = env::args_os().collect();
+    let cli = match try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS) {
+        Some(expanded) => Cli::parse_from(expanded),
+        None => Cli::parse_from(args),
     };
 
     match cli.command {
-        Some(Command::Index { force, embed }) => run_index(force, embed, cli.verbose, &cli.db_path),
+        Some(Command::Index { force }) => run_index(force, cli.verbose, &cli.db_path),
+        Some(Command::Embed) => run_embed(cli.verbose, &cli.db_path),
+        Some(Command::Model(ModelCommand::Download)) => run_model_download(),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, cli.verbose, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
@@ -536,6 +584,8 @@ fn run() -> Result<()> {
 
 /// Exit codes: 1 = user error (bad query, missing args), 2 = system error (IO, DB).
 fn main() {
+    handle_probe_if_needed();
+
     if let Err(e) = run() {
         let msg = format!("{e:#}");
         eprintln!("Error: {msg}");

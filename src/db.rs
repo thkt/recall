@@ -111,7 +111,7 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
 
     if !sql.contains("sub_idx") {
         eprintln!(
-            "recall: Embedding schema changed — clearing embeddings (re-run `recall index --embed` to rebuild)"
+            "recall: Embedding schema changed — clearing embeddings (run `recall embed` to rebuild)"
         );
         let tx = conn.transaction()?;
         tx.execute_batch(

@@ -1042,7 +1042,8 @@ mod tests {
             [],
         )
         .unwrap();
-        for i in 0..40 {
+        let message_count = EMBED_BATCH_SIZE + 10;
+        for i in 0..message_count {
             conn.execute(
                 "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
                 [format!("question number {i}")],

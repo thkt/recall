@@ -90,9 +90,20 @@ recall search "auth" --no-embed                                    # post-search
 ### インデックス
 
 ```sh
-recall index            # parse + chunk + モデルダウンロード
+recall index            # parse + chunk（モデル呼び出しなし）
 recall index --force    # 全件再構築
-recall index --embed    # 全チャンクを一括 embedding（初回は時間がかかります）
+```
+
+### Embedding
+
+```sh
+recall embed            # 未embeddingのチャンクを一括embedding（モデル必須）
+```
+
+### モデル
+
+```sh
+recall model download   # embeddingモデルをダウンロードして verify
 ```
 
 ### セッション表示
@@ -117,7 +128,7 @@ recall status           # セッション数、チャンク数、embeddingカバ
 
 **インデックス** — `recall index` でセッションディレクトリをスキャン、JSONLを解析し、全文検索インデックスとQ&Aチャンクを構築します。差分更新で、変更ファイルのみ再インデックスします。ディレクトリのmtimeチェックにより、変更がなければスキャン自体をスキップします。
 
-**Embedding** — 検索のたびに20チャンクをembed: 結果セッション10件 + 最新10件。Ruri v3（310Mパラメータ）をmlx-rs + MLXでApple Silicon上で実行します。バッチ推論（batch=32）と長さソートによるpadding最小化。モデルは初回 `recall index` 時に自動ダウンロードします。
+**Embedding** — 検索のたびに20チャンクをembed: 結果セッション10件 + 最新10件。Ruri v3（310Mパラメータ）をmlx-rs + MLXでApple Silicon上で実行します。バッチ推論（batch=128）と長さソートによるpadding最小化。モデルは `recall model download` で明示的にダウンロードします。未ダウンロード時はFTS5のキーワード検索のみで動作します。
 
 **ランキング** — embeddingがあればReciprocal Rank Fusion (RRF) でFTS5キーワードスコアとベクトル類似度を統合します。スコアが近い場合は新しいセッションにrecency boostがかかります。
 
@@ -145,7 +156,7 @@ src/
 | --------------------------------------- | ------------------------------------------ |
 | `recall index`（6kファイル）            | 約0.5秒（差分）、約4分（全件再構築）       |
 | `recall search`                         | 約2秒（embedding込み）、即座（--no-embed） |
-| `recall index --embed`（28kチャンク）   | 約11分（M3, batch=32）                     |
+| `recall embed`（28kチャンク）           | 約11分（M3, batch=128）                    |
 | embeddingスループット                   | 約45 chunks/sec（M3 + MLX）                |
 | 初回モデルダウンロード                  | 約1.2 GB                                   |
 

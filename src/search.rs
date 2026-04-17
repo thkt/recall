@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use amici::storage::anon_placeholders;
 use anyhow::{Context, Result};
 use rurico::embed::Embed;
 use rurico::storage::{f32_as_bytes, rrf_merge};
@@ -272,7 +273,7 @@ fn fetch_session_metadata(
     conn: &Connection,
     ranked: &[(String, f64)],
 ) -> Result<HashMap<String, SessionData>> {
-    let placeholders = ranked.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = anon_placeholders(ranked.len());
     let sql = format!(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id IN ({placeholders})"
