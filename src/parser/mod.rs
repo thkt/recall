@@ -97,10 +97,7 @@ pub fn strip_noise_tags(mut result: String) -> String {
     ];
 
     for (open, close) in NOISE_TAGS {
-        loop {
-            let Some(start) = result.find(open) else {
-                break;
-            };
+        while let Some(start) = result.find(open) {
             let Some(end_offset) = result[start..].find(close) else {
                 break; // unclosed tag — leave intact
             };
