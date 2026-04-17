@@ -4,6 +4,7 @@ mod codex;
 pub use claude::parse_claude_session;
 pub use codex::parse_codex_session;
 
+use std::fmt;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -34,8 +35,8 @@ impl Source {
     }
 }
 
-impl std::fmt::Display for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Source {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -236,10 +237,10 @@ pub(super) fn parse_jsonl_entries(
     path: &Path,
     mut process: impl FnMut(&Value) -> Option<Message>,
 ) -> Result<(Vec<Message>, usize)> {
-    use std::io::{BufRead, BufReader};
+    use std::fs::File;
+    use std::io::{BufRead, BufReader, ErrorKind};
 
-    let file =
-        std::fs::File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
     let mut skipped_lines = 0;
@@ -247,7 +248,7 @@ pub(super) fn parse_jsonl_entries(
     for line_result in reader.lines() {
         let raw_line = match line_result {
             Ok(line) => line,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            Err(e) if e.kind() == ErrorKind::InvalidData => {
                 skipped_lines += 1;
                 continue;
             }
@@ -279,7 +280,7 @@ pub(super) fn session_id_from_path(path: &Path) -> Option<String> {
     if stem.is_empty() {
         return None;
     }
-    Some(stem.to_string())
+    Some(stem.to_owned())
 }
 
 pub(super) fn update_earliest(earliest: &mut Option<i64>, ts: i64) {

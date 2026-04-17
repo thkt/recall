@@ -1,6 +1,9 @@
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # paste: no longer maintained (transitive via mlx-rs → rurico)
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2

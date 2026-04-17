@@ -1,6 +1,8 @@
 use std::borrow::Cow;
+use std::iter::Peekable;
+use std::str::Chars;
 
-fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars>) {
+fn skip_csi(chars: &mut Peekable<Chars>) {
     for next in chars.by_ref() {
         if next.is_ascii_alphabetic() {
             break;
@@ -8,7 +10,7 @@ fn skip_csi(chars: &mut std::iter::Peekable<std::str::Chars>) {
     }
 }
 
-fn skip_osc(chars: &mut std::iter::Peekable<std::str::Chars>) {
+fn skip_osc(chars: &mut Peekable<Chars>) {
     while let Some(next) = chars.next() {
         if next == '\x07' {
             break;

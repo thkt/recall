@@ -1,13 +1,17 @@
+use std::path::Path;
+use std::time::Duration;
+
 use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
+use rurico::storage::ensure_sqlite_vec;
 use rusqlite::Connection;
 
 const FTS_TOKENIZER: &str = "trigram";
 
-pub fn open_db(path: &std::path::Path) -> Result<Connection> {
-    rurico::storage::ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
+pub fn open_db(path: &Path) -> Result<Connection> {
+    ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
     let mut conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.busy_timeout(Duration::from_secs(5))?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     create_schema(&mut conn)?;
@@ -148,7 +152,7 @@ mod tests {
             .query_row("SELECT vec_version()", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, "v0.1.7",
+            version, "v0.1.9",
             "sqlite-vec version changed — re-verify unsafe transmute ABI in ensure_sqlite_vec()"
         );
     }
@@ -161,7 +165,7 @@ mod tests {
     }
 
     /// Create a DB with a pre-trigram tokenizer and one session+message.
-    fn create_old_schema_db(path: &std::path::Path) {
+    fn create_old_schema_db(path: &Path) {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch(
             "CREATE TABLE sessions (

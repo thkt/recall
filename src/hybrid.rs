@@ -1,3 +1,5 @@
+use std::f64::consts::LN_2;
+
 use crate::date::MS_PER_DAY;
 
 pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
@@ -7,7 +9,7 @@ pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
     match ts {
         Some(ts) => {
             let age_days = ((now_ms as f64 - ts as f64) / MS_PER_DAY as f64).max(0.0);
-            (-std::f64::consts::LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
+            (-LN_2 * age_days / RECENCY_HALF_LIFE_DAYS).exp()
         }
         None => 0.0,
     }
@@ -32,6 +34,8 @@ pub(crate) fn apply_recency_boost(
 mod tests {
     use std::collections::HashMap;
 
+    use rurico::storage::rrf_merge;
+
     use super::*;
 
     // T-008: FTS5 + vec results merged by RRF (FR-005)
@@ -41,7 +45,7 @@ mod tests {
         // B at position 0 in vec list (rank=0), C at position 1 (rank=1)
         let vec: Vec<(String, f64)> = vec![("B".into(), 0.0), ("C".into(), 0.0)];
 
-        let merged = rurico::storage::rrf_merge(&fts, &vec);
+        let merged = rrf_merge(&fts, &vec);
 
         // B appears in both lists → highest score
         assert_eq!(merged[0].0, "B");
@@ -60,7 +64,7 @@ mod tests {
         let fts: Vec<(String, f64)> = vec![("A".into(), 0.0)];
         let vec: Vec<(String, f64)> = vec![];
 
-        let merged = rurico::storage::rrf_merge(&fts, &vec);
+        let merged = rrf_merge(&fts, &vec);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].0, "A");
@@ -78,11 +82,11 @@ mod tests {
         let now_ms = 1_750_000_000_000_i64;
 
         // Same RRF score but different timestamps
-        let mut results = vec![("old".to_string(), 0.01), ("new".to_string(), 0.01)];
+        let mut results = vec![("old".to_owned(), 0.01), ("new".to_owned(), 0.01)];
 
         let mut timestamps = HashMap::new();
-        timestamps.insert("old".to_string(), Some(now_ms - 365 * MS_PER_DAY));
-        timestamps.insert("new".to_string(), Some(now_ms));
+        timestamps.insert("old".to_owned(), Some(now_ms - 365 * MS_PER_DAY));
+        timestamps.insert("new".to_owned(), Some(now_ms));
 
         apply_recency_boost(
             &mut results,
@@ -101,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_recency_boost_no_timestamp() {
-        let mut results = vec![("no-ts".to_string(), 0.5)];
+        let mut results = vec![("no-ts".to_owned(), 0.5)];
         apply_recency_boost(&mut results, |_| None, 1_000_000);
 
         assert!((results[0].1 - 0.5).abs() < 1e-10);
@@ -111,7 +115,7 @@ mod tests {
     fn test_rrf_empty_inputs() {
         let fts: Vec<(String, f64)> = vec![];
         let vec: Vec<(String, f64)> = vec![];
-        let merged = rurico::storage::rrf_merge(&fts, &vec);
+        let merged = rrf_merge(&fts, &vec);
         assert!(merged.is_empty());
     }
 }

@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use rurico::embed::Embed;
+use rurico::storage::{f32_as_bytes, rrf_merge};
 use rusqlite::Connection;
+use rusqlite::types::{ToSql, ToSqlOutput};
 
 use crate::date::MS_PER_DAY;
 use crate::hybrid;
 use crate::parser::{SessionData, Source};
-use rurico::embed::Embed;
 
 const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
@@ -42,8 +45,8 @@ enum Param {
     Int(i64),
 }
 
-impl rusqlite::types::ToSql for Param {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+impl ToSql for Param {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         match self {
             Param::Str(s) => s.to_sql(),
             Param::Int(i) => i.to_sql(),
@@ -74,7 +77,7 @@ fn sanitize_fts_query(query: &str) -> String {
                 let clean = w.replace('"', "");
                 format!("\"{clean}\"")
             } else {
-                w.to_string()
+                w.to_owned()
             }
         })
         .filter(|w| !w.is_empty())
@@ -99,17 +102,17 @@ fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Para
     let mut conditions = Vec::new();
     if let Some(ref project) = opts.project {
         let escaped = escape_like(project);
-        conditions.push("s2.project LIKE ? || '%' ESCAPE '\\'".to_string());
+        conditions.push("s2.project LIKE ? || '%' ESCAPE '\\'".to_owned());
         params.push(Param::Str(escaped));
     }
     if let Some(days) = opts.days {
         let cutoff = now_ms - days * MS_PER_DAY;
-        conditions.push("s2.timestamp >= ?".to_string());
+        conditions.push("s2.timestamp >= ?".to_owned());
         params.push(Param::Int(cutoff));
     }
     if let Some(source) = opts.source {
-        conditions.push("s2.source = ?".to_string());
-        params.push(Param::Str(source.as_str().to_string()));
+        conditions.push("s2.source = ?".to_owned());
+        params.push(Param::Str(source.as_str().to_owned()));
     }
     if conditions.is_empty() {
         String::new()
@@ -133,7 +136,7 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
     for token in sanitized_query.split_whitespace() {
         let upper = token.to_ascii_uppercase();
         if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            parts.push(token.to_string());
+            parts.push(token.to_owned());
             continue;
         }
         let unquoted = token.trim_matches('"');
@@ -141,7 +144,7 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
             continue;
         }
         if unquoted.chars().count() >= 3 {
-            parts.push(token.to_string());
+            parts.push(token.to_owned());
             continue;
         }
         // Expand <3-char term via fts5vocab prefix match (e.g. "go" → "go" OR "golang" OR ...).
@@ -162,11 +165,11 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
         }
         .into_iter()
         // Trigrams like "go:" or "方針*" break FTS5 MATCH syntax; keep alphanumeric only.
-        .filter(|t| t.chars().all(|c| c.is_alphanumeric()))
+        .filter(|t| t.chars().all(char::is_alphanumeric))
         .map(|t| format!("\"{t}\""))
         .collect();
         if terms.is_empty() {
-            parts.push(token.to_string());
+            parts.push(token.to_owned());
         } else {
             parts.push(format!("({})", terms.join(" OR ")));
         }
@@ -225,11 +228,7 @@ fn build_candidate_sql(sq: &SearchQuery) -> String {
 
 fn find_candidate_sessions(conn: &Connection, sq: &SearchQuery) -> Result<Vec<(String, f64)>> {
     let sql = build_candidate_sql(sq);
-    let refs: Vec<&dyn rusqlite::types::ToSql> = sq
-        .params
-        .iter()
-        .map(|p| p as &dyn rusqlite::types::ToSql)
-        .collect();
+    let refs: Vec<&dyn ToSql> = sq.params.iter().map(|p| p as &dyn ToSql).collect();
     debug_assert_eq!(
         refs.len(),
         sql.matches('?').count(),
@@ -278,10 +277,7 @@ fn fetch_session_metadata(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id IN ({placeholders})"
     );
-    let refs: Vec<&dyn rusqlite::types::ToSql> = ranked
-        .iter()
-        .map(|(sid, _)| sid as &dyn rusqlite::types::ToSql)
-        .collect();
+    let refs: Vec<&dyn ToSql> = ranked.iter().map(|(sid, _)| sid as &dyn ToSql).collect();
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(refs.as_slice(), |row| {
@@ -411,8 +407,8 @@ fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
     match opts.now_ms {
         Some(ms) => Ok(ms),
         None => i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
                 .context("system clock before UNIX epoch")?
                 .as_millis(),
         )
@@ -434,7 +430,7 @@ fn vec_search(
     let embedding = embedder
         .embed_query(query)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let embedding_bytes: &[u8] = rurico::storage::f32_as_bytes(&embedding);
+    let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
 
     // Subquery pushes the knn LIMIT down to the vec0 virtual table.
     // GROUP BY deduplicates sessions; ORDER BY MIN(distance) preserves rank.
@@ -499,7 +495,7 @@ pub fn search_with_embedder(
             }
         };
 
-        let mut merged = rurico::storage::rrf_merge(&fts_hits, &vec_hits);
+        let mut merged = rrf_merge(&fts_hits, &vec_hits);
 
         let mut meta_map = fetch_session_metadata(conn, &merged)?;
 
@@ -528,6 +524,8 @@ pub fn search_with_embedder(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::db::setup_test_db;
     use crate::embedder::MockEmbedder;
@@ -535,7 +533,7 @@ mod tests {
     fn make_result(sid: &str, ts: i64) -> SearchResult {
         SearchResult {
             session: SessionData {
-                session_id: sid.to_string(),
+                session_id: sid.to_owned(),
                 source: Source::Claude,
                 file_path: String::new(),
                 project: String::new(),
@@ -623,7 +621,7 @@ mod tests {
             &conn,
             "error handling",
             &SearchOptions {
-                project: Some("/home/me/proj-a".to_string()),
+                project: Some("/home/me/proj-a".to_owned()),
                 ..Default::default()
             },
         )
@@ -693,7 +691,7 @@ mod tests {
             &conn,
             "wildcard",
             &SearchOptions {
-                project: Some("%".to_string()),
+                project: Some("%".to_owned()),
                 ..Default::default()
             },
         )
@@ -763,7 +761,7 @@ mod tests {
             &conn,
             "型安",
             &SearchOptions {
-                project: Some("/home/me/proj-a".to_string()),
+                project: Some("/home/me/proj-a".to_owned()),
                 ..Default::default()
             },
         )
@@ -937,8 +935,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
             claude_dir.join("sess-alpha.jsonl"),
             concat!(
                 r#"{"type":"user","cwd":"/home/me/alpha","slug":"alpha-session","message":{"role":"user","content":"how to implement authentication in Rust"},"timestamp":"2026-03-01T12:00:00Z"}"#,
@@ -946,7 +944,7 @@ mod tests {
                 r#"{"type":"assistant","message":{"role":"assistant","content":"Use the argon2 crate for password hashing"},"timestamp":"2026-03-01T12:00:01Z"}"#,
             ),
         ).unwrap();
-        std::fs::write(
+        fs::write(
             claude_dir.join("sess-beta.jsonl"),
             r#"{"type":"user","cwd":"/home/me/beta","slug":"beta-session","message":{"role":"user","content":"explain quicksort algorithm"},"timestamp":"2026-03-02T10:00:00Z"}"#,
         ).unwrap();
@@ -981,7 +979,7 @@ mod tests {
             &conn,
             "algorithm OR authentication",
             &SearchOptions {
-                project: Some("/home/me/alpha".to_string()),
+                project: Some("/home/me/alpha".to_owned()),
                 ..Default::default()
             },
         )
@@ -1052,7 +1050,7 @@ mod tests {
         )
         .unwrap();
         let embedding = MockEmbedder::deterministic_vector("authentication");
-        let embedding_bytes: &[u8] = rurico::storage::f32_as_bytes(&embedding);
+        let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
         conn.execute(
             "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
             [embedding_bytes],
@@ -1103,7 +1101,7 @@ mod tests {
         )
         .unwrap();
         let embedding = MockEmbedder::deterministic_vector("content");
-        let embedding_bytes: &[u8] = rurico::storage::f32_as_bytes(&embedding);
+        let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
         conn.execute(
             "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
             [embedding_bytes],

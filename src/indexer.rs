@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::result::Result as StdResult;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 use crate::chunker;
 use crate::parser::{
@@ -27,7 +30,7 @@ enum IndexOutcome {
 }
 
 struct IndexContext<'a> {
-    tx: &'a rusqlite::Transaction<'a>,
+    tx: &'a Transaction<'a>,
     existing: &'a HashMap<String, SessionEntry>,
     verbose: bool,
 }
@@ -48,7 +51,7 @@ enum Mtime {
 }
 
 fn resolve_mtime(fpath: &Path, verbose: bool) -> Mtime {
-    let meta = match std::fs::metadata(fpath) {
+    let meta = match fs::metadata(fpath) {
         Ok(m) => m,
         Err(_) => {
             if verbose {
@@ -66,7 +69,7 @@ fn resolve_mtime(fpath: &Path, verbose: bool) -> Mtime {
             return Mtime::Unknown;
         }
     };
-    match mtime.duration_since(std::time::UNIX_EPOCH) {
+    match mtime.duration_since(UNIX_EPOCH) {
         Ok(d) => Mtime::Value(d.as_secs_f64()),
         Err(e) => {
             if verbose {
@@ -78,7 +81,7 @@ fn resolve_mtime(fpath: &Path, verbose: bool) -> Mtime {
 }
 
 /// Delete all dependent data for a session (messages, chunks, embeddings).
-fn delete_session_dependents(tx: &rusqlite::Transaction, session_id: &str) -> Result<()> {
+fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     tx.execute("DELETE FROM messages WHERE session_id = ?", [session_id])?;
     tx.execute(
         "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)",
@@ -149,7 +152,7 @@ fn upsert_session(
 
 fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f64>)> {
     let fpath_str = match fpath.to_str() {
-        Some(s) => s.to_string(),
+        Some(s) => s.to_owned(),
         None => {
             if ctx.verbose {
                 eprintln!("Warning: skipping non-UTF-8 path: {}", fpath.display());
@@ -204,10 +207,10 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
 
 /// Priority: `RECALL_CLAUDE_DIR` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`
 pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os("RECALL_CLAUDE_DIR") {
+    if let Some(dir) = env::var_os("RECALL_CLAUDE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(dir).join("projects");
     }
     home.join(".claude").join("projects")
@@ -216,7 +219,7 @@ pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
 pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Result<IndexStats> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let claude_dir = resolve_claude_dir(&home);
-    let codex_dir = std::env::var_os("RECALL_CODEX_DIR")
+    let codex_dir = env::var_os("RECALL_CODEX_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex").join("sessions"));
     index_from_dirs(
@@ -277,10 +280,10 @@ fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()
 }
 
 fn dir_mtime_secs(path: &Path) -> Option<f64> {
-    std::fs::metadata(path)
+    fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_secs_f64())
 }
 
@@ -294,7 +297,7 @@ fn dirs_changed_since(opts: &IndexOptions, last_scan: f64) -> bool {
             None => return true,
             _ => {}
         }
-        if let Ok(entries) = std::fs::read_dir(dir) {
+        if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if let Some(mt) = dir_mtime_secs(&entry.path())
                     && mt >= last_scan
@@ -338,9 +341,11 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         && let Some(last_scan) = get_last_scan(conn, &key)
         && !dirs_changed_since(opts, last_scan)
     {
-        let total_sessions: usize = conn
-            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
-            .max(0) as usize;
+        let total_sessions: usize = usize::try_from(
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
+                .max(0),
+        )
+        .expect("non-negative session count fits in usize");
         return Ok(IndexStats {
             indexed: 0,
             parse_errors: 0,
@@ -386,11 +391,11 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
 
     let total_sessions = {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-        n.max(0) as usize
+        usize::try_from(n.max(0)).expect("non-negative session count fits in usize")
     };
 
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
     if let Err(e) = set_last_scan(conn, &key, now_secs) {
@@ -424,7 +429,7 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEn
 }
 
 fn cleanup_orphans(
-    tx: &rusqlite::Transaction,
+    tx: &Transaction,
     existing: &HashMap<String, SessionEntry>,
     sources: &[(PathBuf, Source)],
     indexed: usize,
@@ -432,8 +437,7 @@ fn cleanup_orphans(
     if existing.is_empty() || (indexed == 0 && sources.len() == existing.len()) {
         return Ok(());
     }
-    let source_paths: std::collections::HashSet<&Path> =
-        sources.iter().map(|(p, _)| p.as_path()).collect();
+    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
     for (fp, (sid, _)) in existing {
         if !source_paths.contains(Path::new(fp.as_str())) {
             let deleted = tx.execute(
@@ -475,7 +479,7 @@ fn collect_jsonl_files_inner(
         }
         return;
     }
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("Warning: cannot read {}: {e}", dir.display());
@@ -528,7 +532,7 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+        rows.collect::<StdResult<Vec<_>, _>>()?
     };
 
     if sessions.is_empty() {
@@ -587,7 +591,10 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::db::setup_test_db;
     use crate::embedder::{
@@ -601,8 +608,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
             claude_dir.join("session1.jsonl"),
             r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         ).unwrap();
@@ -642,8 +649,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
             claude_dir.join("session1.jsonl"),
             r#"{"type":"user","message":{"role":"user","content":"hello"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         ).unwrap();
@@ -664,7 +671,7 @@ mod tests {
 
         // Populate qa_chunks + vec_chunks before force reindex
         index_chunks(&mut conn, false).unwrap();
-        let embedder = crate::embedder::MockEmbedder::new();
+        let embedder = MockEmbedder::new();
         embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
         let qa_before: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
@@ -706,11 +713,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
+        fs::create_dir_all(&claude_dir).unwrap();
         let f1 = claude_dir.join("session1.jsonl");
         let f2 = claude_dir.join("session2.jsonl");
-        std::fs::write(&f1, r#"{"type":"user","message":{"role":"user","content":"one"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
-        std::fs::write(&f2, r#"{"type":"user","message":{"role":"user","content":"two"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
+        fs::write(&f1, r#"{"type":"user","message":{"role":"user","content":"one"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
+        fs::write(&f2, r#"{"type":"user","message":{"role":"user","content":"two"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
 
         let codex_dir = tmp.path().join("codex_sessions");
 
@@ -729,7 +736,7 @@ mod tests {
 
         // Create chunks + embeddings for session2 before deleting the file
         index_chunks(&mut conn, false).unwrap();
-        let embedder = crate::embedder::MockEmbedder::new();
+        let embedder = MockEmbedder::new();
         embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
         let chunks_before: i64 = conn
             .query_row(
@@ -747,7 +754,7 @@ mod tests {
             "should have vec_chunks before orphan cleanup"
         );
 
-        std::fs::remove_file(&f2).unwrap();
+        fs::remove_file(&f2).unwrap();
         // force: false exercises cleanup_orphans (force: true bulk-deletes everything,
         // which would make the cascade assertion a false pass)
         let stats2 = index_from_dirs(
@@ -791,13 +798,13 @@ mod tests {
 
         let dir_a = tmp.path().join("claude_a");
         let dir_b = tmp.path().join("claude_b");
-        std::fs::create_dir_all(&dir_a).unwrap();
-        std::fs::create_dir_all(&dir_b).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(
             dir_a.join("collision.jsonl"),
             r#"{"type":"user","message":{"role":"user","content":"from dir a"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         ).unwrap();
-        std::fs::write(
+        fs::write(
             dir_b.join("collision.jsonl"),
             r#"{"type":"user","message":{"role":"user","content":"from dir b"},"timestamp":"2026-03-02T00:00:00Z"}"#,
         ).unwrap();
@@ -846,10 +853,10 @@ mod tests {
         for i in 0..MAX_DIR_DEPTH {
             deep = deep.join(format!("d{i}"));
         }
-        std::fs::create_dir_all(&deep).unwrap();
-        std::fs::write(deep.join("deep.jsonl"), "{}").unwrap();
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.jsonl"), "{}").unwrap();
 
-        std::fs::write(tmp.path().join("shallow.jsonl"), "{}").unwrap();
+        fs::write(tmp.path().join("shallow.jsonl"), "{}").unwrap();
 
         let mut files = Vec::new();
         collect_jsonl_files(tmp.path(), &mut files, Source::Claude, false);
@@ -861,13 +868,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_collect_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
         let tmp = TempDir::new().unwrap();
 
         let real_file = tmp.path().join("real.jsonl");
-        std::fs::write(&real_file, "{}").unwrap();
+        fs::write(&real_file, "{}").unwrap();
 
         let link = tmp.path().join("link.jsonl");
-        std::os::unix::fs::symlink(&real_file, &link).unwrap();
+        symlink(&real_file, &link).unwrap();
 
         let mut files = Vec::new();
         collect_jsonl_files(tmp.path(), &mut files, Source::Claude, false);
@@ -882,8 +891,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
             claude_dir.join("s1.jsonl"),
             concat!(
                 r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello"},"timestamp":"2026-03-01T00:00:00Z"}"#,
@@ -912,22 +921,20 @@ mod tests {
         assert_eq!(stats2.chunks_created, 0);
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// SAFETY: caller must hold ENV_LOCK.
     unsafe fn apply_env(key: &str, val: Option<&str>) {
         match val {
-            Some(v) => unsafe { std::env::set_var(key, v) },
-            None => unsafe { std::env::remove_var(key) },
+            Some(v) => unsafe { env::set_var(key, v) },
+            None => unsafe { env::remove_var(key) },
         }
     }
 
     fn with_env_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
         let _lock = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(&str, Option<String>)> = vars
-            .iter()
-            .map(|(k, _)| (*k, std::env::var(*k).ok()))
-            .collect();
+        let saved: Vec<(&str, Option<String>)> =
+            vars.iter().map(|(k, _)| (*k, env::var(*k).ok())).collect();
         for (k, v) in vars {
             // SAFETY: serialized by ENV_LOCK; no other threads access these env vars.
             unsafe { apply_env(k, *v) };
@@ -982,8 +989,8 @@ mod tests {
         let (_dir, mut conn) = setup_test_db();
         let tmp = TempDir::new().unwrap();
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
             claude_dir.join("s1.jsonl"),
             concat!(
                 r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
@@ -1014,7 +1021,7 @@ mod tests {
         let embedder = MockEmbedder::new();
         let result = embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
 
-        assert_eq!(result.embedded, chunk_count as usize);
+        assert_eq!(result.embedded, usize::try_from(chunk_count).unwrap());
         assert!(result.stopped_at_error.is_none());
 
         let vec_count: i64 = conn
@@ -1058,7 +1065,13 @@ mod tests {
         );
 
         let embedder = MockEmbedder::failing_after(EMBED_BATCH_SIZE);
-        let result = embed_recent_chunks(&mut conn, &embedder, chunk_count as usize, None).unwrap();
+        let result = embed_recent_chunks(
+            &mut conn,
+            &embedder,
+            usize::try_from(chunk_count).unwrap(),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             result.embedded, EMBED_BATCH_SIZE,
@@ -1080,8 +1093,8 @@ mod tests {
         let (_dir, mut conn) = setup_test_db();
         let tmp = TempDir::new().unwrap();
         let claude_dir = tmp.path().join("claude_projects");
-        std::fs::create_dir_all(&claude_dir).unwrap();
-        std::fs::write(
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
             claude_dir.join("s1.jsonl"),
             concat!(
                 r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
@@ -1111,9 +1124,9 @@ mod tests {
 
         let embedder = MockEmbedder::new();
         let result =
-            embed_near_sessions(&mut conn, &embedder, &["s1".to_string()], 100, None).unwrap();
+            embed_near_sessions(&mut conn, &embedder, &["s1".to_owned()], 100, None).unwrap();
 
-        assert_eq!(result.embedded, chunk_count as usize);
+        assert_eq!(result.embedded, usize::try_from(chunk_count).unwrap());
         assert!(result.stopped_at_error.is_none());
 
         let vec_count: i64 = conn
@@ -1122,7 +1135,7 @@ mod tests {
         assert_eq!(vec_count, chunk_count, "all chunks should be embedded");
 
         let result2 =
-            embed_near_sessions(&mut conn, &embedder, &["s1".to_string()], 100, None).unwrap();
+            embed_near_sessions(&mut conn, &embedder, &["s1".to_owned()], 100, None).unwrap();
         assert_eq!(result2.embedded, 0);
     }
 
@@ -1135,7 +1148,7 @@ mod tests {
         assert_eq!(result.embedded, 0);
 
         let result2 =
-            embed_near_sessions(&mut conn, &embedder, &["s1".to_string()], 0, None).unwrap();
+            embed_near_sessions(&mut conn, &embedder, &["s1".to_owned()], 0, None).unwrap();
         assert_eq!(result2.embedded, 0);
     }
 }
