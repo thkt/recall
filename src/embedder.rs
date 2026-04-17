@@ -2,6 +2,7 @@ use std::result::Result as StdResult;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use amici::storage::anon_placeholders;
 use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
@@ -112,11 +113,7 @@ pub(crate) fn embed_near_sessions(
         return Ok(EmbedResult::default());
     }
 
-    let placeholders = session_ids
-        .iter()
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(", ");
+    let placeholders = anon_placeholders(session_ids.len());
     let sql = format!(
         "SELECT c.id, c.content FROM qa_chunks c \
          WHERE c.session_id IN ({placeholders}) \
