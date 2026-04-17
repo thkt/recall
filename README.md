@@ -130,7 +130,7 @@ recall status           # sessions, chunks, embedding coverage, model status
 
 **Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — only changed files are re-indexed. Directory mtime checking skips the scan entirely when nothing changed.
 
-**Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=32) with length-sorted padding minimization. Download the model explicitly with `recall model download`; without it, search falls back to FTS5 keyword ranking only.
+**Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=128) with length-sorted padding minimization. Download the model explicitly with `recall model download`; without it, search falls back to FTS5 keyword ranking only.
 
 **Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close.
 
@@ -158,7 +158,7 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 | ----------------------------------- | ------------------------------------------ |
 | `recall index` (6k files)           | ~0.5s (incremental), ~4min (full rebuild)  |
 | `recall search`                     | ~2s (with embedding), instant (--no-embed) |
-| `recall embed` (28k chunks)         | ~11 min (M3, batch=32)                     |
+| `recall embed` (28k chunks)         | ~11 min (M3, batch=128)                    |
 | Embedding throughput                | ~45 chunks/sec (M3 + MLX)                  |
 | Initial model download              | ~1.2 GB                                    |
 

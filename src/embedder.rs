@@ -25,7 +25,7 @@ impl EmbedResult {
     }
 }
 
-pub(crate) const EMBED_BATCH_SIZE: usize = 32;
+pub(crate) const EMBED_BATCH_SIZE: usize = 128;
 
 fn embed_chunks(
     conn: &mut Connection,
