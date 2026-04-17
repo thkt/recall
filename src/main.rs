@@ -9,11 +9,15 @@ mod parser;
 mod progress;
 mod search;
 
-use std::io::Write;
+use std::env;
+use std::fs::OpenOptions;
+use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::process;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rurico::embed::{Embed, Embedder, download_model};
 use rusqlite::Connection;
 
 use crate::parser::Source;
@@ -84,8 +88,8 @@ enum Command {
 
 const EXCERPT_MAX_BYTES: usize = 200;
 
-fn create_db_file(path: &Path) -> std::io::Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
+fn create_db_file(path: &Path) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
@@ -98,7 +102,7 @@ fn create_db_file(path: &Path) -> std::io::Result<()> {
 
 fn format_timestamp(ts_ms: Option<i64>) -> String {
     let Some(ts) = ts_ms else {
-        return "unknown".to_string();
+        return "unknown".to_owned();
     };
     let days = ts.div_euclid(date::MS_PER_DAY);
     let (y, m, d) = date::civil_from_days(days);
@@ -112,7 +116,7 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 fn open_or_create_db(path: &Path) -> Result<Connection> {
     match create_db_file(path) {
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).context("Failed to create database file"),
     }
     db::open_db(path).context("Failed to open database")
@@ -127,15 +131,15 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn try_load_embedder() -> Option<rurico::embed::Embedder> {
-    let paths = match rurico::embed::download_model() {
+fn try_load_embedder() -> Option<Embedder> {
+    let paths = match download_model() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Warning: model download failed: {e}");
             return None;
         }
     };
-    match rurico::embed::Embedder::new(&paths) {
+    match Embedder::new(&paths) {
         Ok(e) => Some(e),
         Err(e) => {
             eprintln!("Warning: model load failed: {e}");
@@ -174,10 +178,10 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
 
     if embed {
         let sp = progress::Spinner::new("Loading model...");
-        let paths = rurico::embed::download_model()
-            .map_err(|e| anyhow::anyhow!("Failed to download model: {e}"))?;
-        let embedder = rurico::embed::Embedder::new(&paths)
-            .map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
+        let paths =
+            download_model().map_err(|e| anyhow::anyhow!("Failed to download model: {e}"))?;
+        let embedder =
+            Embedder::new(&paths).map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         sp.finish("Model ready");
 
         let total: i64 = conn.query_row(
@@ -191,7 +195,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
             let result = embedder::embed_recent_chunks(
                 &mut conn,
                 &embedder,
-                total as usize,
+                usize::try_from(total).expect("chunk count fits in usize"),
                 Some(&|done, all| {
                     sp.set_message(&format!("Embedding chunks... {done}/{all}"));
                 }),
@@ -202,7 +206,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
             progress::done("All chunks already embedded");
         }
     } else {
-        let model_cached = rurico::embed::download_model().is_ok();
+        let model_cached = download_model().is_ok();
         eprintln!(
             "  Model: {}",
             if model_cached {
@@ -257,7 +261,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             limit: limit.into(),
             now_ms: None,
         },
-        embedder.as_ref().map(|e| e as &dyn rurico::embed::Embed),
+        embedder.as_ref().map(|e| e as &dyn Embed),
     )?;
 
     print_results(&results);
@@ -370,13 +374,13 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
     }
 
     let conn = open_or_create_db(&path)?;
-    let mut w = std::io::stdout().lock();
+    let mut w = io::stdout().lock();
 
     if let Err(e) = show_session(&conn, session_id, verbose, &mut w) {
-        if let Some(io_err) = e.downcast_ref::<std::io::Error>()
-            && io_err.kind() == std::io::ErrorKind::BrokenPipe
+        if let Some(io_err) = e.downcast_ref::<io::Error>()
+            && io_err.kind() == ErrorKind::BrokenPipe
         {
-            std::process::exit(0);
+            process::exit(0);
         }
         return Err(e);
     }
@@ -401,7 +405,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     println!("QA chunks: {chunks}");
     println!("Embedded: {embedded}/{chunks}");
 
-    let model_ok = rurico::embed::download_model().is_ok();
+    let model_ok = download_model().is_ok();
     println!(
         "Model: {}",
         if model_ok {
@@ -432,11 +436,7 @@ fn extract_parent_session(file_path: &str) -> Option<&str> {
     }
 }
 
-fn format_result(
-    w: &mut impl std::io::Write,
-    i: usize,
-    r: &search::SearchResult,
-) -> std::io::Result<()> {
+fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::Result<()> {
     let s = &r.session;
     let date = format_timestamp(s.timestamp);
     let proj_name = if s.project.is_empty() {
@@ -482,9 +482,9 @@ fn format_result(
 }
 
 fn print_result(i: usize, r: &search::SearchResult) {
-    if let Err(e) = format_result(&mut std::io::stdout().lock(), i, r) {
-        if e.kind() == std::io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
+    if let Err(e) = format_result(&mut io::stdout().lock(), i, r) {
+        if e.kind() == ErrorKind::BrokenPipe {
+            process::exit(0);
         }
         eprintln!("Warning: failed to write result: {e}");
     }
@@ -507,14 +507,14 @@ fn print_results(results: &[search::SearchResult]) {
 
 fn run() -> Result<()> {
     // Backward compat: if first arg is not a subcommand, treat as `search <query>`
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = env::args().collect();
     let known_commands = ["index", "search", "show", "status", "help"];
 
     let cli = if args.len() > 1
         && !args[1].starts_with('-')
         && !known_commands.contains(&args[1].as_str())
     {
-        let mut patched = vec![args[0].clone(), "search".to_string()];
+        let mut patched = vec![args[0].clone(), "search".to_owned()];
         patched.extend_from_slice(&args[1..]);
         Cli::parse_from(patched)
     } else {
@@ -544,7 +544,7 @@ fn main() {
         } else {
             2
         };
-        std::process::exit(code);
+        process::exit(code);
     }
 }
 
@@ -586,14 +586,14 @@ mod tests {
     fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
         search::SearchResult {
             session: parser::SessionData {
-                session_id: session_id.to_string(),
+                session_id: session_id.to_owned(),
                 source: parser::Source::Claude,
-                file_path: "/path/to/file.jsonl".to_string(),
-                project: project.to_string(),
-                slug: "test-slug".to_string(),
+                file_path: "/path/to/file.jsonl".to_owned(),
+                project: project.to_owned(),
+                slug: "test-slug".to_owned(),
                 timestamp: Some(1709251200000),
             },
-            excerpt: excerpt.to_string(),
+            excerpt: excerpt.to_owned(),
         }
     }
 
@@ -643,15 +643,15 @@ mod tests {
     fn test_subagent_file_path_shows_parent_session() {
         let r = search::SearchResult {
             session: parser::SessionData {
-                session_id: "agent-a58c408".to_string(),
+                session_id: "agent-a58c408".to_owned(),
                 source: parser::Source::Claude,
                 file_path: "/home/.claude/projects/proj/abc-def-123/subagents/agent-a58c408.jsonl"
-                    .to_string(),
-                project: "/proj".to_string(),
-                slug: "agent-slug".to_string(),
+                    .to_owned(),
+                project: "/proj".to_owned(),
+                slug: "agent-slug".to_owned(),
                 timestamp: Some(1709251200000),
             },
-            excerpt: "some text".to_string(),
+            excerpt: "some text".to_owned(),
         };
         let mut buf = Vec::new();
         format_result(&mut buf, 0, &r).unwrap();

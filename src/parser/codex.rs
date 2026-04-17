@@ -65,13 +65,13 @@ fn process_codex_entry(
                 && !id.is_empty()
                 && state.session_id.starts_with("rollout-")
             {
-                state.session_id = id.to_string();
+                state.session_id = id.to_owned();
             }
             if state.project.is_empty()
                 && let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str())
                 && !cwd.is_empty()
             {
-                state.project = cwd.to_string();
+                state.project = cwd.to_owned();
             }
             None
         }
@@ -166,7 +166,7 @@ fn extract_uuid_short(filename: &str) -> Option<String> {
             && window[0].chars().all(|c| c.is_ascii_hexdigit())
             && window[1].chars().all(|c| c.is_ascii_hexdigit())
         {
-            return Some(window[0].to_string());
+            return Some(window[0].to_owned());
         }
     }
     None
@@ -183,7 +183,7 @@ fn extract_cwd_from_env_context(text: &str) -> Option<String> {
             let after = &line[pos + MARKER.len()..];
             let trimmed = after.trim();
             if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
+                return Some(trimmed.to_owned());
             }
         }
     }
@@ -192,6 +192,8 @@ fn extract_cwd_from_env_context(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::parser::write_test_jsonl as write_jsonl;
 
@@ -236,7 +238,7 @@ mod tests {
         let path = dir
             .path()
             .join("rollout-2026-01-17T16-39-33-019bccd3-8798-7e11-b1d1-c61959201d0b.jsonl");
-        std::fs::write(
+        fs::write(
             &path,
             concat!(
                 r#"{"timestamp":"2026-01-17T16:39:33Z","type":"session_meta","payload":{"id":"019bccd3-8798-7e11-b1d1-c61959201d0b","cwd":"/home/me/codex-proj"}}"#,
@@ -258,7 +260,7 @@ mod tests {
     fn test_codex_date_slug_from_path() {
         assert_eq!(
             extract_date_from_path("/home/.codex/sessions/2026/01/18/rollout-xxx.jsonl"),
-            Some("2026-01-18".to_string())
+            Some("2026-01-18".to_owned())
         );
         assert_eq!(extract_date_from_path("/some/other/path/file.jsonl"), None);
         // Windows-style backslash path
@@ -266,7 +268,7 @@ mod tests {
             extract_date_from_path(
                 "C:\\Users\\me\\.codex\\sessions\\2026\\01\\18\\rollout-xxx.jsonl"
             ),
-            Some("2026-01-18".to_string())
+            Some("2026-01-18".to_owned())
         );
     }
 
@@ -274,7 +276,7 @@ mod tests {
     fn test_uuid_short_extraction() {
         assert_eq!(
             extract_uuid_short("rollout-2026-01-18T01-37-09-019bccd1-564a-73b3-b3b0-f6b12671ed24"),
-            Some("019bccd1".to_string())
+            Some("019bccd1".to_owned())
         );
         assert_eq!(extract_uuid_short("no-uuid-here"), None);
     }

@@ -17,7 +17,7 @@ struct ClaudeParseState {
 fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<Message> {
     if entry
         .get("isMeta")
-        .and_then(|v| v.as_bool())
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
         return None;
@@ -27,7 +27,7 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
         && let Some(cwd) = entry.get("cwd").and_then(|v| v.as_str())
         && !cwd.is_empty()
     {
-        state.project = cwd.to_string();
+        state.project = cwd.to_owned();
     }
 
     if state.slug.is_empty()
@@ -37,7 +37,7 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
             .and_then(|v| v.as_str())
         && !s.is_empty()
     {
-        state.slug = s.to_string();
+        state.slug = s.to_owned();
     }
 
     if let Some(ts_val) = entry.get("timestamp")

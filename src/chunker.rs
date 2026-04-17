@@ -18,7 +18,7 @@ const MAX_CHUNK_BYTES: usize = 16_000;
 
 fn split_text(text: &str, max_bytes: usize) -> Vec<String> {
     if text.len() <= max_bytes {
-        return vec![text.to_string()];
+        return vec![text.to_owned()];
     }
     let mut chunks = Vec::new();
     let mut remaining = text;
@@ -79,7 +79,7 @@ fn find_split_boundary(text: &str, max_bytes: usize) -> usize {
 fn sha256_hex(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Build Q&A chunks from a session's messages.
@@ -123,7 +123,7 @@ pub(crate) fn chunk_messages(
         for content in contents {
             let chunk_hash = sha256_hex(&content);
             chunks.push(QAChunk {
-                session_id: session_id.to_string(),
+                session_id: session_id.to_owned(),
                 user_text: msg.text.clone(),
                 assistant_text: assistant_text.map(String::from),
                 content,
@@ -145,7 +145,7 @@ mod tests {
     fn msg(role: Role, text: &str) -> Message {
         Message {
             role,
-            text: text.to_string(),
+            text: text.to_owned(),
         }
     }
 

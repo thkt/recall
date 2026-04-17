@@ -1,8 +1,14 @@
+use std::result::Result as StdResult;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{EMBEDDING_DIMS, EmbedError};
+use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
+use rusqlite::types::ToSql;
 
 #[derive(Default)]
 pub(crate) struct EmbedResult {
@@ -43,7 +49,7 @@ fn embed_chunks(
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
                 for (embedding, &i) in embeddings.iter().zip(batch_idx) {
-                    let embedding_bytes = rurico::storage::f32_as_bytes(embedding);
+                    let embedding_bytes = f32_as_bytes(embedding);
                     tx.execute(
                         "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
                         rusqlite::params![chunks[i].0, embedding_bytes],
@@ -72,7 +78,7 @@ fn query_and_embed(
     conn: &mut Connection,
     embedder: &dyn Embed,
     sql: &str,
-    params: &[&dyn rusqlite::types::ToSql],
+    params: &[&dyn ToSql],
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
     let missing: Vec<(i64, String)> = {
@@ -80,7 +86,7 @@ fn query_and_embed(
         let rows = stmt.query_map(params, |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()?
+        rows.collect::<StdResult<Vec<_>, _>>()?
     };
 
     embed_chunks(conn, embedder, &missing, on_progress)
@@ -111,10 +117,7 @@ pub(crate) fn embed_near_sessions(
     );
 
     let budget_i64 = budget as i64;
-    let mut refs: Vec<&dyn rusqlite::types::ToSql> = session_ids
-        .iter()
-        .map(|s| s as &dyn rusqlite::types::ToSql)
-        .collect();
+    let mut refs: Vec<&dyn ToSql> = session_ids.iter().map(|s| s as &dyn ToSql).collect();
     refs.push(&budget_i64);
 
     query_and_embed(conn, embedder, &sql, &refs, on_progress)
@@ -138,7 +141,7 @@ pub(crate) fn embed_recent_chunks(
          WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
          ORDER BY c.timestamp DESC NULLS LAST \
          LIMIT ?",
-        &[&budget_i64 as &dyn rusqlite::types::ToSql],
+        &[&budget_i64 as &dyn ToSql],
         on_progress,
     )
 }
@@ -147,7 +150,7 @@ pub(crate) fn embed_recent_chunks(
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct MockEmbedder {
-    call_count: std::sync::atomic::AtomicUsize,
+    call_count: AtomicUsize,
     fail_after: Option<usize>,
 }
 
@@ -155,14 +158,14 @@ pub(crate) struct MockEmbedder {
 impl MockEmbedder {
     pub(crate) fn new() -> Self {
         Self {
-            call_count: std::sync::atomic::AtomicUsize::new(0),
+            call_count: AtomicUsize::new(0),
             fail_after: None,
         }
     }
 
     pub(crate) fn failing_after(n: usize) -> Self {
         Self {
-            call_count: std::sync::atomic::AtomicUsize::new(0),
+            call_count: AtomicUsize::new(0),
             fail_after: Some(n),
         }
     }
@@ -191,11 +194,9 @@ impl Embed for MockEmbedder {
 
     fn embed_document(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         if let Some(limit) = self.fail_after {
-            let count = self
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count >= limit {
-                return Err(EmbedError::Inference("mock failure".to_string()));
+                return Err(EmbedError::Inference("mock failure".to_owned()));
             }
         }
         Ok(Self::deterministic_vector(text))
@@ -204,11 +205,14 @@ impl Embed for MockEmbedder {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::db::setup_test_db;
 
     #[test]
     fn test_embed_recent_chunks_budget_zero() {
-        let (_dir, mut conn) = crate::db::setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         let embedder = MockEmbedder::new();
         let result = embed_recent_chunks(&mut conn, &embedder, 0, None).unwrap();
         assert_eq!(result.embedded, 0);
@@ -217,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_embed_chunks_progress_callback() {
-        let (_dir, mut conn) = crate::db::setup_test_db();
+        let (_dir, mut conn) = setup_test_db();
         conn.execute(
             "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
             [],
@@ -239,7 +243,7 @@ mod tests {
             (3, "content 2".into()),
         ];
 
-        let calls = std::sync::Mutex::new(Vec::new());
+        let calls = Mutex::new(Vec::new());
         let result = embed_chunks(
             &mut conn,
             &embedder,
