@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
-use rurico::embed::{EMBEDDING_DIMS, EmbedError};
+use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
 use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
@@ -48,12 +48,21 @@ fn embed_chunks(
         match embedder.embed_documents_batch(&texts) {
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
-                for (embedding, &i) in embeddings.iter().zip(batch_idx) {
-                    let embedding_bytes = f32_as_bytes(embedding);
-                    tx.execute(
-                        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![chunks[i].0, embedding_bytes],
-                    )?;
+                for (chunked, &i) in embeddings.iter().zip(batch_idx) {
+                    for (sub_idx, sub_emb) in chunked.chunks.iter().enumerate() {
+                        let embedding_bytes = f32_as_bytes(sub_emb);
+                        tx.execute(
+                            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
+                             VALUES (?1, ?2, ?3)",
+                            rusqlite::params![embedding_bytes, chunks[i].0, sub_idx as i64],
+                        )?;
+                        let vec_rowid = tx.last_insert_rowid();
+                        tx.execute(
+                            "INSERT INTO embedded_chunk_ids (chunk_id, sub_idx, vec_rowid) \
+                             VALUES (?1, ?2, ?3)",
+                            rusqlite::params![chunks[i].0, sub_idx as i64, vec_rowid],
+                        )?;
+                    }
                 }
                 tx.commit()?;
                 embedded += embeddings.len();
@@ -171,7 +180,7 @@ impl MockEmbedder {
     }
 
     pub(crate) fn deterministic_vector(text: &str) -> Vec<f32> {
-        let dims = EMBEDDING_DIMS as usize;
+        let dims = EMBEDDING_DIMS;
         let mut v = vec![0.0f32; dims];
         for (i, b) in text.bytes().enumerate() {
             v[i % dims] += b as f32;
@@ -189,16 +198,28 @@ impl MockEmbedder {
 #[cfg(test)]
 impl Embed for MockEmbedder {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        self.embed_document(text)
-    }
-
-    fn embed_document(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         if let Some(limit) = self.fail_after {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count >= limit {
                 return Err(EmbedError::Inference("mock failure".to_owned()));
             }
         }
+        Ok(Self::deterministic_vector(text))
+    }
+
+    fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+        if let Some(limit) = self.fail_after {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count >= limit {
+                return Err(EmbedError::Inference("mock failure".to_owned()));
+            }
+        }
+        Ok(ChunkedEmbedding {
+            chunks: vec![Self::deterministic_vector(text)],
+        })
+    }
+
+    fn embed_text(&self, text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
         Ok(Self::deterministic_vector(text))
     }
 }

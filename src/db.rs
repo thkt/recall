@@ -32,6 +32,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     )?;
 
     migrate_fts_if_needed(conn)?;
+    migrate_vec_chunks_if_needed(conn)?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
@@ -70,14 +71,54 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-            chunk_id INTEGER PRIMARY KEY,
-            embedding FLOAT[{EMBEDDING_DIMS}]
+            embedding FLOAT[{EMBEDDING_DIMS}],
+            +chunk_id INTEGER,
+            +sub_idx INTEGER
         );"
     ))?;
 
     conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS embedded_chunk_ids (
+            chunk_id INTEGER NOT NULL,
+            sub_idx INTEGER NOT NULL,
+            vec_rowid INTEGER NOT NULL,
+            PRIMARY KEY (chunk_id, sub_idx)
+        );
+        CREATE INDEX IF NOT EXISTS idx_embedded_chunk_ids_chunk ON embedded_chunk_ids(chunk_id);",
+    )?;
+
+    conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
     )?;
+
+    Ok(())
+}
+
+fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
+    let sql: Option<String> = match conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_chunks'",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(sql) => Some(sql),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.into()),
+    };
+
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+
+    if !sql.contains("sub_idx") {
+        eprintln!(
+            "recall: Embedding schema changed — clearing embeddings (re-run `recall index --embed` to rebuild)"
+        );
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS vec_chunks; DROP TABLE IF EXISTS embedded_chunk_ids;",
+        )?;
+        tx.commit()?;
+    }
 
     Ok(())
 }

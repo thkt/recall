@@ -17,7 +17,7 @@ use std::process;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rurico::embed::{Embed, Embedder, download_model};
+use rurico::embed::{Embed, Embedder, ModelId, download_model};
 use rusqlite::Connection;
 
 use crate::parser::Source;
@@ -132,7 +132,7 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn try_load_embedder() -> Option<Embedder> {
-    let paths = match download_model() {
+    let paths = match download_model(ModelId::default()) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Warning: model download failed: {e}");
@@ -178,8 +178,8 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
 
     if embed {
         let sp = progress::Spinner::new("Loading model...");
-        let paths =
-            download_model().map_err(|e| anyhow::anyhow!("Failed to download model: {e}"))?;
+        let paths = download_model(ModelId::default())
+            .map_err(|e| anyhow::anyhow!("Failed to download model: {e}"))?;
         let embedder =
             Embedder::new(&paths).map_err(|e| anyhow::anyhow!("Failed to load model: {e}"))?;
         sp.finish("Model ready");
@@ -206,7 +206,7 @@ fn run_index(force: bool, embed: bool, verbose: bool, db_path: &Option<PathBuf>)
             progress::done("All chunks already embedded");
         }
     } else {
-        let model_cached = download_model().is_ok();
+        let model_cached = download_model(ModelId::default()).is_ok();
         eprintln!(
             "  Model: {}",
             if model_cached {
@@ -405,7 +405,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     println!("QA chunks: {chunks}");
     println!("Embedded: {embedded}/{chunks}");
 
-    let model_ok = download_model().is_ok();
+    let model_ok = download_model(ModelId::default()).is_ok();
     println!(
         "Model: {}",
         if model_ok {
