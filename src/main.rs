@@ -177,7 +177,7 @@ fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
 
 // -- Subcommands --
 
-fn run_index(force: bool, _verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(force: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
@@ -218,7 +218,7 @@ fn run_index(force: bool, _verbose: bool, db_path: &Option<PathBuf>) -> Result<(
     Ok(())
 }
 
-fn run_embed(_verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
@@ -275,7 +275,7 @@ fn run_model_download() -> Result<()> {
     download_and_verify_model().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn run_search(cmd: Command, _verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
     let Command::Search {
         query,
         project,
@@ -584,10 +584,10 @@ fn run() -> Result<()> {
     init_subscriber(default_filter);
 
     match cli.command {
-        Some(Command::Index { force }) => run_index(force, cli.verbose, &cli.db_path),
-        Some(Command::Embed) => run_embed(cli.verbose, &cli.db_path),
+        Some(Command::Index { force }) => run_index(force, &cli.db_path),
+        Some(Command::Embed) => run_embed(&cli.db_path),
         Some(Command::Model(ModelCommand::Download)) => run_model_download(),
-        Some(cmd @ Command::Search { .. }) => run_search(cmd, cli.verbose, &cli.db_path),
+        Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         None => {
