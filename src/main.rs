@@ -17,7 +17,8 @@ use std::process;
 use std::sync::Arc;
 
 use amici::cli::{
-    Spinner, done, embed_with_spinners, exit_error, progress_step, try_expand_shorthand,
+    Spinner, done, embed_with_spinners, exit_error, info as cli_info, progress_step,
+    try_expand_shorthand,
 };
 use amici::logging::init_subscriber;
 use amici::model::download_and_verify_model;
@@ -155,8 +156,8 @@ fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
     ) {
         Ok(e) => Some(e),
         Err(DegradedReason::NotInstalled) => {
-            eprintln!(
-                "Note: embedding model not installed; using text search only. Run `recall model download` to enable semantic search."
+            cli_info(
+                "note: embedding model not installed; using text search only. Run `recall model download` to enable semantic search.",
             );
             None
         }
@@ -439,8 +440,8 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
-        println!("Database not found at {}", path.display());
-        println!("Run `recall index` to create the index.");
+        cli_info(&format!("database not found at {}", path.display()));
+        cli_info("run `recall index` to create the index.");
         return Ok(());
     }
 
