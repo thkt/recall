@@ -7,6 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction};
+use tracing::{debug, info, warn};
 
 use crate::chunker;
 use crate::parser::{
@@ -23,6 +24,14 @@ pub struct IndexStats {
     pub elapsed_secs: f64,
 }
 
+impl IndexStats {
+    pub fn parse_error_detail(&self) -> Option<String> {
+        self.first_error
+            .as_ref()
+            .map(|err| format!("Failed to parse {} files — {err}", self.parse_errors))
+    }
+}
+
 enum IndexOutcome {
     Indexed,
     Unchanged,
@@ -32,12 +41,10 @@ enum IndexOutcome {
 struct IndexContext<'a> {
     tx: &'a Transaction<'a>,
     existing: &'a HashMap<String, SessionEntry>,
-    verbose: bool,
 }
 
 pub(crate) struct IndexOptions<'a> {
     pub force: bool,
-    pub verbose: bool,
     pub claude_dir: &'a Path,
     pub codex_dir: &'a Path,
 }
@@ -50,31 +57,25 @@ enum Mtime {
     Inaccessible,
 }
 
-fn resolve_mtime(fpath: &Path, verbose: bool) -> Mtime {
+fn resolve_mtime(fpath: &Path) -> Mtime {
     let meta = match fs::metadata(fpath) {
         Ok(m) => m,
         Err(_) => {
-            if verbose {
-                eprintln!("Warning: cannot stat {}", fpath.display());
-            }
+            debug!(path = %fpath.display(), "cannot stat");
             return Mtime::Inaccessible;
         }
     };
     let mtime = match meta.modified() {
         Ok(t) => t,
         Err(e) => {
-            if verbose {
-                eprintln!("Warning: mtime unavailable for {}: {e}", fpath.display());
-            }
+            debug!(path = %fpath.display(), error = %e, "mtime unavailable");
             return Mtime::Unknown;
         }
     };
     match mtime.duration_since(UNIX_EPOCH) {
         Ok(d) => Mtime::Value(d.as_secs_f64()),
         Err(e) => {
-            if verbose {
-                eprintln!("Warning: mtime before epoch for {}: {e}", fpath.display());
-            }
+            debug!(path = %fpath.display(), error = %e, "mtime before epoch");
             Mtime::Unknown
         }
     }
@@ -129,10 +130,11 @@ fn upsert_session(
         ],
     )?;
 
-    if ctx.verbose && parsed.skipped_lines > 0 {
-        eprintln!(
-            "Warning: {} skipped lines in {}",
-            parsed.skipped_lines, fpath_str
+    if parsed.skipped_lines > 0 {
+        debug!(
+            skipped_lines = parsed.skipped_lines,
+            path = fpath_str,
+            "skipped lines during parse"
         );
     }
 
@@ -154,14 +156,12 @@ fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f
     let fpath_str = match fpath.to_str() {
         Some(s) => s.to_owned(),
         None => {
-            if ctx.verbose {
-                eprintln!("Warning: skipping non-UTF-8 path: {}", fpath.display());
-            }
+            debug!(path = %fpath.display(), "skipping non-UTF-8 path");
             return None;
         }
     };
 
-    let mtime = match resolve_mtime(fpath, ctx.verbose) {
+    let mtime = match resolve_mtime(fpath) {
         Mtime::Value(v) => Some(v),
         Mtime::Unknown => None,
         Mtime::Inaccessible => return None,
@@ -191,9 +191,7 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         Ok(Some(p)) => p,
         Ok(None) => return Ok(IndexOutcome::Unchanged),
         Err(e) => {
-            if ctx.verbose {
-                eprintln!("Warning: {}: {e}", fpath.display());
-            }
+            info!(path = %fpath.display(), error = %e, "parse failed");
             return Ok(IndexOutcome::ParseError(format!(
                 "{}: {e}",
                 fpath.display()
@@ -216,7 +214,7 @@ pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
     home.join(".claude").join("projects")
 }
 
-pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Result<IndexStats> {
+pub fn index_sessions(conn: &mut Connection, force: bool) -> Result<IndexStats> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let claude_dir = resolve_claude_dir(&home);
     let codex_dir = env::var_os("RECALL_CODEX_DIR")
@@ -226,7 +224,6 @@ pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Resu
         conn,
         &IndexOptions {
             force,
-            verbose,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
@@ -236,10 +233,10 @@ pub fn index_sessions(conn: &mut Connection, force: bool, verbose: bool) -> Resu
 fn collect_sources(opts: &IndexOptions) -> Vec<(PathBuf, Source)> {
     let mut sources = Vec::new();
     if opts.claude_dir.is_dir() {
-        collect_jsonl_files(opts.claude_dir, &mut sources, Source::Claude, opts.verbose);
+        collect_jsonl_files(opts.claude_dir, &mut sources, Source::Claude);
     }
     if opts.codex_dir.is_dir() {
-        collect_jsonl_files(opts.codex_dir, &mut sources, Source::Codex, opts.verbose);
+        collect_jsonl_files(opts.codex_dir, &mut sources, Source::Codex);
     }
     sources
 }
@@ -362,9 +359,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     };
     let sources = collect_sources(opts);
 
-    if opts.verbose {
-        eprintln!("Found {} source files", sources.len());
-    }
+    info!(count = sources.len(), "Found source files");
 
     let tx = conn.transaction().context("Failed to begin transaction")?;
     if opts.force {
@@ -381,7 +376,6 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     let ctx = IndexContext {
         tx: &tx,
         existing: &existing,
-        verbose: opts.verbose,
     };
     let (indexed, parse_errors, first_error) = index_all(&ctx, &sources)?;
     cleanup_orphans(&tx, &existing, &sources, indexed)?;
@@ -399,7 +393,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         .unwrap_or_default()
         .as_secs_f64();
     if let Err(e) = set_last_scan(conn, &key, now_secs) {
-        eprintln!("Warning: failed to save scan timestamp: {e}");
+        warn!(error = %e, "failed to save scan timestamp");
     }
 
     Ok(IndexStats {
@@ -454,13 +448,8 @@ fn cleanup_orphans(
 
 const MAX_DIR_DEPTH: usize = 10;
 
-fn collect_jsonl_files(
-    dir: &Path,
-    out: &mut Vec<(PathBuf, Source)>,
-    source: Source,
-    verbose: bool,
-) {
-    collect_jsonl_files_inner(dir, out, source, 0, verbose);
+fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source) {
+    collect_jsonl_files_inner(dir, out, source, 0);
 }
 
 fn collect_jsonl_files_inner(
@@ -468,21 +457,19 @@ fn collect_jsonl_files_inner(
     out: &mut Vec<(PathBuf, Source)>,
     source: Source,
     depth: usize,
-    verbose: bool,
 ) {
     if depth >= MAX_DIR_DEPTH {
-        if verbose {
-            eprintln!(
-                "Warning: depth limit ({MAX_DIR_DEPTH}) reached at {}",
-                dir.display()
-            );
-        }
+        debug!(
+            max_depth = MAX_DIR_DEPTH,
+            path = %dir.display(),
+            "depth limit reached"
+        );
         return;
     }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("Warning: cannot read {}: {e}", dir.display());
+            warn!(path = %dir.display(), error = %e, "cannot read dir");
             return;
         }
     };
@@ -490,29 +477,24 @@ fn collect_jsonl_files_inner(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("Warning: cannot read entry in {}: {e}", dir.display());
+                warn!(path = %dir.display(), error = %e, "cannot read entry");
                 continue;
             }
         };
         let ft = match entry.file_type() {
             Ok(ft) => ft,
             Err(e) => {
-                eprintln!(
-                    "Warning: cannot get file type for {}: {e}",
-                    entry.path().display()
-                );
+                warn!(path = %entry.path().display(), error = %e, "cannot get file type");
                 continue;
             }
         };
         if ft.is_symlink() {
-            if verbose {
-                eprintln!("Warning: skipping symlink {}", entry.path().display());
-            }
+            debug!(path = %entry.path().display(), "skipping symlink");
             continue;
         }
         let path = entry.path();
         if ft.is_dir() {
-            collect_jsonl_files_inner(&path, out, source, depth + 1, verbose);
+            collect_jsonl_files_inner(&path, out, source, depth + 1);
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
             out.push((path, source));
         }
@@ -523,7 +505,7 @@ pub(crate) struct ChunkStats {
     pub chunks_created: usize,
 }
 
-pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<ChunkStats> {
+pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
     let sessions: Vec<(String, Option<i64>)> = {
         let mut stmt = conn.prepare(
             "SELECT s.session_id, s.timestamp FROM sessions s \
@@ -539,9 +521,7 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
         return Ok(ChunkStats { chunks_created: 0 });
     }
 
-    if verbose {
-        eprintln!("Chunking {} sessions", sessions.len());
-    }
+    info!(count = sessions.len(), "Chunking sessions");
 
     let tx = conn.transaction()?;
     let mut chunks_created = 0;
@@ -557,9 +537,7 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
             for r in rows {
                 let (role_str, text) = r?;
                 let Some(role) = Role::from_db(&role_str) else {
-                    if verbose {
-                        eprintln!("Warning: unknown role '{role_str}' in session {session_id}");
-                    }
+                    debug!(role = %role_str, session_id, "unknown role");
                     continue;
                 };
                 msgs.push(Message { role, text });
@@ -621,7 +599,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -634,7 +611,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -662,7 +638,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -671,7 +646,7 @@ mod tests {
         assert_eq!(stats.indexed, 1);
 
         // Populate qa_chunks + vec_chunks before force reindex
-        index_chunks(&mut conn, false).unwrap();
+        index_chunks(&mut conn).unwrap();
         let embedder = MockEmbedder::new();
         embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
         let qa_before: i64 = conn
@@ -690,7 +665,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: true,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -726,7 +700,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -736,7 +709,7 @@ mod tests {
         assert_eq!(stats.total_sessions, 2);
 
         // Create chunks + embeddings for session2 before deleting the file
-        index_chunks(&mut conn, false).unwrap();
+        index_chunks(&mut conn).unwrap();
         let embedder = MockEmbedder::new();
         embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
         let chunks_before: i64 = conn
@@ -762,7 +735,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -816,7 +788,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &dir_a,
                 codex_dir: &empty_dir,
             },
@@ -828,7 +799,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &dir_b,
                 codex_dir: &empty_dir,
             },
@@ -860,7 +830,7 @@ mod tests {
         fs::write(tmp.path().join("shallow.jsonl"), "{}").unwrap();
 
         let mut files = Vec::new();
-        collect_jsonl_files(tmp.path(), &mut files, Source::Claude, false);
+        collect_jsonl_files(tmp.path(), &mut files, Source::Claude);
 
         assert_eq!(files.len(), 1);
         assert!(files[0].0.ends_with("shallow.jsonl"));
@@ -880,7 +850,7 @@ mod tests {
         symlink(&real_file, &link).unwrap();
 
         let mut files = Vec::new();
-        collect_jsonl_files(tmp.path(), &mut files, Source::Claude, false);
+        collect_jsonl_files(tmp.path(), &mut files, Source::Claude);
 
         assert_eq!(files.len(), 1);
         assert!(files[0].0.ends_with("real.jsonl"));
@@ -908,17 +878,16 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
         )
         .unwrap();
 
-        let stats1 = index_chunks(&mut conn, false).unwrap();
+        let stats1 = index_chunks(&mut conn).unwrap();
         assert_eq!(stats1.chunks_created, 1);
 
-        let stats2 = index_chunks(&mut conn, false).unwrap();
+        let stats2 = index_chunks(&mut conn).unwrap();
         assert_eq!(stats2.chunks_created, 0);
     }
 
@@ -1006,13 +975,12 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
         )
         .unwrap();
-        index_chunks(&mut conn, false).unwrap();
+        index_chunks(&mut conn).unwrap();
 
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
@@ -1056,7 +1024,7 @@ mod tests {
             )
             .unwrap();
         }
-        index_chunks(&mut conn, false).unwrap();
+        index_chunks(&mut conn).unwrap();
 
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
@@ -1111,13 +1079,12 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
         )
         .unwrap();
-        index_chunks(&mut conn, false).unwrap();
+        index_chunks(&mut conn).unwrap();
 
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))

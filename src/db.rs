@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use amici::migration::notify_schema_change;
 use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage::ensure_sqlite_vec;
@@ -110,9 +111,7 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     };
 
     if !sql.contains("sub_idx") {
-        eprintln!(
-            "recall: Embedding schema changed — clearing embeddings (run `recall embed` to rebuild)"
-        );
+        notify_schema_change("recall", "embeddings", 0, "recall embed");
         let tx = conn.transaction()?;
         tx.execute_batch(
             "DROP TABLE IF EXISTS vec_chunks; DROP TABLE IF EXISTS embedded_chunk_ids;",
@@ -141,9 +140,8 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     if !sql.contains(FTS_TOKENIZER) {
         let session_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-        eprintln!(
-            "recall: Index schema changed — clearing {session_count} cached sessions (run `recall index` to rebuild; source files are unaffected)"
-        );
+        let count = usize::try_from(session_count).unwrap_or(0);
+        notify_schema_change("recall", "cached sessions", count, "recall index");
         let tx = conn.transaction()?;
         tx.execute_batch(
             "DROP TABLE messages; DELETE FROM sessions; \

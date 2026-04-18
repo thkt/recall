@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 
-use amici::cli::{Spinner, done, embed_with_spinners, try_expand_shorthand};
+use amici::cli::{
+    Spinner, done, embed_with_spinners, exit_error, info as cli_info, progress_step,
+    try_expand_shorthand,
+};
+use amici::logging::init_subscriber;
 use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use anyhow::{Context, Result};
@@ -24,11 +28,15 @@ use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
 use rurico::model_probe::handle_probe_if_needed;
 use rusqlite::Connection;
+use tracing::{info, warn};
 
 use crate::parser::Source;
 
 /// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
 const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
+
+const LOG_FILTER_VERBOSE: &str = "recall=info";
+const LOG_FILTER_DEFAULT: &str = "recall=warn";
 
 #[derive(Parser)]
 #[command(name = "recall", about = "Search past Claude Code and Codex sessions")]
@@ -143,21 +151,25 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
-    match try_load_embedder_with(
+fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
+    try_load_embedder_with(
         || cached_artifacts(ModelId::default()),
-        |e| eprintln!("Warning: failed to delete corrupt model files: {e}"),
-        |e| eprintln!("Warning: embedder probe failed: {e}"),
-    ) {
+        |e| warn!(error = %e, "failed to delete corrupt model files"),
+        |e| warn!(error = %e, "embedder probe failed"),
+    )
+}
+
+fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
+    match open_cached_embedder() {
         Ok(e) => Some(e),
         Err(DegradedReason::NotInstalled) => {
-            eprintln!(
-                "Note: embedding model not installed; using text search only. Run `recall model download` to enable semantic search."
+            cli_info(
+                "note: embedding model not installed; using text search only. Run `recall model download` to enable semantic search.",
             );
             None
         }
         Err(reason) => {
-            eprintln!("Warning: embedder unavailable ({reason}); using text search only");
+            warn!(%reason, "embedder unavailable; using text search only");
             None
         }
     }
@@ -165,26 +177,24 @@ fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
 
 // -- Subcommands --
 
-fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(force: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
     let sp = Spinner::new("Indexing sessions...");
-    let stats = indexer::index_sessions(&mut conn, force, verbose)?;
-    if stats.indexed > 0 {
-        sp.finish(&format!(
+    let stats = indexer::index_sessions(&mut conn, force)?;
+    let main_msg = if stats.indexed > 0 {
+        format!(
             "Indexed {} sessions in {:.1}s",
             stats.indexed, stats.elapsed_secs
-        ));
+        )
     } else {
-        sp.finish(&format!("{} sessions up to date", stats.total_sessions));
-    }
-    if let Some(ref err) = stats.first_error {
-        eprintln!("  Failed to parse {} files — {err}", stats.parse_errors);
-    }
+        format!("{} sessions up to date", stats.total_sessions)
+    };
+    sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
 
     let sp = Spinner::new("Creating chunks...");
-    let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
+    let chunk_stats = indexer::index_chunks(&mut conn)?;
     if chunk_stats.chunks_created > 0 {
         sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
@@ -194,19 +204,17 @@ fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()
     let model_cached = cached_artifacts(ModelId::default())
         .map(|opt| opt.is_some())
         .unwrap_or(false);
-    eprintln!(
-        "  Model: {}",
-        if model_cached {
-            "ready (run `recall embed` to embed chunks)"
-        } else {
-            "not installed (run `recall model download`)"
-        }
-    );
+    let model_line = if model_cached {
+        "Model: ready (run `recall embed` to embed chunks)"
+    } else {
+        "Model: not installed (run `recall model download`)"
+    };
+    progress_step(&[model_line]);
 
     Ok(())
 }
 
-fn run_embed(_verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
@@ -246,12 +254,7 @@ fn run_embed(_verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
 }
 
 fn load_cached_embedder() -> Result<Arc<dyn Embed>> {
-    try_load_embedder_with(
-        || cached_artifacts(ModelId::default()),
-        |e| eprintln!("Warning: failed to delete corrupt model files: {e}"),
-        |e| eprintln!("Warning: embedder probe failed: {e}"),
-    )
-    .map_err(|reason| {
+    open_cached_embedder().map_err(|reason| {
         let hint = match reason {
             DegradedReason::NotInstalled => {
                 "embedding model not installed; run `recall model download`"
@@ -268,7 +271,7 @@ fn run_model_download() -> Result<()> {
     download_and_verify_model().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
     let Command::Search {
         query,
         project,
@@ -286,16 +289,17 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
 
     // Auto-index FTS5 + chunks (fast: skips scan if dirs unchanged)
     let sp = Spinner::new("Indexing...");
-    let stats = indexer::index_sessions(&mut conn, false, verbose)?;
-    let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
-    if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
-        sp.finish(&format!(
+    let stats = indexer::index_sessions(&mut conn, false)?;
+    let chunk_stats = indexer::index_chunks(&mut conn)?;
+    let main_msg = if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
+        format!(
             "Indexed {} sessions, {} chunks",
             stats.indexed, chunk_stats.chunks_created
-        ));
+        )
     } else {
-        sp.finish(&format!("{} sessions", stats.total_sessions));
-    }
+        format!("{} sessions", stats.total_sessions)
+    };
+    sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
 
     let embedder = try_load_embedder_cached();
 
@@ -327,10 +331,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
                 total += r.embedded;
             }
             Err(e) => {
-                eprintln!("Warning: post-search embedding skipped: {e}");
-                if verbose {
-                    eprintln!("  {e:#}");
-                }
+                warn!(error = %e, "post-search embedding skipped");
             }
         };
         handle(embedder::embed_near_sessions(
@@ -341,8 +342,8 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             None,
         ));
         handle(embedder::embed_recent_chunks(&mut conn, emb, 10, None));
-        if total > 0 && verbose {
-            eprintln!("Embedded {total} chunks (nearby + recent)");
+        if total > 0 {
+            info!(total, "Embedded chunks (nearby + recent)");
         }
     }
 
@@ -366,7 +367,7 @@ fn show_session(
             Ok(parser::SessionData {
                 session_id: row.get(0)?,
                 source: Source::from_db(&source_str).unwrap_or_else(|| {
-                    eprintln!("Warning: unknown source '{source_str}', defaulting to claude");
+                    warn!(source = %source_str, "unknown source, defaulting to claude");
                     Source::Claude
                 }),
                 file_path: row.get(2)?,
@@ -438,8 +439,8 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
-        println!("Database not found at {}", path.display());
-        println!("Run `recall index` to create the index.");
+        cli_info(&format!("database not found at {}", path.display()));
+        cli_info("run `recall index` to create the index.");
         return Ok(());
     }
 
@@ -536,7 +537,7 @@ fn print_result(i: usize, r: &search::SearchResult) {
         if e.kind() == ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("Warning: failed to write result: {e}");
+        warn!(error = %e, "failed to write result");
     }
 }
 
@@ -567,11 +568,18 @@ fn run() -> Result<()> {
         None => Cli::parse_from(args),
     };
 
+    let default_filter = if cli.verbose {
+        LOG_FILTER_VERBOSE
+    } else {
+        LOG_FILTER_DEFAULT
+    };
+    init_subscriber(default_filter);
+
     match cli.command {
-        Some(Command::Index { force }) => run_index(force, cli.verbose, &cli.db_path),
-        Some(Command::Embed) => run_embed(cli.verbose, &cli.db_path),
+        Some(Command::Index { force }) => run_index(force, &cli.db_path),
+        Some(Command::Embed) => run_embed(&cli.db_path),
         Some(Command::Model(ModelCommand::Download)) => run_model_download(),
-        Some(cmd @ Command::Search { .. }) => run_search(cmd, cli.verbose, &cli.db_path),
+        Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         None => {
@@ -588,7 +596,7 @@ fn main() {
 
     if let Err(e) = run() {
         let msg = format!("{e:#}");
-        eprintln!("Error: {msg}");
+        exit_error(&msg);
         let code = if USER_ERROR_MARKERS.iter().any(|m| msg.contains(m)) {
             1
         } else {
