@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::chunker;
 use crate::parser::{
@@ -53,21 +53,21 @@ fn resolve_mtime(fpath: &Path) -> Mtime {
     let meta = match fs::metadata(fpath) {
         Ok(m) => m,
         Err(_) => {
-            warn!(path = %fpath.display(), "cannot stat");
+            debug!(path = %fpath.display(), "cannot stat");
             return Mtime::Inaccessible;
         }
     };
     let mtime = match meta.modified() {
         Ok(t) => t,
         Err(e) => {
-            warn!(path = %fpath.display(), error = %e, "mtime unavailable");
+            debug!(path = %fpath.display(), error = %e, "mtime unavailable");
             return Mtime::Unknown;
         }
     };
     match mtime.duration_since(UNIX_EPOCH) {
         Ok(d) => Mtime::Value(d.as_secs_f64()),
         Err(e) => {
-            warn!(path = %fpath.display(), error = %e, "mtime before epoch");
+            debug!(path = %fpath.display(), error = %e, "mtime before epoch");
             Mtime::Unknown
         }
     }
@@ -123,7 +123,7 @@ fn upsert_session(
     )?;
 
     if parsed.skipped_lines > 0 {
-        warn!(
+        debug!(
             skipped_lines = parsed.skipped_lines,
             path = fpath_str,
             "skipped lines during parse"
@@ -148,7 +148,7 @@ fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f
     let fpath_str = match fpath.to_str() {
         Some(s) => s.to_owned(),
         None => {
-            warn!(path = %fpath.display(), "skipping non-UTF-8 path");
+            debug!(path = %fpath.display(), "skipping non-UTF-8 path");
             return None;
         }
     };
@@ -183,7 +183,7 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         Ok(Some(p)) => p,
         Ok(None) => return Ok(IndexOutcome::Unchanged),
         Err(e) => {
-            warn!(path = %fpath.display(), error = %e, "parse failed");
+            info!(path = %fpath.display(), error = %e, "parse failed");
             return Ok(IndexOutcome::ParseError(format!(
                 "{}: {e}",
                 fpath.display()
@@ -451,7 +451,7 @@ fn collect_jsonl_files_inner(
     depth: usize,
 ) {
     if depth >= MAX_DIR_DEPTH {
-        warn!(
+        debug!(
             max_depth = MAX_DIR_DEPTH,
             path = %dir.display(),
             "depth limit reached"
@@ -481,7 +481,7 @@ fn collect_jsonl_files_inner(
             }
         };
         if ft.is_symlink() {
-            warn!(path = %entry.path().display(), "skipping symlink");
+            debug!(path = %entry.path().display(), "skipping symlink");
             continue;
         }
         let path = entry.path();
@@ -529,7 +529,7 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
             for r in rows {
                 let (role_str, text) = r?;
                 let Some(role) = Role::from_db(&role_str) else {
-                    warn!(role = %role_str, session_id, "unknown role");
+                    debug!(role = %role_str, session_id, "unknown role");
                     continue;
                 };
                 msgs.push(Message { role, text });

@@ -35,6 +35,9 @@ use crate::parser::Source;
 /// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
 const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
 
+const LOG_FILTER_VERBOSE: &str = "recall=info";
+const LOG_FILTER_DEFAULT: &str = "recall=warn";
+
 #[derive(Parser)]
 #[command(name = "recall", about = "Search past Claude Code and Codex sessions")]
 struct Cli {
@@ -148,12 +151,16 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
-    match try_load_embedder_with(
+fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
+    try_load_embedder_with(
         || cached_artifacts(ModelId::default()),
         |e| warn!(error = %e, "failed to delete corrupt model files"),
         |e| warn!(error = %e, "embedder probe failed"),
-    ) {
+    )
+}
+
+fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
+    match open_cached_embedder() {
         Ok(e) => Some(e),
         Err(DegradedReason::NotInstalled) => {
             cli_info(
@@ -201,12 +208,12 @@ fn run_index(force: bool, _verbose: bool, db_path: &Option<PathBuf>) -> Result<(
     let model_cached = cached_artifacts(ModelId::default())
         .map(|opt| opt.is_some())
         .unwrap_or(false);
-    let model_status = if model_cached {
-        "ready (run `recall embed` to embed chunks)"
+    let model_line = if model_cached {
+        "Model: ready (run `recall embed` to embed chunks)"
     } else {
-        "not installed (run `recall model download`)"
+        "Model: not installed (run `recall model download`)"
     };
-    progress_step(&[&format!("Model: {model_status}")]);
+    progress_step(&[model_line]);
 
     Ok(())
 }
@@ -251,12 +258,7 @@ fn run_embed(_verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
 }
 
 fn load_cached_embedder() -> Result<Arc<dyn Embed>> {
-    try_load_embedder_with(
-        || cached_artifacts(ModelId::default()),
-        |e| warn!(error = %e, "failed to delete corrupt model files"),
-        |e| warn!(error = %e, "embedder probe failed"),
-    )
-    .map_err(|reason| {
+    open_cached_embedder().map_err(|reason| {
         let hint = match reason {
             DegradedReason::NotInstalled => {
                 "embedding model not installed; run `recall model download`"
@@ -293,14 +295,19 @@ fn run_search(cmd: Command, _verbose: bool, db_path: &Option<PathBuf>) -> Result
     let sp = Spinner::new("Indexing...");
     let stats = indexer::index_sessions(&mut conn, false)?;
     let chunk_stats = indexer::index_chunks(&mut conn)?;
-    if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
-        sp.finish(&format!(
+    let main_msg = if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
+        format!(
             "Indexed {} sessions, {} chunks",
             stats.indexed, chunk_stats.chunks_created
-        ));
+        )
     } else {
-        sp.finish(&format!("{} sessions", stats.total_sessions));
-    }
+        format!("{} sessions", stats.total_sessions)
+    };
+    let detail = stats
+        .first_error
+        .as_ref()
+        .map(|err| format!("Failed to parse {} files — {err}", stats.parse_errors));
+    sp.finish_with_detail(&main_msg, detail.as_deref());
 
     let embedder = try_load_embedder_cached();
 
@@ -570,9 +577,9 @@ fn run() -> Result<()> {
     };
 
     let default_filter = if cli.verbose {
-        "recall=info"
+        LOG_FILTER_VERBOSE
     } else {
-        "recall=warn"
+        LOG_FILTER_DEFAULT
     };
     init_subscriber(default_filter);
 

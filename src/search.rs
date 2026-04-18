@@ -374,12 +374,12 @@ fn score_and_sort(
     results.into_iter().map(|(r, _)| r).collect()
 }
 
-fn snippet_or_default(result: rusqlite::Result<String>, sid: &str) -> Option<String> {
+fn snippet_or_default(result: rusqlite::Result<String>, session_id: &str) -> Option<String> {
     match result {
         Ok(s) => Some(s),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(e) => {
-            warn!(error = %e, session_id = sid, "snippet extraction failed");
+            warn!(error = %e, session_id, "snippet extraction failed");
             None
         }
     }
