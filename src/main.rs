@@ -17,6 +17,7 @@ use std::process;
 use std::sync::Arc;
 
 use amici::cli::{Spinner, done, embed_with_spinners, try_expand_shorthand};
+use amici::logging::init_subscriber;
 use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use anyhow::{Context, Result};
@@ -566,6 +567,13 @@ fn run() -> Result<()> {
         Some(expanded) => Cli::parse_from(expanded),
         None => Cli::parse_from(args),
     };
+
+    let default_filter = if cli.verbose {
+        "recall=info"
+    } else {
+        "recall=warn"
+    };
+    init_subscriber(default_filter);
 
     match cli.command {
         Some(Command::Index { force }) => run_index(force, cli.verbose, &cli.db_path),
