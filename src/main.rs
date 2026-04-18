@@ -27,6 +27,7 @@ use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
 use rurico::model_probe::handle_probe_if_needed;
 use rusqlite::Connection;
+use tracing::{info, warn};
 
 use crate::parser::Source;
 
@@ -149,8 +150,8 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
 fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
     match try_load_embedder_with(
         || cached_artifacts(ModelId::default()),
-        |e| eprintln!("Warning: failed to delete corrupt model files: {e}"),
-        |e| eprintln!("Warning: embedder probe failed: {e}"),
+        |e| warn!(error = %e, "failed to delete corrupt model files"),
+        |e| warn!(error = %e, "embedder probe failed"),
     ) {
         Ok(e) => Some(e),
         Err(DegradedReason::NotInstalled) => {
@@ -160,7 +161,7 @@ fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
             None
         }
         Err(reason) => {
-            eprintln!("Warning: embedder unavailable ({reason}); using text search only");
+            warn!(%reason, "embedder unavailable; using text search only");
             None
         }
     }
@@ -251,8 +252,8 @@ fn run_embed(_verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
 fn load_cached_embedder() -> Result<Arc<dyn Embed>> {
     try_load_embedder_with(
         || cached_artifacts(ModelId::default()),
-        |e| eprintln!("Warning: failed to delete corrupt model files: {e}"),
-        |e| eprintln!("Warning: embedder probe failed: {e}"),
+        |e| warn!(error = %e, "failed to delete corrupt model files"),
+        |e| warn!(error = %e, "embedder probe failed"),
     )
     .map_err(|reason| {
         let hint = match reason {
@@ -271,7 +272,7 @@ fn run_model_download() -> Result<()> {
     download_and_verify_model().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
-fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_search(cmd: Command, _verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let Command::Search {
         query,
         project,
@@ -330,10 +331,7 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
                 total += r.embedded;
             }
             Err(e) => {
-                eprintln!("Warning: post-search embedding skipped: {e}");
-                if verbose {
-                    eprintln!("  {e:#}");
-                }
+                warn!(error = ?e, "post-search embedding skipped");
             }
         };
         handle(embedder::embed_near_sessions(
@@ -344,8 +342,8 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
             None,
         ));
         handle(embedder::embed_recent_chunks(&mut conn, emb, 10, None));
-        if total > 0 && verbose {
-            eprintln!("Embedded {total} chunks (nearby + recent)");
+        if total > 0 {
+            info!(total, "Embedded chunks (nearby + recent)");
         }
     }
 
@@ -369,7 +367,7 @@ fn show_session(
             Ok(parser::SessionData {
                 session_id: row.get(0)?,
                 source: Source::from_db(&source_str).unwrap_or_else(|| {
-                    eprintln!("Warning: unknown source '{source_str}', defaulting to claude");
+                    warn!(source = %source_str, "unknown source, defaulting to claude");
                     Source::Claude
                 }),
                 file_path: row.get(2)?,
@@ -539,7 +537,7 @@ fn print_result(i: usize, r: &search::SearchResult) {
         if e.kind() == ErrorKind::BrokenPipe {
             process::exit(0);
         }
-        eprintln!("Warning: failed to write result: {e}");
+        warn!(error = %e, "failed to write result");
     }
 }
 
