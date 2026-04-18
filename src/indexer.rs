@@ -24,6 +24,14 @@ pub struct IndexStats {
     pub elapsed_secs: f64,
 }
 
+impl IndexStats {
+    pub fn parse_error_detail(&self) -> Option<String> {
+        self.first_error
+            .as_ref()
+            .map(|err| format!("Failed to parse {} files — {err}", self.parse_errors))
+    }
+}
+
 enum IndexOutcome {
     Indexed,
     Unchanged,

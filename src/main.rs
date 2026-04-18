@@ -191,11 +191,7 @@ fn run_index(force: bool, db_path: &Option<PathBuf>) -> Result<()> {
     } else {
         format!("{} sessions up to date", stats.total_sessions)
     };
-    let detail = stats
-        .first_error
-        .as_ref()
-        .map(|err| format!("Failed to parse {} files — {err}", stats.parse_errors));
-    sp.finish_with_detail(&main_msg, detail.as_deref());
+    sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
 
     let sp = Spinner::new("Creating chunks...");
     let chunk_stats = indexer::index_chunks(&mut conn)?;
@@ -303,11 +299,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
     } else {
         format!("{} sessions", stats.total_sessions)
     };
-    let detail = stats
-        .first_error
-        .as_ref()
-        .map(|err| format!("Failed to parse {} files — {err}", stats.parse_errors));
-    sp.finish_with_detail(&main_msg, detail.as_deref());
+    sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
 
     let embedder = try_load_embedder_cached();
 
@@ -339,7 +331,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
                 total += r.embedded;
             }
             Err(e) => {
-                warn!(error = ?e, "post-search embedding skipped");
+                warn!(error = %e, "post-search embedding skipped");
             }
         };
         handle(embedder::embed_near_sessions(
