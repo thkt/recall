@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 
-use amici::cli::{Spinner, done, embed_with_spinners, try_expand_shorthand};
+use amici::cli::{
+    Spinner, done, embed_with_spinners, exit_error, progress_step, try_expand_shorthand,
+};
 use amici::logging::init_subscriber;
 use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
@@ -172,17 +174,19 @@ fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()
 
     let sp = Spinner::new("Indexing sessions...");
     let stats = indexer::index_sessions(&mut conn, force, verbose)?;
-    if stats.indexed > 0 {
-        sp.finish(&format!(
+    let main_msg = if stats.indexed > 0 {
+        format!(
             "Indexed {} sessions in {:.1}s",
             stats.indexed, stats.elapsed_secs
-        ));
+        )
     } else {
-        sp.finish(&format!("{} sessions up to date", stats.total_sessions));
-    }
-    if let Some(ref err) = stats.first_error {
-        eprintln!("  Failed to parse {} files — {err}", stats.parse_errors);
-    }
+        format!("{} sessions up to date", stats.total_sessions)
+    };
+    let detail = stats
+        .first_error
+        .as_ref()
+        .map(|err| format!("Failed to parse {} files — {err}", stats.parse_errors));
+    sp.finish_with_detail(&main_msg, detail.as_deref());
 
     let sp = Spinner::new("Creating chunks...");
     let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
@@ -195,14 +199,12 @@ fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()
     let model_cached = cached_artifacts(ModelId::default())
         .map(|opt| opt.is_some())
         .unwrap_or(false);
-    eprintln!(
-        "  Model: {}",
-        if model_cached {
-            "ready (run `recall embed` to embed chunks)"
-        } else {
-            "not installed (run `recall model download`)"
-        }
-    );
+    let model_status = if model_cached {
+        "ready (run `recall embed` to embed chunks)"
+    } else {
+        "not installed (run `recall model download`)"
+    };
+    progress_step(&[&format!("Model: {model_status}")]);
 
     Ok(())
 }
@@ -596,7 +598,7 @@ fn main() {
 
     if let Err(e) = run() {
         let msg = format!("{e:#}");
-        eprintln!("Error: {msg}");
+        exit_error(&msg);
         let code = if USER_ERROR_MARKERS.iter().any(|m| msg.contains(m)) {
             1
         } else {
