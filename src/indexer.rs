@@ -556,10 +556,11 @@ pub(crate) fn index_chunks(conn: &mut Connection, verbose: bool) -> Result<Chunk
             let mut msgs = Vec::new();
             for r in rows {
                 let (role_str, text) = r?;
-                let role = match role_str.as_str() {
-                    "user" => Role::User,
-                    "assistant" => Role::Assistant,
-                    _ => continue,
+                let Some(role) = Role::from_db(&role_str) else {
+                    if verbose {
+                        eprintln!("Warning: unknown role '{role_str}' in session {session_id}");
+                    }
+                    continue;
                 };
                 msgs.push(Message { role, text });
             }

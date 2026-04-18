@@ -54,6 +54,14 @@ impl Role {
             Role::Assistant => "assistant",
         }
     }
+
+    pub fn from_db(s: &str) -> Option<Role> {
+        match s {
+            "user" => Some(Role::User),
+            "assistant" => Some(Role::Assistant),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -413,5 +421,18 @@ mod tests {
         let off_ms =
             parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500+09:00".into())).unwrap();
         assert_eq!(utc_ms - off_ms, 9 * 3_600_000);
+    }
+
+    #[test]
+    fn test_role_from_db_known_values() {
+        assert_eq!(Role::from_db("user"), Some(Role::User));
+        assert_eq!(Role::from_db("assistant"), Some(Role::Assistant));
+    }
+
+    #[test]
+    fn test_role_from_db_unknown_returns_none() {
+        assert_eq!(Role::from_db("system"), None);
+        assert_eq!(Role::from_db(""), None);
+        assert_eq!(Role::from_db("USER"), None);
     }
 }
