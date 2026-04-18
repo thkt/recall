@@ -142,7 +142,7 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
         let session_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         eprintln!(
-            "recall: Index schema changed — rebuilding {session_count} sessions (source files are unaffected)"
+            "recall: Index schema changed — clearing {session_count} cached sessions (run `recall index` to rebuild; source files are unaffected)"
         );
         let tx = conn.transaction()?;
         tx.execute_batch(
