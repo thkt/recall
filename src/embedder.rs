@@ -10,6 +10,7 @@ use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
 use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
+use tracing::warn;
 
 #[derive(Default)]
 pub(crate) struct EmbedResult {
@@ -20,7 +21,7 @@ pub(crate) struct EmbedResult {
 impl EmbedResult {
     pub(crate) fn warn_if_stopped(&self) {
         if let Some(ref err) = self.stopped_at_error {
-            eprintln!("Warning: embedding stopped early: {err}");
+            warn!(error = %err, "embedding stopped early");
         }
     }
 }

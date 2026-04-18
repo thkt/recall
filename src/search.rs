@@ -7,6 +7,7 @@ use rurico::embed::Embed;
 use rurico::storage::{f32_as_bytes, rrf_merge};
 use rusqlite::Connection;
 use rusqlite::types::{ToSql, ToSqlOutput};
+use tracing::warn;
 
 use crate::date::MS_PER_DAY;
 use crate::hybrid;
@@ -156,11 +157,11 @@ fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
                 .query_map([&pattern], |row| row.get::<_, String>(0))
                 .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                 .unwrap_or_else(|e| {
-                    eprintln!("Warning: term expansion failed for '{unquoted}': {e}");
+                    warn!(error = %e, unquoted, "term expansion failed");
                     Vec::new()
                 }),
             Err(e) => {
-                eprintln!("Warning: term expansion failed for '{unquoted}': {e}");
+                warn!(error = %e, unquoted, "term expansion failed");
                 Vec::new()
             }
         }
@@ -264,7 +265,7 @@ fn find_candidate_sessions(conn: &Connection, sq: &SearchQuery) -> Result<Vec<(S
                 "Invalid search query: {err_msg}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
             );
         }
-        eprintln!("Warning: {skipped} row(s) skipped during search: {err_msg}");
+        warn!(skipped, %err_msg, "rows skipped during search");
     }
     Ok(ranked)
 }
@@ -300,9 +301,7 @@ fn fetch_session_metadata(
                 let source = match Source::from_db(&source_str) {
                     Some(s) => s,
                     None => {
-                        eprintln!(
-                            "Warning: unknown source {source_str:?} for session {session_id}"
-                        );
+                        warn!(source = %source_str, session_id, "unknown source");
                         continue;
                     }
                 };
@@ -320,14 +319,14 @@ fn fetch_session_metadata(
             }
             Err(e) => {
                 if db_errors == 0 {
-                    eprintln!("Warning: metadata query error: {e}");
+                    warn!(error = %e, "metadata query error");
                 }
                 db_errors += 1;
             }
         }
     }
     if db_errors > 1 {
-        eprintln!("Warning: {db_errors} metadata row(s) failed");
+        warn!(db_errors, "metadata rows failed");
     }
     Ok(map)
 }
@@ -380,7 +379,7 @@ fn snippet_or_default(result: rusqlite::Result<String>, sid: &str) -> Option<Str
         Ok(s) => Some(s),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
         Err(e) => {
-            eprintln!("Warning: snippet extraction failed for session {sid}: {e}");
+            warn!(error = %e, session_id = sid, "snippet extraction failed");
             None
         }
     }
@@ -491,7 +490,7 @@ pub fn search_with_embedder(
         let vec_hits = match vec_search(conn, embedder, query, candidate_limit) {
             Ok(hits) => hits,
             Err(e) => {
-                eprintln!("Warning: vector search failed, using text search only: {e}");
+                warn!(error = %e, "vector search failed, using text search only");
                 Vec::new()
             }
         };
@@ -956,7 +955,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },
@@ -992,7 +990,6 @@ mod tests {
             &mut conn,
             &IndexOptions {
                 force: false,
-                verbose: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
             },

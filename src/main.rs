@@ -168,12 +168,12 @@ fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
 
 // -- Subcommands --
 
-fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(force: bool, _verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
     let sp = Spinner::new("Indexing sessions...");
-    let stats = indexer::index_sessions(&mut conn, force, verbose)?;
+    let stats = indexer::index_sessions(&mut conn, force)?;
     let main_msg = if stats.indexed > 0 {
         format!(
             "Indexed {} sessions in {:.1}s",
@@ -189,7 +189,7 @@ fn run_index(force: bool, verbose: bool, db_path: &Option<PathBuf>) -> Result<()
     sp.finish_with_detail(&main_msg, detail.as_deref());
 
     let sp = Spinner::new("Creating chunks...");
-    let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
+    let chunk_stats = indexer::index_chunks(&mut conn)?;
     if chunk_stats.chunks_created > 0 {
         sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
@@ -289,8 +289,8 @@ fn run_search(cmd: Command, verbose: bool, db_path: &Option<PathBuf>) -> Result<
 
     // Auto-index FTS5 + chunks (fast: skips scan if dirs unchanged)
     let sp = Spinner::new("Indexing...");
-    let stats = indexer::index_sessions(&mut conn, false, verbose)?;
-    let chunk_stats = indexer::index_chunks(&mut conn, verbose)?;
+    let stats = indexer::index_sessions(&mut conn, false)?;
+    let chunk_stats = indexer::index_chunks(&mut conn)?;
     if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
         sp.finish(&format!(
             "Indexed {} sessions, {} chunks",
