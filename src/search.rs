@@ -10,10 +10,8 @@ use rusqlite::types::{ToSql, ToSqlOutput};
 use tracing::warn;
 
 use crate::date::MS_PER_DAY;
-use crate::hybrid;
+use crate::hybrid::{self, RECENCY_BOOST_WEIGHT};
 use crate::parser::{SessionData, Source};
-
-const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
 pub struct SearchResult {
     pub session: SessionData,
@@ -507,6 +505,7 @@ pub fn search_with_embedder(
             &mut merged,
             |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
             now_ms,
+            RECENCY_BOOST_WEIGHT,
         );
         merged.truncate(opts.limit);
 
@@ -559,6 +558,28 @@ mod tests {
         conn.execute(
             "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
             rusqlite::params![sid, role, text],
+        )
+        .unwrap();
+    }
+
+    fn insert_chunk_with_embedding(
+        conn: &Connection,
+        chunk_id: i64,
+        sid: &str,
+        text: &str,
+        ts: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
+             VALUES (?1, ?2, 'q', 'a', ?3, ?4, ?5)",
+            rusqlite::params![chunk_id, sid, text, ts, format!("hash{chunk_id}")],
+        )
+        .unwrap();
+        let embedding = MockEmbedder::deterministic_vector(text);
+        let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
+        conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![chunk_id, embedding_bytes],
         )
         .unwrap();
     }
@@ -1067,19 +1088,7 @@ mod tests {
         insert_session(&conn, "s2", "claude", "/proj", now_ms);
         insert_message(&conn, "s2", "user", "unrelated topic about weather");
 
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-             VALUES (1, 's2', 'q', 'a', 'authentication implementation details', ?1, 'hash1')",
-            [now_ms],
-        )
-        .unwrap();
-        let embedding = MockEmbedder::deterministic_vector("authentication");
-        let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
-        conn.execute(
-            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
-            [embedding_bytes],
-        )
-        .unwrap();
+        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
 
         assert!(has_vec_data(&conn));
 
@@ -1110,6 +1119,47 @@ mod tests {
     }
 
     #[test]
+    fn test_hybrid_recency_boost_favors_newer() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        // Two sessions with identical FTS-matching text and identical embedding content.
+        // Only the timestamp differs; hybrid path must rank the newer one first.
+        for (sid, ts) in [("old", now_ms - 365 * MS_PER_DAY), ("new", now_ms)] {
+            insert_session(&conn, sid, "claude", "/proj", ts);
+            insert_message(&conn, sid, "user", "authentication flow discussion");
+        }
+
+        for (chunk_id, sid) in [(1_i64, "old"), (2, "new")] {
+            insert_chunk_with_embedding(
+                &conn,
+                chunk_id,
+                sid,
+                "authentication flow discussion",
+                now_ms,
+            );
+        }
+
+        let embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&embedder),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].session.session_id, "new",
+            "hybrid path must apply recency boost so newer session ranks first"
+        );
+    }
+
+    #[test]
     fn test_hybrid_search_falls_back_on_vector_error() {
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
@@ -1118,19 +1168,7 @@ mod tests {
         insert_message(&conn, "s1", "user", "authentication flow discussion");
 
         // Need vec_chunks to trigger hybrid path
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-             VALUES (1, 's1', 'q', 'a', 'content', ?1, 'hash1')",
-            [now_ms],
-        )
-        .unwrap();
-        let embedding = MockEmbedder::deterministic_vector("content");
-        let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
-        conn.execute(
-            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
-            [embedding_bytes],
-        )
-        .unwrap();
+        insert_chunk_with_embedding(&conn, 1, "s1", "content", now_ms);
 
         let embedder = MockEmbedder::failing_after(0);
         let results = search_with_embedder(
