@@ -64,7 +64,8 @@ struct SearchQuery {
 
 /// Neutralize FTS5 special syntax in user queries: column-filters (`role:admin`),
 /// start-of-column (`^term`), `NEAR()` grouping, `+` required-match prefix,
-/// and unbalanced quotes (auto-balanced to prevent syntax errors).
+/// slash-prefixed tokens (`/challenge`), and unbalanced quotes (auto-balanced
+/// to prevent syntax errors).
 fn sanitize_fts_query(query: &str) -> String {
     let result = query
         .split_whitespace()
@@ -75,9 +76,13 @@ fn sanitize_fts_query(query: &str) -> String {
         .map(|w| {
             let w = w.trim_start_matches(['^', '+', '-']);
             let w = w.trim_matches(['(', ')']);
-            if (w.contains(':') || w.contains('-')) && !w.starts_with('"') {
+            if (w.contains(':') || w.contains('-') || w.contains('/')) && !w.starts_with('"') {
                 let clean = w.replace('"', "");
-                format!("\"{clean}\"")
+                if clean.chars().any(char::is_alphanumeric) {
+                    format!("\"{clean}\"")
+                } else {
+                    String::new()
+                }
             } else {
                 w.to_owned()
             }
@@ -864,6 +869,21 @@ mod tests {
     }
 
     #[test]
+    fn test_slash_command_query_matches_body() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "used /challenge to review the plan");
+
+        let results = search(&conn, "/challenge", &SearchOptions::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "quoted slash token should match body text"
+        );
+        assert_eq!(results[0].session.session_id, "s1");
+    }
+
+    #[test]
     fn test_score_and_sort_respects_limit() {
         let now_ms = 1_750_000_000_000_i64;
         let candidates: Vec<_> = (0..5)
@@ -919,6 +939,13 @@ mod tests {
             ("mlx-rs embedding", "\"mlx-rs\" embedding"),
             ("state-of-the-art", "\"state-of-the-art\""),
             ("\"mlx-rs\"", "\"mlx-rs\""),
+            // Slash-containing tokens → quoted (prevents FTS5 syntax error)
+            ("/challenge", "\"/challenge\""),
+            ("use /foo today", "use \"/foo\" today"),
+            ("path/to/file", "\"path/to/file\""),
+            // Bare slashes have no alphanumerics → dropped
+            ("/", ""),
+            ("//", ""),
             // Quote balancing
             ("\"unbalanced", "\"unbalanced\""),
             ("\"balanced\"", "\"balanced\""),
