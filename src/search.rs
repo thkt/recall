@@ -481,10 +481,9 @@ pub fn search_with_embedder(
     let sq = build_search_query(conn, query, opts, now_ms);
     let fts_ranked = find_candidate_sessions(conn, &sq)?;
 
-    let use_hybrid = embedder.is_some() && has_vec_data(conn);
-
-    if use_hybrid {
-        let embedder = embedder.unwrap();
+    if let Some(embedder) = embedder
+        && has_vec_data(conn)
+    {
         let candidate_limit = opts.limit * 3;
 
         let fts_hits: Vec<(String, f64)> = fts_ranked
