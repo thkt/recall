@@ -3,6 +3,7 @@ use std::f64::consts::LN_2;
 use crate::date::MS_PER_DAY;
 
 pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
+pub(crate) const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
 /// Exponential recency decay: 1.0 for now, 0.5 at half-life, approaching 0.0.
 pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
@@ -18,14 +19,16 @@ pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
 /// Apply exponential recency boost to RRF scores.
 ///
 /// `get_timestamp` resolves a session_id to its epoch-ms timestamp.
+/// `weight` scales the boost's influence on the final score.
 pub(crate) fn apply_recency_boost(
     results: &mut [(String, f64)],
     get_timestamp: impl Fn(&str) -> Option<i64>,
     now_ms: i64,
+    weight: f64,
 ) {
     for (session_id, score) in results.iter_mut() {
         let boost = recency_decay(now_ms, get_timestamp(session_id));
-        *score *= 1.0 + boost;
+        *score *= 1.0 + weight * boost;
     }
     results.sort_by(|a, b| b.1.total_cmp(&a.1));
 }
@@ -92,6 +95,7 @@ mod tests {
             &mut results,
             |sid| timestamps.get(sid).copied().flatten(),
             now_ms,
+            0.2,
         );
 
         assert_eq!(results[0].0, "new");
@@ -106,9 +110,26 @@ mod tests {
     #[test]
     fn test_recency_boost_no_timestamp() {
         let mut results = vec![("no-ts".to_owned(), 0.5)];
-        apply_recency_boost(&mut results, |_| None, 1_000_000);
+        apply_recency_boost(&mut results, |_| None, 1_000_000, 0.2);
 
         assert!((results[0].1 - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_apply_recency_boost_scales_with_weight() {
+        // At now (age=0), recency_decay returns 1.0, so final score = base * (1.0 + weight).
+        let now_ms = 1_000_000;
+        let base = 1.0;
+
+        for (weight, expected) in [(0.0, 1.0), (0.2, 1.2), (1.0, 2.0)] {
+            let mut results = vec![("s1".to_owned(), base)];
+            apply_recency_boost(&mut results, |_| Some(now_ms), now_ms, weight);
+            assert!(
+                (results[0].1 - expected).abs() < 1e-10,
+                "weight={weight} → expected {expected}, got {}",
+                results[0].1
+            );
+        }
     }
 
     #[test]
