@@ -370,9 +370,8 @@ pub fn search_with_embedder(
             return Ok(Vec::new());
         }
     };
-    let fts_query = match clean_for_trigram(&matched) {
-        Some(q) => q,
-        None => return Ok(Vec::new()),
+    let Some(fts_query) = clean_for_trigram(&matched) else {
+        return Ok(Vec::new());
     };
     let sq = build_search_query(&fts_query, opts, now_ms);
     let fts_ranked = find_candidate_sessions(conn, &sq)?;
