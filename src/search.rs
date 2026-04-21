@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use amici::storage::anon_placeholders;
+use amici::storage::{anon_placeholders, fts::clean_for_trigram};
 use anyhow::{Context, Result};
 use rurico::embed::Embed;
 use rurico::storage::{SanitizeError, f32_as_bytes, prepare_match_query, rrf_merge};
@@ -107,91 +107,6 @@ fn build_search_query(fts_query: &str, opts: &SearchOptions, now_ms: i64) -> Sea
         session_filter,
         params,
     }
-}
-
-// Trigram FTS5 quirk: `("a" OR "b") "c"` is a syntax error because implicit AND
-// cannot precede an OR-group. Distribute OR-groups into flat alternatives:
-// `(A OR B) C` → `A C OR B C`. Also strips control chars and drops sub-trigram
-// (<3 chars) expansions that trigram tokenizer cannot index.
-//
-// Mirrors sae's equivalent. Candidate for promotion to rurico once a shared
-// shape settles.
-fn clean_for_trigram(query: &str) -> String {
-    let cleaned: String = query.chars().filter(|c| !c.is_control()).collect();
-    let (fixed, or_groups) = parse_fts_segments(&cleaned);
-
-    if or_groups.is_empty() {
-        return fixed.join(" ");
-    }
-
-    let combos = cross_product(&or_groups);
-    let alternatives: Vec<String> = combos
-        .iter()
-        .map(|combo| {
-            let mut parts = combo.clone();
-            parts.extend(fixed.iter().cloned());
-            parts.join(" ")
-        })
-        .collect();
-    alternatives.join(" OR ")
-}
-
-// Split a `MatchFtsQuery` string into fixed quoted terms and OR-groups.
-// Expects fully-quoted input from `prepare_match_query`; bare tokens outside
-// `(...)` or `"..."` are silently dropped. Sub-trigram (<3 chars) entries
-// inside OR-groups are filtered out because the trigram tokenizer cannot
-// index them.
-fn parse_fts_segments(cleaned: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let mut fixed: Vec<String> = Vec::new();
-    let mut or_groups: Vec<Vec<String>> = Vec::new();
-    let mut chars = cleaned.chars();
-
-    while let Some(c) = chars.next() {
-        if c == '(' {
-            let mut group = String::new();
-            for gc in chars.by_ref() {
-                if gc == ')' {
-                    break;
-                }
-                group.push(gc);
-            }
-            let terms: Vec<String> = group
-                .split(" OR ")
-                .filter(|t| t.trim().trim_matches('"').chars().count() >= 3)
-                .map(|t| t.trim().to_owned())
-                .collect();
-            if !terms.is_empty() {
-                or_groups.push(terms);
-            }
-        } else if c == '"' {
-            let mut term = String::from('"');
-            for tc in chars.by_ref() {
-                term.push(tc);
-                if tc == '"' {
-                    break;
-                }
-            }
-            fixed.push(term);
-        }
-    }
-
-    (fixed, or_groups)
-}
-
-fn cross_product(groups: &[Vec<String>]) -> Vec<Vec<String>> {
-    if groups.is_empty() {
-        return vec![vec![]];
-    }
-    let rest = cross_product(&groups[1..]);
-    let mut result = Vec::new();
-    for term in &groups[0] {
-        for combo in &rest {
-            let mut v = vec![term.clone()];
-            v.extend(combo.iter().cloned());
-            result.push(v);
-        }
-    }
-    result
 }
 
 fn build_candidate_sql(sq: &SearchQuery) -> String {
@@ -455,13 +370,10 @@ pub fn search_with_embedder(
             return Ok(Vec::new());
         }
     };
-    // `clean_for_trigram` returns an empty string when every vocab-expanded
-    // term is sub-trigram (<3 chars) and no fixed terms remain. Bail before
-    // passing an empty query to FTS5.
-    let fts_query = clean_for_trigram(matched.as_str());
-    if fts_query.is_empty() {
-        return Ok(Vec::new());
-    }
+    let fts_query = match clean_for_trigram(&matched) {
+        Some(q) => q,
+        None => return Ok(Vec::new()),
+    };
     let sq = build_search_query(&fts_query, opts, now_ms);
     let fts_ranked = find_candidate_sessions(conn, &sq)?;
 
@@ -1170,46 +1082,5 @@ mod tests {
         assert_eq!(escape_like("a_b"), "a\\_b");
         assert_eq!(escape_like("c:\\path"), "c:\\\\path");
         assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
-    }
-
-    #[test]
-    fn test_clean_for_trigram_distributes_or_groups() {
-        // Control chars removed + sub-trigram dropped + distributed
-        assert_eq!(
-            clean_for_trigram("(\"認証の\" OR \"認証\n\" OR \"認証フ\") \"フロー\""),
-            "\"認証の\" \"フロー\" OR \"認証フ\" \"フロー\""
-        );
-        // Single-element group + fixed term → distributed
-        assert_eq!(clean_for_trigram("\"std\" (\"ioの\")"), "\"ioの\" \"std\"");
-        // Multi-element group + fixed term → distributed
-        assert_eq!(
-            clean_for_trigram("(\"abc\" OR \"def\") \"ghi\""),
-            "\"abc\" \"ghi\" OR \"def\" \"ghi\""
-        );
-        // No parens → unchanged
-        assert_eq!(clean_for_trigram("\"hello\""), "\"hello\"");
-        // Single group, no fixed terms → just OR
-        assert_eq!(
-            clean_for_trigram("(\"abc\" OR \"def\")"),
-            "\"abc\" OR \"def\""
-        );
-        // Multiple OR groups → cross-product
-        assert_eq!(
-            clean_for_trigram("(\"a01\" OR \"a02\") (\"b01\" OR \"b02\")"),
-            "\"a01\" \"b01\" OR \"a01\" \"b02\" OR \"a02\" \"b01\" OR \"a02\" \"b02\""
-        );
-        // Multiple OR groups + fixed term
-        assert_eq!(
-            clean_for_trigram("(\"a01\" OR \"a02\") \"xyz\" (\"b01\" OR \"b02\")"),
-            "\"a01\" \"b01\" \"xyz\" OR \"a01\" \"b02\" \"xyz\" OR \"a02\" \"b01\" \"xyz\" OR \"a02\" \"b02\" \"xyz\""
-        );
-    }
-
-    #[test]
-    fn test_clean_for_trigram_empties_all_sub_trigram() {
-        // All terms in the only OR-group are sub-trigram (<3 chars);
-        // parse_fts_segments filters them out, leaving no fixed terms →
-        // empty output. The empty-guard in search_with_embedder relies on this.
-        assert_eq!(clean_for_trigram("(\"ab\" OR \"cd\")"), "");
     }
 }
