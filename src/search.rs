@@ -4,10 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use amici::storage::anon_placeholders;
 use anyhow::{Context, Result};
 use rurico::embed::Embed;
-use rurico::storage::{f32_as_bytes, rrf_merge};
+use rurico::storage::{SanitizeError, f32_as_bytes, prepare_match_query, rrf_merge};
 use rusqlite::Connection;
 use rusqlite::types::{ToSql, ToSqlOutput};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::date::MS_PER_DAY;
 use crate::hybrid::{self, RECENCY_BOOST_WEIGHT};
@@ -60,42 +60,6 @@ struct SearchQuery {
     params: Vec<Param>,
 }
 
-/// Neutralize FTS5 special syntax in user queries: column-filters (`role:admin`),
-/// start-of-column (`^term`), `NEAR()` grouping, `+` required-match prefix,
-/// slash-prefixed tokens (`/challenge`), and unbalanced quotes (auto-balanced
-/// to prevent syntax errors).
-fn sanitize_fts_query(query: &str) -> String {
-    let result = query
-        .split_whitespace()
-        .filter(|w| {
-            let upper = w.to_ascii_uppercase();
-            !upper.starts_with("NEAR(") && !upper.starts_with("NEAR/")
-        })
-        .map(|w| {
-            let w = w.trim_start_matches(['^', '+', '-']);
-            let w = w.trim_matches(['(', ')']);
-            if (w.contains(':') || w.contains('-') || w.contains('/')) && !w.starts_with('"') {
-                let clean = w.replace('"', "");
-                if clean.chars().any(char::is_alphanumeric) {
-                    format!("\"{clean}\"")
-                } else {
-                    String::new()
-                }
-            } else {
-                w.to_owned()
-            }
-        })
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let quote_count = result.chars().filter(|&c| c == '"').count();
-    if quote_count % 2 != 0 {
-        format!("{result}\"")
-    } else {
-        result
-    }
-}
-
 /// Escape LIKE metacharacters (`%`, `_`, `\`) for use with `ESCAPE '\'`.
 pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -129,86 +93,9 @@ fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Para
     }
 }
 
-/// Trigram tokenizer requires 3+ chars; short terms are expanded to matching trigrams
-/// joined with OR so FTS5 MATCH can find them.
-fn expand_short_terms(conn: &Connection, sanitized_query: &str) -> String {
-    let mut vocab_stmt = conn.prepare(
-        "SELECT term FROM messages_vocab \
-         WHERE term LIKE ?1 ESCAPE '\\' \
-         ORDER BY cnt DESC LIMIT 25",
-    );
-    let mut parts = Vec::new();
-    for token in sanitized_query.split_whitespace() {
-        let upper = token.to_ascii_uppercase();
-        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            parts.push(token.to_owned());
-            continue;
-        }
-        let unquoted = token.trim_matches('"');
-        if unquoted.is_empty() {
-            continue;
-        }
-        if unquoted.chars().count() >= 3 {
-            parts.push(token.to_owned());
-            continue;
-        }
-        // Expand <3-char term via fts5vocab prefix match (e.g. "go" → "go" OR "golang" OR ...).
-        let escaped = escape_like(unquoted);
-        let pattern = format!("{escaped}%");
-        let terms: Vec<String> = match vocab_stmt.as_mut() {
-            Ok(stmt) => stmt
-                .query_map([&pattern], |row| row.get::<_, String>(0))
-                .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-                .unwrap_or_else(|e| {
-                    warn!(error = %e, unquoted, "term expansion failed");
-                    Vec::new()
-                }),
-            Err(e) => {
-                warn!(error = %e, unquoted, "term expansion failed");
-                Vec::new()
-            }
-        }
-        .into_iter()
-        // Trigrams like "go:" or "方針*" break FTS5 MATCH syntax; keep alphanumeric only.
-        .filter(|t| t.chars().all(char::is_alphanumeric))
-        .map(|t| format!("\"{t}\""))
-        .collect();
-        if terms.is_empty() {
-            parts.push(token.to_owned());
-        } else {
-            parts.push(format!("({})", terms.join(" OR ")));
-        }
-    }
-    // FTS5 trigram quirk: `term1 (a OR b)` is a syntax error because implicit
-    // AND (space-separated) cannot precede an OR-group. Insert explicit AND.
-    let mut result = String::new();
-    for (i, part) in parts.iter().enumerate() {
-        if i > 0 {
-            let prev = parts[i - 1].to_ascii_uppercase();
-            let curr = part.to_ascii_uppercase();
-            let is_op = |s: &str| matches!(s, "AND" | "OR" | "NOT");
-            let has_or = |s: &str| s.contains(" OR ");
-            if !is_op(&prev) && !is_op(&curr) && (has_or(part) || has_or(&parts[i - 1])) {
-                result.push_str(" AND ");
-            } else {
-                result.push(' ');
-            }
-        }
-        result.push_str(part);
-    }
-    result
-}
-
-fn build_search_query(
-    conn: &Connection,
-    query: &str,
-    opts: &SearchOptions,
-    now_ms: i64,
-) -> SearchQuery {
+fn build_search_query(fts_query: &str, opts: &SearchOptions, now_ms: i64) -> SearchQuery {
     let mut params = Vec::new();
-    let sanitized = sanitize_fts_query(query);
-    let expanded = expand_short_terms(conn, &sanitized);
-    params.push(Param::Str(expanded.clone()));
+    params.push(Param::Str(fts_query.to_owned()));
 
     let session_filter = build_session_filter(opts, now_ms, &mut params);
 
@@ -216,10 +103,95 @@ fn build_search_query(
     params.push(Param::Int(candidate_limit as i64));
 
     SearchQuery {
-        fts_query: expanded,
+        fts_query: fts_query.to_owned(),
         session_filter,
         params,
     }
+}
+
+// Trigram FTS5 quirk: `("a" OR "b") "c"` is a syntax error because implicit AND
+// cannot precede an OR-group. Distribute OR-groups into flat alternatives:
+// `(A OR B) C` → `A C OR B C`. Also strips control chars and drops sub-trigram
+// (<3 chars) expansions that trigram tokenizer cannot index.
+//
+// Mirrors sae's equivalent. Candidate for promotion to rurico once a shared
+// shape settles.
+fn clean_for_trigram(query: &str) -> String {
+    let cleaned: String = query.chars().filter(|c| !c.is_control()).collect();
+    let (fixed, or_groups) = parse_fts_segments(&cleaned);
+
+    if or_groups.is_empty() {
+        return fixed.join(" ");
+    }
+
+    let combos = cross_product(&or_groups);
+    let alternatives: Vec<String> = combos
+        .iter()
+        .map(|combo| {
+            let mut parts = combo.clone();
+            parts.extend(fixed.iter().cloned());
+            parts.join(" ")
+        })
+        .collect();
+    alternatives.join(" OR ")
+}
+
+// Split a `MatchFtsQuery` string into fixed quoted terms and OR-groups.
+// Expects fully-quoted input from `prepare_match_query`; bare tokens outside
+// `(...)` or `"..."` are silently dropped. Sub-trigram (<3 chars) entries
+// inside OR-groups are filtered out because the trigram tokenizer cannot
+// index them.
+fn parse_fts_segments(cleaned: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut fixed: Vec<String> = Vec::new();
+    let mut or_groups: Vec<Vec<String>> = Vec::new();
+    let mut chars = cleaned.chars();
+
+    while let Some(c) = chars.next() {
+        if c == '(' {
+            let mut group = String::new();
+            for gc in chars.by_ref() {
+                if gc == ')' {
+                    break;
+                }
+                group.push(gc);
+            }
+            let terms: Vec<String> = group
+                .split(" OR ")
+                .filter(|t| t.trim().trim_matches('"').chars().count() >= 3)
+                .map(|t| t.trim().to_owned())
+                .collect();
+            if !terms.is_empty() {
+                or_groups.push(terms);
+            }
+        } else if c == '"' {
+            let mut term = String::from('"');
+            for tc in chars.by_ref() {
+                term.push(tc);
+                if tc == '"' {
+                    break;
+                }
+            }
+            fixed.push(term);
+        }
+    }
+
+    (fixed, or_groups)
+}
+
+fn cross_product(groups: &[Vec<String>]) -> Vec<Vec<String>> {
+    if groups.is_empty() {
+        return vec![vec![]];
+    }
+    let rest = cross_product(&groups[1..]);
+    let mut result = Vec::new();
+    for term in &groups[0] {
+        for combo in &rest {
+            let mut v = vec![term.clone()];
+            v.extend(combo.iter().cloned());
+            result.push(v);
+        }
+    }
+    result
 }
 
 fn build_candidate_sql(sq: &SearchQuery) -> String {
@@ -476,7 +448,21 @@ pub fn search_with_embedder(
     }
 
     let now_ms = resolve_now_ms(opts)?;
-    let sq = build_search_query(conn, query, opts, now_ms);
+    let matched = match prepare_match_query(conn, query, "messages_vocab") {
+        Ok(m) => m,
+        Err(SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms) => {
+            debug!(%query, "query produced no searchable terms");
+            return Ok(Vec::new());
+        }
+    };
+    // `clean_for_trigram` returns an empty string when every vocab-expanded
+    // term is sub-trigram (<3 chars) and no fixed terms remain. Bail before
+    // passing an empty query to FTS5.
+    let fts_query = clean_for_trigram(matched.as_str());
+    if fts_query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sq = build_search_query(&fts_query, opts, now_ms);
     let fts_ranked = find_candidate_sessions(conn, &sq)?;
 
     if let Some(embedder) = embedder
@@ -932,49 +918,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_fts_query() {
-        for (input, expected) in [
-            // Colons → quoted
-            ("role:admin", "\"role:admin\""),
-            ("foo role:user bar", "foo \"role:user\" bar"),
-            // Passthrough
-            ("hello world", "hello world"),
-            ("AND OR NOT", "AND OR NOT"),
-            // Already-quoted preserved
-            ("\"role:admin\"", "\"role:admin\""),
-            // Prefix operators stripped
-            ("^hello world", "hello world"),
-            ("^foo ^bar", "foo bar"),
-            ("^", ""),
-            ("+required term", "required term"),
-            ("-excluded term", "excluded term"),
-            ("keep -this", "keep this"),
-            // NEAR filtered
-            ("NEAR(a b)", "b"),
-            ("hello NEAR(a b) world", "hello b world"),
-            ("hello NEAR/3 world", "hello world"),
-            ("near(x y)", "y"),
-            ("Near/2 test", "test"),
-            // Internal hyphens → quoted (prevents FTS5 NOT interpretation)
-            ("mlx-rs embedding", "\"mlx-rs\" embedding"),
-            ("state-of-the-art", "\"state-of-the-art\""),
-            ("\"mlx-rs\"", "\"mlx-rs\""),
-            // Slash-containing tokens → quoted (prevents FTS5 syntax error)
-            ("/challenge", "\"/challenge\""),
-            ("use /foo today", "use \"/foo\" today"),
-            ("path/to/file", "\"path/to/file\""),
-            // Bare slashes have no alphanumerics → dropped
-            ("/", ""),
-            ("//", ""),
-            // Quote balancing
-            ("\"unbalanced", "\"unbalanced\""),
-            ("\"balanced\"", "\"balanced\""),
-        ] {
-            assert_eq!(sanitize_fts_query(input), expected, "input: {input:?}");
-        }
-    }
-
-    #[test]
     fn test_index_then_search_roundtrip() {
         use crate::indexer::{IndexOptions, index_from_dirs};
 
@@ -1020,10 +963,11 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "sess-beta");
 
-        // Project filter — only alpha
+        // Project filter — alpha-only. rurico quotes FTS5 operators as literal
+        // terms, so test each side separately instead of a single OR query.
         let results = search(
             &conn,
-            "algorithm OR authentication",
+            "authentication",
             &SearchOptions {
                 project: Some("/home/me/alpha".to_owned()),
                 ..Default::default()
@@ -1032,6 +976,20 @@ mod tests {
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.project, "/home/me/alpha");
+
+        let results = search(
+            &conn,
+            "algorithm",
+            &SearchOptions {
+                project: Some("/home/me/alpha".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            results.is_empty(),
+            "algorithm lives in beta; alpha filter should exclude it"
+        );
 
         let stats2 = index_from_dirs(
             &mut conn,
@@ -1186,83 +1144,6 @@ mod tests {
         assert_eq!(results[0].session.session_id, "s1");
     }
 
-    fn setup_vocab_db() -> (tempfile::TempDir, Connection) {
-        let (dir, conn) = setup_test_db();
-        insert_session(&conn, "s1", "claude", "/p", 1000);
-        insert_message(&conn, "s1", "user", "go language tutorial");
-        insert_message(&conn, "s1", "assistant", "golang guide here");
-        (dir, conn)
-    }
-
-    #[test]
-    fn test_expand_long_terms_passthrough() {
-        let (_dir, conn) = setup_vocab_db();
-        let result = expand_short_terms(&conn, "language tutorial");
-        assert_eq!(result, "language tutorial");
-    }
-
-    #[test]
-    fn test_expand_fts_operators_passthrough() {
-        let (_dir, conn) = setup_vocab_db();
-        let result = expand_short_terms(&conn, "foo AND bar");
-        assert_eq!(result, "foo AND bar");
-    }
-
-    #[test]
-    fn test_expand_short_term_with_vocab_match() {
-        let (_dir, conn) = setup_vocab_db();
-        let result = expand_short_terms(&conn, "go");
-        assert!(
-            result.starts_with('(') && result.ends_with(')'),
-            "short term should be expanded to OR-group: {result}"
-        );
-        assert!(result != "go", "should not be the original short term");
-    }
-
-    #[test]
-    fn test_expand_short_term_no_vocab_match() {
-        let (_dir, conn) = setup_vocab_db();
-        let result = expand_short_terms(&conn, "zz");
-        assert_eq!(result, "zz");
-    }
-
-    #[test]
-    fn test_expand_mixed_short_and_long_terms() {
-        let (_dir, conn) = setup_vocab_db();
-        let result = expand_short_terms(&conn, "go tutorial");
-        // If "go" expands to an OR-group, explicit AND should be inserted
-        if result.contains("OR") {
-            assert!(
-                result.contains(" AND "),
-                "should have explicit AND between OR-group and plain term: {result}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_expand_empty_input() {
-        let (_dir, conn) = setup_vocab_db();
-        let result = expand_short_terms(&conn, "");
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_expand_short_term_filters_special_char_trigrams() {
-        let (_dir, conn) = setup_test_db();
-        insert_session(&conn, "s1", "claude", "/p", 1000);
-        // Colons produce trigrams like "go:" which must be filtered by is_alphanumeric
-        insert_message(&conn, "s1", "user", "go:run go:test go:build go:vet");
-
-        let result = expand_short_terms(&conn, "go");
-        if result.starts_with('(') {
-            assert!(
-                !result.contains(':'),
-                "special-char trigrams should be filtered: {result}"
-            );
-        }
-        assert!(search(&conn, "go", &SearchOptions::default()).is_ok());
-    }
-
     #[test]
     fn test_search_cjk_short_term_with_special_chars() {
         // The actual bug scenario: 2-char CJK term where vocab contains
@@ -1289,5 +1170,46 @@ mod tests {
         assert_eq!(escape_like("a_b"), "a\\_b");
         assert_eq!(escape_like("c:\\path"), "c:\\\\path");
         assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[test]
+    fn test_clean_for_trigram_distributes_or_groups() {
+        // Control chars removed + sub-trigram dropped + distributed
+        assert_eq!(
+            clean_for_trigram("(\"認証の\" OR \"認証\n\" OR \"認証フ\") \"フロー\""),
+            "\"認証の\" \"フロー\" OR \"認証フ\" \"フロー\""
+        );
+        // Single-element group + fixed term → distributed
+        assert_eq!(clean_for_trigram("\"std\" (\"ioの\")"), "\"ioの\" \"std\"");
+        // Multi-element group + fixed term → distributed
+        assert_eq!(
+            clean_for_trigram("(\"abc\" OR \"def\") \"ghi\""),
+            "\"abc\" \"ghi\" OR \"def\" \"ghi\""
+        );
+        // No parens → unchanged
+        assert_eq!(clean_for_trigram("\"hello\""), "\"hello\"");
+        // Single group, no fixed terms → just OR
+        assert_eq!(
+            clean_for_trigram("(\"abc\" OR \"def\")"),
+            "\"abc\" OR \"def\""
+        );
+        // Multiple OR groups → cross-product
+        assert_eq!(
+            clean_for_trigram("(\"a01\" OR \"a02\") (\"b01\" OR \"b02\")"),
+            "\"a01\" \"b01\" OR \"a01\" \"b02\" OR \"a02\" \"b01\" OR \"a02\" \"b02\""
+        );
+        // Multiple OR groups + fixed term
+        assert_eq!(
+            clean_for_trigram("(\"a01\" OR \"a02\") \"xyz\" (\"b01\" OR \"b02\")"),
+            "\"a01\" \"b01\" \"xyz\" OR \"a01\" \"b02\" \"xyz\" OR \"a02\" \"b01\" \"xyz\" OR \"a02\" \"b02\" \"xyz\""
+        );
+    }
+
+    #[test]
+    fn test_clean_for_trigram_empties_all_sub_trigram() {
+        // All terms in the only OR-group are sub-trigram (<3 chars);
+        // parse_fts_segments filters them out, leaving no fixed terms →
+        // empty output. The empty-guard in search_with_embedder relies on this.
+        assert_eq!(clean_for_trigram("(\"ab\" OR \"cd\")"), "");
     }
 }
