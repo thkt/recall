@@ -11,7 +11,7 @@ repository = "https://github.com/thkt/recall"
 test-support = ["rurico/test-support"]
 
 [dependencies]
-amici = { git = "https://github.com/thkt/amici", rev = "2a8c734" }
+amici = { git = "https://github.com/thkt/amici", rev = "9c45884" }
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 dirs = "6.0.0"
