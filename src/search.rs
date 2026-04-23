@@ -67,6 +67,33 @@ pub(crate) fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
+fn session_matches(meta: &SessionData, opts: &SearchOptions, now_ms: i64) -> bool {
+    // Case-insensitive prefix match to mirror SQLite LIKE (ASCII case-insensitive).
+    if let Some(ref prefix) = opts.project
+        && !meta
+            .project
+            .as_bytes()
+            .get(..prefix.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(prefix.as_bytes()))
+    {
+        return false;
+    }
+    if let Some(days) = opts.days {
+        let Some(ts) = meta.timestamp else {
+            return false;
+        };
+        if ts < now_ms - days * MS_PER_DAY {
+            return false;
+        }
+    }
+    if let Some(source) = opts.source
+        && meta.source != source
+    {
+        return false;
+    }
+    true
+}
+
 fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Param>) -> String {
     let mut conditions = Vec::new();
     if let Some(ref project) = opts.project {
@@ -398,6 +425,17 @@ pub fn search_with_embedder(
 
         let mut meta_map = fetch_session_metadata(conn, &merged)?;
 
+        // vec_search does not apply session_filter; re-check here.
+        merged.retain(|(sid, _)| {
+            meta_map
+                .get(sid)
+                .is_some_and(|meta| session_matches(meta, opts, now_ms))
+        });
+
+        if merged.is_empty() {
+            return Ok(Vec::new());
+        }
+
         hybrid::apply_recency_boost(
             &mut merged,
             |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
@@ -405,10 +443,6 @@ pub fn search_with_embedder(
             RECENCY_BOOST_WEIGHT,
         );
         merged.truncate(opts.limit);
-
-        if merged.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let candidates = fetch_snippets(conn, &sq, merged, &mut meta_map)?;
         Ok(candidates.into_iter().map(|(_, r)| r).collect())
@@ -1053,6 +1087,163 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
+    }
+
+    #[test]
+    fn test_hybrid_project_filter_excludes_vec_only_mismatch() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        // s1: /home/me/proj-a, FTS match → filter IN
+        insert_session(&conn, "s1", "claude", "/home/me/proj-a", now_ms);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // s2: /home/me/proj-b, vec-only match → filter OUT
+        insert_session(&conn, "s2", "claude", "/home/me/proj-b", now_ms);
+        insert_message(&conn, "s2", "user", "unrelated topic about weather");
+        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+
+        let embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                project: Some("/home/me/proj-a".to_owned()),
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&embedder),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"s1"),
+            "s1 (project match) should appear, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"s2"),
+            "s2 (project mismatch) must be filtered out from vec path, got: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_days_filter_excludes_vec_only_old() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        // s1: recent, FTS match → within 7-day window
+        insert_session(&conn, "s1", "claude", "/proj", now_ms - MS_PER_DAY);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // s2: 60 days old, vec-only match → outside window
+        insert_session(&conn, "s2", "claude", "/proj", now_ms - 60 * MS_PER_DAY);
+        insert_message(&conn, "s2", "user", "unrelated topic about weather");
+        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+
+        let embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                days: Some(7),
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&embedder),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"s1"),
+            "s1 (within days) should appear, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"s2"),
+            "s2 (outside days) must be filtered out from vec path, got: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_project_filter_case_insensitive_parity() {
+        // SQLite LIKE is ASCII case-insensitive by default. The vec-path
+        // post-filter must preserve that behavior so FTS and vec paths agree.
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        insert_session(&conn, "s1", "claude", "/Home/me/Proj-A", now_ms);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+        insert_chunk_with_embedding(&conn, 1, "s1", "authentication", now_ms);
+
+        let embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                project: Some("/home/me/proj-a".to_owned()),
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&embedder),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"s1"),
+            "case-mismatched project should match (SQLite LIKE parity), got: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_source_filter_excludes_vec_only_mismatch() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        // s1: claude, FTS match → source match
+        insert_session(&conn, "s1", "claude", "/proj", now_ms);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // s2: codex, vec-only match → source mismatch
+        insert_session(&conn, "s2", "codex", "/proj", now_ms);
+        insert_message(&conn, "s2", "user", "unrelated topic about weather");
+        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+
+        let embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                source: Some(Source::Claude),
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&embedder),
+        )
+        .unwrap();
+
+        let ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"s1"),
+            "s1 (source match) should appear, got: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"s2"),
+            "s2 (source mismatch) must be filtered out from vec path, got: {ids:?}"
+        );
     }
 
     #[test]
