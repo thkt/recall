@@ -54,12 +54,6 @@ impl ToSql for Param {
     }
 }
 
-struct SearchQuery {
-    fts_query: String,
-    session_filter: String,
-    params: Vec<Param>,
-}
-
 /// Escape LIKE metacharacters (`%`, `_`, `\`) for use with `ESCAPE '\'`.
 pub(crate) fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
@@ -67,34 +61,19 @@ pub(crate) fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn session_matches(meta: &SessionData, opts: &SearchOptions, now_ms: i64) -> bool {
-    // Case-insensitive prefix match to mirror SQLite LIKE (ASCII case-insensitive).
-    if let Some(ref prefix) = opts.project
-        && !meta
-            .project
-            .as_bytes()
-            .get(..prefix.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(prefix.as_bytes()))
-    {
-        return false;
-    }
-    if let Some(days) = opts.days {
-        let Some(ts) = meta.timestamp else {
-            return false;
-        };
-        if ts < now_ms - days * MS_PER_DAY {
-            return false;
-        }
-    }
-    if let Some(source) = opts.source
-        && meta.source != source
-    {
-        return false;
-    }
-    true
-}
-
-fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Param>) -> String {
+/// Append ` AND {column} IN (...)` to `sql` and push matching params.
+///
+/// `column` lets FTS pass `"session_id"` and vec pass `"c.session_id"` — both
+/// paths emit identical filter SQL, keeping yomu #103's single-source strategy.
+/// `&'static str` restricts `column` to compile-time literals so runtime input
+/// cannot reach the SQL string (matches amici filter helper convention).
+fn append_session_filter(
+    sql: &mut String,
+    params: &mut Vec<Param>,
+    column: &'static str,
+    opts: &SearchOptions,
+    now_ms: i64,
+) {
     let mut conditions = Vec::new();
     if let Some(ref project) = opts.project {
         let escaped = escape_like(project);
@@ -111,43 +90,37 @@ fn build_session_filter(opts: &SearchOptions, now_ms: i64, params: &mut Vec<Para
         params.push(Param::Str(source.as_str().to_owned()));
     }
     if conditions.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " AND session_id IN (SELECT s2.session_id FROM sessions s2 WHERE {})",
-            conditions.join(" AND ")
-        )
+        return;
     }
+    sql.push_str(&format!(
+        " AND {column} IN (SELECT s2.session_id FROM sessions s2 WHERE {})",
+        conditions.join(" AND ")
+    ));
 }
 
-fn build_search_query(fts_query: &str, opts: &SearchOptions, now_ms: i64) -> SearchQuery {
-    let mut params = Vec::new();
-    params.push(Param::Str(fts_query.to_owned()));
-
-    let session_filter = build_session_filter(opts, now_ms, &mut params);
-
+fn build_fts_candidate_query(
+    fts_query: &str,
+    opts: &SearchOptions,
+    now_ms: i64,
+) -> (String, Vec<Param>) {
+    let mut sql =
+        "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
+    let mut params = vec![Param::Str(fts_query.to_owned())];
+    append_session_filter(&mut sql, &mut params, "session_id", opts, now_ms);
+    sql.push_str(" GROUP BY session_id ORDER BY best_rank LIMIT ?");
     let candidate_limit = opts.limit * 3;
     params.push(Param::Int(candidate_limit as i64));
-
-    SearchQuery {
-        fts_query: fts_query.to_owned(),
-        session_filter,
-        params,
-    }
+    (sql, params)
 }
 
-fn build_candidate_sql(sq: &SearchQuery) -> String {
-    format!(
-        "SELECT session_id, MIN(rank) as best_rank FROM messages \
-         WHERE messages MATCH ?{filter} \
-         GROUP BY session_id ORDER BY best_rank LIMIT ?",
-        filter = sq.session_filter
-    )
-}
-
-fn find_candidate_sessions(conn: &Connection, sq: &SearchQuery) -> Result<Vec<(String, f64)>> {
-    let sql = build_candidate_sql(sq);
-    let refs: Vec<&dyn ToSql> = sq.params.iter().map(|p| p as &dyn ToSql).collect();
+fn find_candidate_sessions(
+    conn: &Connection,
+    opts: &SearchOptions,
+    fts_query: &str,
+    now_ms: i64,
+) -> Result<Vec<(String, f64)>> {
+    let (sql, params) = build_fts_candidate_query(fts_query, opts, now_ms);
+    let refs: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
     debug_assert_eq!(
         refs.len(),
         sql.matches('?').count(),
@@ -304,7 +277,7 @@ fn snippet_or_default(result: rusqlite::Result<String>, session_id: &str) -> Opt
 
 fn fetch_snippets(
     conn: &Connection,
-    sq: &SearchQuery,
+    fts_query: &str,
     ranked: Vec<(String, f64)>,
     meta_map: &mut HashMap<String, SessionData>,
 ) -> Result<Vec<(f64, SearchResult)>> {
@@ -313,7 +286,7 @@ fn fetch_snippets(
     let mut stmt = conn.prepare(sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
         snippet_or_default(
-            stmt.query_row(rusqlite::params![&sq.fts_query, sid], |row| row.get(0)),
+            stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
             sid,
         )
         .unwrap_or_default()
@@ -343,6 +316,8 @@ fn vec_search(
     embedder: &dyn Embed,
     query: &str,
     limit: usize,
+    opts: &SearchOptions,
+    now_ms: i64,
 ) -> Result<Vec<(String, f64)>> {
     let embedding = embedder
         .embed_query(query)
@@ -351,7 +326,9 @@ fn vec_search(
 
     // Subquery pushes the knn LIMIT down to the vec0 virtual table.
     // GROUP BY deduplicates sessions; ORDER BY MIN(distance) preserves rank.
-    let mut stmt = conn.prepare(
+    // `WHERE 1 = 1` anchors the optional session_filter without branching on
+    // its presence; SQLite folds the constant at plan time.
+    let mut sql = String::from(
         "SELECT c.session_id \
          FROM qa_chunks c \
          JOIN ( \
@@ -360,12 +337,27 @@ fn vec_search(
              ORDER BY distance \
              LIMIT ? \
          ) v ON c.id = v.chunk_id \
-         GROUP BY c.session_id \
-         ORDER BY MIN(v.distance)",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![embedding_bytes, limit as i64], |row| {
-        row.get::<_, String>(0)
-    })?;
+         WHERE 1 = 1",
+    );
+    let mut filter_params: Vec<Param> = Vec::new();
+    append_session_filter(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
+    sql.push_str(" GROUP BY c.session_id ORDER BY MIN(v.distance)");
+
+    let limit_i64 = limit as i64;
+    let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());
+    refs.push(&embedding_bytes);
+    refs.push(&limit_i64);
+    for p in &filter_params {
+        refs.push(p as &dyn ToSql);
+    }
+    debug_assert_eq!(
+        refs.len(),
+        sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))?;
 
     let mut hits = Vec::new();
     for r in rows {
@@ -400,8 +392,7 @@ pub fn search_with_embedder(
     let Some(fts_query) = clean_for_trigram(&matched) else {
         return Ok(Vec::new());
     };
-    let sq = build_search_query(&fts_query, opts, now_ms);
-    let fts_ranked = find_candidate_sessions(conn, &sq)?;
+    let fts_ranked = find_candidate_sessions(conn, opts, &fts_query, now_ms)?;
 
     if let Some(embedder) = embedder
         && has_vec_data(conn)
@@ -413,7 +404,7 @@ pub fn search_with_embedder(
             .map(|(sid, _)| (sid.clone(), 0.0))
             .collect();
 
-        let vec_hits = match vec_search(conn, embedder, query, candidate_limit) {
+        let vec_hits = match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
             Ok(hits) => hits,
             Err(e) => {
                 warn!(error = %e, "vector search failed, using text search only");
@@ -423,14 +414,17 @@ pub fn search_with_embedder(
 
         let mut merged = rrf_merge(&fts_hits, &vec_hits);
 
+        if merged.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut meta_map = fetch_session_metadata(conn, &merged)?;
 
-        // vec_search does not apply session_filter; re-check here.
-        merged.retain(|(sid, _)| {
-            meta_map
-                .get(sid)
-                .is_some_and(|meta| session_matches(meta, opts, now_ms))
-        });
+        // Drop hits whose `sessions` row is missing or has an unknown source;
+        // `fetch_session_metadata` skips those, and without pruning here they
+        // would consume `limit` slots during truncate and cause `fetch_snippets`
+        // to under-fill the result set.
+        merged.retain(|(sid, _)| meta_map.contains_key(sid));
 
         if merged.is_empty() {
             return Ok(Vec::new());
@@ -444,14 +438,14 @@ pub fn search_with_embedder(
         );
         merged.truncate(opts.limit);
 
-        let candidates = fetch_snippets(conn, &sq, merged, &mut meta_map)?;
+        let candidates = fetch_snippets(conn, &fts_query, merged, &mut meta_map)?;
         Ok(candidates.into_iter().map(|(_, r)| r).collect())
     } else {
         if fts_ranked.is_empty() {
             return Ok(Vec::new());
         }
         let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
-        let candidates = fetch_snippets(conn, &sq, fts_ranked, &mut meta_map)?;
+        let candidates = fetch_snippets(conn, &fts_query, fts_ranked, &mut meta_map)?;
         Ok(score_and_sort(candidates, now_ms, opts.limit))
     }
 }
@@ -459,6 +453,8 @@ pub fn search_with_embedder(
 #[cfg(test)]
 mod tests {
     use std::fs;
+
+    use amici::testing::hybrid::assert_filter_symmetric;
 
     use super::*;
     use crate::db::setup_test_db;
@@ -1089,44 +1085,54 @@ mod tests {
         assert_eq!(results[0].session.session_id, "s1");
     }
 
+    fn hybrid_search_ids(
+        conn: &Connection,
+        embedder: &MockEmbedder,
+        opts: &SearchOptions,
+    ) -> Vec<String> {
+        search_with_embedder(conn, "authentication", opts, Some(embedder))
+            .unwrap()
+            .into_iter()
+            .map(|r| r.session.session_id)
+            .collect()
+    }
+
     #[test]
     fn test_hybrid_project_filter_excludes_vec_only_mismatch() {
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
-
-        // s1: /home/me/proj-a, FTS match → filter IN
-        insert_session(&conn, "s1", "claude", "/home/me/proj-a", now_ms);
-        insert_message(&conn, "s1", "user", "authentication flow discussion");
-
-        // s2: /home/me/proj-b, vec-only match → filter OUT
-        insert_session(&conn, "s2", "claude", "/home/me/proj-b", now_ms);
-        insert_message(&conn, "s2", "user", "unrelated topic about weather");
-        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
-
         let embedder = MockEmbedder::new();
-        let results = search_with_embedder(
-            &conn,
-            "authentication",
-            &SearchOptions {
-                project: Some("/home/me/proj-a".to_owned()),
-                now_ms: Some(now_ms),
-                ..Default::default()
-            },
-            Some(&embedder),
-        )
-        .unwrap();
 
-        let ids: Vec<&str> = results
-            .iter()
-            .map(|r| r.session.session_id.as_str())
-            .collect();
-        assert!(
-            ids.contains(&"s1"),
-            "s1 (project match) should appear, got: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"s2"),
-            "s2 (project mismatch) must be filtered out from vec path, got: {ids:?}"
+        assert_filter_symmetric(
+            || {
+                insert_session(&conn, "s1", "claude", "/home/me/proj-a", now_ms);
+                insert_message(&conn, "s1", "user", "authentication flow discussion");
+                insert_session(&conn, "s2", "claude", "/home/me/proj-b", now_ms);
+                insert_message(&conn, "s2", "user", "unrelated topic about weather");
+                insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+                ("s1".to_owned(), "s2".to_owned())
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        project: Some("/home/me/proj-a".to_owned()),
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
         );
     }
 
@@ -1134,47 +1140,46 @@ mod tests {
     fn test_hybrid_days_filter_excludes_vec_only_old() {
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
-
-        // s1: recent, FTS match → within 7-day window
-        insert_session(&conn, "s1", "claude", "/proj", now_ms - MS_PER_DAY);
-        insert_message(&conn, "s1", "user", "authentication flow discussion");
-
-        // s2: 60 days old, vec-only match → outside window
-        insert_session(&conn, "s2", "claude", "/proj", now_ms - 60 * MS_PER_DAY);
-        insert_message(&conn, "s2", "user", "unrelated topic about weather");
-        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
-
         let embedder = MockEmbedder::new();
-        let results = search_with_embedder(
-            &conn,
-            "authentication",
-            &SearchOptions {
-                days: Some(7),
-                now_ms: Some(now_ms),
-                ..Default::default()
-            },
-            Some(&embedder),
-        )
-        .unwrap();
 
-        let ids: Vec<&str> = results
-            .iter()
-            .map(|r| r.session.session_id.as_str())
-            .collect();
-        assert!(
-            ids.contains(&"s1"),
-            "s1 (within days) should appear, got: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"s2"),
-            "s2 (outside days) must be filtered out from vec path, got: {ids:?}"
+        assert_filter_symmetric(
+            || {
+                insert_session(&conn, "s1", "claude", "/proj", now_ms - MS_PER_DAY);
+                insert_message(&conn, "s1", "user", "authentication flow discussion");
+                insert_session(&conn, "s2", "claude", "/proj", now_ms - 60 * MS_PER_DAY);
+                insert_message(&conn, "s2", "user", "unrelated topic about weather");
+                insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+                ("s1".to_owned(), "s2".to_owned())
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        days: Some(7),
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
         );
     }
 
     #[test]
-    fn test_hybrid_project_filter_case_insensitive_parity() {
-        // SQLite LIKE is ASCII case-insensitive by default. The vec-path
-        // post-filter must preserve that behavior so FTS and vec paths agree.
+    fn test_hybrid_project_filter_case_insensitive_match() {
+        // SQLite `LIKE` is ASCII case-insensitive. Both FTS and vec paths now
+        // share the same SQL filter, so a case-mismatched project must still
+        // match on the vec path.
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
 
@@ -1183,24 +1188,18 @@ mod tests {
         insert_chunk_with_embedding(&conn, 1, "s1", "authentication", now_ms);
 
         let embedder = MockEmbedder::new();
-        let results = search_with_embedder(
+        let ids = hybrid_search_ids(
             &conn,
-            "authentication",
+            &embedder,
             &SearchOptions {
                 project: Some("/home/me/proj-a".to_owned()),
                 now_ms: Some(now_ms),
                 ..Default::default()
             },
-            Some(&embedder),
-        )
-        .unwrap();
+        );
 
-        let ids: Vec<&str> = results
-            .iter()
-            .map(|r| r.session.session_id.as_str())
-            .collect();
         assert!(
-            ids.contains(&"s1"),
+            ids.iter().any(|id| id == "s1"),
             "case-mismatched project should match (SQLite LIKE parity), got: {ids:?}"
         );
     }
@@ -1209,22 +1208,63 @@ mod tests {
     fn test_hybrid_source_filter_excludes_vec_only_mismatch() {
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
+        let embedder = MockEmbedder::new();
 
-        // s1: claude, FTS match → source match
-        insert_session(&conn, "s1", "claude", "/proj", now_ms);
-        insert_message(&conn, "s1", "user", "authentication flow discussion");
+        assert_filter_symmetric(
+            || {
+                insert_session(&conn, "s1", "claude", "/proj", now_ms);
+                insert_message(&conn, "s1", "user", "authentication flow discussion");
+                insert_session(&conn, "s2", "codex", "/proj", now_ms);
+                insert_message(&conn, "s2", "user", "unrelated topic about weather");
+                insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+                ("s1".to_owned(), "s2".to_owned())
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        source: Some(Source::Claude),
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+        );
+    }
 
-        // s2: codex, vec-only match → source mismatch
-        insert_session(&conn, "s2", "codex", "/proj", now_ms);
-        insert_message(&conn, "s2", "user", "unrelated topic about weather");
-        insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
+    #[test]
+    fn test_hybrid_unknown_source_does_not_crowd_out_valid_hit() {
+        // Regression: if `fetch_session_metadata` skips a merged hit (e.g. the
+        // `sessions.source` value is unknown to `Source::from_db`), that hit
+        // must be pruned before `truncate(limit)`, or a higher-rank invalid
+        // session could consume the slot a valid one should have used.
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        insert_session(&conn, "s_valid", "claude", "/proj", now_ms);
+        insert_message(&conn, "s_valid", "user", "authentication flow discussion");
+
+        insert_session(&conn, "s_unknown", "mystery_source_v99", "/proj", now_ms);
+        insert_message(&conn, "s_unknown", "user", "unrelated topic");
+        insert_chunk_with_embedding(&conn, 1, "s_unknown", "authentication", now_ms);
 
         let embedder = MockEmbedder::new();
         let results = search_with_embedder(
             &conn,
             "authentication",
             &SearchOptions {
-                source: Some(Source::Claude),
+                limit: 1,
                 now_ms: Some(now_ms),
                 ..Default::default()
             },
@@ -1232,18 +1272,12 @@ mod tests {
         )
         .unwrap();
 
-        let ids: Vec<&str> = results
-            .iter()
-            .map(|r| r.session.session_id.as_str())
-            .collect();
-        assert!(
-            ids.contains(&"s1"),
-            "s1 (source match) should appear, got: {ids:?}"
+        assert_eq!(
+            results.len(),
+            1,
+            "s_valid must fill the limit slot even if s_unknown ranks above it"
         );
-        assert!(
-            !ids.contains(&"s2"),
-            "s2 (source mismatch) must be filtered out from vec path, got: {ids:?}"
-        );
+        assert_eq!(results[0].session.session_id, "s_valid");
     }
 
     #[test]
