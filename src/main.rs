@@ -23,6 +23,7 @@ use amici::cli::{
 use amici::logging::init_subscriber;
 use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
+use amici::storage::filter::escape_like;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
@@ -360,7 +361,7 @@ fn show_session(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\' ORDER BY session_id",
     )?;
-    let pattern = format!("{}%", search::escape_like(session_id));
+    let pattern = format!("{}%", escape_like(session_id));
     let matches: Vec<parser::SessionData> = stmt
         .query_map([&pattern], |row| {
             let source_str: String = row.get(1)?;
