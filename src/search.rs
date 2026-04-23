@@ -1,12 +1,16 @@
 use std::collections::HashMap;
+use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use amici::storage::filter::{
+    append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter,
+};
 use amici::storage::{anon_placeholders, fts::clean_for_trigram};
 use anyhow::{Context, Result};
 use rurico::embed::Embed;
 use rurico::storage::{SanitizeError, f32_as_bytes, prepare_match_query, rrf_merge};
 use rusqlite::Connection;
-use rusqlite::types::{ToSql, ToSqlOutput};
+use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
 use crate::date::MS_PER_DAY;
@@ -40,76 +44,50 @@ impl Default for SearchOptions {
     }
 }
 
-enum Param {
-    Str(String),
-    Int(i64),
-}
-
-impl ToSql for Param {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        match self {
-            Param::Str(s) => s.to_sql(),
-            Param::Int(i) => i.to_sql(),
-        }
-    }
-}
-
-/// Escape LIKE metacharacters (`%`, `_`, `\`) for use with `ESCAPE '\'`.
-pub(crate) fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// Append ` AND {column} IN (...)` to `sql` and push matching params.
 ///
 /// `column` lets FTS pass `"session_id"` and vec pass `"c.session_id"` — both
 /// paths emit identical filter SQL, keeping yomu #103's single-source strategy.
 /// `&'static str` restricts `column` to compile-time literals so runtime input
 /// cannot reach the SQL string (matches amici filter helper convention).
+///
+/// Precondition: `sql` ends inside an open WHERE clause — callers anchor with
+/// `MATCH ?` (FTS path) or a trailing `WHERE 1 = 1` (vec path).
 fn append_session_filter(
     sql: &mut String,
-    params: &mut Vec<Param>,
+    params: &mut Vec<Box<dyn ToSql>>,
     column: &'static str,
     opts: &SearchOptions,
     now_ms: i64,
 ) {
-    let mut conditions = Vec::new();
-    if let Some(ref project) = opts.project {
-        let escaped = escape_like(project);
-        conditions.push("s2.project LIKE ? || '%' ESCAPE '\\'".to_owned());
-        params.push(Param::Str(escaped));
-    }
-    if let Some(days) = opts.days {
-        let cutoff = now_ms - days * MS_PER_DAY;
-        conditions.push("s2.timestamp >= ?".to_owned());
-        params.push(Param::Int(cutoff));
-    }
-    if let Some(source) = opts.source {
-        conditions.push("s2.source = ?".to_owned());
-        params.push(Param::Str(source.as_str().to_owned()));
-    }
-    if conditions.is_empty() {
+    if opts.project.is_none() && opts.days.is_none() && opts.source.is_none() {
         return;
     }
-    sql.push_str(&format!(
-        " AND {column} IN (SELECT s2.session_id FROM sessions s2 WHERE {})",
-        conditions.join(" AND ")
-    ));
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
+    if let Some(ref project) = opts.project {
+        append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
+    }
+    let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
+    append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
+    let source_str = opts.source.as_ref().map(Source::as_str);
+    append_eq_filter(sql, params, "s2.source", source_str);
+    sql.push(')');
 }
 
 fn build_fts_candidate_query(
     fts_query: &str,
     opts: &SearchOptions,
     now_ms: i64,
-) -> (String, Vec<Param>) {
+) -> (String, Vec<Box<dyn ToSql>>) {
     let mut sql =
         "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
-    let mut params = vec![Param::Str(fts_query.to_owned())];
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
     append_session_filter(&mut sql, &mut params, "session_id", opts, now_ms);
     sql.push_str(" GROUP BY session_id ORDER BY best_rank LIMIT ?");
     let candidate_limit = opts.limit * 3;
-    params.push(Param::Int(candidate_limit as i64));
+    params.push(Box::new(candidate_limit as i64));
     (sql, params)
 }
 
@@ -120,7 +98,7 @@ fn find_candidate_sessions(
     now_ms: i64,
 ) -> Result<Vec<(String, f64)>> {
     let (sql, params) = build_fts_candidate_query(fts_query, opts, now_ms);
-    let refs: Vec<&dyn ToSql> = params.iter().map(|p| p as &dyn ToSql).collect();
+    let refs: Vec<&dyn ToSql> = params.iter().map(AsRef::as_ref).collect();
     debug_assert_eq!(
         refs.len(),
         sql.matches('?').count(),
@@ -339,7 +317,7 @@ fn vec_search(
          ) v ON c.id = v.chunk_id \
          WHERE 1 = 1",
     );
-    let mut filter_params: Vec<Param> = Vec::new();
+    let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_session_filter(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
     sql.push_str(" GROUP BY c.session_id ORDER BY MIN(v.distance)");
 
@@ -348,7 +326,7 @@ fn vec_search(
     refs.push(&embedding_bytes);
     refs.push(&limit_i64);
     for p in &filter_params {
-        refs.push(p as &dyn ToSql);
+        refs.push(p.as_ref());
     }
     debug_assert_eq!(
         refs.len(),
@@ -1297,14 +1275,5 @@ mod tests {
         let results = search(&conn, "ディレクトリ整理 方針", &SearchOptions::default())
             .expect("CJK short term + long term should not cause FTS5 error");
         assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn test_escape_like_basic() {
-        assert_eq!(escape_like("hello"), "hello");
-        assert_eq!(escape_like("100%"), "100\\%");
-        assert_eq!(escape_like("a_b"), "a\\_b");
-        assert_eq!(escape_like("c:\\path"), "c:\\\\path");
-        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
     }
 }
