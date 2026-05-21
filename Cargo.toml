@@ -27,7 +27,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [dev-dependencies]
 amici = { git = "https://github.com/thkt/amici", rev = "dddbef0", features = ["test-support"] }
 rurico = { git = "https://github.com/thkt/rurico", rev = "7b739d1", features = ["test-support"] }
-serial_test = "3"
 tempfile = "3"
 
 [lints.rust]

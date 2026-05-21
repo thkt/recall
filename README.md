@@ -171,6 +171,26 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 | Apple Silicon focus | MLX acceleration requires Apple Silicon. candle (CPU) fallback available for Linux |
 | Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations  |
 
+## Development
+
+### Setup
+
+Run once after cloning:
+
+```sh
+git config --local core.hooksPath .githooks
+```
+
+This installs a pre-commit hook that runs `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` before each commit. Violations abort the commit. To skip for one commit: `git commit --no-verify`.
+
+### Common commands
+
+```sh
+cargo nextest run                                         # all tests (install: cargo install cargo-nextest --locked)
+cargo clippy --all-targets --all-features -- -D warnings  # lint (matches CI)
+cargo fmt -- --check                                      # format check
+```
+
 ## Acknowledgements
 
 This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/recall). The original idea of making past Claude Code sessions searchable came from there. This is a Rust reimplementation with semantic search — single binary, local embeddings, and CJK support.
