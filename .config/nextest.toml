@@ -1,0 +1,9 @@
+[profile.default]
+fail-fast = false
+
+[profile.ci]
+fail-fast = false
+# 120s × 2 = 4min hard ceiling per test. embedding/model-load tests (Ruri v3 on MLX) are
+# the slowest known path; re-measure if those tests start hitting the limit.
+slow-timeout = { period = "120s", terminate-after = 2 }
+final-status-level = "flaky"

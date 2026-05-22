@@ -14,14 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Apply priority labels
-        uses: stefanbuck/[email protected]
+        uses: stefanbuck/github-issue-parser@cb6e97157cbf851e3a393ff8d57c93a484cc323f # v3
         with:
           template: bug.yml
           section: priority
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Apply priority labels (feature)
-        uses: stefanbuck/[email protected]
+        uses: stefanbuck/github-issue-parser@cb6e97157cbf851e3a393ff8d57c93a484cc323f # v3
         with:
           template: feature.yml
           section: priority
