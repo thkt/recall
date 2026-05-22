@@ -12,6 +12,10 @@ updates:
       include: scope
     cooldown:
       default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
   - package-ecosystem: cargo
     directory: /
