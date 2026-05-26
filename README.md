@@ -92,8 +92,8 @@ Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_sy
 ### Index
 
 ```sh
-recall index            # parse + chunk session logs (no model calls)
-recall index --force    # full rebuild
+recall index            # parse + chunk new session logs (incremental, no model calls)
+recall rebuild          # drop and rebuild the full index from scratch
 ```
 
 ### Embed
@@ -156,7 +156,8 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 
 | Operation                           | Time                                       |
 | ----------------------------------- | ------------------------------------------ |
-| `recall index` (6k files)           | ~0.5s (incremental), ~4min (full rebuild)  |
+| `recall index` (6k files)           | ~0.5s (incremental)                        |
+| `recall rebuild` (6k files)         | ~4min (full rebuild)                       |
 | `recall search`                     | ~2s (with embedding), instant (--no-embed) |
 | `recall embed` (28k chunks)         | ~11 min (M3, batch=128)                    |
 | Embedding throughput                | ~45 chunks/sec (M3 + MLX)                  |

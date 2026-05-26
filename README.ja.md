@@ -90,8 +90,8 @@ recall search "auth" --no-embed                                    # post-search
 ### インデックス
 
 ```sh
-recall index            # parse + chunk（モデル呼び出しなし）
-recall index --force    # 全件再構築
+recall index            # 新規セッションログを解析 + チャンク化（差分、モデル呼び出しなし）
+recall rebuild          # インデックスを破棄して全件再構築
 ```
 
 ### Embedding
@@ -154,7 +154,8 @@ src/
 
 | 操作                                    | 所要時間                                   |
 | --------------------------------------- | ------------------------------------------ |
-| `recall index`（6kファイル）            | 約0.5秒（差分）、約4分（全件再構築）       |
+| `recall index`（6kファイル）            | 約0.5秒（差分）                            |
+| `recall rebuild`（6kファイル）          | 約4分（全件再構築）                        |
 | `recall search`                         | 約2秒（embedding込み）、即座（--no-embed） |
 | `recall embed`（28kチャンク）           | 約11分（M3, batch=128）                    |
 | embeddingスループット                   | 約45 chunks/sec（M3 + MLX）                |
