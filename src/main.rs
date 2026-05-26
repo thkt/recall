@@ -56,12 +56,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Parse and chunk session logs. No model calls.
-    Index {
-        /// Force full rebuild
-        #[arg(long)]
-        force: bool,
-    },
+    /// Parse and chunk new session logs (incremental). No model calls.
+    Index,
+    /// Drop the index and rebuild from all sessions. No model calls.
+    Rebuild,
     /// Embed pending chunks for semantic search.
     Embed,
     /// Manage the embedding model.
@@ -178,7 +176,17 @@ fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
 
 // -- Subcommands --
 
-fn run_index(force: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(db_path: &Option<PathBuf>) -> Result<()> {
+    index_and_report(db_path, false)
+}
+
+fn run_rebuild(db_path: &Option<PathBuf>) -> Result<()> {
+    index_and_report(db_path, true)
+}
+
+/// Shared index pipeline for `index` (incremental) and `rebuild` (full).
+/// `force` is internalized here so both entry points stay argument-free.
+fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
@@ -215,6 +223,16 @@ fn run_index(force: bool, db_path: &Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Message shown when no chunks are pending embedding. Distinguishes
+/// "index not run yet" (no chunks at all) from "everything already embedded".
+fn embed_idle_message(total_chunks: i64) -> &'static str {
+    if total_chunks == 0 {
+        "No chunks to embed. Run `recall index` first."
+    } else {
+        "All chunks already embedded"
+    }
+}
+
 fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
@@ -227,7 +245,9 @@ fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
     )?;
 
     if pending == 0 {
-        done("All chunks already embedded");
+        let total_chunks: i64 =
+            conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
+        done(embed_idle_message(total_chunks));
         return Ok(());
     }
 
@@ -558,7 +578,7 @@ fn print_results(results: &[search::SearchResult]) {
 // -- Entry point --
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "index", "embed", "model", "search", "show", "status", "help",
+    "index", "rebuild", "embed", "model", "search", "show", "status", "help",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v"];
 
@@ -577,7 +597,8 @@ fn run() -> Result<()> {
     init_subscriber(default_filter);
 
     match cli.command {
-        Some(Command::Index { force }) => run_index(force, &cli.db_path),
+        Some(Command::Index) => run_index(&cli.db_path),
+        Some(Command::Rebuild) => run_rebuild(&cli.db_path),
         Some(Command::Embed) => run_embed(&cli.db_path),
         Some(Command::Model(ModelCommand::Download)) => run_model_download(),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
@@ -696,6 +717,36 @@ mod tests {
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("> "));
+    }
+
+    #[test]
+    fn test_embed_idle_message_distinguishes_unindexed_from_embedded() {
+        assert_eq!(
+            embed_idle_message(0),
+            "No chunks to embed. Run `recall index` first."
+        );
+        assert_eq!(embed_idle_message(5), "All chunks already embedded");
+    }
+
+    #[test]
+    fn test_rebuild_is_a_distinct_subcommand() {
+        let cli = Cli::try_parse_from(["recall", "rebuild"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Rebuild)));
+    }
+
+    #[test]
+    fn test_index_no_longer_accepts_force_flag() {
+        assert!(Cli::try_parse_from(["recall", "index", "--force"]).is_err());
+        let cli = Cli::try_parse_from(["recall", "index"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Index)));
+    }
+
+    #[test]
+    fn test_rebuild_recognized_by_shorthand_expansion() {
+        // Without `rebuild` in KNOWN_SUBCOMMANDS, `recall rebuild` would be
+        // rewritten to `search rebuild` by shorthand expansion.
+        let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
+        assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
     }
 
     #[test]
