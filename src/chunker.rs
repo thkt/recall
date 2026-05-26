@@ -41,7 +41,9 @@ fn build_content(user_text: &str, assistant_text: Option<&str>) -> Vec<String> {
             }
             // Split assistant text with user_text as prefix per sub-chunk
             let available = MAX_CHUNK_BYTES.saturating_sub(header.len());
-            if available > 0 {
+            // Need room for at least one full char (max 4 UTF-8 bytes); below that,
+            // find_split_boundary returns 0 and the sub-chunk loop cannot advance.
+            if available >= 4 {
                 let mut chunks = Vec::new();
                 let mut remaining = a;
                 while !remaining.is_empty() {
@@ -52,7 +54,8 @@ fn build_content(user_text: &str, assistant_text: Option<&str>) -> Vec<String> {
                 }
                 return chunks;
             }
-            // user_text alone exceeds limit; split both independently
+            // user_text leaves < 4 bytes of room (or exceeds the limit);
+            // split user and assistant independently.
             let mut chunks = split_text(user_text, MAX_CHUNK_BYTES);
             chunks.extend(split_text(a, MAX_CHUNK_BYTES));
             chunks
@@ -270,5 +273,53 @@ mod tests {
         ];
         let chunks = chunk_messages("s1", &messages, None);
         assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_user_near_limit_multibyte_assistant_terminates() {
+        // Regression: user_text within 1-3 bytes of MAX_CHUNK_BYTES leaves `available` < 4.
+        // When assistant text leads with a multibyte char wider than `available`,
+        // find_split_boundary returns 0, so the sub-chunk loop never advances —
+        // an infinite loop that also pushes a ~16KB header every iteration (OOM).
+        let user = "a".repeat(15998); // header = 15999 bytes → available = 1
+        let assistant = "こんにちは世界"; // 3-byte CJK lead char > available
+        let messages = vec![msg(Role::User, &user), msg(Role::Assistant, assistant)];
+        let chunks = chunk_messages("s1", &messages, None);
+        assert!(!chunks.is_empty(), "must terminate and produce chunks");
+        assert!(
+            chunks.iter().any(|c| c.content.contains("こんにちは")),
+            "assistant content must be preserved across the split"
+        );
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.content.len() <= MAX_CHUNK_BYTES,
+                "chunk[{i}] is {} bytes, exceeds limit {MAX_CHUNK_BYTES}",
+                chunk.content.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_available_4_takes_sub_chunk_path() {
+        // Boundary: available == 4 is the smallest value that enters the sub-chunk
+        // branch (>= 4), where each chunk carries user_text as a prefix. One byte less
+        // (available == 3) falls to the independent-split branch instead.
+        let user = "a".repeat(15995); // header = 15996 bytes → available = 4
+        let assistant = "日本語のテキスト"; // exceeds available → forces a split
+        let messages = vec![msg(Role::User, &user), msg(Role::Assistant, assistant)];
+        let chunks = chunk_messages("s1", &messages, None);
+
+        assert!(chunks.len() > 1, "must split, got {}", chunks.len());
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert!(
+                chunk.content.starts_with(&user),
+                "chunk[{i}] must carry user_text as prefix (sub-chunk path)"
+            );
+            assert!(
+                chunk.content.len() <= MAX_CHUNK_BYTES,
+                "chunk[{i}] is {} bytes, exceeds limit {MAX_CHUNK_BYTES}",
+                chunk.content.len()
+            );
+        }
     }
 }
