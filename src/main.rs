@@ -292,6 +292,12 @@ fn run_model_download() -> Result<()> {
     download_and_verify_model().map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+/// Guidance when search runs against an empty index. `recall search` no longer
+/// auto-indexes, so zero sessions means the user must run `recall index` first.
+fn search_idle_message(session_count: i64) -> Option<&'static str> {
+    (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
+}
+
 fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
     let Command::Search {
         query,
@@ -308,19 +314,13 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
-    // Auto-index FTS5 + chunks (fast: skips scan if dirs unchanged)
-    let sp = Spinner::new("Indexing...");
-    let stats = indexer::index_sessions(&mut conn, false)?;
-    let chunk_stats = indexer::index_chunks(&mut conn)?;
-    let main_msg = if stats.indexed > 0 || chunk_stats.chunks_created > 0 {
-        format!(
-            "Indexed {} sessions, {} chunks",
-            stats.indexed, chunk_stats.chunks_created
-        )
-    } else {
-        format!("{} sessions", stats.total_sessions)
-    };
-    sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
+    // Search reads the pre-built index; indexing happens via `recall index`,
+    // not on every search, so search latency no longer depends on scan cost.
+    let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+    if let Some(msg) = search_idle_message(session_count) {
+        done(msg);
+        return Ok(());
+    }
 
     let embedder = try_load_embedder_cached();
 
@@ -726,6 +726,16 @@ mod tests {
             "No chunks to embed. Run `recall index` first."
         );
         assert_eq!(embed_idle_message(5), "All chunks already embedded");
+    }
+
+    #[test]
+    fn test_search_idle_message_only_when_unindexed() {
+        // `recall search` no longer auto-indexes, so an empty DB must surface guidance.
+        assert_eq!(
+            search_idle_message(0),
+            Some("No sessions indexed. Run `recall index` first.")
+        );
+        assert_eq!(search_idle_message(5), None);
     }
 
     #[test]
