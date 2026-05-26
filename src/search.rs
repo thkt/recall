@@ -258,16 +258,31 @@ fn fetch_snippets(
     fts_query: &str,
     ranked: Vec<(String, f64)>,
     meta_map: &mut HashMap<String, SessionData>,
+    vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<(f64, SearchResult)>> {
-    let sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
+    let snippet_sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
                FROM messages WHERE messages MATCH ?1 AND session_id = ?2 LIMIT 1";
-    let mut stmt = conn.prepare(sql)?;
+    let mut snippet_stmt = conn.prepare(snippet_sql)?;
+    let chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
+    let mut chunk_stmt = conn.prepare(chunk_sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
-        snippet_or_default(
-            stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+        if let Some(snippet) = snippet_or_default(
+            snippet_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
             sid,
-        )
-        .unwrap_or_default()
+        ) {
+            return snippet;
+        }
+        // Vector-only hit: no FTS snippet exists. Fall back to the matched chunk's
+        // content so the result shows why it matched (#36).
+        if let Some(&chunk_id) = vec_chunks.get(sid)
+            && let Some(content) = snippet_or_default(
+                chunk_stmt.query_row(rusqlite::params![chunk_id], |row| row.get(0)),
+                sid,
+            )
+        {
+            return content;
+        }
+        String::new()
     }))
 }
 
@@ -296,7 +311,7 @@ fn vec_search(
     limit: usize,
     opts: &SearchOptions,
     now_ms: i64,
-) -> Result<Vec<(String, f64)>> {
+) -> Result<Vec<(String, i64)>> {
     let embedding = embedder
         .embed_query(query)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -304,10 +319,13 @@ fn vec_search(
 
     // Subquery pushes the knn LIMIT down to the vec0 virtual table.
     // GROUP BY deduplicates sessions; ORDER BY MIN(distance) preserves rank.
+    // The explicit MIN(v.distance) in the SELECT binds the bare `c.id` to the
+    // MIN-distance row (SQLite single-min/max rule) — the chunk closest to the
+    // query, used as the excerpt source for vector-only hits (no FTS snippet).
     // `WHERE 1 = 1` anchors the optional session_filter without branching on
     // its presence; SQLite folds the constant at plan time.
     let mut sql = String::from(
-        "SELECT c.session_id \
+        "SELECT c.session_id, c.id, MIN(v.distance) AS d \
          FROM qa_chunks c \
          JOIN ( \
              SELECT chunk_id, distance FROM vec_chunks \
@@ -319,7 +337,7 @@ fn vec_search(
     );
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_session_filter(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
-    sql.push_str(" GROUP BY c.session_id ORDER BY MIN(v.distance)");
+    sql.push_str(" GROUP BY c.session_id ORDER BY d");
 
     let limit_i64 = limit as i64;
     let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());
@@ -335,11 +353,13 @@ fn vec_search(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(refs.as_slice(), |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map(refs.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
 
     let mut hits = Vec::new();
     for r in rows {
-        hits.push((r?, 0.0));
+        hits.push(r?);
     }
     Ok(hits)
 }
@@ -390,7 +410,13 @@ pub fn search_with_embedder(
             }
         };
 
-        let mut merged = rrf_merge(&fts_hits, &vec_hits);
+        // Map each vector-hit session to its closest chunk so fetch_snippets can use
+        // that chunk's content as the excerpt when there is no FTS snippet (#36).
+        let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
+        let vec_for_rrf: Vec<(String, f64)> =
+            vec_hits.iter().map(|(sid, _)| (sid.clone(), 0.0)).collect();
+
+        let mut merged = rrf_merge(&fts_hits, &vec_for_rrf);
 
         if merged.is_empty() {
             return Ok(Vec::new());
@@ -416,14 +442,17 @@ pub fn search_with_embedder(
         );
         merged.truncate(opts.limit);
 
-        let candidates = fetch_snippets(conn, &fts_query, merged, &mut meta_map)?;
+        let candidates = fetch_snippets(conn, &fts_query, merged, &mut meta_map, &vec_chunks)?;
         Ok(candidates.into_iter().map(|(_, r)| r).collect())
     } else {
         if fts_ranked.is_empty() {
             return Ok(Vec::new());
         }
         let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
-        let candidates = fetch_snippets(conn, &fts_query, fts_ranked, &mut meta_map)?;
+        // FTS-only path: every session matched FTS, so there is always a snippet;
+        // pass an empty vec-chunk map (no vector-only fallback needed here).
+        let candidates =
+            fetch_snippets(conn, &fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
         Ok(score_and_sort(candidates, now_ms, opts.limit))
     }
 }
@@ -992,6 +1021,62 @@ mod tests {
         assert!(
             ids.contains(&"s2"),
             "s2 should appear (vector match), got: {ids:?}"
+        );
+
+        // #36: a vector-only hit must expose the matched chunk content, not an empty
+        // excerpt — `messages MATCH fts_query` returns no row for these sessions.
+        let s2 = results
+            .iter()
+            .find(|r| r.session.session_id == "s2")
+            .unwrap();
+        assert!(
+            s2.excerpt.contains("authentication"),
+            "vector-only excerpt must contain matched chunk content, got: {:?}",
+            s2.excerpt
+        );
+    }
+
+    #[test]
+    fn test_vector_only_excerpt_uses_closest_chunk() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+
+        insert_session(&conn, "s1", "claude", "/proj", now_ms);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+        // s2 is vector-only with two chunks. The query embedding is closest to
+        // chunk 2, so the excerpt must come from chunk 2 (MIN distance), not chunk 1.
+        // This pins the bare-column / single-MIN behavior, not just "non-empty".
+        insert_session(&conn, "s2", "claude", "/proj", now_ms);
+        insert_message(&conn, "s2", "user", "unrelated weather topic");
+        insert_chunk_with_embedding(&conn, 1, "s2", "totally unrelated weather forecast", now_ms);
+        insert_chunk_with_embedding(&conn, 2, "s2", "authentication", now_ms);
+
+        let embedder = MockEmbedder::new();
+        let results = search_with_embedder(
+            &conn,
+            "authentication",
+            &SearchOptions {
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+            Some(&embedder),
+        )
+        .unwrap();
+
+        let s2 = results
+            .iter()
+            .find(|r| r.session.session_id == "s2")
+            .unwrap();
+        assert!(
+            s2.excerpt.contains("authentication"),
+            "excerpt must come from the closest chunk (chunk 2), got: {:?}",
+            s2.excerpt
+        );
+        assert!(
+            !s2.excerpt.contains("weather"),
+            "excerpt must be the MIN-distance chunk, not an arbitrary one, got: {:?}",
+            s2.excerpt
         );
     }
 
