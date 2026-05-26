@@ -223,6 +223,16 @@ fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// Message shown when no chunks are pending embedding. Distinguishes
+/// "index not run yet" (no chunks at all) from "everything already embedded".
+fn embed_idle_message(total_chunks: i64) -> &'static str {
+    if total_chunks == 0 {
+        "No chunks to embed. Run `recall index` first."
+    } else {
+        "All chunks already embedded"
+    }
+}
+
 fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
@@ -235,7 +245,9 @@ fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
     )?;
 
     if pending == 0 {
-        done("All chunks already embedded");
+        let total_chunks: i64 =
+            conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
+        done(embed_idle_message(total_chunks));
         return Ok(());
     }
 
@@ -705,6 +717,15 @@ mod tests {
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.contains("> "));
+    }
+
+    #[test]
+    fn test_embed_idle_message_distinguishes_unindexed_from_embedded() {
+        assert_eq!(
+            embed_idle_message(0),
+            "No chunks to embed. Run `recall index` first."
+        );
+        assert_eq!(embed_idle_message(5), "All chunks already embedded");
     }
 
     #[test]
