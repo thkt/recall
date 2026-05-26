@@ -201,6 +201,38 @@ mod tests {
     }
 
     #[test]
+    fn classify_maps_invalid_vocab_table_to_internal() {
+        let err = anyhow::Error::new(SanitizeError::InvalidVocabTable("1bad".into()));
+        assert_eq!(classify(&err), ErrorCode::Internal);
+    }
+
+    #[test]
+    fn classify_maps_empty_query_to_data_error() {
+        assert_eq!(
+            classify(&anyhow::Error::new(SanitizeError::EmptyInput)),
+            ErrorCode::DataError
+        );
+        assert_eq!(
+            classify(&anyhow::Error::new(SanitizeError::NoSearchableTerms)),
+            ErrorCode::DataError
+        );
+    }
+
+    // The public ExitCode wrappers (classify_exit_code, CliError::exit_code)
+    // must agree with the ErrorCode::code() table they delegate to.
+    #[test]
+    fn exit_code_wrappers_agree_with_code_table() {
+        assert_eq!(
+            classify_exit_code(&anyhow::Error::new(RecallError::Usage("x".into()))),
+            ExitCode::from(codes::USAGE)
+        );
+        assert_eq!(
+            RecallError::DataError("x".into()).exit_code(),
+            ExitCode::from(codes::DATA_ERROR)
+        );
+    }
+
+    #[test]
     fn classify_maps_raw_io_error() {
         let err = anyhow::Error::new(io::Error::other("boom"));
         assert_eq!(classify(&err), ErrorCode::IoError);
