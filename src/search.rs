@@ -14,6 +14,7 @@ use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
 use crate::embedder::f32_as_bytes;
+use crate::error::RecallError;
 use crate::hybrid::rrf_merge_strings;
 
 use crate::date::MS_PER_DAY;
@@ -132,9 +133,10 @@ fn find_candidate_sessions(
     }
     if let Some(ref err_msg) = first_error {
         if ranked.is_empty() {
-            anyhow::bail!(
+            return Err(RecallError::DataError(format!(
                 "Invalid search query: {err_msg}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
-            );
+            ))
+            .into());
         }
         warn!(skipped, %err_msg, "rows skipped during search");
     }

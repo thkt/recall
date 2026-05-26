@@ -3,6 +3,7 @@ mod chunker;
 mod date;
 mod db;
 mod embedder;
+mod error;
 mod hybrid;
 mod indexer;
 mod parser;
@@ -13,9 +14,10 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, ExitCode};
 use std::sync::Arc;
 
+use amici::cli::exit_code::codes;
 use amici::cli::{
     Spinner, done, embed_with_spinners, exit_error, info as cli_info, progress_step,
     try_expand_shorthand,
@@ -25,16 +27,15 @@ use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use amici::storage::filter::escape_like;
 use anyhow::{Context, Result};
+use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
+use crate::error::{RecallError, classify_exit_code, download_error, embedder_error};
 use crate::parser::Source;
-
-/// Keep in sync with bail! sites: `run()` and `find_candidate_sessions()`.
-const USER_ERROR_MARKERS: &[&str] = &["search query is required", "Invalid search query"];
 
 const LOG_FILTER_VERBOSE: &str = "recall=info";
 const LOG_FILTER_DEFAULT: &str = "recall=warn";
@@ -275,21 +276,11 @@ fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
 }
 
 fn load_cached_embedder() -> Result<Arc<dyn Embed>> {
-    open_cached_embedder().map_err(|reason| {
-        let hint = match reason {
-            DegradedReason::NotInstalled => {
-                "embedding model not installed; run `recall model download`"
-            }
-            DegradedReason::BackendUnavailable => "MLX backend unavailable",
-            DegradedReason::ProbeFailed => "embedding model probe failed",
-            DegradedReason::Disabled => "embedder disabled",
-        };
-        anyhow::anyhow!("{hint}")
-    })
+    open_cached_embedder().map_err(|reason| embedder_error(reason).into())
 }
 
 fn run_model_download() -> Result<()> {
-    download_and_verify_model().map_err(|e| anyhow::anyhow!("{e}"))
+    download_and_verify_model().map_err(|e| download_error(&e).into())
 }
 
 /// Guidance when search runs against an empty index. `recall search` no longer
@@ -400,7 +391,7 @@ fn show_session(
         .collect::<Result<_, _>>()?;
 
     if matches.is_empty() {
-        anyhow::bail!("No session found matching '{session_id}'");
+        return Err(RecallError::Usage(format!("No session found matching '{session_id}'")).into());
     }
     if matches.len() > 1 {
         let mut msg = format!("Multiple sessions match '{session_id}':\n");
@@ -408,7 +399,7 @@ fn show_session(
             msg.push_str(&format!("  {}  {}\n", s.session_id, s.slug));
         }
         msg.push_str("Narrow the session ID prefix to match exactly one session");
-        anyhow::bail!(msg);
+        return Err(RecallError::Usage(msg).into());
     }
 
     let session = &matches[0];
@@ -440,7 +431,9 @@ fn show_session(
 fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
-        anyhow::bail!("Database not found. Run `recall index` first.");
+        return Err(
+            RecallError::Usage("Database not found. Run `recall index` first.".to_owned()).into(),
+        );
     }
 
     let conn = open_or_create_db(&path)?;
@@ -582,13 +575,31 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v"];
 
-fn run() -> Result<()> {
-    let args: Vec<OsString> = env::args_os().collect();
-    let cli = match try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS) {
-        Some(expanded) => Cli::parse_from(expanded),
-        None => Cli::parse_from(args),
+/// Parse argv into a [`Cli`], expanding shorthand first. Both expansion
+/// branches funnel through one `try_parse_from`, so a parse error prints once.
+/// Returns the exit code to use when parsing does not yield a command:
+/// success for `--help`, `USAGE` (64) for a real parse error.
+fn parse_cli(args: Vec<OsString>) -> Result<Cli, ExitCode> {
+    let parsed = match try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS) {
+        Some(expanded) => Cli::try_parse_from(expanded),
+        None => Cli::try_parse_from(args),
     };
+    parsed.map_err(|e| handle_parse_error(&e))
+}
 
+/// Print a clap parse error (or `--help` text) and map it to an exit code.
+/// `--help` is not a failure (clap writes it to stdout); everything else is a
+/// usage error. recall defines no `--version`, so it falls through to `USAGE`
+/// like any other unknown flag.
+fn handle_parse_error(err: &clap::Error) -> ExitCode {
+    let _ = err.print();
+    match err.kind() {
+        ClapErrorKind::DisplayHelp => ExitCode::SUCCESS,
+        _ => ExitCode::from(codes::USAGE),
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
     let default_filter = if cli.verbose {
         LOG_FILTER_VERBOSE
     } else {
@@ -604,27 +615,27 @@ fn run() -> Result<()> {
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
-        None => {
-            anyhow::bail!(
-                "A search query is required. Usage: recall search \"query\" or recall index"
-            )
-        }
+        None => Err(RecallError::Usage(
+            "A search query is required. Usage: recall search \"query\" or recall index".to_owned(),
+        )
+        .into()),
     }
 }
 
-/// Exit codes: 1 = user error (bad query, missing args), 2 = system error (IO, DB).
-fn main() {
+fn main() -> ExitCode {
     handle_probe_if_needed();
 
-    if let Err(e) = run() {
-        let msg = format!("{e:#}");
-        exit_error(&msg);
-        let code = if USER_ERROR_MARKERS.iter().any(|m| msg.contains(m)) {
-            1
-        } else {
-            2
-        };
-        process::exit(code);
+    let cli = match parse_cli(env::args_os().collect()) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
+
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            exit_error(&format!("{e:#}"));
+            classify_exit_code(&e)
+        }
     }
 }
 
