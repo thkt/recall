@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction};
@@ -276,82 +276,12 @@ fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()
     Ok(())
 }
 
-fn dir_mtime_secs(path: &Path) -> Option<f64> {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs_f64())
-}
-
-fn dirs_changed_since(opts: &IndexOptions, last_scan: f64) -> bool {
-    for dir in [opts.claude_dir, opts.codex_dir] {
-        if !dir.is_dir() {
-            continue;
-        }
-        match dir_mtime_secs(dir) {
-            Some(mt) if mt >= last_scan => return true,
-            None => return true,
-            _ => {}
-        }
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if let Some(mt) = dir_mtime_secs(&entry.path())
-                    && mt >= last_scan
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn scan_key(opts: &IndexOptions) -> String {
-    format!(
-        "last_scan:{}:{}",
-        opts.claude_dir.display(),
-        opts.codex_dir.display()
-    )
-}
-
-fn get_last_scan(conn: &Connection, key: &str) -> Option<f64> {
-    conn.query_row("SELECT value FROM recall_meta WHERE key = ?", [key], |r| {
-        r.get::<_, f64>(0)
-    })
-    .ok()
-}
-
-fn set_last_scan(conn: &Connection, key: &str, ts: f64) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO recall_meta (key, value) VALUES (?, ?)",
-        rusqlite::params![key, ts],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Result<IndexStats> {
     let start = Instant::now();
 
-    let key = scan_key(opts);
-    if !opts.force
-        && let Some(last_scan) = get_last_scan(conn, &key)
-        && !dirs_changed_since(opts, last_scan)
-    {
-        let total_sessions: usize = usize::try_from(
-            conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))?
-                .max(0),
-        )
-        .expect("non-negative session count fits in usize");
-        return Ok(IndexStats {
-            indexed: 0,
-            parse_errors: 0,
-            first_error: None,
-            total_sessions,
-            elapsed_secs: start.elapsed().as_secs_f64(),
-        });
-    }
-
+    // Always full-scan: file-level mtime checks in check_freshness keep indexing
+    // incremental. A directory-mtime skip optimization here used to miss new files
+    // added to existing deep dirs (Codex Y/M/D, Claude subagents) — #52 / #70.
     let existing = if opts.force {
         HashMap::new()
     } else {
@@ -387,14 +317,6 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         usize::try_from(n.max(0)).expect("non-negative session count fits in usize")
     };
-
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-    if let Err(e) = set_last_scan(conn, &key, now_secs) {
-        warn!(error = %e, "failed to save scan timestamp");
-    }
 
     Ok(IndexStats {
         indexed,
@@ -618,6 +540,54 @@ mod tests {
         .unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 1);
+    }
+
+    #[test]
+    fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+        let day_dir = codex_dir.join("2026/04/27");
+        fs::create_dir_all(&day_dir).unwrap();
+
+        let s1 = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"codex-s1","cwd":"/proj"}}
+{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"first codex session"}]}}"#;
+        fs::write(day_dir.join("s1.jsonl"), s1).unwrap();
+
+        let stats1 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats1.indexed, 1);
+
+        // New session added into the SAME existing day dir. The parent `2026/` mtime
+        // does not change, so the old dirs_changed_since optimization skipped the scan
+        // and permanently missed the new session (#52 / #70).
+        let s2 = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"codex-s2","cwd":"/proj"}}
+{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"second codex session"}]}}"#;
+        fs::write(day_dir.join("s2.jsonl"), s2).unwrap();
+
+        let stats2 = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stats2.indexed, 1,
+            "a new session in an existing deep dir must be indexed (parent mtime unchanged)"
+        );
+        assert_eq!(stats2.total_sessions, 2);
     }
 
     #[test]
