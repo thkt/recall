@@ -1,5 +1,7 @@
 use std::f64::consts::LN_2;
 
+use rurico::retrieval::{Candidate, CandidateSource, MergeStrategy, WeightedRrf};
+
 use crate::date::MS_PER_DAY;
 
 pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
@@ -33,11 +35,48 @@ pub(crate) fn apply_recency_boost(
     results.sort_by(|a, b| b.1.total_cmp(&a.1));
 }
 
+/// Merge FTS and vector ranking lists by Reciprocal Rank Fusion, keyed by
+/// session id. Adapts recall's `(session_id, score)` shape to rurico's
+/// `Candidate` / `MergedHit` and delegates to `WeightedRrf::default()`, whose
+/// score is bit-equal to the removed `rurico::storage::rrf_merge` (#79).
+/// Only list position (rank) feeds the fusion; input scores are ignored.
+pub(crate) fn rrf_merge_strings(
+    fts_hits: &[(String, f64)],
+    vec_hits: &[(String, f64)],
+) -> Vec<(String, f64)> {
+    let candidates: Vec<Candidate> = fts_hits
+        .iter()
+        .enumerate()
+        .map(|(rank, (sid, _))| Candidate {
+            source: CandidateSource::Fts,
+            doc_id: sid.clone(),
+            chunk_id: None,
+            score: 0.0,
+            rank,
+        })
+        .chain(
+            vec_hits
+                .iter()
+                .enumerate()
+                .map(|(rank, (sid, _))| Candidate {
+                    source: CandidateSource::Vector,
+                    doc_id: sid.clone(),
+                    chunk_id: None,
+                    score: 0.0,
+                    rank,
+                }),
+        )
+        .collect();
+    WeightedRrf::default()
+        .merge(&candidates)
+        .into_iter()
+        .map(|h| (h.doc_id, h.score))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-
-    use rurico::storage::rrf_merge;
 
     use super::*;
 
@@ -48,7 +87,7 @@ mod tests {
         // B at position 0 in vec list (rank=0), C at position 1 (rank=1)
         let vec: Vec<(String, f64)> = vec![("B".into(), 0.0), ("C".into(), 0.0)];
 
-        let merged = rrf_merge(&fts, &vec);
+        let merged = rrf_merge_strings(&fts, &vec);
 
         // B appears in both lists → highest score
         assert_eq!(merged[0].0, "B");
@@ -67,7 +106,7 @@ mod tests {
         let fts: Vec<(String, f64)> = vec![("A".into(), 0.0)];
         let vec: Vec<(String, f64)> = vec![];
 
-        let merged = rrf_merge(&fts, &vec);
+        let merged = rrf_merge_strings(&fts, &vec);
 
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].0, "A");
@@ -136,7 +175,7 @@ mod tests {
     fn test_rrf_empty_inputs() {
         let fts: Vec<(String, f64)> = vec![];
         let vec: Vec<(String, f64)> = vec![];
-        let merged = rrf_merge(&fts, &vec);
+        let merged = rrf_merge_strings(&fts, &vec);
         assert!(merged.is_empty());
     }
 }
