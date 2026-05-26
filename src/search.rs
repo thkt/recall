@@ -8,10 +8,13 @@ use amici::storage::filter::{
 use amici::storage::{anon_placeholders, fts::clean_for_trigram};
 use anyhow::{Context, Result};
 use rurico::embed::Embed;
-use rurico::storage::{SanitizeError, f32_as_bytes, prepare_match_query, rrf_merge};
+use rurico::storage::{QueryNormalizationConfig, SanitizeError, prepare_match_query};
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
+
+use crate::embedder::f32_as_bytes;
+use crate::hybrid::rrf_merge_strings;
 
 use crate::date::MS_PER_DAY;
 use crate::hybrid::{self, RECENCY_BOOST_WEIGHT};
@@ -380,11 +383,25 @@ pub fn search_with_embedder(
     }
 
     let now_ms = resolve_now_ms(opts)?;
-    let matched = match prepare_match_query(conn, query, "messages_vocab") {
+    // Normalization disabled to stay symmetric with the index: the indexer writes
+    // raw message text into FTS (no normalize_for_fts pass), so query-side NFKC /
+    // lowercase / whitespace folding would silently miss full-width and CJK matches.
+    // Adopting normalization means normalizing both sides and re-indexing (#51).
+    let matched = match prepare_match_query(
+        conn,
+        query,
+        "messages_vocab",
+        &QueryNormalizationConfig::disabled(),
+    ) {
         Ok(m) => m,
         Err(SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms) => {
             debug!(%query, "query produced no searchable terms");
             return Ok(Vec::new());
+        }
+        // A bad vocab-table name or a failed SQLite vocab lookup is a real
+        // fault, not an empty query — surface it instead of returning no hits.
+        Err(e @ (SanitizeError::InvalidVocabTable(_) | SanitizeError::VocabLookupFailed(_))) => {
+            return Err(e.into());
         }
     };
     let Some(fts_query) = clean_for_trigram(&matched) else {
@@ -416,7 +433,7 @@ pub fn search_with_embedder(
         let vec_for_rrf: Vec<(String, f64)> =
             vec_hits.iter().map(|(sid, _)| (sid.clone(), 0.0)).collect();
 
-        let mut merged = rrf_merge(&fts_hits, &vec_for_rrf);
+        let mut merged = rrf_merge_strings(&fts_hits, &vec_for_rrf);
 
         if merged.is_empty() {
             return Ok(Vec::new());

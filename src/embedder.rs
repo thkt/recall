@@ -7,7 +7,6 @@ use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
-use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
@@ -27,6 +26,12 @@ impl EmbedResult {
 }
 
 pub(crate) const EMBED_BATCH_SIZE: usize = 128;
+
+/// Reinterprets an f32 slice as its raw byte view for sqlite-vec storage.
+/// Replaces `rurico::storage::f32_as_bytes`, removed in rurico a573655 (#78).
+pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
+    bytemuck::cast_slice(v)
+}
 
 fn embed_chunks(
     conn: &mut Connection,
@@ -212,9 +217,9 @@ impl Embed for MockEmbedder {
                 return Err(EmbedError::Inference("mock failure".to_owned()));
             }
         }
-        Ok(ChunkedEmbedding {
-            chunks: vec![Self::deterministic_vector(text)],
-        })
+        Ok(ChunkedEmbedding::new(vec![Self::deterministic_vector(
+            text,
+        )]))
     }
 
     fn embed_text(&self, text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {

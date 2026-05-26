@@ -27,7 +27,7 @@ use amici::storage::filter::escape_like;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
-use rurico::model_probe::handle_probe_if_needed;
+use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
