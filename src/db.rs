@@ -50,13 +50,6 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     ))?;
 
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS recall_meta (
-            key TEXT PRIMARY KEY,
-            value REAL
-        );",
-    )?;
-
-    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qa_chunks (
             id INTEGER PRIMARY KEY,
             session_id TEXT NOT NULL,

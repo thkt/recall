@@ -128,7 +128,9 @@ recall status           # sessions, chunks, embedding coverage, model status
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — only changed files are re-indexed. Directory mtime checking skips the scan entirely when nothing changed.
+**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — it walks every session file but re-parses only those modified since they were last indexed.
+
+**Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first. (Automatic re-indexing on session change is planned, not yet shipped.) Searching an empty index prints `No sessions indexed. Run recall index first.`
 
 **Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=128) with length-sorted padding minimization. Download the model explicitly with `recall model download`; without it, search falls back to FTS5 keyword ranking only.
 
