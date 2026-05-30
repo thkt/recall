@@ -3,6 +3,7 @@ mod chunker;
 mod date;
 mod db;
 mod embedder;
+mod envelope;
 mod error;
 mod hybrid;
 mod indexer;
@@ -35,7 +36,10 @@ use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
 use tracing::{info, warn};
 
-use crate::error::{RecallError, classify_exit_code, download_error, embedder_error};
+use crate::envelope::{CommandOutput, render_json_error, render_json_success};
+use crate::error::{
+    RecallError, classify_exit_code, download_error, embedder_error, error_envelope,
+};
 use crate::output::{WriteOutcome, write_result};
 use crate::parser::Source;
 
@@ -55,6 +59,10 @@ struct Cli {
     /// Database file path (default: ~/.recall.db, env: RECALL_DB)
     #[arg(long, env = "RECALL_DB", global = true)]
     db_path: Option<PathBuf>,
+
+    /// Emit a machine-readable JSON envelope instead of human-readable text
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -291,7 +299,7 @@ fn search_idle_message(session_count: i64) -> Option<&'static str> {
     (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
 }
 
-fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let Command::Search {
         query,
         project,
@@ -312,10 +320,25 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     if let Some(msg) = search_idle_message(session_count) {
         done(msg);
-        return Ok(());
+        return Ok(CommandOutput::ok(
+            String::new(),
+            serde_json::json!({ "results": [] }),
+        ));
     }
 
     let embedder = try_load_embedder_cached();
+    // A missing embedding model degrades search to FTS-only; surface it so an
+    // agent knows semantic ranking was unavailable (the `--json` notes channel).
+    let (degraded, notes) = match &embedder {
+        Some(_) => (false, Vec::new()),
+        None => (
+            true,
+            vec![
+                "semantic search unavailable: embedding model not installed (run `recall model download`)"
+                    .to_owned(),
+            ],
+        ),
+    };
 
     let results = search::search_with_embedder(
         &conn,
@@ -330,46 +353,54 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<()> {
         embedder.as_deref(),
     )?;
 
-    print_results(&results);
+    let markdown = render_results(&results);
+    let data = serde_json::json!({
+        "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+    });
 
-    // Post-search: progressive embedding (search results + recent)
+    // Embedding runs after the payload is built, but the result is not emitted
+    // until this returns, so it adds latency; `--no-embed` skips it to keep
+    // piped/scripted usage responsive.
     if !no_embed && let Some(emb) = embedder.as_deref() {
-        let session_ids: Vec<String> = results
-            .iter()
-            .map(|r| r.session.session_id.clone())
-            .collect();
-        let mut total = 0;
-        let mut handle = |result: anyhow::Result<embedder::EmbedResult>| match result {
-            Ok(r) => {
-                r.warn_if_stopped();
-                total += r.embedded;
-            }
-            Err(e) => {
-                warn!(error = %e, "post-search embedding skipped");
-            }
-        };
-        handle(embedder::embed_near_sessions(
-            &mut conn,
-            emb,
-            &session_ids,
-            10,
-            None,
-        ));
-        handle(embedder::embed_recent_chunks(&mut conn, emb, 10, None));
-        if total > 0 {
-            info!(total, "Embedded chunks (nearby + recent)");
-        }
+        embed_around_results(&mut conn, emb, &results);
     }
 
-    Ok(())
+    Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
 }
 
-fn show_session(
-    conn: &Connection,
-    session_id: &str,
-    verbose: bool,
-    w: &mut impl Write,
-) -> Result<()> {
+/// Post-search progressive embedding: a side effect that warms the index around
+/// the hits (nearby sessions) plus the most recent chunks. Progress goes to the
+/// log, not the result. The caller emits its result only after this returns, so
+/// it adds latency; `recall search --no-embed` skips it for interactive use.
+fn embed_around_results(conn: &mut Connection, emb: &dyn Embed, results: &[search::SearchResult]) {
+    let session_ids: Vec<String> = results
+        .iter()
+        .map(|r| r.session.session_id.clone())
+        .collect();
+    let mut total = 0;
+    let mut handle = |result: anyhow::Result<embedder::EmbedResult>| match result {
+        Ok(r) => {
+            r.warn_if_stopped();
+            total += r.embedded;
+        }
+        Err(e) => {
+            warn!(error = %e, "post-search embedding skipped");
+        }
+    };
+    handle(embedder::embed_near_sessions(
+        conn,
+        emb,
+        &session_ids,
+        10,
+        None,
+    ));
+    handle(embedder::embed_recent_chunks(conn, emb, 10, None));
+    if total > 0 {
+        info!(total, "Embedded chunks (nearby + recent)");
+    }
+}
+
+fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<CommandOutput> {
     let mut stmt = conn.prepare(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\' ORDER BY session_id",
@@ -412,25 +443,41 @@ fn show_session(
         .query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
 
-    writeln!(w, "# {}", session.slug)?;
-    writeln!(w, "- session_id: {}", session.session_id)?;
-    writeln!(w, "- date: {}", format_timestamp(session.timestamp))?;
-    writeln!(w, "- project: {}", session.project)?;
-    writeln!(w, "- source: {}", session.source)?;
+    // Writes to an in-memory Vec are infallible; the pipe is only touched later
+    // by the single emit_success -> print_to_stdout.
+    let mut buf = Vec::new();
+    let _ = writeln!(buf, "# {}", session.slug);
+    let _ = writeln!(buf, "- session_id: {}", session.session_id);
+    let _ = writeln!(buf, "- date: {}", format_timestamp(session.timestamp));
+    let _ = writeln!(buf, "- project: {}", session.project);
+    let _ = writeln!(buf, "- source: {}", session.source);
     if verbose {
-        writeln!(w, "- file: {}", session.file_path)?;
+        let _ = writeln!(buf, "- file: {}", session.file_path);
     }
-    writeln!(w)?;
-
+    let _ = writeln!(buf);
     for (role, text) in &messages {
-        writeln!(w, "## [{role}]")?;
-        writeln!(w, "{text}")?;
-        writeln!(w)?;
+        let _ = writeln!(buf, "## [{role}]");
+        let _ = writeln!(buf, "{text}");
+        let _ = writeln!(buf);
     }
-    Ok(())
+    let markdown = String::from_utf8_lossy(&buf).into_owned();
+
+    let data = serde_json::json!({
+        "session_id": session.session_id,
+        "slug": session.slug,
+        "project": session.project,
+        "source": session.source.to_string(),
+        "timestamp": session.timestamp,
+        "messages": messages
+            .iter()
+            .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
+            .collect::<Vec<_>>(),
+    });
+
+    Ok(CommandOutput::ok(markdown, data))
 }
 
-fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
         return Err(
@@ -439,25 +486,23 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
     }
 
     let conn = open_or_create_db(&path)?;
-    let mut w = io::stdout().lock();
-
-    if let Err(e) = show_session(&conn, session_id, verbose, &mut w) {
-        if let Some(io_err) = e.downcast_ref::<io::Error>()
-            && io_err.kind() == ErrorKind::BrokenPipe
-        {
-            process::exit(0);
-        }
-        return Err(e);
-    }
-    Ok(())
+    show_session(&conn, session_id, verbose)
 }
 
-fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
+fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
         cli_info("run `recall index` to create the index.");
-        return Ok(());
+        return Ok(CommandOutput::ok(
+            String::new(),
+            serde_json::json!({
+                "sessions": 0,
+                "qa_chunks": 0,
+                "embedded": 0,
+                "model_ready": false,
+            }),
+        ));
     }
 
     let conn = open_or_create_db(&path)?;
@@ -470,8 +515,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
         .map(|opt| opt.is_some())
         .unwrap_or(false);
 
-    // Writes to an in-memory Vec are infallible, so the io::Result is discarded;
-    // the pipe is only touched by the single print_to_stdout below.
+    // Writes to an in-memory Vec are infallible, so the io::Result is discarded.
     let mut buf = Vec::new();
     let _ = writeln!(buf, "Sessions: {sessions}");
     let _ = writeln!(buf, "QA chunks: {chunks}");
@@ -488,9 +532,15 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     if verbose {
         let _ = writeln!(buf, "DB: {}", path.display());
     }
-    print_to_stdout(&String::from_utf8_lossy(&buf));
+    let markdown = String::from_utf8_lossy(&buf).into_owned();
+    let data = serde_json::json!({
+        "sessions": sessions,
+        "qa_chunks": chunks,
+        "embedded": embedded,
+        "model_ready": model_ok,
+    });
 
-    Ok(())
+    Ok(CommandOutput::ok(markdown, data))
 }
 
 // -- Output formatting --
@@ -553,9 +603,9 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
 }
 
 /// Write fully-rendered `rendered` to stdout, stopping cleanly (exit 0) when the
-/// consumer closed the pipe early. Shared SIGPIPE boundary for the search/status
-/// result paths; `run_show` keeps its own (to be unified in Phase 2). See
-/// [`crate::output`].
+/// consumer closed the pipe early. The single SIGPIPE boundary for every result
+/// path (search/status/show, human or `--json`), reached via [`emit_success`].
+/// See [`crate::output`].
 fn print_to_stdout(rendered: &str) {
     match write_result(&mut io::stdout().lock(), rendered) {
         Ok(WriteOutcome::Written) => {}
@@ -580,8 +630,46 @@ fn render_results(results: &[search::SearchResult]) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-fn print_results(results: &[search::SearchResult]) {
-    print_to_stdout(&render_results(results));
+/// The machine payload for one search hit (#67 Phase 2), built explicitly so the
+/// `--json` schema stays decoupled from [`search::SearchResult`]'s internal
+/// shape (which is deliberately not `Serialize`).
+fn result_to_json(r: &search::SearchResult) -> serde_json::Value {
+    let s = &r.session;
+    serde_json::json!({
+        "session_id": s.session_id,
+        "project": s.project,
+        "slug": s.slug,
+        "source": s.source.to_string(),
+        "timestamp": s.timestamp,
+        "excerpt": r.excerpt,
+    })
+}
+
+/// Emit a command's result to stdout: the JSON success envelope when
+/// `json_mode`, else the human-readable markdown. Empty markdown (a side-effect
+/// command in text mode) prints nothing. Routes through [`print_to_stdout`] so
+/// the SIGPIPE boundary covers both modes.
+fn emit_success(out: &CommandOutput, json_mode: bool) {
+    let body = if json_mode {
+        render_json_success(out)
+    } else {
+        out.markdown.clone()
+    };
+    if !body.is_empty() {
+        print_to_stdout(&body);
+    }
+}
+
+/// Emit an error to stderr: the JSON error envelope when `json_mode`, else the
+/// human-readable `error: <msg>` line. The exit code is decided separately by
+/// [`classify_exit_code`], so the rendered shape and the exit code never
+/// disagree.
+fn emit_error(err: &anyhow::Error, json_mode: bool) {
+    if json_mode {
+        eprintln!("{}", render_json_error(&error_envelope(err)));
+    } else {
+        exit_error(&format!("{err:#}"));
+    }
 }
 
 // -- Entry point --
@@ -589,7 +677,7 @@ fn print_results(results: &[search::SearchResult]) {
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "index", "rebuild", "embed", "model", "search", "show", "status", "help",
 ];
-const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v"];
+const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
 /// Parse argv into a [`Cli`], expanding shorthand first. Both expansion
 /// branches funnel through one `try_parse_from`, so a parse error prints once.
@@ -615,7 +703,15 @@ fn handle_parse_error(err: &clap::Error) -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+/// The [`CommandOutput`] for a side-effect command (index/embed/model): empty
+/// `markdown` and `null` `data`, since its progress already went to stderr. In
+/// `--json` mode [`emit_success`] still emits a `data: null` success envelope so
+/// an agent gets a parseable signal; in text mode it prints nothing.
+fn no_payload() -> CommandOutput {
+    CommandOutput::ok(String::new(), serde_json::Value::Null)
+}
+
+fn run(cli: Cli) -> Result<CommandOutput> {
     let default_filter = if cli.verbose {
         LOG_FILTER_VERBOSE
     } else {
@@ -624,10 +720,10 @@ fn run(cli: Cli) -> Result<()> {
     init_subscriber(default_filter);
 
     match cli.command {
-        Some(Command::Index) => run_index(&cli.db_path),
-        Some(Command::Rebuild) => run_rebuild(&cli.db_path),
-        Some(Command::Embed) => run_embed(&cli.db_path),
-        Some(Command::Model(ModelCommand::Download)) => run_model_download(),
+        Some(Command::Index) => run_index(&cli.db_path).map(|()| no_payload()),
+        Some(Command::Rebuild) => run_rebuild(&cli.db_path).map(|()| no_payload()),
+        Some(Command::Embed) => run_embed(&cli.db_path).map(|()| no_payload()),
+        Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
@@ -645,11 +741,15 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(code) => return code,
     };
+    let json_mode = cli.json;
 
     match run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(out) => {
+            emit_success(&out, json_mode);
+            ExitCode::SUCCESS
+        }
         Err(e) => {
-            exit_error(&format!("{e:#}"));
+            emit_error(&e, json_mode);
             classify_exit_code(&e)
         }
     }
@@ -862,58 +962,52 @@ mod tests {
     #[test]
     fn test_show_session_exact_match() {
         let (_dir, conn) = setup_show_db();
-        let mut buf = Vec::new();
-        show_session(&conn, "abc-123", false, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("# my-slug"));
-        assert!(output.contains("- session_id: abc-123"));
-        assert!(output.contains("- date: 2024-03-01"));
-        assert!(output.contains("## [user]\nhello world"));
-        assert!(output.contains("## [assistant]\nhi there"));
+        let out = show_session(&conn, "abc-123", false).unwrap();
+        assert!(out.markdown.contains("# my-slug"));
+        assert!(out.markdown.contains("- session_id: abc-123"));
+        assert!(out.markdown.contains("- date: 2024-03-01"));
+        assert!(out.markdown.contains("## [user]\nhello world"));
+        assert!(out.markdown.contains("## [assistant]\nhi there"));
+        // The `--json` payload carries the same session, machine-readable (#67 Phase 2).
+        assert_eq!(out.data["session_id"], "abc-123");
+        assert_eq!(out.data["messages"][0]["role"], "user");
+        assert_eq!(out.data["messages"][0]["text"], "hello world");
     }
 
     #[test]
     fn test_show_session_prefix_match() {
         let (_dir, conn) = setup_show_db();
-        let mut buf = Vec::new();
-        show_session(&conn, "abc-1", false, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("- session_id: abc-123"));
+        let out = show_session(&conn, "abc-1", false).unwrap();
+        assert!(out.markdown.contains("- session_id: abc-123"));
     }
 
     #[test]
     fn test_show_session_ambiguous_prefix() {
         let (_dir, conn) = setup_show_db();
-        let mut buf = Vec::new();
-        let err = show_session(&conn, "abc", false, &mut buf).unwrap_err();
+        let err = show_session(&conn, "abc", false).unwrap_err();
         assert!(err.to_string().contains("Multiple sessions match"));
     }
 
     #[test]
     fn test_show_session_not_found() {
         let (_dir, conn) = setup_show_db();
-        let mut buf = Vec::new();
-        let err = show_session(&conn, "zzz", false, &mut buf).unwrap_err();
+        let err = show_session(&conn, "zzz", false).unwrap_err();
         assert!(err.to_string().contains("No session found matching"));
     }
 
     #[test]
     fn test_show_session_verbose_includes_file() {
         let (_dir, conn) = setup_show_db();
-        let mut buf = Vec::new();
-        show_session(&conn, "abc-123", true, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("- file: /path/f.jsonl"));
+        let out = show_session(&conn, "abc-123", true).unwrap();
+        assert!(out.markdown.contains("- file: /path/f.jsonl"));
     }
 
     #[test]
     fn test_show_session_message_order() {
         let (_dir, conn) = setup_show_db();
-        let mut buf = Vec::new();
-        show_session(&conn, "abc-123", false, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        let user_pos = output.find("## [user]").unwrap();
-        let assistant_pos = output.find("## [assistant]").unwrap();
+        let out = show_session(&conn, "abc-123", false).unwrap();
+        let user_pos = out.markdown.find("## [user]").unwrap();
+        let assistant_pos = out.markdown.find("## [assistant]").unwrap();
         assert!(
             user_pos < assistant_pos,
             "user message should come before assistant"
