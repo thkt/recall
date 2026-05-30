@@ -164,3 +164,297 @@ fn search_with_matching_index_lists_results() {
         "search stdout should list the matching session, got: {stdout}"
     );
 }
+
+// -- #67 Phase 2: global `--json` envelope (T-CLI011..T-CLI017) --
+//
+// These spawn the real binary with the global `--json` flag and pin the wire
+// envelope an agent consumes. Several assert on the response body, not the exit
+// code alone: a usage error (T-CLI012) exits 64, but a plain-text rejection
+// would too, so the `{"error":{"code":"USAGE_ERROR",...}}` body is what proves
+// the envelope path ran. The contract keys (`results`, `session_id`, `excerpt`,
+// `messages`, `sessions`, `qa_chunks`, `embedded`, `degraded`, `notes`) are the
+// public surface; assert them verbatim.
+
+/// Seed a one-session Claude index in `dir` so `--json` search has a hit to
+/// emit. Mirrors the T-CLI010 fixture (JSONL seed → `index` builds the DB);
+/// only `index` reads the source dir, so search then reads the built DB.
+fn seed_indexed_session(dir: &Path) {
+    let claude_dir = dir.join("claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("s1.jsonl"),
+        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        exit_code(
+            recall(dir)
+                .env("RECALL_CLAUDE_DIR", &claude_dir)
+                .arg("index")
+        ),
+        0,
+        "index should build the DB and exit 0"
+    );
+}
+
+// T-CLI011: `search <q> --json` against a matching index prints the success
+// envelope to stdout and exits 0. The machine path of the core OUTCOME (search
+// returns results): parses the envelope and asserts data.results carries the hit
+// (session_id + excerpt), and that degraded co-varies with notes — asserting the
+// invariant, not a fixed value, keeps it portable across machines that have or
+// lack the cached embedding model. Perspective: normal (the JSON happy path).
+#[test]
+fn search_json_emits_success_envelope_with_results() {
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let out = recall(dir.path())
+        .args(["search", "hello", "--no-embed", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    let results = v["data"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("data.results should be an array, got: {stdout}"));
+    assert_eq!(
+        results.len(),
+        1,
+        "the one seeded session should be the single hit, got: {stdout}"
+    );
+    assert!(
+        results[0]["session_id"].is_string() && results[0]["excerpt"].is_string(),
+        "each result row should carry session_id and excerpt, got: {stdout}"
+    );
+    // degraded and notes co-vary: search sets degraded=true with an FTS-fallback
+    // note exactly when the embedding model is absent. Asserting the invariant
+    // (not a fixed value) keeps the test portable across machines that have or
+    // lack the cached model.
+    let degraded = v["degraded"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));
+    let notes = v["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notes should be an array, got: {stdout}"));
+    assert_eq!(
+        degraded,
+        !notes.is_empty(),
+        "degraded must coincide with a non-empty notes list, got: {stdout}"
+    );
+}
+
+// T-CLI012: `--json` with no subcommand prints the usage error as a JSON
+// envelope on stderr and exits 64. Assert on the body, not the exit code alone:
+// today clap rejects the unknown `--json` flag with exit 64 too, so an exit-only
+// check would pass against plain-text stderr (a false green). The body must be
+// `{"error":{"code":"USAGE_ERROR",...}}` with a next_step. Perspective: error.
+#[test]
+fn no_subcommand_json_emits_error_envelope_on_stderr() {
+    let dir = TempDir::new().unwrap();
+    let out = recall(dir.path())
+        .arg("--json")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(
+        out.status.code(),
+        Some(64),
+        "missing query is a usage error (64)"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(r#""error""#) && stderr.contains(r#""code":"USAGE_ERROR""#),
+        "stderr should be a JSON error envelope with USAGE_ERROR, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(r#""next_step""#),
+        "the error envelope should carry next_step guidance, got: {stderr}"
+    );
+}
+
+// T-CLI013: `status --json` against a created index prints the stats as a
+// success envelope on stdout and exits 0. The data payload carries the
+// machine-readable counters (`sessions`, `qa_chunks`, `embedded`) — the
+// snake_case keys, not the human "Sessions:" / "QA chunks:" labels.
+// Perspective: normal.
+#[test]
+fn status_json_emits_stats_envelope() {
+    let dir = TempDir::new().unwrap();
+    // `index` creates the (empty) DB so `status` has counts to report.
+    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
+    let out = recall(dir.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "status --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#""data""#),
+        "stdout should be a success envelope, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""sessions""#)
+            && stdout.contains(r#""qa_chunks""#)
+            && stdout.contains(r#""embedded""#),
+        "data should carry sessions/qa_chunks/embedded counters, got: {stdout}"
+    );
+}
+
+// T-CLI014: `--json` does not change the exit code of an empty-index search.
+// Searching an empty (but created) index is a success (exit 0) with or without
+// `--json` — the flag selects the output format, never the exit class.
+// Perspective: boundary (empty index, the zero-result edge) + regression (exit
+// code invariant across the flag). Pairs with T-CLI005 (the `--json`-less twin).
+#[test]
+fn search_empty_index_json_exit_code_matches_human() {
+    let human = TempDir::new().unwrap();
+    assert_eq!(exit_code(recall(human.path()).arg("index")), 0);
+    let human_code = exit_code(recall(human.path()).args(["search", "anything", "--no-embed"]));
+
+    let json = TempDir::new().unwrap();
+    assert_eq!(exit_code(recall(json.path()).arg("index")), 0);
+    let json_code =
+        exit_code(recall(json.path()).args(["search", "anything", "--no-embed", "--json"]));
+
+    assert_eq!(human_code, 0, "empty-index search (human) should exit 0");
+    assert_eq!(
+        json_code, human_code,
+        "--json must not change the exit code of an empty-index search"
+    );
+}
+
+// T-CLI015: without `--json`, search still prints the human-readable listing and
+// exits 0 — the Phase-2 envelope work must not regress the default output that
+// T-CLI010 pins. Regression guard: the same matching-index fixture must yield
+// the "Found N sessions:" text (not JSON) when `--json` is absent.
+#[test]
+fn search_without_json_keeps_human_output() {
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let out = recall(dir.path())
+        .args(["search", "hello", "--no-embed"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Found 1 sessions:"),
+        "default output should stay human-readable, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(r#""data""#),
+        "default output must not emit the JSON envelope, got: {stdout}"
+    );
+}
+
+// T-CLI016: `show <id> --json` against a matching index prints the success
+// envelope to stdout and exits 0. The data payload carries the session identity
+// (`session_id`) and the conversation as `messages` (each a role/text object) —
+// the machine path of `show`. Perspective: normal (the JSON happy path).
+#[test]
+fn show_json_emits_session_envelope() {
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let out = recall(dir.path())
+        .args(["show", "s1", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "show --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#""data""#) && stdout.contains(r#""session_id":"s1""#),
+        "stdout should be a success envelope carrying the session id, got: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""messages""#)
+            && stdout.contains(r#""role":"user""#)
+            && stdout.contains(r#""text":"hello world recall""#),
+        "data should carry the conversation messages, got: {stdout}"
+    );
+}
+
+// T-CLI017: without `--json`, `show` prints the human-readable markdown and
+// exits 0 — the envelope work must not regress the default `show` output. The
+// markdown carries the slug header and the role-tagged message body, and must
+// not emit the JSON envelope. Perspective: regression. Pairs with T-CLI016.
+#[test]
+fn show_without_json_keeps_human_output() {
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let out = recall(dir.path())
+        .args(["show", "s1"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "show should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("# s1") && stdout.contains("## [user]"),
+        "default output should stay human-readable markdown, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(r#""data""#),
+        "default output must not emit the JSON envelope, got: {stdout}"
+    );
+}
+
+// T-CLI018: a side-effect command (`index`) with `--json` emits the no_payload
+// envelope — data:null, degraded:false, empty notes — and exits 0. Pins the
+// machine contract for commands that produce no result payload (the only source
+// of `data:null` in the envelope). Progress spinners go to stderr, so stdout is
+// exactly the one envelope; parsed as JSON, not substring-matched.
+#[test]
+fn index_json_emits_null_data_envelope() {
+    let dir = TempDir::new().unwrap();
+    let out = recall(dir.path())
+        .args(["index", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "index --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    assert!(
+        v["data"].is_null(),
+        "a side-effect command must emit data:null, got: {stdout}"
+    );
+    assert_eq!(
+        v["degraded"],
+        serde_json::json!(false),
+        "index is not a degraded path, got: {stdout}"
+    );
+    assert_eq!(
+        v["notes"],
+        serde_json::json!([]),
+        "index carries no notes, got: {stdout}"
+    );
+}
+
+// T-CLI019: `status --json` against a never-created index reports zero counters
+// with model_ready:false as a success envelope, exit 0 — the no-database branch
+// of run_status. Pairs with T-CLI013, which runs `index` first (the live path).
+#[test]
+fn status_json_without_index_reports_zero_counts() {
+    let dir = TempDir::new().unwrap();
+    let out = recall(dir.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "status --json should exit 0 without an index"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    assert_eq!(
+        v["data"]["sessions"],
+        serde_json::json!(0),
+        "no index means zero sessions, got: {stdout}"
+    );
+    assert_eq!(
+        v["data"]["model_ready"],
+        serde_json::json!(false),
+        "the no-database branch reports model_ready:false, got: {stdout}"
+    );
+}
