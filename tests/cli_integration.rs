@@ -428,3 +428,33 @@ fn index_json_emits_null_data_envelope() {
         "index carries no notes, got: {stdout}"
     );
 }
+
+// T-CLI019: `status --json` against a never-created index reports zero counters
+// with model_ready:false as a success envelope, exit 0 — the no-database branch
+// of run_status. Pairs with T-CLI013, which runs `index` first (the live path).
+#[test]
+fn status_json_without_index_reports_zero_counts() {
+    let dir = TempDir::new().unwrap();
+    let out = recall(dir.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "status --json should exit 0 without an index"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    assert_eq!(
+        v["data"]["sessions"],
+        serde_json::json!(0),
+        "no index means zero sessions, got: {stdout}"
+    );
+    assert_eq!(
+        v["data"]["model_ready"],
+        serde_json::json!(false),
+        "the no-database branch reports model_ready:false, got: {stdout}"
+    );
+}

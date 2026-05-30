@@ -1013,4 +1013,52 @@ mod tests {
             "user message should come before assistant"
         );
     }
+
+    /// Seed one session with one pending (un-embedded) chunk, the fixture both
+    /// `embed_around_results` tests share.
+    fn setup_pending_chunk_db() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = db::setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
+             VALUES (1, 's1', 'q', 'a', 'hello content', 0, 'h1')",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    // T-EAR001: embed_around_results embeds the pending chunk near a hit session
+    // (the embedder-present side effect run_search runs after building its
+    // payload). Uses MockEmbedder because CI has no real embedding model.
+    #[test]
+    fn embed_around_results_embeds_pending_chunk() {
+        let (_dir, mut conn) = setup_pending_chunk_db();
+        let emb = embedder::MockEmbedder::new();
+        let results = [make_search_result("s1", "/p", "hello")];
+        embed_around_results(&mut conn, &emb, &results);
+        let embedded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(embedded, 1, "the pending chunk should be embedded");
+    }
+
+    // T-EAR002: a failing embedder is swallowed — embed_around_results is
+    // best-effort background work, so it logs and returns (no panic, nothing
+    // embedded) and a search still succeeds when post-search embedding fails.
+    #[test]
+    fn embed_around_results_swallows_embed_failure() {
+        let (_dir, mut conn) = setup_pending_chunk_db();
+        let emb = embedder::MockEmbedder::failing_after(0);
+        let results = [make_search_result("s1", "/p", "hello")];
+        embed_around_results(&mut conn, &emb, &results);
+        let embedded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(embedded, 0, "a failed embed must leave no vec_chunks");
+    }
 }
