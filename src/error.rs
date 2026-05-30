@@ -451,4 +451,18 @@ mod tests {
             "an untyped error carries no structured next_step"
         );
     }
+
+    // T-ERR007: error_envelope assembles the IO_ERROR envelope for a raw io::Error
+    // (the untyped path's IoError branch). The JSON twin of classify_maps_raw_io_error,
+    // which pins only the code, not the assembled envelope (code + retryable + next_step).
+    #[test]
+    fn error_envelope_assembles_io_error_for_raw_io() {
+        let env = error_envelope(&anyhow::Error::new(io::Error::other("disk failure")));
+        assert_eq!(env.error.code, ErrorCode::IoError);
+        assert!(!env.error.retryable, "an I/O error must not be retryable");
+        assert!(
+            env.error.next_step.is_none(),
+            "an untyped I/O error carries no structured next_step"
+        );
+    }
 }

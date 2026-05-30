@@ -58,7 +58,7 @@ impl CommandOutput {
 }
 
 /// Serialized to stdout when `--json` is set.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct SuccessEnvelope {
     pub data: serde_json::Value,
     pub degraded: bool,
@@ -67,7 +67,7 @@ pub(crate) struct SuccessEnvelope {
 
 /// Serialized to stderr when `--json` is set and the command failed. Wrapping the
 /// payload under `error` lets consumers branch on the root key.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct ErrorEnvelope {
     pub error: ErrorPayload,
 }
@@ -76,7 +76,7 @@ pub(crate) struct ErrorEnvelope {
 ///
 /// `next_step` and `candidates` are omitted from JSON when absent/empty, keeping
 /// the envelope compact when no structured guidance applies.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct ErrorPayload {
     pub code: ErrorCode,
     pub message: String,

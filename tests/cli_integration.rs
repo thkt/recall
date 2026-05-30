@@ -199,8 +199,10 @@ fn seed_indexed_session(dir: &Path) {
 
 // T-CLI011: `search <q> --json` against a matching index prints the success
 // envelope to stdout and exits 0. The machine path of the core OUTCOME (search
-// returns results): the data payload carries `results`, and each result row
-// carries `session_id` and `excerpt`. Perspective: normal (the JSON happy path).
+// returns results): parses the envelope and asserts data.results carries the hit
+// (session_id + excerpt), and that degraded co-varies with notes — asserting the
+// invariant, not a fixed value, keeps it portable across machines that have or
+// lack the cached embedding model. Perspective: normal (the JSON happy path).
 #[test]
 fn search_json_emits_success_envelope_with_results() {
     let dir = TempDir::new().unwrap();
@@ -211,17 +213,34 @@ fn search_json_emits_success_envelope_with_results() {
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search --json should exit 0");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(r#""data""#) && stdout.contains(r#""results""#),
-        "stdout should be a success envelope carrying results, got: {stdout}"
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    let results = v["data"]["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("data.results should be an array, got: {stdout}"));
+    assert_eq!(
+        results.len(),
+        1,
+        "the one seeded session should be the single hit, got: {stdout}"
     );
     assert!(
-        stdout.contains(r#""degraded""#) && stdout.contains(r#""notes""#),
-        "envelope should carry degraded + notes fields, got: {stdout}"
-    );
-    assert!(
-        stdout.contains(r#""session_id""#) && stdout.contains(r#""excerpt""#),
+        results[0]["session_id"].is_string() && results[0]["excerpt"].is_string(),
         "each result row should carry session_id and excerpt, got: {stdout}"
+    );
+    // degraded and notes co-vary: search sets degraded=true with an FTS-fallback
+    // note exactly when the embedding model is absent. Asserting the invariant
+    // (not a fixed value) keeps the test portable across machines that have or
+    // lack the cached model.
+    let degraded = v["degraded"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));
+    let notes = v["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notes should be an array, got: {stdout}"));
+    assert_eq!(
+        degraded,
+        !notes.is_empty(),
+        "degraded must coincide with a non-empty notes list, got: {stdout}"
     );
 }
 
@@ -375,5 +394,37 @@ fn show_without_json_keeps_human_output() {
     assert!(
         !stdout.contains(r#""data""#),
         "default output must not emit the JSON envelope, got: {stdout}"
+    );
+}
+
+// T-CLI018: a side-effect command (`index`) with `--json` emits the no_payload
+// envelope — data:null, degraded:false, empty notes — and exits 0. Pins the
+// machine contract for commands that produce no result payload (the only source
+// of `data:null` in the envelope). Progress spinners go to stderr, so stdout is
+// exactly the one envelope; parsed as JSON, not substring-matched.
+#[test]
+fn index_json_emits_null_data_envelope() {
+    let dir = TempDir::new().unwrap();
+    let out = recall(dir.path())
+        .args(["index", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "index --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    assert!(
+        v["data"].is_null(),
+        "a side-effect command must emit data:null, got: {stdout}"
+    );
+    assert_eq!(
+        v["degraded"],
+        serde_json::json!(false),
+        "index is not a degraded path, got: {stdout}"
+    );
+    assert_eq!(
+        v["notes"],
+        serde_json::json!([]),
+        "index carries no notes, got: {stdout}"
     );
 }
