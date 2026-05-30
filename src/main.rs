@@ -6,6 +6,7 @@ mod embedder;
 mod error;
 mod hybrid;
 mod indexer;
+mod output;
 mod parser;
 mod search;
 
@@ -35,6 +36,7 @@ use rusqlite::Connection;
 use tracing::{info, warn};
 
 use crate::error::{RecallError, classify_exit_code, download_error, embedder_error};
+use crate::output::{WriteOutcome, write_result};
 use crate::parser::Source;
 
 const LOG_FILTER_VERBOSE: &str = "recall=info";
@@ -464,14 +466,18 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
     let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?;
 
-    println!("Sessions: {sessions}");
-    println!("QA chunks: {chunks}");
-    println!("Embedded: {embedded}/{chunks}");
-
     let model_ok = cached_artifacts(ModelId::default())
         .map(|opt| opt.is_some())
         .unwrap_or(false);
-    println!(
+
+    // Writes to an in-memory Vec are infallible, so the io::Result is discarded;
+    // the pipe is only touched by the single print_to_stdout below.
+    let mut buf = Vec::new();
+    let _ = writeln!(buf, "Sessions: {sessions}");
+    let _ = writeln!(buf, "QA chunks: {chunks}");
+    let _ = writeln!(buf, "Embedded: {embedded}/{chunks}");
+    let _ = writeln!(
+        buf,
         "Model: {}",
         if model_ok {
             "ready"
@@ -479,10 +485,10 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<()> {
             "not installed (run `recall model download`)"
         }
     );
-
     if verbose {
-        println!("DB: {}", path.display());
+        let _ = writeln!(buf, "DB: {}", path.display());
     }
+    print_to_stdout(&String::from_utf8_lossy(&buf));
 
     Ok(())
 }
@@ -546,26 +552,36 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
     Ok(())
 }
 
-fn print_result(i: usize, r: &search::SearchResult) {
-    if let Err(e) = format_result(&mut io::stdout().lock(), i, r) {
-        if e.kind() == ErrorKind::BrokenPipe {
-            process::exit(0);
-        }
-        warn!(error = %e, "failed to write result");
+/// Write fully-rendered `rendered` to stdout, stopping cleanly (exit 0) when the
+/// consumer closed the pipe early. Shared SIGPIPE boundary for the search/status
+/// result paths; `run_show` keeps its own (to be unified in Phase 2). See
+/// [`crate::output`].
+fn print_to_stdout(rendered: &str) {
+    match write_result(&mut io::stdout().lock(), rendered) {
+        Ok(WriteOutcome::Written) => {}
+        Ok(WriteOutcome::PipeClosed) => process::exit(0),
+        Err(e) => warn!(error = %e, "failed to write output"),
     }
 }
 
-fn print_results(results: &[search::SearchResult]) {
+/// Render search results into the human-readable listing: empty results yield
+/// the no-match line, otherwise a header plus one block per result. Writes go
+/// to an in-memory buffer (infallible), so the result emits as a single write.
+fn render_results(results: &[search::SearchResult]) -> String {
     if results.is_empty() {
-        println!("No matching sessions found.");
-        return;
+        return "No matching sessions found.".to_owned();
     }
 
-    println!("Found {} sessions:\n", results.len());
-
+    let mut buf = Vec::new();
+    let _ = writeln!(buf, "Found {} sessions:\n", results.len());
     for (i, r) in results.iter().enumerate() {
-        print_result(i, r);
+        let _ = format_result(&mut buf, i, r);
     }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn print_results(results: &[search::SearchResult]) {
+    print_to_stdout(&render_results(results));
 }
 
 // -- Entry point --
@@ -699,6 +715,25 @@ mod tests {
         assert!(output.contains("project [claude]"));
         assert!(output.contains("ID: s1"));
         assert!(output.contains("> some excerpt"));
+    }
+
+    // T-RR001: empty results render the no-match line (not a header).
+    #[test]
+    fn test_render_results_empty_reports_no_match() {
+        assert_eq!(render_results(&[]), "No matching sessions found.");
+    }
+
+    // T-RR002: non-empty results render a count header plus one block per result.
+    #[test]
+    fn test_render_results_lists_header_and_each_result() {
+        let results = [
+            make_search_result("abc123", "/proj/a", "hello world"),
+            make_search_result("def456", "/proj/b", "another match"),
+        ];
+        let out = render_results(&results);
+        assert!(out.starts_with("Found 2 sessions:\n"), "got: {out}");
+        assert!(out.contains("ID: abc123"), "got: {out}");
+        assert!(out.contains("ID: def456"), "got: {out}");
     }
 
     #[test]
