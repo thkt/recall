@@ -100,6 +100,19 @@ enum Command {
         /// Skip post-search embedding (faster for piped/scripted usage)
         #[arg(long)]
         no_embed: bool,
+
+        /// Exclude the invoking Claude Code session from results. Default when
+        /// CLAUDE_CODE_SESSION_ID is set (recall run from inside a session).
+        #[arg(long, conflicts_with_all = ["include_current", "only_current"])]
+        exclude_current: bool,
+
+        /// Include the invoking session even when CLAUDE_CODE_SESSION_ID is set.
+        #[arg(long, conflicts_with_all = ["exclude_current", "only_current"])]
+        include_current: bool,
+
+        /// Return only the invoking session (requires CLAUDE_CODE_SESSION_ID).
+        #[arg(long, conflicts_with_all = ["exclude_current", "include_current"])]
+        only_current: bool,
     },
     /// Show full conversation of a session
     Show {
@@ -299,6 +312,54 @@ fn search_idle_message(session_count: i64) -> Option<&'static str> {
     (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
 }
 
+/// The three mutually exclusive `--*-current` flags, grouped so
+/// `resolve_current_session` takes one argument instead of three booleans.
+#[derive(Clone, Copy, Debug)]
+struct CurrentSessionFlags {
+    exclude: bool,
+    include: bool,
+    only: bool,
+}
+
+/// Resolve how `recall search` treats the invoking session, from the
+/// `--*-current` flags and the `CLAUDE_CODE_SESSION_ID` env value (read by the
+/// caller and passed in, so the truth table is testable without touching process
+/// env). With no flag, an env id present defaults to excluding the current
+/// session: an agent searching mid-session does not want its own in-progress
+/// transcript echoed back. A blank (empty or whitespace-only) env value is
+/// treated as absent, so `--only-current` still reports the usage error instead
+/// of silently matching no session.
+fn resolve_current_session(
+    flags: CurrentSessionFlags,
+    env_session_id: Option<String>,
+) -> Result<search::CurrentSession, RecallError> {
+    use search::CurrentSession;
+    // A set-but-blank env value (e.g. exported empty in a shell) is not a usable
+    // session id; treat it as absent so every mode below behaves consistently.
+    let env_session_id = env_session_id.filter(|s| !s.trim().is_empty());
+    if flags.only {
+        return match env_session_id {
+            Some(id) => Ok(CurrentSession::Only(id)),
+            None => Err(RecallError::Usage(
+                "--only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session"
+                    .to_owned(),
+            )),
+        };
+    }
+    if flags.include {
+        return Ok(CurrentSession::Ignore);
+    }
+    match env_session_id {
+        Some(id) => Ok(CurrentSession::Exclude(id)),
+        None => {
+            if flags.exclude {
+                warn!("--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set");
+            }
+            Ok(CurrentSession::Ignore)
+        }
+    }
+}
+
 fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let Command::Search {
         query,
@@ -307,10 +368,22 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
         source,
         limit,
         no_embed,
+        exclude_current,
+        include_current,
+        only_current,
     } = cmd
     else {
         unreachable!()
     };
+
+    let current = resolve_current_session(
+        CurrentSessionFlags {
+            exclude: exclude_current,
+            include: include_current,
+            only: only_current,
+        },
+        env::var("CLAUDE_CODE_SESSION_ID").ok(),
+    )?;
 
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
@@ -348,6 +421,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
             days,
             source,
             limit: limit.into(),
+            current,
             now_ms: None,
         },
         embedder.as_deref(),
@@ -758,6 +832,67 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T-CS001: resolve_current_session is the single place the env-exclude policy
+    // lives, so this (flags x env) truth table is the contract.
+    #[test]
+    fn resolve_current_session_truth_table() {
+        use search::CurrentSession;
+        let flags = |exclude, include, only| CurrentSessionFlags {
+            exclude,
+            include,
+            only,
+        };
+        let with_env = || Some("sess-x".to_owned());
+        let exclude_x = || CurrentSession::Exclude("sess-x".to_owned());
+
+        // no flag: env present → default-exclude; env absent → ignore
+        assert_eq!(
+            resolve_current_session(flags(false, false, false), with_env()).unwrap(),
+            exclude_x()
+        );
+        assert_eq!(
+            resolve_current_session(flags(false, false, false), None).unwrap(),
+            CurrentSession::Ignore
+        );
+        // --exclude-current: env present → exclude; env absent → ignore (warns, no-op)
+        assert_eq!(
+            resolve_current_session(flags(true, false, false), with_env()).unwrap(),
+            exclude_x()
+        );
+        assert_eq!(
+            resolve_current_session(flags(true, false, false), None).unwrap(),
+            CurrentSession::Ignore
+        );
+        // --include-current: ignore regardless of env
+        assert_eq!(
+            resolve_current_session(flags(false, true, false), with_env()).unwrap(),
+            CurrentSession::Ignore
+        );
+        assert_eq!(
+            resolve_current_session(flags(false, true, false), None).unwrap(),
+            CurrentSession::Ignore
+        );
+        // --only-current: env present → only; env absent → usage error
+        assert_eq!(
+            resolve_current_session(flags(false, false, true), with_env()).unwrap(),
+            CurrentSession::Only("sess-x".to_owned())
+        );
+        assert!(
+            resolve_current_session(flags(false, false, true), None).is_err(),
+            "--only-current without CLAUDE_CODE_SESSION_ID must be a usage error"
+        );
+        // a blank (empty/whitespace) env value is treated as absent
+        assert_eq!(
+            resolve_current_session(flags(false, false, false), Some("  ".to_owned())).unwrap(),
+            CurrentSession::Ignore,
+            "blank CLAUDE_CODE_SESSION_ID must not produce a degenerate Exclude"
+        );
+        assert!(
+            resolve_current_session(flags(false, false, true), Some(String::new())).is_err(),
+            "--only-current with a blank env value must still be a usage error"
+        );
+    }
 
     #[test]
     fn test_format_timestamp() {

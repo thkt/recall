@@ -27,11 +27,30 @@ pub struct SearchResult {
     pub excerpt: String,
 }
 
+/// How `recall search` treats the session that invoked it.
+///
+/// Resolved by the CLI layer from `CLAUDE_CODE_SESSION_ID` and the
+/// `--{exclude,include,only}-current` flags. The library default is `Ignore`, so
+/// existing search behavior is unchanged unless a caller opts in — the env-based
+/// exclude policy lives only in the CLI (`resolve_current_session`), never here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CurrentSession {
+    /// No current-session filtering.
+    #[default]
+    Ignore,
+    /// Drop results whose session id equals this value (the invoking session).
+    Exclude(String),
+    /// Return only results whose session id equals this value.
+    Only(String),
+}
+
 pub struct SearchOptions {
     pub project: Option<String>,
     pub days: Option<i64>,
     pub source: Option<Source>,
     pub limit: usize,
+    /// How to treat the invoking session (see `CurrentSession`).
+    pub current: CurrentSession,
     /// Override current time (epoch ms) for deterministic testing.
     pub now_ms: Option<i64>,
 }
@@ -43,6 +62,7 @@ impl Default for SearchOptions {
             days: None,
             source: None,
             limit: 10,
+            current: CurrentSession::Ignore,
             now_ms: None,
         }
     }
@@ -80,6 +100,29 @@ fn append_session_filter(
     sql.push(')');
 }
 
+/// Append ` AND {column} <> ?` (Exclude) or ` AND {column} = ?` (Only) for the
+/// invoking session; `Ignore` emits nothing. Called unconditionally on both the
+/// FTS and vec candidate queries so an excluded session cannot slip back in via
+/// the path that skipped filtering — the RRF merge re-unions both candidate sets,
+/// so a single-path filter would leak. Precondition matches
+/// `append_session_filter`: `sql` ends inside an open WHERE clause.
+fn append_current_session_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn ToSql>>,
+    column: &'static str,
+    current: &CurrentSession,
+) {
+    let (op, id) = match current {
+        CurrentSession::Ignore => return,
+        CurrentSession::Exclude(id) => (" <> ?", id),
+        CurrentSession::Only(id) => (" = ?", id),
+    };
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(op);
+    params.push(Box::new(id.clone()));
+}
+
 fn build_fts_candidate_query(
     fts_query: &str,
     opts: &SearchOptions,
@@ -89,6 +132,7 @@ fn build_fts_candidate_query(
         "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
     append_session_filter(&mut sql, &mut params, "session_id", opts, now_ms);
+    append_current_session_filter(&mut sql, &mut params, "session_id", &opts.current);
     sql.push_str(" GROUP BY session_id ORDER BY best_rank LIMIT ?");
     let candidate_limit = opts.limit * 3;
     params.push(Box::new(candidate_limit as i64));
@@ -342,6 +386,7 @@ fn vec_search(
     );
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_session_filter(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
+    append_current_session_filter(&mut sql, &mut filter_params, "c.session_id", &opts.current);
     sql.push_str(" GROUP BY c.session_id ORDER BY d");
 
     let limit_i64 = limit as i64;
@@ -1176,6 +1221,99 @@ mod tests {
             .into_iter()
             .map(|r| r.session.session_id)
             .collect()
+    }
+
+    // T-CS002: CurrentSession::Exclude drops the invoking session from BOTH the
+    // FTS and vec candidate paths. The excluded session is seeded into messages
+    // (FTS hit) and vec_chunks (vec hit); if the filter were applied on only one
+    // path, the RRF merge would re-union it from the unfiltered path.
+    // assert_filter_symmetric proves it is absent from the merged output while the
+    // other session survives. This is the load-bearing both-paths guard for #77.
+    // `cur` is intentionally in both paths (not vec-only): that way deleting the
+    // filter call on EITHER builder resurfaces it. The vec path's own liveness is
+    // independently covered by test_hybrid_search_merges_fts_and_vector.
+    #[test]
+    fn test_hybrid_exclude_current_drops_session_from_both_paths() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+        let embedder = MockEmbedder::new();
+
+        assert_filter_symmetric(
+            || {
+                insert_session(&conn, "keep", "claude", "/proj", now_ms);
+                insert_message(&conn, "keep", "user", "authentication flow discussion");
+                // `cur` is the invoking session: it matches on BOTH paths.
+                insert_session(&conn, "cur", "claude", "/proj", now_ms);
+                insert_message(&conn, "cur", "user", "authentication flow discussion");
+                insert_chunk_with_embedding(&conn, 1, "cur", "authentication", now_ms);
+                ("keep".to_owned(), "cur".to_owned())
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        current: CurrentSession::Exclude("cur".to_owned()),
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+        );
+    }
+
+    // T-CS003: CurrentSession::Only keeps only the invoking session. `keep`
+    // matches on both paths but must be dropped; `cur` carries an FTS match and
+    // survives. The `= ?` arm filters both candidate paths (both-paths rationale:
+    // T-CS002).
+    #[test]
+    fn test_hybrid_only_current_keeps_only_invoking_session() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+        let embedder = MockEmbedder::new();
+
+        assert_filter_symmetric(
+            || {
+                insert_session(&conn, "cur", "claude", "/proj", now_ms);
+                insert_message(&conn, "cur", "user", "authentication flow discussion");
+                // `keep` matches on BOTH paths but must be dropped by Only("cur").
+                insert_session(&conn, "keep", "claude", "/proj", now_ms);
+                insert_message(&conn, "keep", "user", "authentication flow discussion");
+                insert_chunk_with_embedding(&conn, 1, "keep", "authentication", now_ms);
+                ("cur".to_owned(), "keep".to_owned())
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        current: CurrentSession::Only("cur".to_owned()),
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+            || {
+                hybrid_search_ids(
+                    &conn,
+                    &embedder,
+                    &SearchOptions {
+                        now_ms: Some(now_ms),
+                        ..Default::default()
+                    },
+                )
+            },
+        );
     }
 
     #[test]
