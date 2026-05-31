@@ -145,8 +145,7 @@ src/
 ├── indexer.rs    Incremental indexer with mtime tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
-├── modernbert.rs ModernBERT model implementation (mlx-rs)
-├── embedder.rs   Ruri v3 embedder (mlx-rs default / candle fallback, mean pooling)
+├── embedder.rs   Post-search embedding orchestration (batches chunks via rurico)
 ├── chunker.rs    Q&A pair chunker with size splitting + SHA256 change detection
 ├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
 └── date.rs       Civil calendar date utilities
@@ -171,7 +170,7 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 | ------------------- | ------------------------------------------------------------------------- |
 | Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync   |
 | Text only           | Images, tool results, and binary content are not indexed                  |
-| Apple Silicon focus | MLX acceleration requires Apple Silicon. candle (CPU) fallback available for Linux |
+| Apple Silicon only  | Requires Apple Silicon. The MLX backend has no CPU/Linux fallback         |
 | Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations  |
 
 ## Development

@@ -143,8 +143,7 @@ src/
 ├── indexer.rs    mtime追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
 ├── hybrid.rs     RRF 統合 + recency boost
-├── modernbert.rs ModernBERTモデル実装（mlx-rs）
-├── embedder.rs   Ruri v3 embedder（mlx-rsデフォルト / candleフォールバック, mean pooling）
+├── embedder.rs   検索後embeddingのオーケストレーション（チャンクをruricoでバッチ処理）
 ├── chunker.rs    Q&Aペアチャンカー（サイズ分割 + SHA256変更検知）
 ├── db.rs         SQLite スキーマ（WAL, FTS5, sqlite-vec）
 └── date.rs       日付ユーティリティ
@@ -167,7 +166,7 @@ src/
 
 - `~/.claude/projects/` と `~/.codex/sessions/` のローカルセッションのみ対応。クラウド同期なし
 - 画像、ツール結果、バイナリコンテンツはインデックスしない
-- MLXアクセラレーションはApple Siliconが必要。Linux向けにcandle（CPU）フォールバックあり
+- Apple Siliconが必要。MLXバックエンドにCPU/Linuxフォールバックはなし
 - 検索結果は抜粋表示。完全な会話は `recall show <id>` で表示可能
 
 ## 謝辞
