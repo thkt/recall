@@ -21,6 +21,11 @@ use crate::date::MS_PER_DAY;
 use crate::hybrid::{self, RECENCY_BOOST_WEIGHT};
 use crate::parser::{SessionData, Source};
 
+/// Candidate over-sample factor: each path fetches `limit * CANDIDATE_LIMIT_MULTIPLIER`
+/// candidates before the RRF merge and recency boost truncate the union back to
+/// `limit`. Shared by the FTS and vec paths so the two stay in lockstep (#54).
+const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
+
 pub struct SearchResult {
     pub session: SessionData,
     /// Snippet with `**` highlight markers from FTS5.
@@ -134,7 +139,7 @@ fn build_fts_candidate_query(
     append_session_filter(&mut sql, &mut params, "session_id", opts, now_ms);
     append_current_session_filter(&mut sql, &mut params, "session_id", &opts.current);
     sql.push_str(" GROUP BY session_id ORDER BY best_rank LIMIT ?");
-    let candidate_limit = opts.limit * 3;
+    let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
     params.push(Box::new(candidate_limit as i64));
     (sql, params)
 }
@@ -457,7 +462,7 @@ pub fn search_with_embedder(
     if let Some(embedder) = embedder
         && has_vec_data(conn)
     {
-        let candidate_limit = opts.limit * 3;
+        let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
 
         let fts_hits: Vec<(String, f64)> = fts_ranked
             .iter()
@@ -821,7 +826,7 @@ mod tests {
         let (_dir, conn) = setup_test_db();
         let now_ms = 1_750_000_000_000_i64;
         let limit = 5;
-        let candidate_limit = limit * 3; // 15
+        let candidate_limit = limit * CANDIDATE_LIMIT_MULTIPLIER; // 15
 
         // Insert 20 old sessions (exceeds candidate_limit)
         for i in 0..20 {
