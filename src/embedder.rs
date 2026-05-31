@@ -63,12 +63,6 @@ fn embed_chunks(
                              VALUES (?1, ?2, ?3)",
                             rusqlite::params![embedding_bytes, chunks[i].0, sub_idx as i64],
                         )?;
-                        let vec_rowid = tx.last_insert_rowid();
-                        tx.execute(
-                            "INSERT INTO embedded_chunk_ids (chunk_id, sub_idx, vec_rowid) \
-                             VALUES (?1, ?2, ?3)",
-                            rusqlite::params![chunks[i].0, sub_idx as i64, vec_rowid],
-                        )?;
                     }
                 }
                 tx.commit()?;
@@ -253,9 +247,9 @@ mod tests {
         .unwrap();
         for i in 0..3 {
             conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-                 VALUES (?1, 's1', 'q', 'a', ?2, 0, ?3)",
-                rusqlite::params![i + 1, format!("content {i}"), format!("hash{i}")],
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![i + 1, format!("content {i}")],
             )
             .unwrap();
         }

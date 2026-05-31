@@ -1,15 +1,10 @@
-use sha2::{Digest, Sha256};
-
 use crate::parser::{Message, Role};
 
 pub(crate) struct QAChunk {
     pub session_id: String,
-    pub user_text: String,
-    pub assistant_text: Option<String>,
     /// Embedding content: user_text [+ "\n" + assistant_text]. Prefix added by embedder.
     pub content: String,
     pub timestamp: Option<i64>,
-    pub chunk_hash: String,
 }
 
 /// Max content bytes per chunk (~4000-5000 tokens, well under model's 8192 limit).
@@ -79,12 +74,6 @@ fn find_split_boundary(text: &str, max_bytes: usize) -> usize {
     }
 }
 
-fn sha256_hex(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 /// Build Q&A chunks from a session's messages.
 ///
 /// Rules:
@@ -124,14 +113,10 @@ pub(crate) fn chunk_messages(
 
         let contents = build_content(&msg.text, assistant_text);
         for content in contents {
-            let chunk_hash = sha256_hex(&content);
             chunks.push(QAChunk {
                 session_id: session_id.to_owned(),
-                user_text: msg.text.clone(),
-                assistant_text: assistant_text.map(String::from),
                 content,
                 timestamp,
-                chunk_hash,
             });
         }
 
@@ -161,16 +146,10 @@ mod tests {
         let chunks = chunk_messages("s1", &messages, Some(1000));
 
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].user_text, "認証フローについて教えて");
-        assert_eq!(
-            chunks[0].assistant_text.as_deref(),
-            Some("OAuth2を使う方法があります")
-        );
         assert!(chunks[0].content.contains("認証フロー"));
         assert!(chunks[0].content.contains("OAuth2"));
         assert_eq!(chunks[0].session_id, "s1");
         assert_eq!(chunks[0].timestamp, Some(1000));
-        assert!(!chunks[0].chunk_hash.is_empty());
     }
 
     #[test]
@@ -179,9 +158,8 @@ mod tests {
         let chunks = chunk_messages("s1", &messages, None);
 
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].user_text, "最初の質問");
-        assert!(chunks[0].assistant_text.is_none());
-        assert_eq!(chunks[1].user_text, "次の質問");
+        assert_eq!(chunks[0].content, "最初の質問");
+        assert_eq!(chunks[1].content, "次の質問");
     }
 
     #[test]
@@ -211,12 +189,11 @@ mod tests {
         let chunks = chunk_messages("s1", &messages, Some(500));
 
         assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[0].user_text, "Q1");
-        assert_eq!(chunks[0].assistant_text.as_deref(), Some("A1"));
-        assert_eq!(chunks[1].user_text, "Q2");
-        assert!(chunks[1].assistant_text.is_none());
-        assert_eq!(chunks[2].user_text, "Q3");
-        assert_eq!(chunks[2].assistant_text.as_deref(), Some("A3"));
+        assert!(chunks[0].content.contains("Q1"));
+        assert!(chunks[0].content.contains("A1"));
+        assert_eq!(chunks[1].content, "Q2");
+        assert!(chunks[2].content.contains("Q3"));
+        assert!(chunks[2].content.contains("A3"));
     }
 
     #[test]
@@ -224,17 +201,6 @@ mod tests {
         let messages = vec![msg(Role::User, ""), msg(Role::Assistant, "answer")];
         let chunks = chunk_messages("s1", &messages, None);
         assert!(chunks.is_empty());
-    }
-
-    #[test]
-    fn test_chunk_hash_deterministic() {
-        let messages = vec![msg(Role::User, "same question")];
-        let c1 = chunk_messages("s1", &messages, None);
-        let c2 = chunk_messages("s2", &messages, None);
-        assert_eq!(
-            c1[0].chunk_hash, c2[0].chunk_hash,
-            "same content → same hash"
-        );
     }
 
     #[test]

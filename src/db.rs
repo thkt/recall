@@ -34,6 +34,12 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     migrate_fts_if_needed(conn)?;
     migrate_vec_chunks_if_needed(conn)?;
+    migrate_qa_chunks_if_needed(conn)?;
+
+    // embedded_chunk_ids (a removed ledger) was dropped inside two separate
+    // migrations; collapse those into one unconditional drop so every pre-cleanup
+    // DB ends up without it after open_db.
+    conn.execute_batch("DROP TABLE IF EXISTS embedded_chunk_ids;")?;
 
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
@@ -53,14 +59,10 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS qa_chunks (
             id INTEGER PRIMARY KEY,
             session_id TEXT NOT NULL,
-            user_text TEXT NOT NULL,
-            assistant_text TEXT,
             content TEXT NOT NULL,
-            timestamp INTEGER,
-            chunk_hash TEXT NOT NULL
+            timestamp INTEGER
         );
-        CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);
-        CREATE INDEX IF NOT EXISTS idx_qa_chunks_hash ON qa_chunks(chunk_hash);",
+        CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);",
     )?;
 
     conn.execute_batch(&format!(
@@ -72,42 +74,58 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     ))?;
 
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS embedded_chunk_ids (
-            chunk_id INTEGER NOT NULL,
-            sub_idx INTEGER NOT NULL,
-            vec_rowid INTEGER NOT NULL,
-            PRIMARY KEY (chunk_id, sub_idx)
-        );
-        CREATE INDEX IF NOT EXISTS idx_embedded_chunk_ids_chunk ON embedded_chunk_ids(chunk_id);",
-    )?;
-
-    conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
     )?;
 
     Ok(())
 }
 
-fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
-    let sql: Option<String> = match conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='vec_chunks'",
-        [],
+/// Fetch a table's stored `CREATE` SQL from `sqlite_master`, or `None` if it
+/// does not exist. Virtual tables (fts5, vec0) are stored with `type='table'`,
+/// so this resolves regular and virtual tables alike.
+fn table_def(conn: &Connection, name: &str) -> Result<Option<String>> {
+    match conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
         |r| r.get(0),
     ) {
-        Ok(sql) => Some(sql),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
+        Ok(sql) => Ok(Some(sql)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
 
-    let Some(sql) = sql else {
+fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
+    let Some(sql) = table_def(conn, "vec_chunks")? else {
         return Ok(());
     };
 
     if !sql.contains("sub_idx") {
         notify_schema_change("recall", "embeddings", 0, "recall embed");
         let tx = conn.transaction()?;
+        tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+/// Drop the write-only columns (chunk_hash / user_text / assistant_text) from
+/// pre-cleanup databases. ALTER ... DROP COLUMN keeps content / id and the
+/// vec_chunks linkage by chunk_id intact, so existing embeddings survive without
+/// a re-index. The removed embedded_chunk_ids ledger is dropped in create_schema.
+fn migrate_qa_chunks_if_needed(conn: &mut Connection) -> Result<()> {
+    let Some(sql) = table_def(conn, "qa_chunks")? else {
+        return Ok(());
+    };
+
+    if sql.contains("chunk_hash") {
+        let tx = conn.transaction()?;
         tx.execute_batch(
-            "DROP TABLE IF EXISTS vec_chunks; DROP TABLE IF EXISTS embedded_chunk_ids;",
+            "DROP INDEX IF EXISTS idx_qa_chunks_hash;
+             ALTER TABLE qa_chunks DROP COLUMN chunk_hash;
+             ALTER TABLE qa_chunks DROP COLUMN user_text;
+             ALTER TABLE qa_chunks DROP COLUMN assistant_text;",
         )?;
         tx.commit()?;
     }
@@ -116,17 +134,7 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
 }
 
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
-    let sql: Option<String> = match conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'",
-        [],
-        |r| r.get(0),
-    ) {
-        Ok(sql) => Some(sql),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
-    let Some(sql) = sql else {
+    let Some(sql) = table_def(conn, "messages")? else {
         return Ok(());
     };
 
@@ -157,6 +165,7 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedder::f32_as_bytes;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -280,5 +289,135 @@ mod tests {
             chunks, 0,
             "qa_chunks should be cleared by migration cascade"
         );
+    }
+
+    /// Build a DB with the pre-cleanup qa_chunks schema (chunk_hash / user_text /
+    /// assistant_text + idx_qa_chunks_hash), an embedded_chunk_ids table, and a
+    /// vec_chunks row linked by chunk_id. Uses the trigram tokenizer and the
+    /// sub_idx vec schema so neither migrate_fts_if_needed nor
+    /// migrate_vec_chunks_if_needed fires (both would wipe qa_chunks/vec_chunks).
+    fn create_pre_cleanup_db(path: &Path) {
+        ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e)).unwrap();
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE sessions (
+                session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
+                project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
+            );
+            CREATE VIRTUAL TABLE messages USING fts5(
+                session_id UNINDEXED, role, text, tokenize='{FTS_TOKENIZER}'
+            );
+            CREATE TABLE qa_chunks (
+                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                user_text TEXT NOT NULL, assistant_text TEXT,
+                content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
+            );
+            CREATE INDEX idx_qa_chunks_hash ON qa_chunks(chunk_hash);
+            CREATE TABLE embedded_chunk_ids (
+                chunk_id INTEGER NOT NULL, sub_idx INTEGER NOT NULL,
+                vec_rowid INTEGER NOT NULL, PRIMARY KEY (chunk_id, sub_idx)
+            );
+            CREATE VIRTUAL TABLE vec_chunks USING vec0(
+                embedding FLOAT[{EMBEDDING_DIMS}], +chunk_id INTEGER, +sub_idx INTEGER
+            );"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
+             VALUES (1, 's1', 'q', 'a', 'q\na', 0, 'deadbeef')",
+            [],
+        )
+        .unwrap();
+        let emb = vec![0.1f32; EMBEDDING_DIMS];
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+            [f32_as_bytes(&emb)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO embedded_chunk_ids (chunk_id, sub_idx, vec_rowid) VALUES (1, 0, 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
+        let tmp = NamedTempFile::new().unwrap();
+        create_pre_cleanup_db(tmp.path());
+
+        let conn = open_db(tmp.path()).unwrap();
+
+        // (a) write-only columns are gone
+        let cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(qa_chunks)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        for gone in ["chunk_hash", "user_text", "assistant_text"] {
+            assert!(
+                !cols.contains(&gone.to_owned()),
+                "column {gone} should be dropped, got {cols:?}"
+            );
+        }
+
+        // (b) content + id preserved
+        let (id, content): (i64, String) = conn
+            .query_row("SELECT id, content FROM qa_chunks WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(content, "q\na");
+
+        // (c) vec_chunks row preserved and still linked by chunk_id (embedding not orphaned)
+        let vec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            vec_count, 1,
+            "vec_chunks row must survive and stay linked to qa_chunks"
+        );
+
+        // (d) embedded_chunk_ids table is gone
+        let tbl: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedded_chunk_ids'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl, 0, "embedded_chunk_ids table should be dropped");
+
+        // Idempotency: re-opening an already-migrated DB must be a no-op, not
+        // re-run or error. This is the path every returning user hits on their
+        // next `recall`, so the chunk_hash sniff must stay false after migration.
+        drop(conn);
+        let conn = open_db(tmp.path()).unwrap();
+        let cols2: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(qa_chunks)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(
+            !cols2.contains(&"chunk_hash".to_owned()),
+            "re-open must stay migrated, got {cols2:?}"
+        );
+        let vec_count2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_count2, 1, "re-open must keep vec row linked");
     }
 }
