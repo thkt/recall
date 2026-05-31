@@ -146,9 +146,8 @@ fn find_candidate_sessions(
     now_ms: i64,
 ) -> Result<Vec<(String, f64)>> {
     let (sql, params) = build_fts_candidate_query(fts_query, opts, now_ms);
-    let refs: Vec<&dyn ToSql> = params.iter().map(AsRef::as_ref).collect();
     debug_assert_eq!(
-        refs.len(),
+        params.len(),
         sql.matches('?').count(),
         "param count must match SQL placeholder count"
     );
@@ -156,7 +155,7 @@ fn find_candidate_sessions(
         .prepare(&sql)
         .context("Failed to prepare search query")?;
     let rows = stmt
-        .query_map(refs.as_slice(), |row| {
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
         })
         .context("Search query failed")?;
@@ -196,10 +195,9 @@ fn fetch_session_metadata(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id IN ({placeholders})"
     );
-    let refs: Vec<&dyn ToSql> = ranked.iter().map(|(sid, _)| sid as &dyn ToSql).collect();
-
+    let params = rusqlite::params_from_iter(ranked.iter().map(|(sid, _)| sid));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(refs.as_slice(), |row| {
+    let rows = stmt.query_map(params, |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
