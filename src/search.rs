@@ -28,7 +28,9 @@ const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
 
 pub struct SearchResult {
     pub session: SessionData,
-    /// Snippet with `**` highlight markers from FTS5.
+    /// Excerpt for display: the full containing qa_chunk for an FTS hit, else the
+    /// FTS5 20-token snippet (with `**` highlight markers), else the closest vector
+    /// chunk, else empty.
     pub excerpt: String,
 }
 
@@ -305,30 +307,49 @@ fn snippet_or_default(result: rusqlite::Result<String>, session_id: &str) -> Opt
     }
 }
 
-fn fetch_snippets(
+fn fetch_chunks(
     conn: &Connection,
     fts_query: &str,
     ranked: Vec<(String, f64)>,
     meta_map: &mut HashMap<String, SessionData>,
     vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<(f64, SearchResult)>> {
+    // Full chunk for an FTS hit (#8): find the message that matched, then the
+    // qa_chunk whose content contains that message text. `instr` runs on the
+    // already-matched message text (not the raw query), so FTS5 operators
+    // (AND/OR/quotes) are resolved by MATCH and never reach `instr`. Scoped to the
+    // session, so it scans only that session's handful of chunks (idx_qa_chunks_session).
+    // `ORDER BY rank` picks the most relevant matched message when several match,
+    // instead of an arbitrary rowid-ordered one.
+    let chunk_match_sql = "SELECT c.content FROM qa_chunks c \
+        JOIN (SELECT text FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
+          ON instr(c.content, m.text) > 0 \
+        WHERE c.session_id = ?2 LIMIT 1";
+    let mut chunk_match_stmt = conn.prepare(chunk_match_sql)?;
+    // Fallback when no single chunk contains the matched message (e.g. the message
+    // was split across chunks, or the session has no qa_chunks): the 20-token snippet.
     let snippet_sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
                FROM messages WHERE messages MATCH ?1 AND session_id = ?2 LIMIT 1";
     let mut snippet_stmt = conn.prepare(snippet_sql)?;
-    let chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
-    let mut chunk_stmt = conn.prepare(chunk_sql)?;
+    // Vector-only hit: no FTS match exists, so use the closest chunk by id (#36).
+    let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
+    let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
+        if let Some(content) = snippet_or_default(
+            chunk_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+            sid,
+        ) {
+            return content;
+        }
         if let Some(snippet) = snippet_or_default(
             snippet_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
             sid,
         ) {
             return snippet;
         }
-        // Vector-only hit: no FTS snippet exists. Fall back to the matched chunk's
-        // content so the result shows why it matched (#36).
         if let Some(&chunk_id) = vec_chunks.get(sid)
             && let Some(content) = snippet_or_default(
-                chunk_stmt.query_row(rusqlite::params![chunk_id], |row| row.get(0)),
+                vec_chunk_stmt.query_row(rusqlite::params![chunk_id], |row| row.get(0)),
                 sid,
             )
         {
@@ -477,7 +498,7 @@ pub fn search_with_embedder(
             }
         };
 
-        // Map each vector-hit session to its closest chunk so fetch_snippets can use
+        // Map each vector-hit session to its closest chunk so fetch_chunks can use
         // that chunk's content as the excerpt when there is no FTS snippet (#36).
         let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
         let vec_for_rrf: Vec<(String, f64)> =
@@ -493,7 +514,7 @@ pub fn search_with_embedder(
 
         // Drop hits whose `sessions` row is missing or has an unknown source;
         // `fetch_session_metadata` skips those, and without pruning here they
-        // would consume `limit` slots during truncate and cause `fetch_snippets`
+        // would consume `limit` slots during truncate and cause `fetch_chunks`
         // to under-fill the result set.
         merged.retain(|(sid, _)| meta_map.contains_key(sid));
 
@@ -509,7 +530,7 @@ pub fn search_with_embedder(
         );
         merged.truncate(opts.limit);
 
-        let candidates = fetch_snippets(conn, &fts_query, merged, &mut meta_map, &vec_chunks)?;
+        let candidates = fetch_chunks(conn, &fts_query, merged, &mut meta_map, &vec_chunks)?;
         Ok(candidates.into_iter().map(|(_, r)| r).collect())
     } else {
         if fts_ranked.is_empty() {
@@ -519,7 +540,7 @@ pub fn search_with_embedder(
         // FTS-only path: every session matched FTS, so there is always a snippet;
         // pass an empty vec-chunk map (no vector-only fallback needed here).
         let candidates =
-            fetch_snippets(conn, &fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
+            fetch_chunks(conn, &fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
         Ok(score_and_sort(candidates, now_ms, opts.limit))
     }
 }
@@ -595,6 +616,131 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session.session_id, "s1");
         assert!(!results[0].excerpt.is_empty());
+    }
+
+    // T-001 (#8): an FTS-hit excerpt is the full qa_chunk content, not a 20-token
+    // snippet of the matched message. The chunk holds the matched message text
+    // plus the rest of the Q&A; fetch_chunks locates it via instr(content,
+    // message_text) and returns the whole chunk.
+    #[test]
+    fn test_fts_hit_excerpt_is_full_chunk_not_snippet() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "how to implement authentication");
+        insert_chunk_with_embedding(
+            &conn,
+            1,
+            "s1",
+            "how to implement authentication — use JWT with short-lived access tokens and rotating refresh tokens",
+            1709251200000,
+        );
+
+        let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let excerpt = &results[0].excerpt;
+        assert!(
+            excerpt.contains("rotating refresh tokens"),
+            "FTS-hit excerpt must be the full chunk, not a 20-token snippet: {excerpt:?}"
+        );
+    }
+
+    // T-002 (#8): a multi-term (implicit-AND) query still resolves to the
+    // containing chunk. MATCH applies the operator; instr only sees the concrete
+    // matched message text, so the operator never reaches instr.
+    #[test]
+    fn test_fts_operator_query_returns_containing_chunk() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(
+            &conn,
+            "s1",
+            "user",
+            "authentication middleware configuration",
+        );
+        insert_chunk_with_embedding(
+            &conn,
+            1,
+            "s1",
+            "authentication middleware configuration — mount it before the route handlers",
+            1709251200000,
+        );
+
+        let results = search(
+            &conn,
+            "authentication middleware",
+            &SearchOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let excerpt = &results[0].excerpt;
+        assert!(
+            excerpt.contains("mount it before the route handlers"),
+            "operator query must return the full containing chunk: {excerpt:?}"
+        );
+    }
+
+    // T-003 (#8): an FTS hit whose session has no containing qa_chunk falls back to
+    // the 20-token snippet (with `**` highlight markers), not an empty excerpt.
+    #[test]
+    fn test_fts_hit_without_chunk_falls_back_to_snippet() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+        // no qa_chunk inserted for s1
+
+        let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let excerpt = &results[0].excerpt;
+        assert!(
+            excerpt.contains("**"),
+            "fallback must be the FTS snippet (** markers), not a chunk: {excerpt:?}"
+        );
+    }
+
+    // T-006 (#8 audit/B): when a session has multiple messages matching the query,
+    // the chunk of the highest-ranked (most relevant) message is selected, not an
+    // arbitrary rowid-ordered one. `chunk_match_sql` orders the inner message
+    // subquery by FTS5 `rank`. The low-rank message is inserted first (lower rowid),
+    // so a rowid-ordered LIMIT 1 would pick the wrong chunk.
+    #[test]
+    fn test_fts_hit_selects_highest_ranked_message_chunk() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+        // rowid 1: long, diluted -> lower bm25 rank for "authentication".
+        insert_message(
+            &conn,
+            "s1",
+            "user",
+            "authentication alpha padded with many extra filler words here to lower its relevance",
+        );
+        // rowid 2: short, focused -> higher bm25 rank.
+        insert_message(&conn, "s1", "user", "authentication beta");
+        insert_chunk_with_embedding(
+            &conn,
+            1,
+            "s1",
+            "authentication alpha padded with many extra filler words here to lower its relevance — ALPHA_CHUNK_BODY",
+            1709251200000,
+        );
+        insert_chunk_with_embedding(
+            &conn,
+            2,
+            "s1",
+            "authentication beta — BETA_CHUNK_BODY",
+            1709251200000,
+        );
+
+        let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
+
+        assert_eq!(results.len(), 1);
+        let excerpt = &results[0].excerpt;
+        assert!(
+            excerpt.contains("BETA_CHUNK_BODY"),
+            "must select the highest-ranked message's chunk, not the first by rowid: {excerpt:?}"
+        );
     }
 
     #[test]

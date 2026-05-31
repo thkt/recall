@@ -129,8 +129,6 @@ enum ModelCommand {
     Download,
 }
 
-const EXCERPT_MAX_BYTES: usize = 200;
-
 fn create_db_file(path: &Path) -> io::Result<()> {
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -150,10 +148,6 @@ fn format_timestamp(ts_ms: Option<i64>) -> String {
     let days = ts.div_euclid(date::MS_PER_DAY);
     let (y, m, d) = date::civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn truncate_str(s: &str, max_bytes: usize) -> &str {
-    &s[..s.floor_char_boundary(max_bytes)]
 }
 
 fn open_or_create_db(path: &Path) -> Result<Connection> {
@@ -663,13 +657,9 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
         writeln!(w, "    Parent: {parent}")?;
     }
     if !r.excerpt.is_empty() {
-        let clean = r.excerpt.trim();
-        let truncated = truncate_str(clean, EXCERPT_MAX_BYTES);
-        for line in truncated.lines() {
+        let excerpt = ansi::strip_control_chars(&r.excerpt);
+        for line in excerpt.trim().lines() {
             writeln!(w, "    > {line}")?;
-        }
-        if truncated.len() < clean.len() {
-            writeln!(w, "    > ...")?;
         }
     }
     writeln!(w)?;
@@ -906,25 +896,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_truncate_str() {
-        for (input, max, expected) in [
-            ("hello", 10, "hello"),
-            ("hello", 5, "hello"),
-            ("hello world", 5, "hello"),
-        ] {
-            assert_eq!(
-                truncate_str(input, max),
-                expected,
-                "input: {input:?}, max: {max}"
-            );
-        }
-        // Multibyte: 3 bytes per char, 10 bytes fits 3 chars (9 bytes)
-        let result = truncate_str("こんにちは", 10);
-        assert_eq!(result, "こんに");
-        assert!(result.len() <= 10);
-    }
-
     fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
         search::SearchResult {
             session: parser::SessionData {
@@ -981,14 +952,43 @@ mod tests {
         assert!(!output.contains("    /"));
     }
 
+    // T-004 (#8/FR-004): the excerpt renders in full — no byte-cap truncation and
+    // no "..." marker — so the whole chunk reaches the agent in one search.
     #[test]
-    fn test_format_result_truncated_excerpt() {
+    fn test_format_result_excerpt_not_truncated() {
         let long = "a".repeat(300);
         let r = make_search_result("s1", "/proj", &long);
         let mut buf = Vec::new();
         format_result(&mut buf, 0, &r).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("..."));
+        assert!(
+            output.contains(&format!("> {long}")),
+            "the full excerpt must render without truncation"
+        );
+        assert!(
+            !output.contains("> ..."),
+            "no truncation marker should be emitted, got: {output}"
+        );
+    }
+
+    // T-005 (#8 audit/C): the excerpt passes through ansi::strip_control_chars like
+    // every peer field (slug/project/session_id/file_path), so stored ANSI/control
+    // sequences from indexed content cannot reach the terminal raw. #8 expanded this
+    // surface (200-byte snippet -> full chunk content), making the gap material.
+    #[test]
+    fn test_format_result_excerpt_strips_control_chars() {
+        let r = make_search_result("s1", "/proj", "clean\x1b[31mANSI\x1b[0mhere\x07bell");
+        let mut buf = Vec::new();
+        format_result(&mut buf, 0, &r).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            !output.contains('\x1b') && !output.contains('\x07'),
+            "control characters must be stripped from the excerpt, got: {output:?}"
+        );
+        assert!(
+            output.contains("> cleanANSIherebell"),
+            "the cleaned excerpt text must render, got: {output:?}"
+        );
     }
 
     #[test]
