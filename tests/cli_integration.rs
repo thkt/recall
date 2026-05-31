@@ -10,12 +10,17 @@ use tempfile::TempDir;
 
 /// A `recall` invocation isolated from the developer's real sessions and DB.
 /// `RECALL_DB` points at a path inside `dir`; the source dirs point nowhere so
-/// indexing never touches `~/.claude` or `~/.codex`.
+/// indexing never touches `~/.claude` or `~/.codex`. `CLAUDE_CODE_SESSION_ID` is
+/// cleared so a suite run from inside a live Claude Code session does not inherit
+/// the invoking session id — `search` now excludes that session by default, so
+/// inheritance would leak the runner's environment into results. Tests that
+/// exercise the exclusion set the variable explicitly.
 fn recall(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_recall"));
     cmd.env("RECALL_DB", dir.join("recall.db"))
         .env("RECALL_CLAUDE_DIR", dir.join("no-claude"))
-        .env("RECALL_CODEX_DIR", dir.join("no-codex"));
+        .env("RECALL_CODEX_DIR", dir.join("no-codex"))
+        .env_remove("CLAUDE_CODE_SESSION_ID");
     cmd
 }
 
@@ -456,5 +461,129 @@ fn status_json_without_index_reports_zero_counts() {
         v["data"]["model_ready"],
         serde_json::json!(false),
         "the no-database branch reports model_ready:false, got: {stdout}"
+    );
+}
+
+/// Seed a two-session Claude index (s1, s2) that both match "hello", then index
+/// it. The current-session tests differ only in the flag and env they pass next,
+/// so the seed lives here once.
+fn seed_two_matching_sessions(dir: &Path) {
+    let claude_dir = dir.join("claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    for sid in ["s1", "s2"] {
+        fs::write(
+            claude_dir.join(format!("{sid}.jsonl")),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        exit_code(
+            recall(dir)
+                .env("RECALL_CLAUDE_DIR", &claude_dir)
+                .arg("index")
+        ),
+        0,
+        "index should build the DB and exit 0"
+    );
+}
+
+// T-CLI020: CLAUDE_CODE_SESSION_ID excludes the invoking session by default (#77).
+// Two sessions (s1, s2) both match the query. With the env var set to s1 and no
+// flag, the default drops s1 and keeps s2 — proving the binary reads the env var
+// and threads it into SearchOptions.current, the glue the in-process resolve unit
+// test cannot reach. The baseline (env cleared by the helper) lists both, so the
+// assertion cannot pass vacuously by returning nothing.
+#[test]
+fn search_excludes_current_session_by_env_default() {
+    let dir = TempDir::new().unwrap();
+    seed_two_matching_sessions(dir.path());
+
+    // Baseline: no invoking session (helper clears the env) → both are candidates.
+    let baseline = recall(dir.path())
+        .args(["search", "hello", "--no-embed"])
+        .output()
+        .expect("spawn recall binary");
+    let baseline_out = String::from_utf8_lossy(&baseline.stdout);
+    assert!(
+        baseline_out.contains("ID: s1") && baseline_out.contains("ID: s2"),
+        "baseline (no env) should list both sessions, got: {baseline_out}"
+    );
+
+    // CLAUDE_CODE_SESSION_ID=s1 → s1 is the invoking session, excluded by default.
+    let out = recall(dir.path())
+        .args(["search", "hello", "--no-embed"])
+        .env("CLAUDE_CODE_SESSION_ID", "s1")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ID: s2"),
+        "the non-current session must remain, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ID: s1"),
+        "the invoking session (s1) must be excluded by default, got: {stdout}"
+    );
+}
+
+// T-CLI022: --include-current overrides the default exclusion (#77). With
+// CLAUDE_CODE_SESSION_ID=s1 the flag keeps s1, so both s1 and s2 appear — the
+// end-to-end path for the Ignore mode that the default/exclude tests never reach.
+#[test]
+fn search_include_current_keeps_invoking_session() {
+    let dir = TempDir::new().unwrap();
+    seed_two_matching_sessions(dir.path());
+
+    let out = recall(dir.path())
+        .args(["search", "hello", "--no-embed", "--include-current"])
+        .env("CLAUDE_CODE_SESSION_ID", "s1")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ID: s1") && stdout.contains("ID: s2"),
+        "--include-current must keep the invoking session, got: {stdout}"
+    );
+}
+
+// T-CLI023: --only-current restricts results to the invoking session (#77). With
+// CLAUDE_CODE_SESSION_ID=s1, only s1 appears even though s2 also matches — the
+// positive end-to-end path that T-CLI021 (the env-absent usage error) omits.
+#[test]
+fn search_only_current_restricts_to_invoking_session() {
+    let dir = TempDir::new().unwrap();
+    seed_two_matching_sessions(dir.path());
+
+    let out = recall(dir.path())
+        .args(["search", "hello", "--no-embed", "--only-current"])
+        .env("CLAUDE_CODE_SESSION_ID", "s1")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ID: s1"),
+        "--only-current must keep the invoking session, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ID: s2"),
+        "--only-current must drop other sessions, got: {stdout}"
+    );
+}
+
+// T-CLI021: --only-current without CLAUDE_CODE_SESSION_ID is a usage error (64).
+// resolve_current_session has nothing to filter to, so it returns
+// RecallError::Usage; this pins that it classifies to the sysexits USAGE code end
+// to end (not a crash or a silently empty result). resolve runs before the DB is
+// opened, so no index is needed.
+#[test]
+fn only_current_without_env_exits_usage() {
+    let dir = TempDir::new().unwrap();
+    assert_eq!(
+        exit_code(recall(dir.path()).args(["search", "hello", "--no-embed", "--only-current"])),
+        64
     );
 }
