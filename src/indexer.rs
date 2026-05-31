@@ -471,16 +471,8 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
 
         for chunk in &chunks {
             tx.execute(
-                "INSERT INTO qa_chunks (session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    chunk.session_id,
-                    chunk.user_text,
-                    chunk.assistant_text,
-                    chunk.content,
-                    chunk.timestamp,
-                    chunk.chunk_hash,
-                ],
+                "INSERT INTO qa_chunks (session_id, content, timestamp) VALUES (?1, ?2, ?3)",
+                rusqlite::params![chunk.session_id, chunk.content, chunk.timestamp],
             )?;
             chunks_created += 1;
         }

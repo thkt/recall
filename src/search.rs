@@ -523,9 +523,8 @@ mod tests {
         ts: i64,
     ) {
         conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-             VALUES (?1, ?2, 'q', 'a', ?3, ?4, ?5)",
-            rusqlite::params![chunk_id, sid, text, ts, format!("hash{chunk_id}")],
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![chunk_id, sid, text, ts],
         )
         .unwrap();
         let embedding = MockEmbedder::deterministic_vector(text);

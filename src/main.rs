@@ -1024,8 +1024,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-             VALUES (1, 's1', 'q', 'a', 'hello content', 0, 'h1')",
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (1, 's1', 'hello content', 0)",
             [],
         )
         .unwrap();
