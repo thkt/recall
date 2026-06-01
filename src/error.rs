@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use amici::cli::exit_code::{CliError, codes};
 use amici::model::ModelDownloadError;
-use amici::model::embedder::DegradedReason;
+use amici::model::embedder::{DegradedReason, degraded_reason_user_note};
 use rurico::storage::SanitizeError;
 use serde::Serialize;
 
@@ -197,7 +197,9 @@ pub(crate) fn download_error(e: &ModelDownloadError) -> RecallError {
 pub(crate) fn embedder_error(reason: DegradedReason) -> RecallError {
     match reason {
         DegradedReason::NotInstalled => RecallError::Usage(
-            "embedding model not installed; run `recall model download`".to_owned(),
+            degraded_reason_user_note(reason, "recall model download").unwrap_or_else(|| {
+                "embedding model not installed; run `recall model download`".to_owned()
+            }),
         ),
         DegradedReason::ProbeFailed => {
             RecallError::TempFailure("embedding model probe failed".to_owned())

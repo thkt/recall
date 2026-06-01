@@ -56,6 +56,9 @@ fn embed_chunks(
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
                 for (chunked, &i) in embeddings.iter().zip(batch_idx) {
+                    // Idempotent replay guard: stale concurrent work may still
+                    // reach this tx after the NOT EXISTS pending query.
+                    tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [chunks[i].0])?;
                     for (sub_idx, sub_emb) in chunked.chunks.iter().enumerate() {
                         let embedding_bytes = f32_as_bytes(sub_emb);
                         tx.execute(
@@ -276,5 +279,38 @@ mod tests {
         let calls = calls.into_inner().unwrap();
         assert!(!calls.is_empty());
         assert_eq!(calls.last().unwrap(), &(3, 3));
+    }
+
+    #[test]
+    fn test_embed_chunks_replaces_existing_vectors_for_stale_pending_work() {
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (1, 's1', 'content 0', 0)",
+            [],
+        )
+        .unwrap();
+
+        let embedder = MockEmbedder::new();
+        let chunks: Vec<(i64, String)> = vec![(1, "content 0".into())];
+
+        let first = embed_chunks(&mut conn, &embedder, &chunks, None).unwrap();
+        assert_eq!(first.embedded, 1);
+        let second = embed_chunks(&mut conn, &embedder, &chunks, None).unwrap();
+        assert_eq!(second.embedded, 1);
+
+        let vec_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_count, 1, "re-embedding must not duplicate vec rows");
     }
 }

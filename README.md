@@ -173,6 +173,20 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 | Apple Silicon only  | Requires Apple Silicon. The MLX backend has no CPU/Linux fallback         |
 | Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations  |
 
+## Exit Codes
+
+recall uses sysexits-style exit codes instead of a generic `1`/`2` split.
+
+| Code | Name           | Meaning                                      |
+| ---- | -------------- | -------------------------------------------- |
+| 0    | success        | Command completed successfully               |
+| 64   | `USAGE_ERROR`  | Invalid command usage or missing local index |
+| 65   | `DATA_ERROR`   | Malformed user input, such as a bad query    |
+| 70   | `INTERNAL`     | Internal invariant or unsupported backend    |
+| 74   | `IO_ERROR`     | Filesystem or SQLite I/O failure             |
+| 75   | `TEMP_FAILURE` | Retryable transient failure                  |
+| 104  | `UNKNOWN`      | Unclassified error path                      |
+
 ## Development
 
 ### Setup

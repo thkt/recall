@@ -84,6 +84,13 @@ jobs:
       - name: Generate lcov coverage
         run: cargo llvm-cov --lcov --output-path lcov.info
 
+      - name: Exclude inline Rust test code from coverage
+        run: |
+          python3 .github/scripts/filter_lcov_cfg_test.py \
+            lcov.info \
+            lcov.filtered.info \
+            --repo-root "$GITHUB_WORKSPACE"
+
       - name: Diff coverage gate (changed lines >= 95%)
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
@@ -91,7 +98,7 @@ jobs:
           # (externally-managed environments) regardless of the runner's Python.
           python3 -m venv /tmp/diff-cover-venv
           /tmp/diff-cover-venv/bin/pip install --quiet diff-cover
-          /tmp/diff-cover-venv/bin/diff-cover lcov.info \
+          /tmp/diff-cover-venv/bin/diff-cover lcov.filtered.info \
             --compare-branch=origin/main \
             --fail-under=95
 

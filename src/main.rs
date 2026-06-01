@@ -26,10 +26,10 @@ use amici::cli::{
     try_expand_shorthand,
 };
 use amici::logging::init_subscriber;
-use amici::model::download_and_verify_model;
-use amici::model::embedder::{DegradedReason, try_load_embedder_with};
-use amici::storage::filter::escape_like;
-use anyhow::{Context, Result};
+use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
+use amici::model::{degraded_reason_user_note, download_and_verify_model, record_degraded};
+use amici::storage::{collect_rows, filter::escape_like};
+use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
@@ -184,24 +184,27 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
-    try_load_embedder_with(
-        || cached_artifacts(ModelId::default()),
-        |e| warn!(error = %e, "failed to delete corrupt model files"),
-        |e| warn!(error = %e, "embedder probe failed"),
-    )
+    try_load_embedder_default_logging()
 }
 
 fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
-    match open_cached_embedder() {
+    try_load_embedder_cached_with(open_cached_embedder)
+}
+
+fn try_load_embedder_cached_with<F>(open_embedder: F) -> Option<Arc<dyn Embed>>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    match open_embedder() {
         Ok(e) => Some(e),
-        Err(DegradedReason::NotInstalled) => {
-            cli_info(
-                "note: embedding model not installed; using text search only. Run `recall model download` to enable semantic search.",
-            );
+        Err(reason @ DegradedReason::NotInstalled) => {
+            if let Some(note) = degraded_reason_user_note(reason, "recall model download") {
+                cli_info(&format!("note: {note}."));
+            }
             None
         }
         Err(reason) => {
-            warn!(%reason, "embedder unavailable; using text search only");
+            record_degraded(reason, "embedder load");
             None
         }
     }
@@ -510,22 +513,22 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
          FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\' ORDER BY session_id",
     )?;
     let pattern = format!("{}%", escape_like(session_id));
-    let matches: Vec<parser::SessionData> = stmt
-        .query_map([&pattern], |row| {
-            let source_str: String = row.get(1)?;
-            Ok(parser::SessionData {
-                session_id: row.get(0)?,
-                source: Source::from_db(&source_str).unwrap_or_else(|| {
-                    warn!(source = %source_str, "unknown source, defaulting to claude");
-                    Source::Claude
-                }),
-                file_path: row.get(2)?,
-                project: row.get(3)?,
-                slug: row.get(4)?,
-                timestamp: row.get(5)?,
-            })
-        })?
-        .collect::<Result<_, _>>()?;
+    let rows = stmt.query_map([&pattern], |row| {
+        let source_str: String = row.get(1)?;
+        Ok(parser::SessionData {
+            session_id: row.get(0)?,
+            source: Source::from_db(&source_str).unwrap_or_else(|| {
+                warn!(source = %source_str, "unknown source, defaulting to claude");
+                Source::Claude
+            }),
+            file_path: row.get(2)?,
+            project: row.get(3)?,
+            slug: row.get(4)?,
+            timestamp: row.get(5)?,
+        })
+    })?;
+    let matches: Vec<parser::SessionData> =
+        collect_rows::<_, parser::SessionData, Vec<parser::SessionData>, Error>(rows)?;
 
     if matches.is_empty() {
         return Err(RecallError::Usage(format!("No session found matching '{session_id}'")).into());
@@ -543,9 +546,9 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
 
     let mut msg_stmt =
         conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
-    let messages: Vec<(String, String)> = msg_stmt
-        .query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<Result<_, _>>()?;
+    let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let messages: Vec<(String, String)> =
+        collect_rows::<_, (String, String), Vec<(String, String)>, Error>(rows)?;
 
     // Writes to an in-memory Vec are infallible; the pipe is only touched later
     // by the single emit_success -> print_to_stdout.
@@ -1048,6 +1051,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn try_load_embedder_cached_records_degraded_non_install_failure() {
+        let result = try_load_embedder_cached_with(|| Err(DegradedReason::ProbeFailed));
+        assert!(result.is_none());
+    }
+
+    // The Ok arm: a loaded embedder is returned so search can rank semantically.
+    // Injected via the loader seam to stay independent of whether a model is
+    // installed in the test environment (production coverage of this arm would
+    // otherwise flip with model presence).
+    #[test]
+    fn try_load_embedder_cached_returns_loaded_embedder() {
+        let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
+        let result = try_load_embedder_cached_with(|| Ok(loaded));
+        assert!(result.is_some(), "a loaded embedder must be returned");
+    }
+
+    // The NotInstalled arm: a missing model degrades search to FTS-only (None)
+    // after surfacing the install note, rather than aborting the command.
+    #[test]
+    fn try_load_embedder_cached_returns_none_when_model_not_installed() {
+        let result = try_load_embedder_cached_with(|| Err(DegradedReason::NotInstalled));
+        assert!(
+            result.is_none(),
+            "a not-installed model must degrade to None, not abort"
+        );
+    }
+
     fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
         search::SearchResult {
             session: parser::SessionData {
@@ -1298,6 +1329,26 @@ mod tests {
         assert!(
             user_pos < assistant_pos,
             "user message should come before assistant"
+        );
+    }
+
+    // A row stored with a source outside the known set ('claude'/'codex') must
+    // not abort show: Source::from_db returns None and the row falls back to
+    // Claude (with a warn) so the session still renders. Covers the
+    // unknown-source guard in show_session's query_map closure.
+    #[test]
+    fn test_show_session_unknown_source_falls_back_to_claude() {
+        let (_dir, conn) = db::setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        let out = show_session(&conn, "xyz-1", false).unwrap();
+        assert!(
+            out.markdown.contains("- source: claude"),
+            "an unknown stored source must fall back to claude, got: {}",
+            out.markdown
         );
     }
 
