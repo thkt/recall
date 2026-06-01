@@ -114,6 +114,11 @@ enum Command {
         /// Return only the invoking session (requires CLAUDE_CODE_SESSION_ID).
         #[arg(long, conflicts_with_all = ["exclude_current", "include_current"])]
         only_current: bool,
+
+        /// Include sessions classified automated (hook/script/agent-generated).
+        /// Default excludes them.
+        #[arg(long)]
+        include_automated: bool,
     },
     /// Show full conversation of a session
     Show {
@@ -366,6 +371,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
         exclude_current,
         include_current,
         only_current,
+        include_automated,
     } = cmd
     else {
         unreachable!()
@@ -417,6 +423,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
             source,
             limit: limit.into(),
             current,
+            include_automated,
             now_ms: None,
         },
         embedder.as_deref(),
