@@ -1057,6 +1057,28 @@ mod tests {
         assert!(result.is_none());
     }
 
+    // The Ok arm: a loaded embedder is returned so search can rank semantically.
+    // Injected via the loader seam to stay independent of whether a model is
+    // installed in the test environment (production coverage of this arm would
+    // otherwise flip with model presence).
+    #[test]
+    fn try_load_embedder_cached_returns_loaded_embedder() {
+        let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
+        let result = try_load_embedder_cached_with(|| Ok(loaded));
+        assert!(result.is_some(), "a loaded embedder must be returned");
+    }
+
+    // The NotInstalled arm: a missing model degrades search to FTS-only (None)
+    // after surfacing the install note, rather than aborting the command.
+    #[test]
+    fn try_load_embedder_cached_returns_none_when_model_not_installed() {
+        let result = try_load_embedder_cached_with(|| Err(DegradedReason::NotInstalled));
+        assert!(
+            result.is_none(),
+            "a not-installed model must degrade to None, not abort"
+        );
+    }
+
     fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
         search::SearchResult {
             session: parser::SessionData {
@@ -1307,6 +1329,26 @@ mod tests {
         assert!(
             user_pos < assistant_pos,
             "user message should come before assistant"
+        );
+    }
+
+    // A row stored with a source outside the known set ('claude'/'codex') must
+    // not abort show: Source::from_db returns None and the row falls back to
+    // Claude (with a warn) so the session still renders. Covers the
+    // unknown-source guard in show_session's query_map closure.
+    #[test]
+    fn test_show_session_unknown_source_falls_back_to_claude() {
+        let (_dir, conn) = db::setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        let out = show_session(&conn, "xyz-1", false).unwrap();
+        assert!(
+            out.markdown.contains("- source: claude"),
+            "an unknown stored source must fall back to claude, got: {}",
+            out.markdown
         );
     }
 
