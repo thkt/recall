@@ -56,6 +56,8 @@ fn embed_chunks(
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
                 for (chunked, &i) in embeddings.iter().zip(batch_idx) {
+                    // Idempotent replay guard: stale concurrent work may still
+                    // reach this tx after the NOT EXISTS pending query.
                     tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [chunks[i].0])?;
                     for (sub_idx, sub_emb) in chunked.chunks.iter().enumerate() {
                         let embedding_bytes = f32_as_bytes(sub_emb);

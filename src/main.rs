@@ -188,7 +188,14 @@ fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
 }
 
 fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
-    match open_cached_embedder() {
+    try_load_embedder_cached_with(open_cached_embedder)
+}
+
+fn try_load_embedder_cached_with<F>(open_embedder: F) -> Option<Arc<dyn Embed>>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    match open_embedder() {
         Ok(e) => Some(e),
         Err(reason @ DegradedReason::NotInstalled) => {
             if let Some(note) = degraded_reason_user_note(reason, "recall model download") {
@@ -1042,6 +1049,12 @@ mod tests {
         ] {
             assert_eq!(format_timestamp(input), expected, "input: {input:?}");
         }
+    }
+
+    #[test]
+    fn try_load_embedder_cached_records_degraded_non_install_failure() {
+        let result = try_load_embedder_cached_with(|| Err(DegradedReason::ProbeFailed));
+        assert!(result.is_none());
     }
 
     fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
