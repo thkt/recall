@@ -412,7 +412,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     let embedder = try_load_embedder_cached();
     // A missing embedding model degrades search to FTS-only; surface it so an
     // agent knows semantic ranking was unavailable (the `--json` notes channel).
-    let (degraded, notes) = match &embedder {
+    let (degraded, mut notes) = match &embedder {
         Some(_) => (false, Vec::new()),
         None => (
             true,
@@ -437,6 +437,25 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
         },
         embedder.as_deref(),
     )?;
+
+    // Surface the default automated-session exclusion so an agent consumer can
+    // discover --include-automated; skipped when the agent already opted in.
+    if !include_automated {
+        // Best-effort: a failed count skips the advisory note rather than aborting
+        // an otherwise-successful search.
+        let automated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_type = 'automated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if automated > 0 {
+            notes.push(format!(
+                "{automated} automated session(s) excluded by default; use --include-automated to include them"
+            ));
+        }
+    }
 
     let markdown = render_results(&results);
     let data = serde_json::json!({
@@ -767,7 +786,7 @@ struct ClassifyOutcome {
 /// written — the caller displays the returned outcomes. Sessions without a user
 /// turn are left untouched (NULL = interactive).
 fn reclassify_sessions(
-    conn: &Connection,
+    conn: &mut Connection,
     all: bool,
     dry_run: bool,
 ) -> Result<Vec<ClassifyOutcome>> {
@@ -792,7 +811,13 @@ fn reclassify_sessions(
         for row in rows {
             let (session_id, first_turn) = row?;
             let session_type = classify::classify_first_turn(&first_turn);
-            let excerpt: String = first_turn.trim_start().chars().take(80).collect();
+            // The excerpt is for --dry-run display only; skip the allocation on the
+            // write path where it is never read.
+            let excerpt = if dry_run {
+                first_turn.trim_start().chars().take(80).collect()
+            } else {
+                String::new()
+            };
             outcomes.push(ClassifyOutcome {
                 session_id,
                 session_type,
@@ -803,11 +828,18 @@ fn reclassify_sessions(
     };
 
     if !dry_run {
-        let mut update =
-            conn.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1")?;
-        for o in &outcomes {
-            update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
+        // One transaction for the whole batch: a single commit instead of one per
+        // row, and all-or-nothing so an interrupted run leaves session_type
+        // unchanged and is cleanly re-runnable.
+        let tx = conn.transaction()?;
+        {
+            let mut update =
+                tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1")?;
+            for o in &outcomes {
+                update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
+            }
         }
+        tx.commit()?;
     }
 
     Ok(outcomes)
@@ -818,8 +850,8 @@ fn reclassify_sessions(
 /// unclassified ones. `--dry-run` reports what would change without writing.
 fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
-    let conn = open_or_create_db(&path)?;
-    let outcomes = reclassify_sessions(&conn, all, dry_run)?;
+    let mut conn = open_or_create_db(&path)?;
+    let outcomes = reclassify_sessions(&mut conn, all, dry_run)?;
     let automated = outcomes
         .iter()
         .filter(|o| o.session_type == classify::SessionType::Automated)
@@ -1311,8 +1343,8 @@ mod tests {
     // from their first user turn and writes session_type.
     #[test]
     fn test_010_reclassify_all_tags_sessions() {
-        let (_dir, conn) = seed_classify_db();
-        let outcomes = reclassify_sessions(&conn, true, false).unwrap();
+        let (_dir, mut conn) = seed_classify_db();
+        let outcomes = reclassify_sessions(&mut conn, true, false).unwrap();
         assert_eq!(session_type_of(&conn, "auto").as_deref(), Some("automated"));
         assert_eq!(
             session_type_of(&conn, "human").as_deref(),
@@ -1329,8 +1361,8 @@ mod tests {
     // not write session_type.
     #[test]
     fn test_011_reclassify_dry_run_does_not_write() {
-        let (_dir, conn) = seed_classify_db();
-        let outcomes = reclassify_sessions(&conn, true, true).unwrap();
+        let (_dir, mut conn) = seed_classify_db();
+        let outcomes = reclassify_sessions(&mut conn, true, true).unwrap();
         assert_eq!(
             session_type_of(&conn, "auto"),
             None,
@@ -1342,13 +1374,17 @@ mod tests {
             .find(|o| o.session_id == "auto")
             .expect("dry-run still reports the outcome for display");
         assert_eq!(auto.session_type, classify::SessionType::Automated);
+        assert!(
+            !auto.excerpt.is_empty(),
+            "dry-run outcome carries the first-turn excerpt for display"
+        );
     }
 
     // T-012 (#24/FR-008): without --all, only unclassified (NULL) sessions are
     // (re)classified; an already-tagged session is left untouched.
     #[test]
     fn test_012_reclassify_incremental_skips_already_tagged() {
-        let (_dir, conn) = db::setup_test_db();
+        let (_dir, mut conn) = db::setup_test_db();
         conn.execute(
             "INSERT INTO sessions VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
             [],
@@ -1372,7 +1408,7 @@ mod tests {
         )
         .unwrap();
 
-        let outcomes = reclassify_sessions(&conn, false, false).unwrap();
+        let outcomes = reclassify_sessions(&mut conn, false, false).unwrap();
 
         assert_eq!(
             session_type_of(&conn, "fresh").as_deref(),
