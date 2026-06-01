@@ -587,3 +587,118 @@ fn only_current_without_env_exits_usage() {
         64
     );
 }
+
+// T-CLI024 (#24 Phase 3): `recall classify` reports outcomes end to end, and
+// --dry-run previews without persisting. The session's first user turn is a
+// slash-command wrapper, so it classifies automated.
+#[test]
+fn classify_reports_and_dry_run_previews() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = dir.path().join("claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("s1.jsonl"),
+        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"<command-message>clear</command-message>"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        exit_code(
+            recall(dir.path())
+                .env("RECALL_CLAUDE_DIR", &claude_dir)
+                .arg("index")
+        ),
+        0,
+        "index should build the DB and exit 0"
+    );
+
+    let dry = recall(dir.path())
+        .args(["classify", "--all", "--dry-run"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(
+        dry.status.code(),
+        Some(0),
+        "classify --dry-run should exit 0"
+    );
+    let dry_out = String::from_utf8_lossy(&dry.stdout);
+    assert!(dry_out.contains("dry-run"), "dry-run output: {dry_out}");
+
+    let run = recall(dir.path())
+        .args(["classify", "--all"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(run.status.code(), Some(0), "classify --all should exit 0");
+    let out = String::from_utf8_lossy(&run.stdout);
+    assert!(out.contains("classified"), "classify output: {out}");
+}
+
+// T-CLI025 (#24 audit/N): a default search surfaces a note that automated sessions
+// are excluded, so an AI-agent consumer can discover --include-automated.
+#[test]
+fn search_notes_automated_exclusion() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = dir.path().join("claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("auto.jsonl"),
+        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"<command-message>clear</command-message>"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    fs::write(
+        claude_dir.join("human.jsonl"),
+        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        exit_code(
+            recall(dir.path())
+                .env("RECALL_CLAUDE_DIR", &claude_dir)
+                .arg("index")
+        ),
+        0
+    );
+
+    let out = recall(dir.path())
+        .args(["search", "authentication", "--no-embed", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--include-automated"),
+        "default search must note the automated exclusion: {stdout}"
+    );
+}
+
+// T-CLI026 (#24 audit/N): when the index has no automated sessions, the search
+// output carries no exclusion note (the hint does not appear spuriously).
+#[test]
+fn search_omits_automated_note_when_none_excluded() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = dir.path().join("claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(
+        claude_dir.join("human.jsonl"),
+        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        exit_code(
+            recall(dir.path())
+                .env("RECALL_CLAUDE_DIR", &claude_dir)
+                .arg("index")
+        ),
+        0
+    );
+
+    let out = recall(dir.path())
+        .args(["search", "authentication", "--no-embed", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "search should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.contains("--include-automated"),
+        "no automated sessions means no exclusion note: {stdout}"
+    );
+}

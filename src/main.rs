@@ -1,5 +1,6 @@
 mod ansi;
 mod chunker;
+mod classify;
 mod date;
 mod db;
 mod embedder;
@@ -113,11 +114,25 @@ enum Command {
         /// Return only the invoking session (requires CLAUDE_CODE_SESSION_ID).
         #[arg(long, conflicts_with_all = ["exclude_current", "include_current"])]
         only_current: bool,
+
+        /// Include sessions classified automated (hook/script/agent-generated).
+        /// Default excludes them.
+        #[arg(long)]
+        include_automated: bool,
     },
     /// Show full conversation of a session
     Show {
         /// Session ID (prefix match supported)
         session_id: String,
+    },
+    /// Classify existing sessions interactive/automated from their first user turn
+    Classify {
+        /// Re-classify every session (default: only unclassified)
+        #[arg(long)]
+        all: bool,
+        /// Report what would change without writing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show index and embedding status
     Status,
@@ -365,6 +380,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
         exclude_current,
         include_current,
         only_current,
+        include_automated,
     } = cmd
     else {
         unreachable!()
@@ -396,7 +412,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     let embedder = try_load_embedder_cached();
     // A missing embedding model degrades search to FTS-only; surface it so an
     // agent knows semantic ranking was unavailable (the `--json` notes channel).
-    let (degraded, notes) = match &embedder {
+    let (degraded, mut notes) = match &embedder {
         Some(_) => (false, Vec::new()),
         None => (
             true,
@@ -416,10 +432,30 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
             source,
             limit: limit.into(),
             current,
+            include_automated,
             now_ms: None,
         },
         embedder.as_deref(),
     )?;
+
+    // Surface the default automated-session exclusion so an agent consumer can
+    // discover --include-automated; skipped when the agent already opted in.
+    if !include_automated {
+        // Best-effort: a failed count skips the advisory note rather than aborting
+        // an otherwise-successful search.
+        let automated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_type = 'automated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if automated > 0 {
+            notes.push(format!(
+                "{automated} automated session(s) excluded by default; use --include-automated to include them"
+            ));
+        }
+    }
 
     let markdown = render_results(&results);
     let data = serde_json::json!({
@@ -736,10 +772,125 @@ fn emit_error(err: &anyhow::Error, json_mode: bool) {
     }
 }
 
+/// One session's reclassification result (#24 Phase 3).
+struct ClassifyOutcome {
+    session_id: String,
+    session_type: classify::SessionType,
+    /// First ~80 chars of the first user turn (after trim), for `--dry-run` display.
+    excerpt: String,
+}
+
+/// Re-classify existing sessions from their first user turn and update
+/// `session_type`. With `all`, every session that has a user turn is re-evaluated;
+/// otherwise only those still unclassified (NULL). When `dry_run`, nothing is
+/// written — the caller displays the returned outcomes. Sessions without a user
+/// turn are left untouched (NULL = interactive).
+fn reclassify_sessions(
+    conn: &mut Connection,
+    all: bool,
+    dry_run: bool,
+) -> Result<Vec<ClassifyOutcome>> {
+    // First user turn per session: the lowest-rowid user message (document order,
+    // AS-003). Without `all`, restrict to still-unclassified sessions.
+    let base = "SELECT m.session_id, m.text FROM messages m \
+        WHERE m.rowid IN (SELECT MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id)";
+    let sql = if all {
+        base.to_owned()
+    } else {
+        format!(
+            "{base} AND m.session_id IN (SELECT session_id FROM sessions WHERE session_type IS NULL)"
+        )
+    };
+
+    let outcomes = {
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut outcomes = Vec::new();
+        for row in rows {
+            let (session_id, first_turn) = row?;
+            let session_type = classify::classify_first_turn(&first_turn);
+            // The excerpt is for --dry-run display only; skip the allocation on the
+            // write path where it is never read.
+            let excerpt = if dry_run {
+                first_turn.trim_start().chars().take(80).collect()
+            } else {
+                String::new()
+            };
+            outcomes.push(ClassifyOutcome {
+                session_id,
+                session_type,
+                excerpt,
+            });
+        }
+        outcomes
+    };
+
+    if !dry_run {
+        // One transaction for the whole batch: a single commit instead of one per
+        // row, and all-or-nothing so an interrupted run leaves session_type
+        // unchanged and is cleanly re-runnable.
+        let tx = conn.transaction()?;
+        {
+            let mut update =
+                tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1")?;
+            for o in &outcomes {
+                update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
+            }
+        }
+        tx.commit()?;
+    }
+
+    Ok(outcomes)
+}
+
+/// `recall classify`: tag existing sessions interactive/automated from their first
+/// user turn (#24 Phase 3). `--all` re-classifies every session; otherwise only
+/// unclassified ones. `--dry-run` reports what would change without writing.
+fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    let path = resolve_db_path(db_path)?;
+    let mut conn = open_or_create_db(&path)?;
+    let outcomes = reclassify_sessions(&mut conn, all, dry_run)?;
+    let automated = outcomes
+        .iter()
+        .filter(|o| o.session_type == classify::SessionType::Automated)
+        .count();
+    let interactive = outcomes.len() - automated;
+
+    let mut markdown = String::new();
+    if dry_run {
+        for o in &outcomes {
+            markdown.push_str(&format!(
+                "{} [{}] {}\n",
+                o.session_id,
+                o.session_type.as_str(),
+                o.excerpt
+            ));
+        }
+        markdown.push_str(&format!(
+            "dry-run: {} session(s) would be classified ({automated} automated, {interactive} interactive)",
+            outcomes.len()
+        ));
+    } else {
+        markdown.push_str(&format!(
+            "classified {} session(s): {automated} automated, {interactive} interactive",
+            outcomes.len()
+        ));
+    }
+    let data = serde_json::json!({
+        "classified": outcomes.len(),
+        "automated": automated,
+        "interactive": interactive,
+        "dry_run": dry_run,
+    });
+    Ok(CommandOutput::ok(markdown, data))
+}
+
 // -- Entry point --
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "index", "rebuild", "embed", "model", "search", "show", "status", "help",
+    "index", "rebuild", "embed", "model", "search", "show", "status", "classify", "help",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
@@ -790,6 +941,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
+        Some(Command::Classify { all, dry_run }) => run_classify(all, dry_run, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         None => Err(RecallError::Usage(
             "A search query is required. Usage: recall search \"query\" or recall index".to_owned(),
@@ -1072,12 +1224,12 @@ mod tests {
     fn setup_show_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
+            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0, NULL)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
+            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -1151,10 +1303,134 @@ mod tests {
 
     /// Seed one session with one pending (un-embedded) chunk, the fixture both
     /// `embed_around_results` tests share.
+    fn seed_classify_db() -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = db::setup_test_db();
+        // 'auto': first user turn is a slash-command wrapper; 'human': a normal
+        // turn. Both start unclassified (session_type NULL).
+        conn.execute(
+            "INSERT INTO sessions VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('auto', 'user', '<command-message>clear</command-message>')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('human', 'user', 'how do I implement auth')",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    fn session_type_of(conn: &Connection, sid: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT session_type FROM sessions WHERE session_id = ?1",
+            [sid],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    // T-010 (#24/FR-008): `recall classify --all` re-classifies existing sessions
+    // from their first user turn and writes session_type.
+    #[test]
+    fn test_010_reclassify_all_tags_sessions() {
+        let (_dir, mut conn) = seed_classify_db();
+        let outcomes = reclassify_sessions(&mut conn, true, false).unwrap();
+        assert_eq!(session_type_of(&conn, "auto").as_deref(), Some("automated"));
+        assert_eq!(
+            session_type_of(&conn, "human").as_deref(),
+            Some("interactive")
+        );
+        assert_eq!(
+            outcomes.len(),
+            2,
+            "both sessions with a user turn are classified"
+        );
+    }
+
+    // T-011 (#24/FR-009a, FR-009b): --dry-run returns outcomes for display but does
+    // not write session_type.
+    #[test]
+    fn test_011_reclassify_dry_run_does_not_write() {
+        let (_dir, mut conn) = seed_classify_db();
+        let outcomes = reclassify_sessions(&mut conn, true, true).unwrap();
+        assert_eq!(
+            session_type_of(&conn, "auto"),
+            None,
+            "dry-run must not write session_type"
+        );
+        assert_eq!(session_type_of(&conn, "human"), None);
+        let auto = outcomes
+            .iter()
+            .find(|o| o.session_id == "auto")
+            .expect("dry-run still reports the outcome for display");
+        assert_eq!(auto.session_type, classify::SessionType::Automated);
+        assert!(
+            !auto.excerpt.is_empty(),
+            "dry-run outcome carries the first-turn excerpt for display"
+        );
+    }
+
+    // T-012 (#24/FR-008): without --all, only unclassified (NULL) sessions are
+    // (re)classified; an already-tagged session is left untouched.
+    #[test]
+    fn test_012_reclassify_incremental_skips_already_tagged() {
+        let (_dir, mut conn) = db::setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('fresh', 'user', '<command-message>clear</command-message>')",
+            [],
+        )
+        .unwrap();
+        // 'tagged' carries an automated first turn but was already tagged interactive;
+        // without --all it must stay interactive (not re-evaluated).
+        conn.execute(
+            "INSERT INTO sessions VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('tagged', 'user', '<command-message>clear</command-message>')",
+            [],
+        )
+        .unwrap();
+
+        let outcomes = reclassify_sessions(&mut conn, false, false).unwrap();
+
+        assert_eq!(
+            session_type_of(&conn, "fresh").as_deref(),
+            Some("automated"),
+            "an unclassified session is classified"
+        );
+        assert_eq!(
+            session_type_of(&conn, "tagged").as_deref(),
+            Some("interactive"),
+            "an already-tagged session is untouched without --all"
+        );
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "only the unclassified session is processed"
+        );
+    }
+
     fn setup_pending_chunk_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
             [],
         )
         .unwrap();

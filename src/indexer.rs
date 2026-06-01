@@ -10,6 +10,7 @@ use rusqlite::{Connection, Transaction};
 use tracing::{debug, info, warn};
 
 use crate::chunker;
+use crate::classify::classify_first_turn;
 use crate::parser::{
     Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session,
 };
@@ -117,8 +118,21 @@ fn upsert_session(
         )?;
     }
 
+    // Classify from the first user turn so `recall search` can exclude automated
+    // sessions by default (#24). Done at ingest from the already-parsed messages —
+    // no extra read. No user turn → interactive (never hidden by default).
+    let session_type = classify_first_turn(
+        parsed
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, Role::User))
+            .map(|m| m.text.as_str())
+            .unwrap_or(""),
+    )
+    .as_str();
+
     ctx.tx.execute(
-        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
             parsed.metadata.session_id,
             parsed.metadata.source.as_str(),
@@ -127,6 +141,7 @@ fn upsert_session(
             parsed.metadata.slug,
             parsed.metadata.timestamp,
             mtime,
+            session_type,
         ],
     )?;
 
@@ -532,6 +547,45 @@ mod tests {
         .unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 1);
+    }
+
+    fn index_one_claude_session(content: &str) -> Option<String> {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let line = format!(
+            r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":{content:?}}},"timestamp":"2026-03-01T00:00:00Z"}}"#
+        );
+        fs::write(claude_dir.join("s.jsonl"), line).unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+        index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+        conn.query_row("SELECT session_type FROM sessions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    // T-004 (#24/FR-003): ingest tags session_type from the first user turn — an
+    // automated marker yields 'automated', a human turn yields 'interactive'.
+    #[test]
+    fn test_ingest_tags_session_type_from_first_user_turn() {
+        assert_eq!(
+            index_one_claude_session("<command-message>clear</command-message>").as_deref(),
+            Some("automated"),
+            "a slash-command first turn must be tagged automated"
+        );
+        assert_eq!(
+            index_one_claude_session("how do I implement authentication").as_deref(),
+            Some("interactive"),
+            "a human first turn must be tagged interactive"
+        );
     }
 
     #[test]
@@ -969,7 +1023,7 @@ mod tests {
         let (_dir, mut conn) = setup_test_db();
 
         conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
             [],
         )
         .unwrap();

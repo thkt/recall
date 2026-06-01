@@ -58,6 +58,9 @@ pub struct SearchOptions {
     pub limit: usize,
     /// How to treat the invoking session (see `CurrentSession`).
     pub current: CurrentSession,
+    /// Include sessions tagged automated. Default false: automated sessions
+    /// (hook/script/agent-generated) are excluded from results (#24).
+    pub include_automated: bool,
     /// Override current time (epoch ms) for deterministic testing.
     pub now_ms: Option<i64>,
 }
@@ -70,6 +73,7 @@ impl Default for SearchOptions {
             source: None,
             limit: 10,
             current: CurrentSession::Ignore,
+            include_automated: false,
             now_ms: None,
         }
     }
@@ -130,6 +134,26 @@ fn append_current_session_filter(
     params.push(Box::new(id.clone()));
 }
 
+/// Append a NULL-safe automated-session exclusion. `session_type` lives on
+/// `sessions` (not on the messages / qa_chunks candidate tables), so the filter is
+/// a subquery on session_id. `COALESCE` treats a NULL / unclassified session_type
+/// as interactive, so sessions indexed before classification are never hidden by
+/// default. `include_automated` skips it. Called on both candidate paths — the RRF
+/// merge re-unions both sets, so a single-path filter would leak — matching
+/// `append_current_session_filter`. Emits no `?` placeholders (the labels are
+/// compile-time literals), so callers' param counts are unaffected.
+fn append_automated_filter(sql: &mut String, column: &'static str, include_automated: bool) {
+    if include_automated {
+        return;
+    }
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(
+        " IN (SELECT s3.session_id FROM sessions s3 \
+         WHERE COALESCE(s3.session_type, 'interactive') <> 'automated')",
+    );
+}
+
 fn build_fts_candidate_query(
     fts_query: &str,
     opts: &SearchOptions,
@@ -140,6 +164,7 @@ fn build_fts_candidate_query(
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
     append_session_filter(&mut sql, &mut params, "session_id", opts, now_ms);
     append_current_session_filter(&mut sql, &mut params, "session_id", &opts.current);
+    append_automated_filter(&mut sql, "session_id", opts.include_automated);
     sql.push_str(" GROUP BY session_id ORDER BY best_rank LIMIT ?");
     let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
     params.push(Box::new(candidate_limit as i64));
@@ -411,6 +436,7 @@ fn vec_search(
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_session_filter(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
     append_current_session_filter(&mut sql, &mut filter_params, "c.session_id", &opts.current);
+    append_automated_filter(&mut sql, "c.session_id", opts.include_automated);
     sql.push_str(" GROUP BY c.session_id ORDER BY d");
 
     let limit_i64 = limit as i64;
@@ -1370,6 +1396,102 @@ mod tests {
             .into_iter()
             .map(|r| r.session.session_id)
             .collect()
+    }
+
+    fn set_session_type(conn: &Connection, sid: &str, session_type: &str) {
+        conn.execute(
+            "UPDATE sessions SET session_type = ?2 WHERE session_id = ?1",
+            rusqlite::params![sid, session_type],
+        )
+        .unwrap();
+    }
+
+    fn fts_ids(conn: &Connection, opts: &SearchOptions) -> Vec<String> {
+        search(conn, "authentication", opts)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.session.session_id)
+            .collect()
+    }
+
+    // T-005 (#24/FR-005,FR-006) + T-006 (#24/FR-011): default search excludes an
+    // automated session but keeps a NULL-session_type (unclassified) one — NULL is
+    // treated as interactive (COALESCE), so pre-classification sessions never vanish.
+    #[test]
+    fn test_default_search_excludes_automated_keeps_null() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "auto", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "auto", "user", "authentication flow");
+        set_session_type(&conn, "auto", "automated");
+        // "null" keeps its NULL session_type (insert_session does not set it).
+        insert_session(&conn, "null", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "null", "user", "authentication flow");
+
+        let ids = fts_ids(&conn, &SearchOptions::default());
+
+        assert!(
+            !ids.contains(&"auto".to_owned()),
+            "automated session must be excluded by default: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"null".to_owned()),
+            "NULL session_type must stay visible (interactive): {ids:?}"
+        );
+    }
+
+    // T-008 (#24/FR-007): include_automated surfaces automated sessions.
+    #[test]
+    fn test_include_automated_surfaces_automated() {
+        let (_dir, conn) = setup_test_db();
+        insert_session(&conn, "auto", "claude", "/proj", 1709251200000);
+        insert_message(&conn, "auto", "user", "authentication flow");
+        set_session_type(&conn, "auto", "automated");
+
+        let ids = fts_ids(
+            &conn,
+            &SearchOptions {
+                include_automated: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            ids.contains(&"auto".to_owned()),
+            "include_automated must surface automated: {ids:?}"
+        );
+    }
+
+    // T-007 (#24/FR-006): the automated exclusion applies on the vec path too — an
+    // automated session reachable only via vector search is dropped by default.
+    #[test]
+    fn test_default_hybrid_excludes_automated_on_vec_path() {
+        let (_dir, conn) = setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+        let embedder = MockEmbedder::new();
+        insert_session(&conn, "keep", "claude", "/proj", now_ms);
+        insert_message(&conn, "keep", "user", "authentication flow discussion");
+        // "auto" is reachable only via the vec path (chunk embedding, no FTS row).
+        insert_session(&conn, "auto", "claude", "/proj", now_ms);
+        insert_chunk_with_embedding(&conn, 1, "auto", "authentication", now_ms);
+        set_session_type(&conn, "auto", "automated");
+
+        let ids = hybrid_search_ids(
+            &conn,
+            &embedder,
+            &SearchOptions {
+                now_ms: Some(now_ms),
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            !ids.contains(&"auto".to_owned()),
+            "automated vec-only session must be excluded by default: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"keep".to_owned()),
+            "non-automated session must remain: {ids:?}"
+        );
     }
 
     // T-CS002: CurrentSession::Exclude drops the invoking session from BOTH the

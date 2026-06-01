@@ -241,7 +241,7 @@ mod tests {
     fn test_embed_chunks_progress_callback() {
         let (_dir, mut conn) = setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
