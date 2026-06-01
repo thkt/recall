@@ -84,6 +84,14 @@ jobs:
       - name: Generate lcov coverage
         run: cargo llvm-cov --lcov --output-path lcov.info
 
+      - name: Test coverage filter script
+        run: |
+          # The cfg(test) filter gates coverage; a brace-counting regression
+          # could silently strip production lines, so test it before use.
+          python3 -m venv /tmp/pytest-venv
+          /tmp/pytest-venv/bin/pip install --quiet pytest
+          /tmp/pytest-venv/bin/python -m pytest .github/scripts/test_filter_lcov_cfg_test.py -q
+
       - name: Exclude inline Rust test code from coverage
         run: |
           python3 .github/scripts/filter_lcov_cfg_test.py \

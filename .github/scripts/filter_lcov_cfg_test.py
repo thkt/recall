@@ -15,6 +15,11 @@ from pathlib import Path
 
 
 def brace_delta(line: str) -> int:
+    # NOTE: counts raw `{`/`}` including those inside string literals, char
+    # literals, and comments. This miscounts lines like `write!(buf, "{{")`, but
+    # no current recall source triggers it (multi-line raw-string JSON braces in
+    # the tests are balanced and net to zero). A correct fix needs a Rust
+    # tokenizer; tracked as a followup. See test_filter_lcov_cfg_test.py xfails.
     return line.count("{") - line.count("}")
 
 
