@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
@@ -219,22 +220,40 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
 }
 
 /// Priority: `RECALL_CLAUDE_DIR` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`
-pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
-    if let Some(dir) = env::var_os("RECALL_CLAUDE_DIR") {
+pub(crate) fn resolve_claude_dir_with<F>(home: &Path, get: F) -> PathBuf
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    if let Some(dir) = get("RECALL_CLAUDE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR") {
+    if let Some(dir) = get("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(dir).join("projects");
     }
     home.join(".claude").join("projects")
 }
 
+pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
+    resolve_claude_dir_with(home, |key| env::var_os(key))
+}
+
+pub(crate) fn resolve_codex_dir_with<F>(home: &Path, get: F) -> PathBuf
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    get("RECALL_CODEX_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex").join("sessions"))
+}
+
+pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
+    resolve_codex_dir_with(home, |key| env::var_os(key))
+}
+
 pub fn index_sessions(conn: &mut Connection, force: bool) -> Result<IndexStats> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let claude_dir = resolve_claude_dir(&home);
-    let codex_dir = env::var_os("RECALL_CODEX_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex").join("sessions"));
+    let codex_dir = resolve_codex_dir(&home);
     index_from_dirs(
         conn,
         &IndexOptions {
@@ -499,10 +518,7 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::db::setup_test_db;
     use crate::embedder::{
@@ -907,67 +923,50 @@ mod tests {
         assert_eq!(stats2.chunks_created, 0);
     }
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// SAFETY: caller must hold ENV_LOCK.
-    unsafe fn apply_env(key: &str, val: Option<&str>) {
-        match val {
-            Some(v) => unsafe { env::set_var(key, v) },
-            None => unsafe { env::remove_var(key) },
-        }
-    }
-
-    fn with_env_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(&str, Option<String>)> =
-            vars.iter().map(|(k, _)| (*k, env::var(*k).ok())).collect();
-        for (k, v) in vars {
-            // SAFETY: serialized by ENV_LOCK; no other threads access these env vars.
-            unsafe { apply_env(k, *v) };
-        }
-        f();
-        for (k, old) in &saved {
-            // SAFETY: restoring original values under the same lock.
-            unsafe { apply_env(k, old.as_deref()) };
-        }
-    }
-
     #[test]
     fn test_009_recall_claude_dir_overrides_claude_config_dir() {
         let home = Path::new("/fake/home");
-        with_env_vars(
-            &[
-                ("RECALL_CLAUDE_DIR", Some("/custom/recall/dir")),
-                ("CLAUDE_CONFIG_DIR", Some("/custom/config/dir")),
-            ],
-            || {
-                let result = resolve_claude_dir(home);
-                assert_eq!(
-                    result,
-                    PathBuf::from("/custom/recall/dir"),
-                    "RECALL_CLAUDE_DIR should take priority over CLAUDE_CONFIG_DIR"
-                );
-            },
+        let result = resolve_claude_dir_with(home, |key| match key {
+            "RECALL_CLAUDE_DIR" => Some(OsString::from("/custom/recall/dir")),
+            "CLAUDE_CONFIG_DIR" => Some(OsString::from("/custom/config/dir")),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            PathBuf::from("/custom/recall/dir"),
+            "RECALL_CLAUDE_DIR should take priority over CLAUDE_CONFIG_DIR"
         );
     }
 
     #[test]
     fn test_010_claude_config_dir_used_as_fallback() {
         let home = Path::new("/fake/home");
-        with_env_vars(
-            &[
-                ("RECALL_CLAUDE_DIR", None),
-                ("CLAUDE_CONFIG_DIR", Some("/custom/config")),
-            ],
-            || {
-                let result = resolve_claude_dir(home);
-                assert_eq!(
-                    result,
-                    PathBuf::from("/custom/config/projects"),
-                    "CLAUDE_CONFIG_DIR/projects should be used when RECALL_CLAUDE_DIR is unset"
-                );
-            },
+        let result = resolve_claude_dir_with(home, |key| match key {
+            "CLAUDE_CONFIG_DIR" => Some(OsString::from("/custom/config")),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            PathBuf::from("/custom/config/projects"),
+            "CLAUDE_CONFIG_DIR/projects should be used when RECALL_CLAUDE_DIR is unset"
         );
+    }
+
+    #[test]
+    fn test_codex_dir_env_override() {
+        let home = Path::new("/fake/home");
+        let result = resolve_codex_dir_with(home, |key| match key {
+            "RECALL_CODEX_DIR" => Some(OsString::from("/custom/codex/sessions")),
+            _ => None,
+        });
+        assert_eq!(result, PathBuf::from("/custom/codex/sessions"));
+    }
+
+    #[test]
+    fn test_codex_dir_default() {
+        let home = Path::new("/fake/home");
+        let result = resolve_codex_dir_with(home, |_| None);
+        assert_eq!(result, PathBuf::from("/fake/home/.codex/sessions"));
     }
 
     #[test]

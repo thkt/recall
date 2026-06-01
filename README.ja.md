@@ -169,6 +169,20 @@ src/
 - Apple Siliconが必要。MLXバックエンドにCPU/Linuxフォールバックはなし
 - 検索結果は抜粋表示。完全な会話は `recall show <id>` で表示可能
 
+## 終了コード
+
+recall は汎用的な `1` / `2` ではなく、sysexits 系の終了コードを返します。
+
+| コード | 名前           | 意味                                       |
+| ------ | -------------- | ------------------------------------------ |
+| 0      | success        | コマンド成功                               |
+| 64     | `USAGE_ERROR`  | コマンド指定ミス、またはローカルindexなし |
+| 65     | `DATA_ERROR`   | 不正な検索クエリなど、ユーザー入力の不備  |
+| 70     | `INTERNAL`     | 内部不変条件違反、または未対応backend     |
+| 74     | `IO_ERROR`     | ファイルシステムまたはSQLite I/O失敗      |
+| 75     | `TEMP_FAILURE` | retry可能な一時失敗                       |
+| 104    | `UNKNOWN`      | 未分類のエラー経路                         |
+
 ## 謝辞
 
 [arjunkmrm/recall](https://github.com/arjunkmrm/recall) のアイデアをもとにRustで書き直しました。セマンティック検索、シングルバイナリ、ローカルembedding、CJK対応。
