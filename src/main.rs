@@ -1,5 +1,6 @@
 mod ansi;
 mod chunker;
+mod classify;
 mod date;
 mod db;
 mod embedder;
@@ -1072,12 +1073,12 @@ mod tests {
     fn setup_show_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
+            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0, NULL)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
+            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -1154,7 +1155,7 @@ mod tests {
     fn setup_pending_chunk_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
             [],
         )
         .unwrap();

@@ -28,13 +28,15 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             project TEXT,
             slug TEXT,
             timestamp INTEGER,
-            mtime REAL
+            mtime REAL,
+            session_type TEXT
         );",
     )?;
 
     migrate_fts_if_needed(conn)?;
     migrate_vec_chunks_if_needed(conn)?;
     migrate_qa_chunks_if_needed(conn)?;
+    migrate_session_type_if_needed(conn)?;
 
     // embedded_chunk_ids (a removed ledger) was dropped inside two separate
     // migrations; collapse those into one unconditional drop so every pre-cleanup
@@ -133,6 +135,24 @@ fn migrate_qa_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add session_type to pre-classification databases. ALTER ... ADD COLUMN keeps
+/// every existing row (the new column is NULL, treated as interactive by the
+/// search filter), so no re-index is forced — retroactive tagging is the explicit
+/// `recall classify` command's job (#24).
+fn migrate_session_type_if_needed(conn: &mut Connection) -> Result<()> {
+    let Some(sql) = table_def(conn, "sessions")? else {
+        return Ok(());
+    };
+
+    if !sql.contains("session_type") {
+        let tx = conn.transaction()?;
+        tx.execute_batch("ALTER TABLE sessions ADD COLUMN session_type TEXT;")?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "messages")? else {
         return Ok(());
@@ -203,6 +223,53 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let _conn1 = open_db(tmp.path()).unwrap();
         let _conn2 = open_db(tmp.path()).unwrap();
+    }
+
+    // T-009 (#24/FR-004): opening a DB whose sessions table predates session_type
+    // adds the column non-destructively — existing rows survive with NULL (treated
+    // as interactive by the search filter), not a destructive rebuild.
+    #[test]
+    fn test_session_type_migration_adds_column_preserving_rows() {
+        let tmp = NamedTempFile::new().unwrap();
+        // Pre-session_type schema: 7-column sessions + a trigram messages table, so
+        // the FTS migration does not fire and wipe sessions.
+        {
+            let conn = Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
+                    project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
+                );
+                CREATE VIRTUAL TABLE messages USING fts5(
+                    session_id UNINDEXED, role, text, tokenize='{FTS_TOKENIZER}'
+                );"
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let conn = open_db(tmp.path()).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "existing session row must survive the migration");
+
+        let session_type: Option<String> = conn
+            .query_row(
+                "SELECT session_type FROM sessions WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            session_type, None,
+            "pre-existing rows get NULL session_type"
+        );
     }
 
     /// Create a DB with a pre-trigram tokenizer and one session+message.
