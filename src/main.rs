@@ -247,6 +247,21 @@ fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Derive the `(degraded, notes)` pair for a search from the embedder load
+/// result. A loaded embedder is the ideal path (not degraded, no notes); a
+/// failure degrades to FTS-only with a reason-aware note from
+/// [`search_fallback_notes`]. `degraded` co-varies with the note (an empty list
+/// keeps it false), so the bool and the text never disagree.
+fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool, Vec<String>) {
+    match load {
+        Ok(_) => (false, Vec::new()),
+        Err(reason) => {
+            let notes = search_fallback_notes(*reason);
+            (!notes.is_empty(), notes)
+        }
+    }
+}
+
 // -- Subcommands --
 
 fn run_index(db_path: &Option<PathBuf>) -> Result<()> {
@@ -450,17 +465,9 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     }
 
     let embedder = try_load_embedder_cached();
-    // A failed embedder load degrades search to FTS-only; surface the reason so an
-    // agent knows semantic ranking was unavailable and why (the `--json` notes
-    // channel). degraded co-varies with the note, so the bool and the text never
-    // disagree.
-    let (degraded, mut notes) = match &embedder {
-        Ok(_) => (false, Vec::new()),
-        Err(reason) => {
-            let notes = search_fallback_notes(*reason);
-            (!notes.is_empty(), notes)
-        }
-    };
+    // A failed embedder load degrades search to FTS-only with a reason-aware note
+    // for the `--json` channel; see search_degraded_state.
+    let (degraded, mut notes) = search_degraded_state(&embedder);
     let embedder = embedder.ok();
 
     let results = search::search_with_embedder(
@@ -1019,6 +1026,22 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     }
 }
 
+/// Map the stdout-write outcome of a successful command to an exit code: a
+/// written result or a consumer that closed the pipe early is success; any other
+/// write failure propagates to a non-zero I/O exit code. The error renders to
+/// stderr (never to the already-failing stdout). Split from [`main`] so the
+/// write-failure arm is unit-testable without a real broken stdout.
+fn exit_code_for_write(write: io::Result<WriteOutcome>, json_mode: bool) -> ExitCode {
+    match write {
+        Ok(WriteOutcome::Written | WriteOutcome::PipeClosed) => ExitCode::SUCCESS,
+        Err(e) => {
+            let err = Error::new(e).context("failed to write output");
+            emit_error(&err, json_mode);
+            classify_exit_code(&err)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     handle_probe_if_needed();
 
@@ -1029,14 +1052,7 @@ fn main() -> ExitCode {
     let json_mode = cli.json;
 
     match run(cli) {
-        Ok(out) => match emit_success(&out, json_mode) {
-            Ok(WriteOutcome::Written | WriteOutcome::PipeClosed) => ExitCode::SUCCESS,
-            Err(e) => {
-                let err = Error::new(e).context("failed to write output");
-                emit_error(&err, json_mode);
-                classify_exit_code(&err)
-            }
-        },
+        Ok(out) => exit_code_for_write(emit_success(&out, json_mode), json_mode),
         Err(e) => {
             emit_error(&e, json_mode);
             classify_exit_code(&e)
@@ -1182,6 +1198,40 @@ mod tests {
         );
     }
 
+    // search_degraded_state Ok arm: a loaded embedder is the ideal path. Driven by
+    // a MockEmbedder because CI has no real model, so run_search itself only
+    // exercises the Err arm — this is the sole coverage of the not-degraded branch.
+    #[test]
+    fn search_degraded_state_loaded_embedder_is_not_degraded() {
+        let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
+        let (degraded, notes) = search_degraded_state(&Ok(loaded));
+        assert!(!degraded, "a loaded embedder must not be marked degraded");
+        assert!(notes.is_empty(), "the ideal path carries no notes");
+    }
+
+    // search_degraded_state Err arm: a load failure degrades with a reason-aware
+    // note, and degraded co-varies with that note.
+    #[test]
+    fn search_degraded_state_reason_failure_degrades_with_note() {
+        let (degraded, notes) = search_degraded_state(&Err(DegradedReason::ProbeFailed));
+        assert!(degraded);
+        assert_eq!(
+            notes,
+            [
+                "semantic search unavailable: embedding model unavailable; results from text search only"
+            ]
+        );
+    }
+
+    // A caller-disabled model yields no note, so degraded stays false: the
+    // invariant degraded == !notes.is_empty() holds even on the Err path.
+    #[test]
+    fn search_degraded_state_disabled_is_not_degraded() {
+        let (degraded, notes) = search_degraded_state(&Err(DegradedReason::Disabled));
+        assert!(!degraded, "a disabled model is intentional, not degraded");
+        assert!(notes.is_empty());
+    }
+
     // The Ok arm: a loaded embedder is returned so search can rank semantically.
     // Injected via the loader seam to stay independent of whether a model is
     // installed in the test environment (production coverage of this arm would
@@ -1300,6 +1350,22 @@ mod tests {
         let err = emit_success_to(&out, false, &mut writer).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::Other);
+    }
+
+    // exit_code_for_write Err arm: a non-pipe stdout write failure surfaces as the
+    // I/O exit code (74), the boundary that gives `recall ... > /full/disk` a
+    // non-zero status instead of a silent exit 0. The Ok arm is exercised by every
+    // integration test that emits a result; only the failure arm is pinned here.
+    #[test]
+    fn exit_code_for_write_maps_write_failure_to_io_error() {
+        let code = exit_code_for_write(Err(io::Error::other("stdout unavailable")), false);
+        assert_eq!(code, ExitCode::from(codes::IO_ERR));
+    }
+
+    #[test]
+    fn exit_code_for_write_maps_written_to_success() {
+        let code = exit_code_for_write(Ok(WriteOutcome::Written), false);
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     // T-005 (#8 audit/C): the excerpt passes through ansi::strip_control_chars like
