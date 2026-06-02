@@ -17,7 +17,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::process::{self, ExitCode};
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use amici::cli::exit_code::codes;
@@ -187,25 +187,77 @@ fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
     try_load_embedder_default_logging()
 }
 
-fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
+fn try_load_embedder_cached() -> Result<Arc<dyn Embed>, DegradedReason> {
     try_load_embedder_cached_with(open_cached_embedder)
 }
 
-fn try_load_embedder_cached_with<F>(open_embedder: F) -> Option<Arc<dyn Embed>>
+fn try_load_embedder_cached_with<F>(open_embedder: F) -> Result<Arc<dyn Embed>, DegradedReason>
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
+    try_load_embedder_cached_with_reporter(open_embedder, cli_info)
+}
+
+/// Load the cached embedder, returning the [`DegradedReason`] on failure so the
+/// caller can build a reason-aware `--json` note. The human-facing stderr note
+/// (via `report_info`) and the structured warn (`record_degraded`) are emitted
+/// here as side effects; the reason itself is surfaced to the caller rather than
+/// flattened to `None`, so the agent channel can say *why* search degraded.
+fn try_load_embedder_cached_with_reporter<F, I>(
+    open_embedder: F,
+    mut report_info: I,
+) -> Result<Arc<dyn Embed>, DegradedReason>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+    I: FnMut(&str),
+{
     match open_embedder() {
-        Ok(e) => Some(e),
+        Ok(e) => Ok(e),
         Err(reason @ DegradedReason::NotInstalled) => {
-            if let Some(note) = degraded_reason_user_note(reason, "recall model download") {
-                cli_info(&format!("note: {note}."));
+            if let Some(note) = search_degraded_note(reason) {
+                report_info(&note);
             }
-            None
+            Err(reason)
         }
         Err(reason) => {
+            if let Some(note) = search_degraded_note(reason) {
+                report_info(&note);
+            }
             record_degraded(reason, "embedder load");
-            None
+            Err(reason)
+        }
+    }
+}
+
+/// The human-facing stderr note for a degraded embedder load (`note: ...`).
+fn search_degraded_note(reason: DegradedReason) -> Option<String> {
+    degraded_reason_user_note(reason, "recall model download").map(|note| format!("note: {note}."))
+}
+
+/// The `--json` `notes[]` entry for a search that fell back to FTS-only, derived
+/// from the same per-reason source as [`search_degraded_note`] so the agent and
+/// human channels never disagree. `NotInstalled` keeps the actionable download
+/// hint; a probe or backend failure reports unavailability without it, because
+/// re-downloading cannot repair a corrupt cache or a missing backend. An empty
+/// list means no degradation note applies (a caller-disabled model), so the
+/// caller's `degraded` flag co-varies with it.
+fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
+    degraded_reason_user_note(reason, "recall model download")
+        .map(|note| vec![format!("semantic search unavailable: {note}")])
+        .unwrap_or_default()
+}
+
+/// Derive the `(degraded, notes)` pair for a search from the embedder load
+/// result. A loaded embedder is the ideal path (not degraded, no notes); a
+/// failure degrades to FTS-only with a reason-aware note from
+/// [`search_fallback_notes`]. `degraded` co-varies with the note (an empty list
+/// keeps it false), so the bool and the text never disagree.
+fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool, Vec<String>) {
+    match load {
+        Ok(_) => (false, Vec::new()),
+        Err(reason) => {
+            let notes = search_fallback_notes(*reason);
+            (!notes.is_empty(), notes)
         }
     }
 }
@@ -413,18 +465,10 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     }
 
     let embedder = try_load_embedder_cached();
-    // A missing embedding model degrades search to FTS-only; surface it so an
-    // agent knows semantic ranking was unavailable (the `--json` notes channel).
-    let (degraded, mut notes) = match &embedder {
-        Some(_) => (false, Vec::new()),
-        None => (
-            true,
-            vec![
-                "semantic search unavailable: embedding model not installed (run `recall model download`)"
-                    .to_owned(),
-            ],
-        ),
-    };
+    // A failed embedder load degrades search to FTS-only with a reason-aware note
+    // for the `--json` channel; see search_degraded_state.
+    let (degraded, mut notes) = search_degraded_state(&embedder);
+    let embedder = embedder.ok();
 
     let results = search::search_with_embedder(
         &conn,
@@ -469,26 +513,38 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     // until this returns, so it adds latency; `--no-embed` skips it to keep
     // piped/scripted usage responsive.
     if !no_embed && let Some(emb) = embedder.as_deref() {
-        embed_around_results(&mut conn, emb, &results);
+        let _ = embed_around_results(&mut conn, emb, &results);
     }
 
     Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
+}
+
+#[derive(Default)]
+struct PostSearchEmbedOutcome {
+    embedded: usize,
+    stopped: bool,
 }
 
 /// Post-search progressive embedding: a side effect that warms the index around
 /// the hits (nearby sessions) plus the most recent chunks. Progress goes to the
 /// log, not the result. The caller emits its result only after this returns, so
 /// it adds latency; `recall search --no-embed` skips it for interactive use.
-fn embed_around_results(conn: &mut Connection, emb: &dyn Embed, results: &[search::SearchResult]) {
+fn embed_around_results(
+    conn: &mut Connection,
+    emb: &dyn Embed,
+    results: &[search::SearchResult],
+) -> PostSearchEmbedOutcome {
     let session_ids: Vec<String> = results
         .iter()
         .map(|r| r.session.session_id.clone())
         .collect();
-    let mut total = 0;
+    let mut outcome = PostSearchEmbedOutcome::default();
     let mut handle = |result: anyhow::Result<embedder::EmbedResult>| match result {
         Ok(r) => {
+            let stopped = r.stopped_at_error.is_some();
             r.warn_if_stopped();
-            total += r.embedded;
+            outcome.embedded += r.embedded;
+            outcome.stopped |= stopped;
         }
         Err(e) => {
             warn!(error = %e, "post-search embedding skipped");
@@ -502,9 +558,20 @@ fn embed_around_results(conn: &mut Connection, emb: &dyn Embed, results: &[searc
         None,
     ));
     handle(embedder::embed_recent_chunks(conn, emb, 10, None));
-    if total > 0 {
-        info!(total, "Embedded chunks (nearby + recent)");
+    if outcome.embedded > 0 {
+        if outcome.stopped {
+            info!(
+                embedded = outcome.embedded,
+                "Embedded chunks before post-search embedding stopped"
+            );
+        } else {
+            info!(
+                total = outcome.embedded,
+                "Embedded chunks (nearby + recent)"
+            );
+        }
     }
+    outcome
 }
 
 fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<CommandOutput> {
@@ -551,7 +618,7 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
         collect_rows::<_, (String, String), Vec<(String, String)>, Error>(rows)?;
 
     // Writes to an in-memory Vec are infallible; the pipe is only touched later
-    // by the single emit_success -> print_to_stdout.
+    // by the single emit_success -> emit_success_to write path.
     let mut buf = Vec::new();
     let _ = writeln!(buf, "# {}", session.slug);
     let _ = writeln!(buf, "- session_id: {}", session.session_id);
@@ -705,18 +772,6 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
     Ok(())
 }
 
-/// Write fully-rendered `rendered` to stdout, stopping cleanly (exit 0) when the
-/// consumer closed the pipe early. The single SIGPIPE boundary for every result
-/// path (search/status/show, human or `--json`), reached via [`emit_success`].
-/// See [`crate::output`].
-fn print_to_stdout(rendered: &str) {
-    match write_result(&mut io::stdout().lock(), rendered) {
-        Ok(WriteOutcome::Written) => {}
-        Ok(WriteOutcome::PipeClosed) => process::exit(0),
-        Err(e) => warn!(error = %e, "failed to write output"),
-    }
-}
-
 /// Render search results into the human-readable listing: empty results yield
 /// the no-match line, otherwise a header plus one block per result. Writes go
 /// to an in-memory buffer (infallible), so the result emits as a single write.
@@ -748,19 +803,37 @@ fn result_to_json(r: &search::SearchResult) -> serde_json::Value {
     })
 }
 
-/// Emit a command's result to stdout: the JSON success envelope when
-/// `json_mode`, else the human-readable markdown. Empty markdown (a side-effect
-/// command in text mode) prints nothing. Routes through [`print_to_stdout`] so
-/// the SIGPIPE boundary covers both modes.
-fn emit_success(out: &CommandOutput, json_mode: bool) {
-    let body = if json_mode {
+fn render_success_body(out: &CommandOutput, json_mode: bool) -> String {
+    if json_mode {
         render_json_success(out)
     } else {
         out.markdown.clone()
-    };
-    if !body.is_empty() {
-        print_to_stdout(&body);
     }
+}
+
+/// Emit a command's result to stdout: the JSON success envelope when
+/// `json_mode`, else the human-readable markdown. Delegates to
+/// [`emit_success_to`] with a locked stdout so production and tests share one
+/// write path (and the single SIGPIPE boundary).
+fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
+    emit_success_to(out, json_mode, &mut io::stdout().lock())
+}
+
+/// Write a command's result to `w`: the JSON success envelope when `json_mode`,
+/// else the human-readable markdown. Empty markdown (a side-effect command in
+/// text mode) writes nothing. A closed pipe is a clean stop
+/// ([`WriteOutcome::PipeClosed`]); any other write error propagates to the CLI
+/// boundary for a non-zero I/O exit code. See [`crate::output`].
+fn emit_success_to<W: Write>(
+    out: &CommandOutput,
+    json_mode: bool,
+    w: &mut W,
+) -> io::Result<WriteOutcome> {
+    let body = render_success_body(out, json_mode);
+    if body.is_empty() {
+        return Ok(WriteOutcome::Written);
+    }
+    write_result(w, &body)
 }
 
 /// Emit an error to stderr: the JSON error envelope when `json_mode`, else the
@@ -953,6 +1026,22 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     }
 }
 
+/// Map the stdout-write outcome of a successful command to an exit code: a
+/// written result or a consumer that closed the pipe early is success; any other
+/// write failure propagates to a non-zero I/O exit code. The error renders to
+/// stderr (never to the already-failing stdout). Split from [`main`] so the
+/// write-failure arm is unit-testable without a real broken stdout.
+fn exit_code_for_write(write: io::Result<WriteOutcome>, json_mode: bool) -> ExitCode {
+    match write {
+        Ok(WriteOutcome::Written | WriteOutcome::PipeClosed) => ExitCode::SUCCESS,
+        Err(e) => {
+            let err = Error::new(e).context("failed to write output");
+            emit_error(&err, json_mode);
+            classify_exit_code(&err)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     handle_probe_if_needed();
 
@@ -963,10 +1052,7 @@ fn main() -> ExitCode {
     let json_mode = cli.json;
 
     match run(cli) {
-        Ok(out) => {
-            emit_success(&out, json_mode);
-            ExitCode::SUCCESS
-        }
+        Ok(out) => exit_code_for_write(emit_success(&out, json_mode), json_mode),
         Err(e) => {
             emit_error(&e, json_mode);
             classify_exit_code(&e)
@@ -1054,7 +1140,96 @@ mod tests {
     #[test]
     fn try_load_embedder_cached_records_degraded_non_install_failure() {
         let result = try_load_embedder_cached_with(|| Err(DegradedReason::ProbeFailed));
-        assert!(result.is_none());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_load_embedder_cached_reports_non_install_degraded_note() {
+        let mut notes = Vec::new();
+        let result = try_load_embedder_cached_with_reporter(
+            || Err(DegradedReason::ProbeFailed),
+            |msg| notes.push(msg.to_owned()),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            notes,
+            ["note: embedding model unavailable; results from text search only."]
+        );
+    }
+
+    #[test]
+    fn search_degraded_note_covers_backend_failures() {
+        assert_eq!(
+            search_degraded_note(DegradedReason::BackendUnavailable).as_deref(),
+            Some("note: embedding model unavailable; results from text search only.")
+        );
+        assert_eq!(search_degraded_note(DegradedReason::Disabled), None);
+    }
+
+    // The `--json` agent channel carries a reason-aware fallback note, not a fixed
+    // "not installed" string: NotInstalled keeps the download hint, a probe/backend
+    // failure reports plain unavailability (re-downloading cannot fix either), and a
+    // disabled model yields no note so `degraded` stays false. These strings are
+    // recall's public `--json` surface, so they are pinned exactly.
+    #[test]
+    fn search_fallback_notes_are_reason_aware() {
+        assert_eq!(
+            search_fallback_notes(DegradedReason::NotInstalled),
+            [
+                "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"
+            ]
+        );
+        assert_eq!(
+            search_fallback_notes(DegradedReason::ProbeFailed),
+            [
+                "semantic search unavailable: embedding model unavailable; results from text search only"
+            ]
+        );
+        assert_eq!(
+            search_fallback_notes(DegradedReason::BackendUnavailable),
+            [
+                "semantic search unavailable: embedding model unavailable; results from text search only"
+            ]
+        );
+        assert!(
+            search_fallback_notes(DegradedReason::Disabled).is_empty(),
+            "a disabled model is intentional, not degraded: no note"
+        );
+    }
+
+    // search_degraded_state Ok arm: a loaded embedder is the ideal path. Driven by
+    // a MockEmbedder because CI has no real model, so run_search itself only
+    // exercises the Err arm — this is the sole coverage of the not-degraded branch.
+    #[test]
+    fn search_degraded_state_loaded_embedder_is_not_degraded() {
+        let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
+        let (degraded, notes) = search_degraded_state(&Ok(loaded));
+        assert!(!degraded, "a loaded embedder must not be marked degraded");
+        assert!(notes.is_empty(), "the ideal path carries no notes");
+    }
+
+    // search_degraded_state Err arm: a load failure degrades with a reason-aware
+    // note, and degraded co-varies with that note.
+    #[test]
+    fn search_degraded_state_reason_failure_degrades_with_note() {
+        let (degraded, notes) = search_degraded_state(&Err(DegradedReason::ProbeFailed));
+        assert!(degraded);
+        assert_eq!(
+            notes,
+            [
+                "semantic search unavailable: embedding model unavailable; results from text search only"
+            ]
+        );
+    }
+
+    // A caller-disabled model yields no note, so degraded stays false: the
+    // invariant degraded == !notes.is_empty() holds even on the Err path.
+    #[test]
+    fn search_degraded_state_disabled_is_not_degraded() {
+        let (degraded, notes) = search_degraded_state(&Err(DegradedReason::Disabled));
+        assert!(!degraded, "a disabled model is intentional, not degraded");
+        assert!(notes.is_empty());
     }
 
     // The Ok arm: a loaded embedder is returned so search can rank semantically.
@@ -1065,17 +1240,18 @@ mod tests {
     fn try_load_embedder_cached_returns_loaded_embedder() {
         let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
         let result = try_load_embedder_cached_with(|| Ok(loaded));
-        assert!(result.is_some(), "a loaded embedder must be returned");
+        assert!(result.is_ok(), "a loaded embedder must be returned");
     }
 
-    // The NotInstalled arm: a missing model degrades search to FTS-only (None)
-    // after surfacing the install note, rather than aborting the command.
+    // The NotInstalled arm: a missing model degrades search to FTS-only (Err,
+    // surfaced as None at the call site) after the install note, rather than
+    // aborting the command.
     #[test]
-    fn try_load_embedder_cached_returns_none_when_model_not_installed() {
+    fn try_load_embedder_cached_returns_err_when_model_not_installed() {
         let result = try_load_embedder_cached_with(|| Err(DegradedReason::NotInstalled));
         assert!(
-            result.is_none(),
-            "a not-installed model must degrade to None, not abort"
+            result.is_err(),
+            "a not-installed model must degrade (Err), not abort"
         );
     }
 
@@ -1152,6 +1328,44 @@ mod tests {
             !output.contains("> ..."),
             "no truncation marker should be emitted, got: {output}"
         );
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("stdout unavailable"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn emit_success_propagates_non_pipe_write_error() {
+        let out = CommandOutput::ok("hello".to_owned(), serde_json::Value::Null);
+        let mut writer = FailingWriter;
+
+        let err = emit_success_to(&out, false, &mut writer).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::Other);
+    }
+
+    // exit_code_for_write Err arm: a non-pipe stdout write failure surfaces as the
+    // I/O exit code (74), the boundary that gives `recall ... > /full/disk` a
+    // non-zero status instead of a silent exit 0. The Ok arm is exercised by every
+    // integration test that emits a result; only the failure arm is pinned here.
+    #[test]
+    fn exit_code_for_write_maps_write_failure_to_io_error() {
+        let code = exit_code_for_write(Err(io::Error::other("stdout unavailable")), false);
+        assert_eq!(code, ExitCode::from(codes::IO_ERR));
+    }
+
+    #[test]
+    fn exit_code_for_write_maps_written_to_success() {
+        let code = exit_code_for_write(Ok(WriteOutcome::Written), false);
+        assert_eq!(code, ExitCode::SUCCESS);
     }
 
     // T-005 (#8 audit/C): the excerpt passes through ansi::strip_control_chars like
@@ -1502,11 +1716,13 @@ mod tests {
         let (_dir, mut conn) = setup_pending_chunk_db();
         let emb = embedder::MockEmbedder::new();
         let results = [make_search_result("s1", "/p", "hello")];
-        embed_around_results(&mut conn, &emb, &results);
+        let outcome = embed_around_results(&mut conn, &emb, &results);
         let embedded: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(embedded, 1, "the pending chunk should be embedded");
+        assert_eq!(outcome.embedded, 1);
+        assert!(!outcome.stopped);
     }
 
     // T-EAR002: a failing embedder is swallowed — embed_around_results is
@@ -1517,10 +1733,42 @@ mod tests {
         let (_dir, mut conn) = setup_pending_chunk_db();
         let emb = embedder::MockEmbedder::failing_after(0);
         let results = [make_search_result("s1", "/p", "hello")];
-        embed_around_results(&mut conn, &emb, &results);
+        let outcome = embed_around_results(&mut conn, &emb, &results);
         let embedded: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(embedded, 0, "a failed embed must leave no vec_chunks");
+        assert_eq!(outcome.embedded, 0);
+        assert!(outcome.stopped);
+    }
+
+    #[test]
+    fn embed_around_results_reports_partial_stop() {
+        let (_dir, mut conn) = setup_pending_chunk_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s2', 'claude', '/f2', '/p', 'slug2', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (2, 's2', 'recent content', 0)",
+            [],
+        )
+        .unwrap();
+
+        let emb = embedder::MockEmbedder::failing_after(1);
+        let results = [make_search_result("s1", "/p", "hello")];
+        let outcome = embed_around_results(&mut conn, &emb, &results);
+
+        assert_eq!(outcome.embedded, 1);
+        assert!(outcome.stopped);
+        let embedded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            embedded, 1,
+            "only the successful near-session chunk remains"
+        );
     }
 }
