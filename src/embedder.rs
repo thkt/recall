@@ -55,10 +55,20 @@ fn embed_chunks(
         match embedder.embed_documents_batch(&texts) {
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
+                // Idempotent replay guard for stale concurrent work that reached
+                // this tx after the NOT EXISTS pending query. Batched into one
+                // IN-delete: vec0's +chunk_id is an unindexed auxiliary column, so
+                // each `DELETE WHERE chunk_id = ?` is a full O(N) scan (EXPLAIN
+                // reports "SCAN vec_chunks VIRTUAL TABLE") — per-chunk deletes were
+                // O(batch × N). Keyed on batch_idx (non-empty by the early return);
+                // on the NOT EXISTS path nothing matches, so it is a no-op there.
+                let batch_ids: Vec<i64> = batch_idx.iter().map(|&i| chunks[i].0).collect();
+                let placeholders = anon_placeholders(batch_ids.len());
+                tx.execute(
+                    &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
+                    rusqlite::params_from_iter(batch_ids.iter()),
+                )?;
                 for (chunked, &i) in embeddings.iter().zip(batch_idx) {
-                    // Idempotent replay guard: stale concurrent work may still
-                    // reach this tx after the NOT EXISTS pending query.
-                    tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [chunks[i].0])?;
                     for (sub_idx, sub_emb) in chunked.chunks.iter().enumerate() {
                         let embedding_bytes = f32_as_bytes(sub_emb);
                         tx.execute(
