@@ -20,7 +20,7 @@ use crate::error::ErrorCode;
 /// schema stays decoupled from internal types ([`crate::search::SearchResult`] /
 /// [`crate::parser::SessionData`] deliberately stay non-`Serialize`). `degraded`
 /// and `notes` surface deviations from the ideal path so agents can react —
-/// currently set only by `search`, when the embedding model is not installed and
+/// currently set only by `search`, when the embedding model fails to load and
 /// ranking falls back to FTS-only.
 #[derive(Debug)]
 pub(crate) struct CommandOutput {
