@@ -122,21 +122,19 @@ recall status           # sessions, chunks, embedding coverage, model status
 
 ### Hook
 
-Register `recall hook-handler` as a Claude Code SessionEnd hook to index sessions the moment they end. It reads the hook's JSON payload from stdin and runs a full FTS index (no embedding — run `recall embed` separately to grow semantic search).
+Register `recall index` as a Claude Code SessionEnd hook to re-index your sessions the moment one ends. Each fire re-scans the whole session tree (incremental — only changed files are re-parsed); embedding stays a separate `recall embed` pass.
 
 Add to `~/.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "SessionEnd": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "recall hook-handler" }] }
-    ]
+    "SessionEnd": [{ "matcher": ".*", "hooks": [{ "type": "command", "command": "recall index" }] }]
   }
 }
 ```
 
-Hooks run via `sh -c`, whose `PATH` may differ from your interactive shell. Confirm `which recall` resolves to a recall new enough to have `hook-handler` (`recall hook-handler --help` exits 0 on a new binary, usage error on an old one), or the hook silently does nothing. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
+`recall index` reads its sources from the environment and ignores the hook's stdin payload, so no extra wiring is needed. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
 
 ## How it works
 

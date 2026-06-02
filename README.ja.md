@@ -120,21 +120,19 @@ recall status           # セッション数、チャンク数、embeddingカバ
 
 ### Hook
 
-`recall hook-handler` を Claude Code の SessionEnd hook に登録すると、セッション終了時に即座にインデックスされます。hook の JSON payload を stdin から読み、全文 (FTS) インデックスを実行します（embedding はしません — semantic search を育てるには `recall embed` を別途実行）。
+`recall index` を Claude Code の SessionEnd hook に登録すると、セッション終了時にインデックスが更新されます。発火のたびにセッションツリー全体を再スキャンします（差分更新 — 変更されたファイルのみ再解析）。embedding は別途 `recall embed` で実行します。
 
 `~/.claude/settings.json` に追加:
 
 ```json
 {
   "hooks": {
-    "SessionEnd": [
-      { "matcher": ".*", "hooks": [{ "type": "command", "command": "recall hook-handler" }] }
-    ]
+    "SessionEnd": [{ "matcher": ".*", "hooks": [{ "type": "command", "command": "recall index" }] }]
   }
 }
 ```
 
-hook は `sh -c` 経由で実行され、その `PATH` は対話シェルと異なる場合があります。`which recall` が `hook-handler` を持つ新しい recall を指すか確認してください（`recall hook-handler --help` は新しい recall では exit 0、古い recall では usage エラー）。さもないと hook は静かに何もしません。Codex には SessionEnd hook がないため、Codex セッションは `recall index` を手動実行してください。
+`recall index` はソースを環境変数から読み、hook の stdin payload は無視するため、追加の配線は不要です。Codex には SessionEnd hook がないため、Codex セッションは `recall index` を手動実行してください。
 
 ## 仕組み
 
