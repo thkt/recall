@@ -187,45 +187,64 @@ fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
     try_load_embedder_default_logging()
 }
 
-fn try_load_embedder_cached() -> Option<Arc<dyn Embed>> {
+fn try_load_embedder_cached() -> Result<Arc<dyn Embed>, DegradedReason> {
     try_load_embedder_cached_with(open_cached_embedder)
 }
 
-fn try_load_embedder_cached_with<F>(open_embedder: F) -> Option<Arc<dyn Embed>>
+fn try_load_embedder_cached_with<F>(open_embedder: F) -> Result<Arc<dyn Embed>, DegradedReason>
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
     try_load_embedder_cached_with_reporter(open_embedder, cli_info)
 }
 
+/// Load the cached embedder, returning the [`DegradedReason`] on failure so the
+/// caller can build a reason-aware `--json` note. The human-facing stderr note
+/// (via `report_info`) and the structured warn (`record_degraded`) are emitted
+/// here as side effects; the reason itself is surfaced to the caller rather than
+/// flattened to `None`, so the agent channel can say *why* search degraded.
 fn try_load_embedder_cached_with_reporter<F, I>(
     open_embedder: F,
     mut report_info: I,
-) -> Option<Arc<dyn Embed>>
+) -> Result<Arc<dyn Embed>, DegradedReason>
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
     I: FnMut(&str),
 {
     match open_embedder() {
-        Ok(e) => Some(e),
+        Ok(e) => Ok(e),
         Err(reason @ DegradedReason::NotInstalled) => {
             if let Some(note) = search_degraded_note(reason) {
                 report_info(&note);
             }
-            None
+            Err(reason)
         }
         Err(reason) => {
             if let Some(note) = search_degraded_note(reason) {
                 report_info(&note);
             }
             record_degraded(reason, "embedder load");
-            None
+            Err(reason)
         }
     }
 }
 
+/// The human-facing stderr note for a degraded embedder load (`note: ...`).
 fn search_degraded_note(reason: DegradedReason) -> Option<String> {
     degraded_reason_user_note(reason, "recall model download").map(|note| format!("note: {note}."))
+}
+
+/// The `--json` `notes[]` entry for a search that fell back to FTS-only, derived
+/// from the same per-reason source as [`search_degraded_note`] so the agent and
+/// human channels never disagree. `NotInstalled` keeps the actionable download
+/// hint; a probe or backend failure reports unavailability without it, because
+/// re-downloading cannot repair a corrupt cache or a missing backend. An empty
+/// list means no degradation note applies (a caller-disabled model), so the
+/// caller's `degraded` flag co-varies with it.
+fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
+    degraded_reason_user_note(reason, "recall model download")
+        .map(|note| vec![format!("semantic search unavailable: {note}")])
+        .unwrap_or_default()
 }
 
 // -- Subcommands --
@@ -431,18 +450,18 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     }
 
     let embedder = try_load_embedder_cached();
-    // A missing embedding model degrades search to FTS-only; surface it so an
-    // agent knows semantic ranking was unavailable (the `--json` notes channel).
+    // A failed embedder load degrades search to FTS-only; surface the reason so an
+    // agent knows semantic ranking was unavailable and why (the `--json` notes
+    // channel). degraded co-varies with the note, so the bool and the text never
+    // disagree.
     let (degraded, mut notes) = match &embedder {
-        Some(_) => (false, Vec::new()),
-        None => (
-            true,
-            vec![
-                "semantic search unavailable: embedding model not installed (run `recall model download`)"
-                    .to_owned(),
-            ],
-        ),
+        Ok(_) => (false, Vec::new()),
+        Err(reason) => {
+            let notes = search_fallback_notes(*reason);
+            (!notes.is_empty(), notes)
+        }
     };
+    let embedder = embedder.ok();
 
     let results = search::search_with_embedder(
         &conn,
@@ -1112,7 +1131,7 @@ mod tests {
     #[test]
     fn try_load_embedder_cached_records_degraded_non_install_failure() {
         let result = try_load_embedder_cached_with(|| Err(DegradedReason::ProbeFailed));
-        assert!(result.is_none());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1123,7 +1142,7 @@ mod tests {
             |msg| notes.push(msg.to_owned()),
         );
 
-        assert!(result.is_none());
+        assert!(result.is_err());
         assert_eq!(
             notes,
             ["note: embedding model unavailable; results from text search only."]
@@ -1139,6 +1158,37 @@ mod tests {
         assert_eq!(search_degraded_note(DegradedReason::Disabled), None);
     }
 
+    // The `--json` agent channel carries a reason-aware fallback note, not a fixed
+    // "not installed" string: NotInstalled keeps the download hint, a probe/backend
+    // failure reports plain unavailability (re-downloading cannot fix either), and a
+    // disabled model yields no note so `degraded` stays false. These strings are
+    // recall's public `--json` surface, so they are pinned exactly.
+    #[test]
+    fn search_fallback_notes_are_reason_aware() {
+        assert_eq!(
+            search_fallback_notes(DegradedReason::NotInstalled),
+            [
+                "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"
+            ]
+        );
+        assert_eq!(
+            search_fallback_notes(DegradedReason::ProbeFailed),
+            [
+                "semantic search unavailable: embedding model unavailable; results from text search only"
+            ]
+        );
+        assert_eq!(
+            search_fallback_notes(DegradedReason::BackendUnavailable),
+            [
+                "semantic search unavailable: embedding model unavailable; results from text search only"
+            ]
+        );
+        assert!(
+            search_fallback_notes(DegradedReason::Disabled).is_empty(),
+            "a disabled model is intentional, not degraded: no note"
+        );
+    }
+
     // The Ok arm: a loaded embedder is returned so search can rank semantically.
     // Injected via the loader seam to stay independent of whether a model is
     // installed in the test environment (production coverage of this arm would
@@ -1147,17 +1197,18 @@ mod tests {
     fn try_load_embedder_cached_returns_loaded_embedder() {
         let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
         let result = try_load_embedder_cached_with(|| Ok(loaded));
-        assert!(result.is_some(), "a loaded embedder must be returned");
+        assert!(result.is_ok(), "a loaded embedder must be returned");
     }
 
-    // The NotInstalled arm: a missing model degrades search to FTS-only (None)
-    // after surfacing the install note, rather than aborting the command.
+    // The NotInstalled arm: a missing model degrades search to FTS-only (Err,
+    // surfaced as None at the call site) after the install note, rather than
+    // aborting the command.
     #[test]
-    fn try_load_embedder_cached_returns_none_when_model_not_installed() {
+    fn try_load_embedder_cached_returns_err_when_model_not_installed() {
         let result = try_load_embedder_cached_with(|| Err(DegradedReason::NotInstalled));
         assert!(
-            result.is_none(),
-            "a not-installed model must degrade to None, not abort"
+            result.is_err(),
+            "a not-installed model must degrade (Err), not abort"
         );
     }
 
