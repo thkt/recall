@@ -35,7 +35,8 @@ use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
-use tracing::{info, warn};
+use serde::Deserialize;
+use tracing::{error, info, warn};
 
 use crate::envelope::{CommandOutput, render_json_error, render_json_success};
 use crate::error::{
@@ -136,6 +137,11 @@ enum Command {
     },
     /// Show index and embedding status
     Status,
+    /// Index sessions from a Claude Code SessionEnd hook (reads hook JSON on stdin).
+    #[command(
+        long_about = "Index new sessions in response to a Claude Code SessionEnd hook. Reads the hook payload as JSON on stdin and runs a full FTS index (no embedding).\n\nRegister in ~/.claude/settings.json:\n\n  {\"hooks\":{\"SessionEnd\":[{\"matcher\":\".*\",\"hooks\":[{\"type\":\"command\",\"command\":\"recall hook-handler\"}]}]}}\n\nPATH note: hooks run via `sh -c`, whose PATH may differ from your interactive shell. Confirm `which recall` resolves to a recall new enough to have this subcommand, or the hook silently does nothing.\n\nCodex has no SessionEnd hook; run `recall index` manually for Codex sessions."
+    )]
+    HookHandler,
 }
 
 #[derive(Subcommand)]
@@ -308,6 +314,57 @@ fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
     };
     progress_step(&[model_line]);
 
+    Ok(())
+}
+
+/// Claude Code SessionEnd hook stdin payload (FR-002). Every field is optional and
+/// unknown fields are ignored (no `deny_unknown_fields`), so adding or removing a
+/// payload field never breaks parsing. Stage 1 does not branch on these fields — it
+/// indexes the whole tree (FR-003) — so they model the SessionEnd contract that later
+/// #73 stages read (transcript_path, cwd, reason) rather than driving logic now.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+#[allow(dead_code)] // modeled ahead of use (see doc comment above)
+struct SessionEndPayload {
+    session_id: Option<String>,
+    transcript_path: Option<String>,
+    cwd: Option<String>,
+    hook_event_name: Option<String>,
+    reason: Option<String>,
+    exit_code: Option<i64>,
+}
+
+/// Index sessions in response to a Claude Code SessionEnd hook (#73). Reads the
+/// hook payload from stdin but indexes the whole tree (FR-003): subagent sidechain
+/// files are not named by the payload's `transcript_path`, and the full scan also
+/// self-heals tails missed on a prior fire. FTS only — embed stays a separate
+/// `recall embed` pass. Progress goes to tracing, never stdout (FR-004).
+fn run_hook_handler(db_path: &Option<PathBuf>) -> Result<()> {
+    // Parse failure (empty / malformed stdin) is non-fatal: the hook is
+    // non-blocking, so warn and exit 0 without indexing (FR-002 input path).
+    if let Err(e) = serde_json::from_reader::<_, SessionEndPayload>(io::stdin().lock()) {
+        warn!(error = %e, "hook-handler: skipping index, invalid stdin payload");
+        return Ok(());
+    }
+    let path = resolve_db_path(db_path)?;
+    let mut conn = open_or_create_db(&path)?;
+    let stats = indexer::index_sessions(&mut conn, false).inspect_err(|e| {
+        error!(error = %e, "hook-handler: session index failed");
+    })?;
+    // Surface the parse-error roll-up the interactive path also reports
+    // (index_and_report uses parse_error_detail), so a hook firing on every session
+    // end does not bury an "N transcripts failed to parse" signal under per-file warns.
+    if let Some(detail) = stats.parse_error_detail() {
+        warn!(detail = %detail, "hook-handler: some sessions failed to parse");
+    }
+    info!(indexed = stats.indexed, "hook-handler: indexed sessions");
+    let chunk_stats = indexer::index_chunks(&mut conn).inspect_err(|e| {
+        error!(error = %e, "hook-handler: chunk index failed");
+    })?;
+    info!(
+        chunks = chunk_stats.chunks_created,
+        "hook-handler: created chunks"
+    );
     Ok(())
 }
 
@@ -966,7 +1023,16 @@ fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<C
 // -- Entry point --
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "index", "rebuild", "embed", "model", "search", "show", "status", "classify", "help",
+    "index",
+    "rebuild",
+    "embed",
+    "model",
+    "search",
+    "show",
+    "status",
+    "classify",
+    "help",
+    "hook-handler",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
@@ -1019,6 +1085,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Classify { all, dry_run }) => run_classify(all, dry_run, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
+        Some(Command::HookHandler) => run_hook_handler(&cli.db_path).map(|()| no_payload()),
         None => Err(RecallError::Usage(
             "A search query is required. Usage: recall search \"query\" or recall index".to_owned(),
         )
@@ -1435,6 +1502,48 @@ mod tests {
         // rewritten to `search rebuild` by shorthand expansion.
         let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
         assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
+    }
+
+    // T-007 (FR-001): "hook-handler" is in KNOWN_SUBCOMMANDS, so shorthand expansion
+    // leaves `recall hook-handler` alone (returns None) instead of rewriting it to
+    // `search "hook-handler"`. Same form as the rebuild guard above; today the term
+    // is absent from the list, so expansion returns Some and this fails.
+    #[test]
+    fn test_hook_handler_recognized_by_shorthand_expansion() {
+        let args: Vec<OsString> = ["recall", "hook-handler"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        assert!(
+            try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none(),
+            "hook-handler must be a known subcommand, not shorthand-expanded to search"
+        );
+    }
+
+    // T-004 (FR-002): a payload carrying an unknown field deserializes without error
+    // and the field is ignored. SessionEndPayload must not use deny_unknown_fields,
+    // so Claude adding future hook keys never breaks parsing. Asserts a known field
+    // round-trips to prove the parse succeeded (not merely that it did not panic).
+    #[test]
+    fn session_end_payload_ignores_unknown_fields() {
+        let json = r#"{"session_id":"s1","hook_event_name":"SessionEnd","brand_new_field":42}"#;
+        let payload: SessionEndPayload =
+            serde_json::from_str(json).expect("unknown fields must be ignored, not rejected");
+        assert_eq!(payload.session_id.as_deref(), Some("s1"));
+    }
+
+    // T-005 (FR-002): every field is Option + #[serde(default)], so a payload with
+    // only transcript_path present still deserializes; the absent fields default to
+    // None. Pins the missing-field tolerance the hook depends on (Claude may omit
+    // exit_code/reason on some terminations).
+    #[test]
+    fn session_end_payload_allows_missing_fields() {
+        let json = r#"{"transcript_path":"/tmp/t.jsonl"}"#;
+        let payload: SessionEndPayload =
+            serde_json::from_str(json).expect("missing fields must default, not fail");
+        assert_eq!(payload.transcript_path.as_deref(), Some("/tmp/t.jsonl"));
+        assert_eq!(payload.session_id, None);
+        assert_eq!(payload.exit_code, None);
     }
 
     #[test]

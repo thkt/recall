@@ -78,14 +78,14 @@ recall search "auth" --no-embed                                  # skip post-sea
 
 Backward compatible: `recall "query"` works as shorthand for `recall search "query"`.
 
-| Flag         | Description                               |
-| ------------ | ----------------------------------------- |
-| `--project`  | Filter by project path (prefix match)     |
-| `--days`     | Only sessions from the last N days        |
-| `--source`   | `claude` or `codex`                       |
-| `--limit`    | Max results, 1-100 (default: 10)          |
-| `--no-embed` | Skip post-search embedding                |
-| `-v`         | Verbose output                            |
+| Flag         | Description                           |
+| ------------ | ------------------------------------- |
+| `--project`  | Filter by project path (prefix match) |
+| `--days`     | Only sessions from the last N days    |
+| `--source`   | `claude` or `codex`                   |
+| `--limit`    | Max results, 1-100 (default: 10)      |
+| `--no-embed` | Skip post-search embedding            |
+| `-v`         | Verbose output                        |
 
 Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
 
@@ -120,6 +120,24 @@ recall show abc-123     # show full conversation of a session (prefix match)
 recall status           # sessions, chunks, embedding coverage, model status
 ```
 
+### Hook
+
+Register `recall hook-handler` as a Claude Code SessionEnd hook to index sessions the moment they end. It reads the hook's JSON payload from stdin and runs a full FTS index (no embedding — run `recall embed` separately to grow semantic search).
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      { "matcher": ".*", "hooks": [{ "type": "command", "command": "recall hook-handler" }] }
+    ]
+  }
+}
+```
+
+Hooks run via `sh -c`, whose `PATH` may differ from your interactive shell. Confirm `which recall` resolves to a recall new enough to have `hook-handler` (`recall hook-handler --help` exits 0 on a new binary, usage error on an old one), or the hook silently does nothing. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
+
 ## How it works
 
 ```text
@@ -130,7 +148,7 @@ recall status           # sessions, chunks, embedding coverage, model status
 
 **Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — it walks every session file but re-parses only those modified since they were last indexed.
 
-**Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first. (Automatic re-indexing on session change is planned, not yet shipped.) Searching an empty index prints `No sessions indexed. Run recall index first.`
+**Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
 
 **Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=128) with length-sorted padding minimization. Download the model explicitly with `recall model download`; without it, search falls back to FTS5 keyword ranking only.
 
@@ -155,23 +173,23 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 
 ## Performance
 
-| Operation                           | Time                                       |
-| ----------------------------------- | ------------------------------------------ |
-| `recall index` (6k files)           | ~0.5s (incremental)                        |
-| `recall rebuild` (6k files)         | ~4min (full rebuild)                       |
-| `recall search`                     | ~2s (with embedding), instant (--no-embed) |
-| `recall embed` (28k chunks)         | ~11 min (M3, batch=128)                    |
-| Embedding throughput                | ~45 chunks/sec (M3 + MLX)                  |
-| Initial model download              | ~1.2 GB                                    |
+| Operation                   | Time                                       |
+| --------------------------- | ------------------------------------------ |
+| `recall index` (6k files)   | ~0.5s (incremental)                        |
+| `recall rebuild` (6k files) | ~4min (full rebuild)                       |
+| `recall search`             | ~2s (with embedding), instant (--no-embed) |
+| `recall embed` (28k chunks) | ~11 min (M3, batch=128)                    |
+| Embedding throughput        | ~45 chunks/sec (M3 + MLX)                  |
+| Initial model download      | ~1.2 GB                                    |
 
 ## Limitations
 
-| Limitation          | Details                                                                   |
-| ------------------- | ------------------------------------------------------------------------- |
-| Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync   |
-| Text only           | Images, tool results, and binary content are not indexed                  |
-| Apple Silicon only  | Requires Apple Silicon. The MLX backend has no CPU/Linux fallback         |
-| Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations  |
+| Limitation          | Details                                                                     |
+| ------------------- | --------------------------------------------------------------------------- |
+| Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync      |
+| Text only           | Images, tool results, and binary content are not indexed                    |
+| Apple Silicon only  | Requires Apple Silicon. The MLX backend has no CPU/Linux fallback           |
+| Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations |
 
 ## Exit Codes
 
