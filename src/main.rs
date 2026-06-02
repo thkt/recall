@@ -611,7 +611,7 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
         collect_rows::<_, (String, String), Vec<(String, String)>, Error>(rows)?;
 
     // Writes to an in-memory Vec are infallible; the pipe is only touched later
-    // by the single emit_success -> print_to_stdout.
+    // by the single emit_success -> emit_success_to write path.
     let mut buf = Vec::new();
     let _ = writeln!(buf, "# {}", session.slug);
     let _ = writeln!(buf, "- session_id: {}", session.session_id);
@@ -765,13 +765,6 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
     Ok(())
 }
 
-/// Write fully-rendered `rendered` to stdout. A closed pipe is a clean stop
-/// (exit 0); non-pipe write errors propagate to the CLI boundary so they get a
-/// non-zero I/O exit code. See [`crate::output`].
-fn print_to_stdout(rendered: &str) -> io::Result<WriteOutcome> {
-    write_result(&mut io::stdout().lock(), rendered)
-}
-
 /// Render search results into the human-readable listing: empty results yield
 /// the no-match line, otherwise a header plus one block per result. Writes go
 /// to an in-memory buffer (infallible), so the result emits as a single write.
@@ -812,28 +805,28 @@ fn render_success_body(out: &CommandOutput, json_mode: bool) -> String {
 }
 
 /// Emit a command's result to stdout: the JSON success envelope when
-/// `json_mode`, else the human-readable markdown. Empty markdown (a side-effect
-/// command in text mode) prints nothing. Routes through [`print_to_stdout`] so
-/// the SIGPIPE boundary covers both modes.
+/// `json_mode`, else the human-readable markdown. Delegates to
+/// [`emit_success_to`] with a locked stdout so production and tests share one
+/// write path (and the single SIGPIPE boundary).
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
-    let body = render_success_body(out, json_mode);
-    if body.is_empty() {
-        return Ok(WriteOutcome::Written);
-    }
-    print_to_stdout(&body)
+    emit_success_to(out, json_mode, &mut io::stdout().lock())
 }
 
-#[cfg(test)]
-fn emit_success_to_writer<W: Write>(
+/// Write a command's result to `w`: the JSON success envelope when `json_mode`,
+/// else the human-readable markdown. Empty markdown (a side-effect command in
+/// text mode) writes nothing. A closed pipe is a clean stop
+/// ([`WriteOutcome::PipeClosed`]); any other write error propagates to the CLI
+/// boundary for a non-zero I/O exit code. See [`crate::output`].
+fn emit_success_to<W: Write>(
     out: &CommandOutput,
     json_mode: bool,
-    writer: &mut W,
+    w: &mut W,
 ) -> io::Result<WriteOutcome> {
     let body = render_success_body(out, json_mode);
     if body.is_empty() {
         return Ok(WriteOutcome::Written);
     }
-    write_result(writer, &body)
+    write_result(w, &body)
 }
 
 /// Emit an error to stderr: the JSON error envelope when `json_mode`, else the
@@ -1304,7 +1297,7 @@ mod tests {
         let out = CommandOutput::ok("hello".to_owned(), serde_json::Value::Null);
         let mut writer = FailingWriter;
 
-        let err = emit_success_to_writer(&out, false, &mut writer).unwrap_err();
+        let err = emit_success_to(&out, false, &mut writer).unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::Other);
     }
