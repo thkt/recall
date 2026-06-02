@@ -207,7 +207,7 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         Ok(Some(p)) => p,
         Ok(None) => return Ok(IndexOutcome::Unchanged),
         Err(e) => {
-            info!(path = %fpath.display(), error = %e, "parse failed");
+            warn!(path = %fpath.display(), error = %e, "parse failed");
             return Ok(IndexOutcome::ParseError(format!(
                 "{}: {e}",
                 fpath.display()
