@@ -21,10 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use amici::cli::exit_code::codes;
-use amici::cli::{
-    Spinner, done, embed_with_spinners, exit_error, info as cli_info, progress_step,
-    try_expand_shorthand,
-};
+use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand};
 use amici::logging::init_subscriber;
 use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
 use amici::model::{degraded_reason_user_note, download_and_verify_model, record_degraded};
@@ -35,12 +32,10 @@ use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::envelope::{CommandOutput, render_json_error, render_json_success};
-use crate::error::{
-    RecallError, classify_exit_code, download_error, embedder_error, error_envelope,
-};
+use crate::error::{RecallError, classify_exit_code, download_error, error_envelope};
 use crate::output::{WriteOutcome, write_result};
 use crate::parser::Source;
 
@@ -72,8 +67,6 @@ enum Command {
     Index,
     /// Drop the index and rebuild from all sessions. No model calls.
     Rebuild,
-    /// Embed pending chunks for semantic search.
-    Embed,
     /// Manage the embedding model.
     #[command(subcommand)]
     Model(ModelCommand),
@@ -97,10 +90,6 @@ enum Command {
         /// Max results (1..=100)
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
         limit: u16,
-
-        /// Skip post-search embedding (faster for piped/scripted usage)
-        #[arg(long)]
-        no_embed: bool,
 
         /// Exclude the invoking Claude Code session from results. Default when
         /// CLAUDE_CODE_SESSION_ID is set (recall run from inside a session).
@@ -273,13 +262,56 @@ fn run_rebuild(db_path: &Option<PathBuf>) -> Result<()> {
 }
 
 /// Shared index pipeline for `index` (incremental) and `rebuild` (full).
-/// `force` is internalized here so both entry points stay argument-free.
+/// Resolves source dirs from the environment, then delegates to
+/// [`index_and_report_with`] with the real cached-embedder loader.
 fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
+    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let claude_dir = indexer::resolve_claude_dir(&home);
+    let codex_dir = indexer::resolve_codex_dir(&home);
+    let opts = indexer::IndexOptions {
+        force,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+    // Load silently: IndexOutcome carries the degraded note and the block below is
+    // its single emitter, so passing cli_info to the loader too would print twice.
+    let outcome = index_and_report_with(db_path, &opts, || {
+        try_load_embedder_cached_with_reporter(open_cached_embedder, |_: &str| {})
+    })?;
+    if let Some(note) = outcome.degraded_note {
+        cli_info(&note);
+    }
+    Ok(())
+}
+
+/// Outcome of an index run. `degraded_note` is `Some` when the embedder could not
+/// load (model-less): the index still completes FTS-only and the wrapper surfaces
+/// the note (naming `recall model download`) instead of failing. `None` means
+/// embedding completed.
+struct IndexOutcome {
+    degraded_note: Option<String>,
+}
+
+/// Index pipeline with an injected embedder loader. Runs FTS indexing + chunking,
+/// then embeds every pending chunk via the loaded embedder so `recall search`
+/// reads a complete index without embedding on the search path. A model-less
+/// loader (`Err`) skips embedding but keeps the FTS index complete, returning a
+/// degraded note. `load_embedder` is a seam: tests inject a `MockEmbedder` or a
+/// degraded `Err`, production passes [`try_load_embedder_cached`]. Source dirs
+/// arrive via `opts` so tests control them without `set_var`.
+fn index_and_report_with<F>(
+    db_path: &Option<PathBuf>,
+    opts: &indexer::IndexOptions,
+    load_embedder: F,
+) -> Result<IndexOutcome>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
     let sp = Spinner::new("Indexing sessions...");
-    let stats = indexer::index_sessions(&mut conn, force)?;
+    let stats = indexer::index_from_dirs(&mut conn, opts)?;
     let main_msg = if stats.indexed > 0 {
         format!(
             "Indexed {} sessions in {:.1}s",
@@ -298,72 +330,50 @@ fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
         sp.finish("Chunks up to date");
     }
 
-    let model_cached = cached_artifacts(ModelId::default())
-        .map(|opt| opt.is_some())
-        .unwrap_or(false);
-    let model_line = if model_cached {
-        "Model: ready (run `recall embed` to embed chunks)"
-    } else {
-        "Model: not installed (run `recall model download`)"
-    };
-    progress_step(&[model_line]);
-
-    Ok(())
-}
-
-/// Message shown when no chunks are pending embedding. Distinguishes
-/// "index not run yet" (no chunks at all) from "everything already embedded".
-fn embed_idle_message(total_chunks: i64) -> &'static str {
-    if total_chunks == 0 {
-        "No chunks to embed. Run `recall index` first."
-    } else {
-        "All chunks already embedded"
+    // Model present: embed all pending. Model absent (degraded): skip embed but
+    // keep the completed FTS index and carry a note naming `recall model download`
+    // so the wrapper can guide the user (FR-004a/004b).
+    match load_embedder() {
+        Ok(embedder) => {
+            embed_all_pending(&mut conn, embedder.as_ref())?;
+            Ok(IndexOutcome {
+                degraded_note: None,
+            })
+        }
+        Err(reason) => Ok(IndexOutcome {
+            degraded_note: search_degraded_note(reason),
+        }),
     }
 }
 
-fn run_embed(db_path: &Option<PathBuf>) -> Result<()> {
-    let path = resolve_db_path(db_path)?;
-    let mut conn = open_or_create_db(&path)?;
-
+/// Embed every chunk absent from `vec_chunks`. Incremental by the `NOT EXISTS`
+/// gate inside `embed_recent_chunks`, so a re-index embeds only new chunks; a
+/// `rebuild` re-embeds all because its `force` DELETE cleared `vec_chunks` first.
+fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<()> {
     let pending: i64 = conn.query_row(
         "SELECT COUNT(*) FROM qa_chunks c \
          WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
         [],
         |r| r.get(0),
     )?;
-
     if pending == 0 {
-        let total_chunks: i64 =
-            conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
-        done(embed_idle_message(total_chunks));
         return Ok(());
     }
-
-    let pending_u32 = u32::try_from(pending).unwrap_or(u32::MAX);
     let pending_usize = usize::try_from(pending).expect("chunk count fits in usize");
-
-    let result = embed_with_spinners(
-        pending_u32,
-        |_| load_cached_embedder(),
-        |r: &embedder::EmbedResult| format!("Embedded {} chunks", r.embedded),
-        |emb, update| {
-            embedder::embed_recent_chunks(
-                &mut conn,
-                emb.as_ref(),
-                pending_usize,
-                Some(&|n, _| update(&format!("Embedding... {n}/{pending} chunks"))),
-            )
-        },
+    let sp = Spinner::new("Embedding chunks...");
+    let result = embedder::embed_recent_chunks(
+        conn,
+        embedder,
+        pending_usize,
+        Some(&|done, total| sp.set_message(&format!("Embedding chunks... {done}/{total}"))),
     )?;
-
-    if let Some(r) = result {
-        r.warn_if_stopped();
-    }
+    sp.finish(&format!("Embedded {} chunks", result.embedded));
+    // A mid-run batch failure is non-fatal: chunks already embedded are committed,
+    // the rest stay pending, and the FTS index is complete and queryable. The next
+    // `recall index` retries the remaining pending via the NOT EXISTS gate, so we
+    // warn rather than fail. (Surfacing the stop in `--json` is tracked in #130.)
+    result.warn_if_stopped();
     Ok(())
-}
-
-fn load_cached_embedder() -> Result<Arc<dyn Embed>> {
-    open_cached_embedder().map_err(|reason| embedder_error(reason).into())
 }
 
 fn run_model_download() -> Result<()> {
@@ -425,13 +435,28 @@ fn resolve_current_session(
 }
 
 fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    run_search_with(cmd, db_path, try_load_embedder_cached)
+}
+
+/// Search pipeline with an injected embedder loader. Reads the pre-built index
+/// (no indexing, no embedding on the search path — embedding happens at `recall
+/// index` time). `load_embedder` is a seam so tests can inject a loaded or
+/// degraded embedder and exercise the FTS-fallback path. A failed load degrades
+/// to FTS-only.
+fn run_search_with<F>(
+    cmd: Command,
+    db_path: &Option<PathBuf>,
+    load_embedder: F,
+) -> Result<CommandOutput>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
     let Command::Search {
         query,
         project,
         days,
         source,
         limit,
-        no_embed,
         exclude_current,
         include_current,
         only_current,
@@ -451,7 +476,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     )?;
 
     let path = resolve_db_path(db_path)?;
-    let mut conn = open_or_create_db(&path)?;
+    let conn = open_or_create_db(&path)?;
 
     // Search reads the pre-built index; indexing happens via `recall index`,
     // not on every search, so search latency no longer depends on scan cost.
@@ -464,7 +489,7 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
         ));
     }
 
-    let embedder = try_load_embedder_cached();
+    let embedder = load_embedder();
     // A failed embedder load degrades search to FTS-only with a reason-aware note
     // for the `--json` channel; see search_degraded_state.
     let (degraded, mut notes) = search_degraded_state(&embedder);
@@ -509,69 +534,9 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
     });
 
-    // Embedding runs after the payload is built, but the result is not emitted
-    // until this returns, so it adds latency; `--no-embed` skips it to keep
-    // piped/scripted usage responsive.
-    if !no_embed && let Some(emb) = embedder.as_deref() {
-        let _ = embed_around_results(&mut conn, emb, &results);
-    }
-
+    // Search is read-only: embedding happens at `recall index` time, never on the
+    // search path, so search latency does not depend on embedding cost.
     Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
-}
-
-#[derive(Default)]
-struct PostSearchEmbedOutcome {
-    embedded: usize,
-    stopped: bool,
-}
-
-/// Post-search progressive embedding: a side effect that warms the index around
-/// the hits (nearby sessions) plus the most recent chunks. Progress goes to the
-/// log, not the result. The caller emits its result only after this returns, so
-/// it adds latency; `recall search --no-embed` skips it for interactive use.
-fn embed_around_results(
-    conn: &mut Connection,
-    emb: &dyn Embed,
-    results: &[search::SearchResult],
-) -> PostSearchEmbedOutcome {
-    let session_ids: Vec<String> = results
-        .iter()
-        .map(|r| r.session.session_id.clone())
-        .collect();
-    let mut outcome = PostSearchEmbedOutcome::default();
-    let mut handle = |result: anyhow::Result<embedder::EmbedResult>| match result {
-        Ok(r) => {
-            let stopped = r.stopped_at_error.is_some();
-            r.warn_if_stopped();
-            outcome.embedded += r.embedded;
-            outcome.stopped |= stopped;
-        }
-        Err(e) => {
-            warn!(error = %e, "post-search embedding skipped");
-        }
-    };
-    handle(embedder::embed_near_sessions(
-        conn,
-        emb,
-        &session_ids,
-        10,
-        None,
-    ));
-    handle(embedder::embed_recent_chunks(conn, emb, 10, None));
-    if outcome.embedded > 0 {
-        if outcome.stopped {
-            info!(
-                embedded = outcome.embedded,
-                "Embedded chunks before post-search embedding stopped"
-            );
-        } else {
-            info!(
-                total = outcome.embedded,
-                "Embedded chunks (nearby + recent)"
-            );
-        }
-    }
-    outcome
 }
 
 fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<CommandOutput> {
@@ -966,7 +931,7 @@ fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<C
 // -- Entry point --
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "index", "rebuild", "embed", "model", "search", "show", "status", "classify", "help",
+    "index", "rebuild", "model", "search", "show", "status", "classify", "help",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
@@ -1013,7 +978,6 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     match cli.command {
         Some(Command::Index) => run_index(&cli.db_path).map(|()| no_payload()),
         Some(Command::Rebuild) => run_rebuild(&cli.db_path).map(|()| no_payload()),
-        Some(Command::Embed) => run_embed(&cli.db_path).map(|()| no_payload()),
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
@@ -1062,6 +1026,8 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     // T-CS001: resolve_current_session is the single place the env-exclude policy
@@ -1398,15 +1364,6 @@ mod tests {
     }
 
     #[test]
-    fn test_embed_idle_message_distinguishes_unindexed_from_embedded() {
-        assert_eq!(
-            embed_idle_message(0),
-            "No chunks to embed. Run `recall index` first."
-        );
-        assert_eq!(embed_idle_message(5), "All chunks already embedded");
-    }
-
-    #[test]
     fn test_search_idle_message_only_when_unindexed() {
         // `recall search` no longer auto-indexes, so an empty DB must surface guidance.
         assert_eq!(
@@ -1435,6 +1392,41 @@ mod tests {
         // rewritten to `search rebuild` by shorthand expansion.
         let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
         assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
+    }
+
+    // T-005 (FR-005): with `embed` dropped from KNOWN_SUBCOMMANDS, `recall embed`
+    // is not a subcommand — shorthand expansion rewrites it to `search embed`.
+    // The inverse of test_rebuild_recognized_by_shorthand_expansion.
+    #[test]
+    fn embed_token_shorthand_expands_to_search() {
+        let args: Vec<OsString> = ["recall", "embed"].iter().map(OsString::from).collect();
+        assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_some());
+    }
+
+    // T-007 (FR-008): the user-facing READMEs must describe index-time embedding,
+    // not the retired post-search/progressive model. OUTCOME.md carries the same
+    // revision but is git-ignored, so this committed test targets the committed
+    // artifacts. The banned tokens are architecture/flag terms (substring-safe —
+    // "recall embed" is excluded because it is a substring of "embeds"); the
+    // embed-at-index rewrite removed all three, so re-adding any must fail here.
+    #[test]
+    fn readme_describes_index_time_embedding_not_post_search_growth() {
+        let en = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
+            .expect("README.md must exist at the crate root");
+        let ja = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.ja.md"))
+            .expect("README.ja.md must exist at the crate root");
+        for (name, doc) in [("README.md", en.as_str()), ("README.ja.md", ja.as_str())] {
+            for banned in [
+                "post-search embedding",
+                "Progressive embedding",
+                "--no-embed",
+            ] {
+                assert!(
+                    !doc.contains(banned),
+                    "{name} still references the retired model: {banned:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1566,8 +1558,8 @@ mod tests {
         );
     }
 
-    /// Seed one session with one pending (un-embedded) chunk, the fixture both
-    /// `embed_around_results` tests share.
+    /// Seed an 'auto' session (first user turn is a slash-command wrapper) and a
+    /// 'human' session (normal turn), both unclassified — the classify tests' fixture.
     fn seed_classify_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         // 'auto': first user turn is a slash-command wrapper; 'human': a normal
@@ -1692,83 +1684,384 @@ mod tests {
         );
     }
 
-    fn setup_pending_chunk_db() -> (tempfile::TempDir, Connection) {
-        let (dir, conn) = db::setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+    // -- #73 段階2 Phase 1: index に full embed を統合 (FR-002 / FR-003 / FR-007) --
+    //
+    // index_and_report_with is the loader-injection seam the SOW/Spec define
+    // (AC-2 #3). These drive it in-process with MockEmbedder so the index-time
+    // embed path is covered on a CI runner that has no MLX model (the spawn path
+    // would degrade to FTS-only and never exercise embed).
+    //
+    // Seam shape under test: index_and_report_with(db_path, &IndexOptions, loader).
+    // The source dirs MUST be injectable, not only db_path: rebuild (force=true)
+    // wipes qa_chunks/sessions/messages then re-scans the source dirs, so T-008
+    // cannot stage an FTS term without a per-test claude_dir. set_var is not an
+    // option here — Cargo.toml denies unsafe_code and edition-2024 makes
+    // std::env::set_var an unsafe fn — so the dir must arrive as an argument.
+    // IndexOptions already bundles {force, claude_dir, codex_dir} (indexer.rs:48)
+    // and mirrors index_from_dirs(conn, &IndexOptions), keeping the seam at 3 args.
+
+    /// Count chunks with no embedding (the pending set: qa_chunks rows absent
+    /// from vec_chunks). The Spec's definition of "fully embedded" is this == 0.
+    fn pending_embed_count(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM qa_chunks c \
+             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
             [],
+            |r| r.get(0),
         )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (1, 's1', 'hello content', 0)",
-            [],
-        )
-        .unwrap();
-        (dir, conn)
+        .unwrap()
     }
 
-    // T-EAR001: embed_around_results embeds the pending chunk near a hit session
-    // (the embedder-present side effect run_search runs after building its
-    // payload). Uses MockEmbedder because CI has no real embedding model.
-    #[test]
-    fn embed_around_results_embeds_pending_chunk() {
-        let (_dir, mut conn) = setup_pending_chunk_db();
-        let emb = embedder::MockEmbedder::new();
-        let results = [make_search_result("s1", "/p", "hello")];
-        let outcome = embed_around_results(&mut conn, &emb, &results);
-        let embedded: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(embedded, 1, "the pending chunk should be embedded");
-        assert_eq!(outcome.embedded, 1);
-        assert!(!outcome.stopped);
+    fn vec_chunk_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap()
     }
 
-    // T-EAR002: a failing embedder is swallowed — embed_around_results is
-    // best-effort background work, so it logs and returns (no panic, nothing
-    // embedded) and a search still succeeds when post-search embedding fails.
-    #[test]
-    fn embed_around_results_swallows_embed_failure() {
-        let (_dir, mut conn) = setup_pending_chunk_db();
-        let emb = embedder::MockEmbedder::failing_after(0);
-        let results = [make_search_result("s1", "/p", "hello")];
-        let outcome = embed_around_results(&mut conn, &emb, &results);
-        let embedded: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(embedded, 0, "a failed embed must leave no vec_chunks");
-        assert_eq!(outcome.embedded, 0);
-        assert!(outcome.stopped);
+    /// A loader that hands the index pipeline a deterministic in-memory embedder.
+    /// `FnOnce` matches the seam's bound; the mock returns 768-dim vectors derived
+    /// from text bytes, so no model download or network is touched.
+    fn mock_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
+        Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
     }
 
+    /// Two temp dirs that do not exist on disk. `collect_sources` gates session
+    /// scanning on `is_dir()` (indexer.rs:269), so passing absent dirs makes
+    /// `index_from_dirs` a guaranteed no-op — directly-seeded qa_chunks then drive
+    /// the embed step alone (force=false never deletes; indexer.rs:329).
+    fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
+        (root.join("no_claude"), root.join("no_codex"))
+    }
+
+    // T-001 (FR-002): index_and_report_with embeds every pending chunk when a
+    // model loads. Given 3 directly-seeded un-embedded chunks and a MockEmbedder
+    // loader, after index the pending set (NOT EXISTS vec_chunks) is empty.
+    // Perspective: equivalence (the "model present, pending > 0" class).
     #[test]
-    fn embed_around_results_reports_partial_stop() {
-        let (_dir, mut conn) = setup_pending_chunk_db();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s2', 'claude', '/f2', '/p', 'slug2', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (2, 's2', 'recent content', 0)",
-            [],
-        )
-        .unwrap();
+    fn index_and_report_with_embeds_all_pending_chunks() {
+        let src = tempfile::TempDir::new().unwrap();
+        let (claude_dir, codex_dir) = absent_source_dirs(src.path());
 
-        let emb = embedder::MockEmbedder::failing_after(1);
-        let results = [make_search_result("s1", "/p", "hello")];
-        let outcome = embed_around_results(&mut conn, &emb, &results);
-
-        assert_eq!(outcome.embedded, 1);
-        assert!(outcome.stopped);
-        let embedded: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+                [],
+            )
             .unwrap();
+            for i in 1..=3 {
+                conn.execute(
+                    "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                     VALUES (?1, 's1', ?2, 0)",
+                    rusqlite::params![i, format!("pending content {i}")],
+                )
+                .unwrap();
+            }
+        }
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
         assert_eq!(
-            embedded, 1,
-            "only the successful near-session chunk remains"
+            pending_embed_count(&conn),
+            0,
+            "index with a loadable model must embed every pending chunk"
+        );
+    }
+
+    // T-002 (FR-003): embedding is incremental — a second index re-embeds nothing.
+    // Given 1 already-embedded chunk and 1 new pending chunk, the first index
+    // embeds the new one; the second leaves the vec_chunks count unchanged (the
+    // NOT EXISTS gate skips both). Perspective: hazard (re-run idempotence) +
+    // boundary (the already-embedded vs pending split).
+    #[test]
+    fn index_and_report_with_reembeds_nothing_on_second_run() {
+        let src = tempfile::TempDir::new().unwrap();
+        let (claude_dir, codex_dir) = absent_source_dirs(src.path());
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+                [],
+            )
+            .unwrap();
+            // chunk 1 pre-embedded, chunk 2 pending.
+            for (id, content) in [(1, "already embedded"), (2, "new pending")] {
+                conn.execute(
+                    "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                     VALUES (?1, 's1', ?2, 0)",
+                    rusqlite::params![id, content],
+                )
+                .unwrap();
+            }
+            let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
+            conn.execute(
+                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+                [embedder::f32_as_bytes(&emb)],
+            )
+            .unwrap();
+        }
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let after_first = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            assert_eq!(
+                pending_embed_count(&conn),
+                0,
+                "first index must embed the one new pending chunk"
+            );
+            vec_chunk_count(&conn)
+        };
+
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let after_second = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            vec_chunk_count(&conn)
+        };
+        assert_eq!(
+            after_second, after_first,
+            "a second index must re-embed nothing (NOT EXISTS vec_chunks gate)"
+        );
+    }
+
+    /// Seed a one-session Claude JSONL under `claude_dir` so a rebuild that
+    /// re-scans the source re-stages the session and its FTS terms. Mirrors the
+    /// integration `seed_indexed_session` fixture (cli_integration.rs:186); the
+    /// unique token `quokka` is the FTS round-trip probe for T-008.
+    fn seed_claude_source(claude_dir: &Path) {
+        fs::create_dir_all(claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("s1.jsonl"),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"quokka rebuild probe"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+    }
+
+    // T-008 (FR-007): rebuild re-embeds every chunk AND rebuilds the FTS index.
+    // Given an already-embedded index built from a seeded source, a force=true
+    // rebuild wipes then re-scans the source: afterward the pending set is empty
+    // (all re-embedded) and the seeded term still matches via FTS search. Two
+    // assertions guard both halves FR-007 names (re-embed + FTS reconstruction),
+    // so neither half can silently regress. Perspective: state (rebuild is a
+    // full-reset transition) + hazard (a destructive rebuild that fails to
+    // repopulate FTS would pass an embed-only check).
+    #[test]
+    fn rebuild_reembeds_all_and_rebuilds_fts_index() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        // Precondition: an already-embedded index (force=false index + embed).
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            assert_eq!(
+                pending_embed_count(&conn),
+                0,
+                "precondition: initial index must leave nothing pending"
+            );
+        }
+
+        // rebuild: force=true drops vec_chunks/qa_chunks/sessions/messages, then
+        // re-scans the source dir and re-embeds.
+        let rebuild_opts = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            pending_embed_count(&conn),
+            0,
+            "rebuild must re-embed every chunk (pending=0 after full reset)"
+        );
+
+        let opts = search::SearchOptions::default();
+        let hits = search::search(&conn, "quokka", &opts).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "rebuild must reconstruct FTS: the seeded term must return its session"
+        );
+    }
+
+    // -- Phase 2 (AC-4): model-less index degrades, never aborts (FR-004a/004b) --
+    //
+    // index_and_report_with returns Result<IndexOutcome> carrying the degraded note
+    // rather than emitting it, so the note is verifiable in-process without a 4th
+    // reporter arg — mirroring search_degraded_state, which returns (degraded,
+    // notes). run_index/run_rebuild surface the note, then map to Ok(()).
+
+    // T-004a (FR-004a): a model-less index completes full-text indexing and
+    // succeeds (exit 0). Given a seeded source and a loader that returns
+    // Err(DegradedReason::NotInstalled), index_and_report_with returns Ok AND the
+    // seeded FTS term still returns its session — the FTS index is built even
+    // though embedding was skipped. Perspective: branch (the loader Err arm, the
+    // sole path a model-less CI runner takes) + hazard (a degraded path that
+    // aborted, or that skipped FTS along with embed, would strand search).
+    #[test]
+    fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
+            Err(DegradedReason::NotInstalled)
+        });
+        assert!(
+            outcome.is_ok(),
+            "a model-less index must complete FTS and exit 0, not abort"
+        );
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        let search_opts = search::SearchOptions::default();
+        let hits = search::search(&conn, "quokka", &search_opts).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the FTS index must be complete after a degraded index: the seeded term returns its session"
+        );
+    }
+
+    // T-004b (FR-004b): a model-less index emits a degraded note that names
+    // `recall model download`. Given the same Err(NotInstalled) loader, the
+    // returned IndexOutcome carries a note string containing that command, so the
+    // user is told how to enable embedding. Perspective: error (the model-absent
+    // path surfaces an actionable message, not a silent skip).
+    #[test]
+    fn index_and_report_with_degraded_loader_emits_model_download_note() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .expect("a degraded index must succeed");
+
+        let note = outcome
+            .degraded_note
+            .expect("a model-less index must carry a degraded note");
+        assert!(
+            note.contains("recall model download"),
+            "the degraded note must name `recall model download` to guide the user, got: {note}"
+        );
+    }
+
+    // -- Phase 3 (AC-1): search is read-only — it embeds nothing (FR-001) --
+    //
+    // Seam choice: model-less, try_load_embedder_cached returns Err(NotInstalled)
+    // so the embed branch is skipped anyway, making a seam-less vec_chunks-count
+    // test vacuous (0 before and after regardless). Injecting a loaded embedder via
+    // run_search_with is the only non-vacuous, CI-robust way to prove the read-only
+    // search path adds no vectors.
+
+    /// A `Command::Search` for `query` with production defaults: every
+    /// `--*-current` flag off and automated sessions excluded. Used by T-003 to
+    /// drive `run_search_with` on the read-only search path.
+    fn search_command(query: &str) -> Command {
+        Command::Search {
+            query: query.to_owned(),
+            project: None,
+            days: None,
+            source: None,
+            limit: 10,
+            exclude_current: false,
+            include_current: false,
+            only_current: false,
+            include_automated: false,
+        }
+    }
+
+    // T-003 (FR-001): search embeds nothing — vec_chunks is unchanged across a
+    // search. Given one session with one pending (un-embedded) chunk and an
+    // embedder injected via the loader seam (so the embed branch is reachable on a
+    // model-less CI runner), run_search_with leaves vec_chunks empty: the search
+    // path reads the pre-built index and never embeds. Asserting count == 0 with the
+    // embedder PRESENT proves the absence is the deleted embed call, not a missing
+    // model. Perspective: hazard (embedding cost leaking onto the search path) +
+    // branch (the embedder-present arm, the only arm that could embed).
+    #[test]
+    fn run_search_with_embedder_present_embeds_nothing() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            // A session is required so search_idle_message does not short-circuit
+            // before run_search_with reaches the embedder branch under test.
+            conn.execute(
+                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+                [],
+            )
+            .unwrap();
+            // One pending chunk: the removed post-search embed warmed the most-recent
+            // pending chunks regardless of which results matched, so a retained embed
+            // call would push vec_chunks to 1. Asserting 0 proves the call is gone.
+            conn.execute(
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (1, 's1', 'pending content', 0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        run_search_with(
+            search_command("anything"),
+            &Some(db_path.clone()),
+            mock_loader,
+        )
+        .unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            0,
+            "search must not embed: vec_chunks stays empty even with an embedder present"
         );
     }
 }

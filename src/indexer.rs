@@ -250,20 +250,6 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
     resolve_codex_dir_with(home, |key| env::var_os(key))
 }
 
-pub fn index_sessions(conn: &mut Connection, force: bool) -> Result<IndexStats> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
-    let claude_dir = resolve_claude_dir(&home);
-    let codex_dir = resolve_codex_dir(&home);
-    index_from_dirs(
-        conn,
-        &IndexOptions {
-            force,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        },
-    )
-}
-
 fn collect_sources(opts: &IndexOptions) -> Vec<(PathBuf, Source)> {
     let mut sources = Vec::new();
     if opts.claude_dir.is_dir() {
@@ -521,9 +507,7 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
 mod tests {
     use super::*;
     use crate::db::setup_test_db;
-    use crate::embedder::{
-        EMBED_BATCH_SIZE, MockEmbedder, embed_near_sessions, embed_recent_chunks,
-    };
+    use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks};
     use tempfile::TempDir;
 
     #[test]
@@ -1071,68 +1055,5 @@ mod tests {
             vec_count, EMBED_BATCH_SIZE as i64,
             "committed batch should survive"
         );
-    }
-
-    #[test]
-    fn test_embed_near_sessions_populates_vec_chunks() {
-        let (_dir, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let claude_dir = tmp.path().join("claude_projects");
-        fs::create_dir_all(&claude_dir).unwrap();
-        fs::write(
-            claude_dir.join("s1.jsonl"),
-            concat!(
-                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"role":"assistant","content":"hi there"}}"#,
-            ),
-        )
-        .unwrap();
-        let codex_dir = tmp.path().join("codex_sessions");
-
-        index_from_dirs(
-            &mut conn,
-            &IndexOptions {
-                force: false,
-                claude_dir: &claude_dir,
-                codex_dir: &codex_dir,
-            },
-        )
-        .unwrap();
-        index_chunks(&mut conn).unwrap();
-
-        let chunk_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert!(chunk_count > 0, "should have chunks to embed");
-
-        let embedder = MockEmbedder::new();
-        let result =
-            embed_near_sessions(&mut conn, &embedder, &["s1".to_owned()], 100, None).unwrap();
-
-        assert_eq!(result.embedded, usize::try_from(chunk_count).unwrap());
-        assert!(result.stopped_at_error.is_none());
-
-        let vec_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(vec_count, chunk_count, "all chunks should be embedded");
-
-        let result2 =
-            embed_near_sessions(&mut conn, &embedder, &["s1".to_owned()], 100, None).unwrap();
-        assert_eq!(result2.embedded, 0);
-    }
-
-    #[test]
-    fn test_embed_near_sessions_empty_input() {
-        let (_dir, mut conn) = setup_test_db();
-        let embedder = MockEmbedder::new();
-
-        let result = embed_near_sessions(&mut conn, &embedder, &[], 100, None).unwrap();
-        assert_eq!(result.embedded, 0);
-
-        let result2 =
-            embed_near_sessions(&mut conn, &embedder, &["s1".to_owned()], 0, None).unwrap();
-        assert_eq!(result2.embedded, 0);
     }
 }
