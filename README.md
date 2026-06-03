@@ -2,7 +2,7 @@
 
 # recall
 
-Your past Claude Code and Codex sessions, searchable. Gets smarter every time you search.
+Your past Claude Code and Codex sessions, searchable by keyword and meaning. Fully local, no API keys.
 
 ## The problem
 
@@ -43,25 +43,25 @@ recall "authentication"
 brew install thkt/tap/recall
 # or: cargo install --path .
 
-# Index your sessions (downloads embedding model on first run)
+# Download the embedding model once (~1.2 GB), then index your sessions
+recall model download
 recall index
 
 # Search
 recall search "authentication"
 ```
 
-## How search gets smarter
+## How search works
 
-recall starts with keyword search (FTS5). Each time you search, it quietly embeds nearby chunks using a local AI model. Over time, this enables **semantic search** — finding sessions by meaning, not just keywords.
+recall indexes every session into keyword search (FTS5) and, in the same pass, embeds each chunk with a local AI model. Search blends both — **semantic search** finds sessions by meaning, not just keywords — and is read-only, so it returns instantly.
 
 ```
-First search:   FTS5 keyword match only
-After search:   Result sessions get embedded (10 nearby + 10 recent)
-Next search:    Hybrid ranking (FTS5 + vector similarity via RRF)
-Over time:      More sessions embedded → better semantic results
+recall index:   Parse + FTS5 + embed every new chunk (needs the model)
+recall search:  Hybrid ranking — FTS5 keyword + vector similarity (RRF), instant
+Over time:      More sessions indexed → broader semantic coverage
 ```
 
-No API keys. No data leaves your machine. The embedding model (Ruri v3) runs locally via MLX on Apple Silicon.
+No API keys. No data leaves your machine. The embedding model (Ruri v3) runs locally via MLX on Apple Silicon. Without the model, index still builds FTS5 and search falls back to keyword ranking.
 
 ## Usage
 
@@ -73,34 +73,28 @@ recall search "database migration" --project /Users/me/GitHub/app  # filter by p
 recall search "React Router" --days 7                            # last 7 days
 recall search "async runtime" --source codex                     # Codex sessions only
 recall search "auth AND middleware"                               # boolean operators
-recall search "auth" --no-embed                                  # skip post-search embedding
 ```
 
 Backward compatible: `recall "query"` works as shorthand for `recall search "query"`.
 
-| Flag         | Description                           |
-| ------------ | ------------------------------------- |
-| `--project`  | Filter by project path (prefix match) |
-| `--days`     | Only sessions from the last N days    |
-| `--source`   | `claude` or `codex`                   |
-| `--limit`    | Max results, 1-100 (default: 10)      |
-| `--no-embed` | Skip post-search embedding            |
-| `-v`         | Verbose output                        |
+| Flag        | Description                           |
+| ----------- | ------------------------------------- |
+| `--project` | Filter by project path (prefix match) |
+| `--days`    | Only sessions from the last N days    |
+| `--source`  | `claude` or `codex`                   |
+| `--limit`   | Max results, 1-100 (default: 10)      |
+| `-v`        | Verbose output                        |
 
 Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
 
 ### Index
 
 ```sh
-recall index            # parse + chunk new session logs (incremental, no model calls)
-recall rebuild          # drop and rebuild the full index from scratch
+recall index            # parse, chunk, and embed new session logs (incremental)
+recall rebuild          # drop, rebuild, and re-embed the full index from scratch
 ```
 
-### Embed
-
-```sh
-recall embed            # embed pending chunks (requires model)
-```
+Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
 
 ### Model
 
@@ -122,7 +116,7 @@ recall status           # sessions, chunks, embedding coverage, model status
 
 ### Hook
 
-Register `recall index` as a Claude Code SessionEnd hook to re-index your sessions the moment one ends. Each fire re-scans the whole session tree (incremental — only changed files are re-parsed); embedding stays a separate `recall embed` pass.
+`recall index` is the primary way to refresh — run it whenever you want search up to date. Optionally register it as a Claude Code SessionEnd hook to re-index the moment a session ends. Each fire re-scans the whole session tree (incremental — only changed files are re-parsed) and embeds new chunks.
 
 Add to `~/.claude/settings.json`:
 
@@ -134,21 +128,21 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-`recall index` reads its sources from the environment and ignores the hook's stdin payload, so no extra wiring is needed. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
+`recall index` reads its sources from the environment and ignores the hook's stdin payload, so no extra wiring is needed. With the model present, the first fire is a one-time cold start — it embeds your whole backlog (~11 min for 28k chunks); later fires only handle new chunks. Without the model, fires stay FTS-only until you run `recall model download`. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
 
 ## How it works
 
 ```text
 ~/.claude/projects/**/*.jsonl  ─┐
-                                ├─→ Parse → FTS5 + Q&A chunks → Progressive embedding
+                                ├─→ Parse → FTS5 + Q&A chunks → Index-time embedding
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, and generates Q&A chunks. Incremental by default — it walks every session file but re-parses only those modified since they were last indexed.
+**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file but re-parses only those modified since they were last indexed.
 
 **Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
 
-**Embedding** — Each search embeds 20 chunks: 10 from search result sessions + 10 most recent. Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=128) with length-sorted padding minimization. Download the model explicitly with `recall model download`; without it, search falls back to FTS5 keyword ranking only.
+**Embedding** — `recall index` embeds every new chunk (those without an embedding). Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=128) with length-sorted padding minimization. Download the model once with `recall model download`; without it, index builds FTS5 only and search falls back to keyword ranking.
 
 **Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close.
 
@@ -161,7 +155,7 @@ src/
 ├── indexer.rs    Incremental indexer with mtime tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
-├── embedder.rs   Post-search embedding orchestration (batches chunks via rurico)
+├── embedder.rs   Index-time embedding orchestration (batches chunks via rurico)
 ├── chunker.rs    Q&A pair chunker with size splitting + SHA256 change detection
 ├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
 └── date.rs       Civil calendar date utilities
@@ -171,14 +165,14 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 
 ## Performance
 
-| Operation                   | Time                                       |
-| --------------------------- | ------------------------------------------ |
-| `recall index` (6k files)   | ~0.5s (incremental)                        |
-| `recall rebuild` (6k files) | ~4min (full rebuild)                       |
-| `recall search`             | ~2s (with embedding), instant (--no-embed) |
-| `recall embed` (28k chunks) | ~11 min (M3, batch=128)                    |
-| Embedding throughput        | ~45 chunks/sec (M3 + MLX)                  |
-| Initial model download      | ~1.2 GB                                    |
+| Operation                       | Time                             |
+| ------------------------------- | -------------------------------- |
+| `recall index` (incremental)    | ~0.5s + embedding for new chunks |
+| `recall index` (first run, 28k) | ~11 min (embedding-dominated)    |
+| `recall rebuild` (28k)          | ~11 min (full re-embed)          |
+| `recall search`                 | instant (read-only)              |
+| Embedding throughput            | ~45 chunks/sec (M3 + MLX)        |
+| Initial model download          | ~1.2 GB                          |
 
 ## Limitations
 

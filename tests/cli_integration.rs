@@ -67,7 +67,7 @@ fn show_without_database_exits_usage() {
 fn search_empty_index_exits_success() {
     let dir = TempDir::new().unwrap();
     assert_eq!(
-        exit_code(recall(dir.path()).args(["search", "anything", "--no-embed"])),
+        exit_code(recall(dir.path()).args(["search", "anything"])),
         0
     );
 }
@@ -77,10 +77,7 @@ fn search_empty_index_exits_success() {
 #[test]
 fn bare_query_shorthand_expands_to_search() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(
-        exit_code(recall(dir.path()).args(["someword", "--no-embed"])),
-        0
-    );
+    assert_eq!(exit_code(recall(dir.path()).args(["someword"])), 0);
 }
 
 // T-CLI006: `show` of an unknown id against an existing index resolves to no
@@ -159,7 +156,7 @@ fn search_with_matching_index_lists_results() {
         0
     );
     let out = recall(dir.path())
-        .args(["search", "hello", "--no-embed"])
+        .args(["search", "hello"])
         .output()
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search should exit 0");
@@ -213,7 +210,7 @@ fn search_json_emits_success_envelope_with_results() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
     let out = recall(dir.path())
-        .args(["search", "hello", "--no-embed", "--json"])
+        .args(["search", "hello", "--json"])
         .output()
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search --json should exit 0");
@@ -314,12 +311,11 @@ fn status_json_emits_stats_envelope() {
 fn search_empty_index_json_exit_code_matches_human() {
     let human = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(human.path()).arg("index")), 0);
-    let human_code = exit_code(recall(human.path()).args(["search", "anything", "--no-embed"]));
+    let human_code = exit_code(recall(human.path()).args(["search", "anything"]));
 
     let json = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(json.path()).arg("index")), 0);
-    let json_code =
-        exit_code(recall(json.path()).args(["search", "anything", "--no-embed", "--json"]));
+    let json_code = exit_code(recall(json.path()).args(["search", "anything", "--json"]));
 
     assert_eq!(human_code, 0, "empty-index search (human) should exit 0");
     assert_eq!(
@@ -337,7 +333,7 @@ fn search_without_json_keeps_human_output() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
     let out = recall(dir.path())
-        .args(["search", "hello", "--no-embed"])
+        .args(["search", "hello"])
         .output()
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search should exit 0");
@@ -501,7 +497,7 @@ fn search_excludes_current_session_by_env_default() {
 
     // Baseline: no invoking session (helper clears the env) → both are candidates.
     let baseline = recall(dir.path())
-        .args(["search", "hello", "--no-embed"])
+        .args(["search", "hello"])
         .output()
         .expect("spawn recall binary");
     let baseline_out = String::from_utf8_lossy(&baseline.stdout);
@@ -512,7 +508,7 @@ fn search_excludes_current_session_by_env_default() {
 
     // CLAUDE_CODE_SESSION_ID=s1 → s1 is the invoking session, excluded by default.
     let out = recall(dir.path())
-        .args(["search", "hello", "--no-embed"])
+        .args(["search", "hello"])
         .env("CLAUDE_CODE_SESSION_ID", "s1")
         .output()
         .expect("spawn recall binary");
@@ -537,7 +533,7 @@ fn search_include_current_keeps_invoking_session() {
     seed_two_matching_sessions(dir.path());
 
     let out = recall(dir.path())
-        .args(["search", "hello", "--no-embed", "--include-current"])
+        .args(["search", "hello", "--include-current"])
         .env("CLAUDE_CODE_SESSION_ID", "s1")
         .output()
         .expect("spawn recall binary");
@@ -558,7 +554,7 @@ fn search_only_current_restricts_to_invoking_session() {
     seed_two_matching_sessions(dir.path());
 
     let out = recall(dir.path())
-        .args(["search", "hello", "--no-embed", "--only-current"])
+        .args(["search", "hello", "--only-current"])
         .env("CLAUDE_CODE_SESSION_ID", "s1")
         .output()
         .expect("spawn recall binary");
@@ -583,7 +579,7 @@ fn search_only_current_restricts_to_invoking_session() {
 fn only_current_without_env_exits_usage() {
     let dir = TempDir::new().unwrap();
     assert_eq!(
-        exit_code(recall(dir.path()).args(["search", "hello", "--no-embed", "--only-current"])),
+        exit_code(recall(dir.path()).args(["search", "hello", "--only-current"])),
         64
     );
 }
@@ -659,7 +655,7 @@ fn search_notes_automated_exclusion() {
     );
 
     let out = recall(dir.path())
-        .args(["search", "authentication", "--no-embed", "--json"])
+        .args(["search", "authentication", "--json"])
         .output()
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search should exit 0");
@@ -692,7 +688,7 @@ fn search_omits_automated_note_when_none_excluded() {
     );
 
     let out = recall(dir.path())
-        .args(["search", "authentication", "--no-embed", "--json"])
+        .args(["search", "authentication", "--json"])
         .output()
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search should exit 0");
@@ -700,5 +696,29 @@ fn search_omits_automated_note_when_none_excluded() {
     assert!(
         !stdout.contains("--include-automated"),
         "no automated sessions means no exclusion note: {stdout}"
+    );
+}
+
+// -- #73 段階2 Phase 4 (AC-3): --no-embed retired (FR-006) --
+//
+// FR-005 (the retired `embed` subcommand) is verified by a main.rs unit test
+// (embed_token_shorthand_expands_to_search): with "embed" dropped from
+// KNOWN_SUBCOMMANDS, `recall embed` shorthand-expands to a search instead of
+// erroring, so the observable is subcommand membership, not an exit code.
+
+// T-006 (FR-006): `recall search <q> --no-embed` is a usage error (64). With the
+// --no-embed arg definition removed, the flag is unknown: clap fails to parse, and
+// handle_parse_error (main.rs:1051) maps every non-help clap error to the sysexits
+// USAGE code (64) — the same mapping T-CLI001 pins for `--no-such-flag`. A bare
+// query is supplied so the failure is the unknown flag, not a missing positional.
+// This spawns the real binary because the parse/dispatch/exit glue is reachable
+// only end to end. Perspective: error (the retired flag must fail, not be silently
+// ignored).
+#[test]
+fn search_no_embed_flag_is_retired_exits_usage() {
+    let dir = TempDir::new().unwrap();
+    assert_eq!(
+        exit_code(recall(dir.path()).args(["search", "anything", "--no-embed"])),
+        64
     );
 }

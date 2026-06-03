@@ -16,7 +16,6 @@ use std::process::ExitCode;
 
 use amici::cli::exit_code::{CliError, codes};
 use amici::model::ModelDownloadError;
-use amici::model::embedder::{DegradedReason, degraded_reason_user_note};
 use rurico::storage::SanitizeError;
 use serde::Serialize;
 
@@ -190,27 +189,6 @@ pub(crate) fn download_error(e: &ModelDownloadError) -> RecallError {
     }
 }
 
-/// Classify why the embedder failed to load for a command that requires it
-/// (`recall embed`). A missing model is a usage error the user resolves with
-/// `recall model download`; a missing backend is a permanent fault; a probe
-/// failure may clear on retry.
-pub(crate) fn embedder_error(reason: DegradedReason) -> RecallError {
-    match reason {
-        DegradedReason::NotInstalled => RecallError::Usage(
-            degraded_reason_user_note(reason, "recall model download").unwrap_or_else(|| {
-                "embedding model not installed; run `recall model download`".to_owned()
-            }),
-        ),
-        DegradedReason::ProbeFailed => {
-            RecallError::TempFailure("embedding model probe failed".to_owned())
-        }
-        DegradedReason::BackendUnavailable => {
-            RecallError::Internal("MLX backend unavailable".to_owned())
-        }
-        DegradedReason::Disabled => RecallError::Internal("embedder disabled".to_owned()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,28 +302,6 @@ mod tests {
         assert_eq!(
             download_error(&ModelDownloadError::ProbeFailed("corrupt".into())).error_code(),
             ErrorCode::TempFailure
-        );
-    }
-
-    // `recall embed` without the model installed is a usage error the user
-    // fixes with `recall model download`, not an Unknown(104) catch-all.
-    #[test]
-    fn embedder_error_classifies_not_installed_as_usage() {
-        assert_eq!(
-            embedder_error(DegradedReason::NotInstalled).error_code(),
-            ErrorCode::UsageError
-        );
-        assert_eq!(
-            embedder_error(DegradedReason::BackendUnavailable).error_code(),
-            ErrorCode::Internal
-        );
-        assert_eq!(
-            embedder_error(DegradedReason::ProbeFailed).error_code(),
-            ErrorCode::TempFailure
-        );
-        assert_eq!(
-            embedder_error(DegradedReason::Disabled).error_code(),
-            ErrorCode::Internal
         );
     }
 

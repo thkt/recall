@@ -115,33 +115,6 @@ fn query_and_embed(
     embed_chunks(conn, embedder, &missing, on_progress)
 }
 
-pub(crate) fn embed_near_sessions(
-    conn: &mut Connection,
-    embedder: &dyn Embed,
-    session_ids: &[String],
-    budget: usize,
-    on_progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<EmbedResult> {
-    if session_ids.is_empty() || budget == 0 {
-        return Ok(EmbedResult::default());
-    }
-
-    let placeholders = anon_placeholders(session_ids.len());
-    let sql = format!(
-        "SELECT c.id, c.content FROM qa_chunks c \
-         WHERE c.session_id IN ({placeholders}) \
-         AND NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
-         ORDER BY c.id \
-         LIMIT ?"
-    );
-
-    let budget_i64 = budget as i64;
-    let mut refs: Vec<&dyn ToSql> = session_ids.iter().map(|s| s as &dyn ToSql).collect();
-    refs.push(&budget_i64);
-
-    query_and_embed(conn, embedder, &sql, &refs, on_progress)
-}
-
 pub(crate) fn embed_recent_chunks(
     conn: &mut Connection,
     embedder: &dyn Embed,
@@ -322,5 +295,41 @@ mod tests {
             )
             .unwrap();
         assert_eq!(vec_count, 1, "re-embedding must not duplicate vec rows");
+    }
+
+    // T-009 (FR-002): a failed embed batch during index is non-fatal and retryable.
+    // embed_recent_chunks records the stop and returns Ok (so the index does not
+    // abort), and the chunk keeps no vec row, so the next index retries it via the
+    // NOT EXISTS gate.
+    #[test]
+    fn test_embed_recent_chunks_batch_failure_is_non_fatal_and_retryable() {
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (1, 's1', 'pending content', 0)",
+            [],
+        )
+        .unwrap();
+
+        let embedder = MockEmbedder::failing_after(0);
+        let result = embed_recent_chunks(&mut conn, &embedder, 10, None).unwrap();
+
+        assert_eq!(result.embedded, 0, "the failed batch embeds nothing");
+        assert!(
+            result.stopped_at_error.is_some(),
+            "the batch failure is recorded, not silently dropped"
+        );
+        let vec_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            vec_count, 0,
+            "the chunk stays pending for the next index to retry"
+        );
     }
 }
