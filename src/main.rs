@@ -24,7 +24,7 @@ use amici::cli::exit_code::codes;
 use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand};
 use amici::logging::init_subscriber;
 use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
-use amici::model::{degraded_reason_user_note, download_and_verify_model, record_degraded};
+use amici::model::{EmbedderDegraded, download_and_verify_model, record_degraded};
 use amici::storage::{collect_rows, filter::escape_like};
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
@@ -61,7 +61,7 @@ struct Cli {
     json: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Parse and chunk new session logs (incremental). No model calls.
     Index,
@@ -127,7 +127,7 @@ enum Command {
     Status,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum ModelCommand {
     /// Download the embedding model and verify it loads.
     Download,
@@ -220,7 +220,9 @@ where
 
 /// The human-facing stderr note for a degraded embedder load (`note: ...`).
 fn search_degraded_note(reason: DegradedReason) -> Option<String> {
-    degraded_reason_user_note(reason, "recall model download").map(|note| format!("note: {note}."))
+    EmbedderDegraded(reason)
+        .user_note("recall model download")
+        .map(|note| format!("note: {note}."))
 }
 
 /// The `--json` `notes[]` entry for a search that fell back to FTS-only, derived
@@ -231,7 +233,8 @@ fn search_degraded_note(reason: DegradedReason) -> Option<String> {
 /// list means no degradation note applies (a caller-disabled model), so the
 /// caller's `degraded` flag co-varies with it.
 fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
-    degraded_reason_user_note(reason, "recall model download")
+    EmbedderDegraded(reason)
+        .user_note("recall model download")
         .map(|note| vec![format!("semantic search unavailable: {note}")])
         .unwrap_or_default()
 }
@@ -704,7 +707,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
     let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?;
 
-    let model_ok = cached_artifacts(ModelId::default())
+    let model_ok = cached_artifacts(ModelId::DEFAULT)
         .map(|opt| opt.is_some())
         .unwrap_or(false);
 
@@ -1080,6 +1083,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::fs;
 
     use super::*;
@@ -1430,14 +1434,14 @@ mod tests {
     #[test]
     fn test_rebuild_is_a_distinct_subcommand() {
         let cli = Cli::try_parse_from(["recall", "rebuild"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Rebuild)));
+        assert_matches!(cli.command, Some(Command::Rebuild));
     }
 
     #[test]
     fn test_index_no_longer_accepts_force_flag() {
         assert!(Cli::try_parse_from(["recall", "index", "--force"]).is_err());
         let cli = Cli::try_parse_from(["recall", "index"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Index)));
+        assert_matches!(cli.command, Some(Command::Index));
     }
 
     #[test]

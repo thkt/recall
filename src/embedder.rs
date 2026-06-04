@@ -77,7 +77,7 @@ fn embed_chunks(
                     rusqlite::params_from_iter(batch_ids.iter()),
                 )?;
                 for (chunked, &i) in embeddings.iter().zip(batch_idx) {
-                    for (sub_idx, sub_emb) in chunked.chunks.iter().enumerate() {
+                    for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
                         let embedding_bytes = f32_as_bytes(sub_emb);
                         tx.execute(
                             "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
@@ -190,6 +190,16 @@ impl MockEmbedder {
         }
     }
 
+    /// Constructs the error inline: rurico's `EmbedError::inference` helpers are
+    /// `pub(crate)`, and the enum's `#[non_exhaustive]` does not block downstream
+    /// construction of existing variants.
+    fn inference_error(message: String) -> EmbedError {
+        EmbedError::Inference {
+            message,
+            source: None,
+        }
+    }
+
     pub(crate) fn deterministic_vector(text: &str) -> Vec<f32> {
         let dims = EMBEDDING_DIMS;
         let mut v = vec![0.0f32; dims];
@@ -212,7 +222,7 @@ impl Embed for MockEmbedder {
         if let Some(limit) = self.fail_after {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count >= limit {
-                return Err(EmbedError::Inference("mock failure".to_owned()));
+                return Err(Self::inference_error("mock failure".to_owned()));
             }
         }
         Ok(Self::deterministic_vector(text))
@@ -222,12 +232,12 @@ impl Embed for MockEmbedder {
         if let Some(limit) = self.fail_after {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count >= limit {
-                return Err(EmbedError::Inference("mock failure".to_owned()));
+                return Err(Self::inference_error("mock failure".to_owned()));
             }
         }
-        Ok(ChunkedEmbedding::new(vec![Self::deterministic_vector(
-            text,
-        )]))
+        Ok(ChunkedEmbedding::try_new(vec![
+            Self::deterministic_vector(text),
+        ])?)
     }
 
     /// Explicit impl of the production dispatch target: `embed_chunks` calls this
@@ -238,7 +248,7 @@ impl Embed for MockEmbedder {
         if let Some(poison) = self.fail_on_text.as_deref()
             && texts.contains(&poison)
         {
-            return Err(EmbedError::Inference(format!("poison text: {poison}")));
+            return Err(Self::inference_error(format!("poison text: {poison}")));
         }
         texts.iter().map(|t| self.embed_document(t)).collect()
     }
