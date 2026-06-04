@@ -300,7 +300,7 @@ mod tests {
             ErrorCode::TempFailure
         );
         assert_eq!(
-            download_error(&ModelDownloadError::ProbeFailed("corrupt".into())).error_code(),
+            download_error(&ModelDownloadError::ProbeFailed(Some("corrupt".into()))).error_code(),
             ErrorCode::TempFailure
         );
     }
