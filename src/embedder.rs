@@ -23,10 +23,10 @@ impl EmbedResult {
         if self.failed_count > 0 {
             // first_error is always Some when failed_count > 0 (both are set in
             // embed_chunks' Err arm together); the fallback is defensive only.
+            let first_error = self.first_error.as_deref().unwrap_or("unknown");
             warn!(
                 failed_count = self.failed_count,
-                first_error = self.first_error.as_deref().unwrap_or("unknown"),
-                "embedding skipped chunks after batch failures"
+                first_error, "embedding skipped chunks after batch failures"
             );
         }
     }

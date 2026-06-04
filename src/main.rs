@@ -1779,118 +1779,149 @@ mod tests {
     }
 
     /// Two temp dirs that do not exist on disk. `collect_sources` gates session
-    /// scanning on `is_dir()` (indexer.rs:269), so passing absent dirs makes
-    /// `index_from_dirs` a guaranteed no-op — directly-seeded qa_chunks then drive
-    /// the embed step alone (force=false never deletes; indexer.rs:329).
+    /// scanning on `is_dir()` (indexer.rs:269), so `index_from_dirs` scans no
+    /// files — but its orphan cleanup still deletes any hand-seeded session
+    /// whose file_path has no on-disk source, chunks included. Use only where
+    /// sessions come from a real source dir (or none); embed-step tests call
+    /// `embed_all_pending` directly instead.
     fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
         (root.join("no_claude"), root.join("no_codex"))
     }
 
-    // T-001 (FR-002): index_and_report_with embeds every pending chunk when a
-    // model loads. Given 3 directly-seeded un-embedded chunks and a MockEmbedder
-    // loader, after index the pending set (NOT EXISTS vec_chunks) is empty.
+    // T-001 (FR-002): embed_all_pending embeds every pending chunk when a model
+    // is present. Given 3 directly-seeded un-embedded chunks, the run embeds all
+    // 3 (vec_chunks gains 3 rows; the NOT EXISTS pending set empties). Calls
+    // embed_all_pending directly: the embed step is the unit under test, and
+    // index_from_dirs' orphan cleanup deletes hand-seeded sessions (no on-disk
+    // source), which would silently empty the pending set before embedding.
     // Perspective: equivalence (the "model present, pending > 0" class).
     #[test]
-    fn index_and_report_with_embeds_all_pending_chunks() {
-        let src = tempfile::TempDir::new().unwrap();
-        let (claude_dir, codex_dir) = absent_source_dirs(src.path());
-
+    fn embed_all_pending_embeds_every_pending_chunk() {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=3 {
             conn.execute(
-                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-                [],
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![i, format!("pending content {i}")],
             )
             .unwrap();
-            for i in 1..=3 {
-                conn.execute(
-                    "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                     VALUES (?1, 's1', ?2, 0)",
-                    rusqlite::params![i, format!("pending content {i}")],
-                )
-                .unwrap();
-            }
         }
 
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let result = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
 
-        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(result.embedded, 3, "every pending chunk embeds");
+        assert_eq!(result.failed_count, 0, "a working embedder fails nothing");
+        assert_eq!(pending_embed_count(&conn), 0, "the pending set empties");
+        assert_eq!(vec_chunk_count(&conn), 3, "each chunk gains a vec row");
+    }
+
+    // T-010 (FR-002, FR-004): a partial embed failure flows through
+    // embed_all_pending — it tallies the failed batch, runs
+    // warn_if_batches_failed (the tracing-warn path), and stays Ok so the index
+    // is non-fatal. Given 3 pending chunks where 'x' poisons their single batch,
+    // the run reports embedded=0, failed_count=3, carries the first batch error
+    // for the --json note, and leaves the batch pending for the next run.
+    // Perspective: error (the failing-embedder arm) + state (EmbedResult tally).
+    #[test]
+    fn embed_all_pending_partial_failure_reports_failed_count() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (1, 's1', 'x', 0)",
+            [],
+        )
+        .unwrap();
+        for i in 2..=3 {
+            conn.execute(
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![i, format!("pending content {i}")],
+            )
+            .unwrap();
+        }
+
+        let result =
+            embed_all_pending(&mut conn, &embedder::MockEmbedder::failing_on_text("x")).unwrap();
+
+        assert_eq!(
+            result.embedded, 0,
+            "the poisoned single batch embeds nothing"
+        );
+        assert_eq!(
+            result.failed_count, 3,
+            "the whole 3-chunk batch is reported failed"
+        );
+        let err = result.first_error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("poison text"),
+            "the first batch error is carried up for the --json note, got: {err:?}"
+        );
         assert_eq!(
             pending_embed_count(&conn),
-            0,
-            "index with a loadable model must embed every pending chunk"
+            3,
+            "the failed batch stays pending for the next run"
         );
     }
 
-    // T-002 (FR-003): embedding is incremental — a second index re-embeds nothing.
-    // Given 1 already-embedded chunk and 1 new pending chunk, the first index
-    // embeds the new one; the second leaves the vec_chunks count unchanged (the
-    // NOT EXISTS gate skips both). Perspective: hazard (re-run idempotence) +
-    // boundary (the already-embedded vs pending split).
+    // T-002 (FR-003): embedding is incremental — a second run re-embeds nothing.
+    // Given 1 already-embedded chunk and 1 new pending chunk, the first
+    // embed_all_pending embeds exactly the pending one (vec 1→2); the second
+    // leaves the count unchanged (the NOT EXISTS gate skips both).
+    // Perspective: hazard (re-run idempotence) + boundary (the already-embedded
+    // vs pending split).
     #[test]
-    fn index_and_report_with_reembeds_nothing_on_second_run() {
-        let src = tempfile::TempDir::new().unwrap();
-        let (claude_dir, codex_dir) = absent_source_dirs(src.path());
-
+    fn embed_all_pending_reembeds_nothing_on_second_run() {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        // chunk 1 pre-embedded, chunk 2 pending.
+        for (id, content) in [(1, "already embedded"), (2, "new pending")] {
             conn.execute(
-                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-                [],
-            )
-            .unwrap();
-            // chunk 1 pre-embedded, chunk 2 pending.
-            for (id, content) in [(1, "already embedded"), (2, "new pending")] {
-                conn.execute(
-                    "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                     VALUES (?1, 's1', ?2, 0)",
-                    rusqlite::params![id, content],
-                )
-                .unwrap();
-            }
-            let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
-            conn.execute(
-                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-                [embedder::f32_as_bytes(&emb)],
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![id, content],
             )
             .unwrap();
         }
+        let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+            [embedder::f32_as_bytes(&emb)],
+        )
+        .unwrap();
 
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let after_first = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            assert_eq!(
-                pending_embed_count(&conn),
-                0,
-                "first index must embed the one new pending chunk"
-            );
-            vec_chunk_count(&conn)
-        };
-
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let after_second = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
+        let first = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
         assert_eq!(
-            after_second, after_first,
-            "a second index must re-embed nothing (NOT EXISTS vec_chunks gate)"
+            first.embedded, 1,
+            "the first run embeds only the pending chunk"
+        );
+        assert_eq!(vec_chunk_count(&conn), 2, "vec gains exactly the new chunk");
+
+        let second = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        assert_eq!(second.embedded, 0, "the second run re-embeds nothing");
+        assert_eq!(
+            vec_chunk_count(&conn),
+            2,
+            "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
         );
     }
 

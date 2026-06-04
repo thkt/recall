@@ -428,6 +428,33 @@ fn index_json_emits_structured_embed_summary() {
     );
 }
 
+// T-CLI027: `rebuild --json` mirrors the index envelope contract through the
+// rebuild dispatch arm (run_rebuild → index_command_output). On an empty index
+// the wipe-and-rebuild embeds nothing and fails nothing, so the counts are a
+// deterministic 0/0 regardless of model presence, and the exit is 0.
+#[test]
+fn rebuild_json_emits_structured_embed_summary() {
+    let dir = TempDir::new().unwrap();
+    let out = recall(dir.path())
+        .args(["rebuild", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "rebuild --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    assert_eq!(
+        v["data"]["embedded"],
+        serde_json::json!(0),
+        "an empty rebuild embeds nothing, got: {stdout}"
+    );
+    assert_eq!(
+        v["data"]["failed_count"],
+        serde_json::json!(0),
+        "an empty rebuild has no embed failures, got: {stdout}"
+    );
+}
+
 // T-CLI019: `status --json` against a never-created index reports zero counters
 // with model_ready:false as a success envelope, exit 0 — the no-database branch
 // of run_status. Pairs with T-CLI013, which runs `index` first (the live path).
