@@ -990,7 +990,7 @@ mod tests {
         let result = embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
 
         assert_eq!(result.embedded, usize::try_from(chunk_count).unwrap());
-        assert!(result.stopped_at_error.is_none());
+        assert_eq!(result.failed_count, 0);
 
         let vec_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
@@ -1001,8 +1001,17 @@ mod tests {
         assert_eq!(result2.embedded, 0);
     }
 
+    // T-007 (FR-001, FR-002): a mid-run batch failure is non-blocking — the run
+    // continues past it and counts the rest as failed. With failing_after(128) the
+    // first batch (128 chunks) succeeds and commits; the MockEmbedder counter is not
+    // reset, so every later batch fails (call_count stays >= 128). Under continue the
+    // run does not stop at batch 2: it reports embedded == 128 and failed_count ==
+    // the remaining chunks, and the committed batch survives.
+    // (Updated from test_embed_chunks_stops_on_error_preserves_progress, whose
+    // stopped_at_error.is_some() assertion predates the break->continue change.)
+    // Perspective: branch (the Err arm continues) + boundary (split at EMBED_BATCH_SIZE).
     #[test]
-    fn test_embed_chunks_stops_on_error_preserves_progress() {
+    fn test_embed_chunks_continues_past_failed_batch_and_counts_remainder() {
         let (_dir, mut conn) = setup_test_db();
 
         conn.execute(
@@ -1044,16 +1053,20 @@ mod tests {
 
         assert_eq!(
             result.embedded, EMBED_BATCH_SIZE,
-            "first batch should succeed"
+            "the first batch embeds and commits before the failures start"
         );
-        assert!(result.stopped_at_error.is_some(), "should report the error");
+        let remaining = usize::try_from(chunk_count).unwrap() - EMBED_BATCH_SIZE;
+        assert_eq!(
+            result.failed_count, remaining,
+            "every batch after the first fails (counter not reset), so all remaining chunks are failed"
+        );
 
         let vec_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
             vec_count, EMBED_BATCH_SIZE as i64,
-            "committed batch should survive"
+            "the committed first batch survives the later failures"
         );
     }
 }

@@ -253,18 +253,18 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
 
 // -- Subcommands --
 
-fn run_index(db_path: &Option<PathBuf>) -> Result<()> {
+fn run_index(db_path: &Option<PathBuf>) -> Result<IndexOutcome> {
     index_and_report(db_path, false)
 }
 
-fn run_rebuild(db_path: &Option<PathBuf>) -> Result<()> {
+fn run_rebuild(db_path: &Option<PathBuf>) -> Result<IndexOutcome> {
     index_and_report(db_path, true)
 }
 
 /// Shared index pipeline for `index` (incremental) and `rebuild` (full).
 /// Resolves source dirs from the environment, then delegates to
 /// [`index_and_report_with`] with the real cached-embedder loader.
-fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
+fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<IndexOutcome> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let claude_dir = indexer::resolve_claude_dir(&home);
     let codex_dir = indexer::resolve_codex_dir(&home);
@@ -278,18 +278,67 @@ fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<()> {
     let outcome = index_and_report_with(db_path, &opts, || {
         try_load_embedder_cached_with_reporter(open_cached_embedder, |_: &str| {})
     })?;
-    if let Some(note) = outcome.degraded_note {
-        cli_info(&note);
+    if let Some(note) = &outcome.degraded_note {
+        cli_info(note);
     }
-    Ok(())
+    Ok(outcome)
 }
 
-/// Outcome of an index run. `degraded_note` is `Some` when the embedder could not
-/// load (model-less): the index still completes FTS-only and the wrapper surfaces
-/// the note (naming `recall model download`) instead of failing. `None` means
-/// embedding completed.
+/// Outcome of an index run, surfaced to the caller for the `--json` envelope.
+/// `degraded_note` is `Some` when the embedder could not load (model-less): the
+/// index still completes FTS-only. `embedded`/`failed_count`/`first_error` report
+/// the embed pass: `failed_count > 0` means some batches failed but the index is
+/// complete and those chunks stay pending for the next run. The two degradation
+/// reasons are mutually exclusive (a model-less run skips embedding, so
+/// `failed_count == 0`).
+#[derive(Default)]
 struct IndexOutcome {
     degraded_note: Option<String>,
+    embedded: usize,
+    failed_count: usize,
+    first_error: Option<String>,
+}
+
+/// Build the `--json` envelope for an index run from its [`IndexOutcome`],
+/// mirroring [`search_degraded_state`]: both degradation reasons — a model-less
+/// load (`degraded_note`) and an embed batch failure (`failed_count`) — become
+/// `notes`, `degraded` co-varies (true iff `notes` is non-empty), and
+/// `{ embedded, failed_count }` is the data so an agent reads the magnitude, not
+/// just a boolean.
+/// Cap on the `first_error` portion of the embed-stop note (chars, not bytes, so
+/// truncation never splits a UTF-8 boundary).
+const EMBED_ERROR_NOTE_MAX_CHARS: usize = 120;
+
+fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
+    debug_assert!(
+        outcome.degraded_note.is_none() || outcome.failed_count == 0,
+        "model-absent and embed-stop degradation are mutually exclusive"
+    );
+    let mut notes = Vec::new();
+    if let Some(note) = &outcome.degraded_note {
+        notes.push(note.clone());
+    }
+    if outcome.failed_count > 0 {
+        // first_error is always Some when failed_count > 0 (both are set in
+        // embed_chunks' Err arm together); the fallback is defensive only. Like
+        // every other envelope-bound string the error is control-char-stripped,
+        // and capped so a verbose MLX error cannot bloat the note.
+        let raw = outcome.first_error.as_deref().unwrap_or("unknown error");
+        let err: String = ansi::strip_control_chars(raw)
+            .chars()
+            .take(EMBED_ERROR_NOTE_MAX_CHARS)
+            .collect();
+        notes.push(format!(
+            "{n} chunk(s) failed to embed ({err}); rerun `recall index` to retry",
+            n = outcome.failed_count,
+        ));
+    }
+    let degraded = !notes.is_empty();
+    let data = serde_json::json!({
+        "embedded": outcome.embedded,
+        "failed_count": outcome.failed_count,
+    });
+    CommandOutput::with_notes(String::new(), data, degraded, notes)
 }
 
 /// Index pipeline with an injected embedder loader. Runs FTS indexing + chunking,
@@ -335,13 +384,17 @@ where
     // so the wrapper can guide the user (FR-004a/004b).
     match load_embedder() {
         Ok(embedder) => {
-            embed_all_pending(&mut conn, embedder.as_ref())?;
+            let result = embed_all_pending(&mut conn, embedder.as_ref())?;
             Ok(IndexOutcome {
                 degraded_note: None,
+                embedded: result.embedded,
+                failed_count: result.failed_count,
+                first_error: result.first_error,
             })
         }
         Err(reason) => Ok(IndexOutcome {
             degraded_note: search_degraded_note(reason),
+            ..IndexOutcome::default()
         }),
     }
 }
@@ -349,7 +402,7 @@ where
 /// Embed every chunk absent from `vec_chunks`. Incremental by the `NOT EXISTS`
 /// gate inside `embed_recent_chunks`, so a re-index embeds only new chunks; a
 /// `rebuild` re-embeds all because its `force` DELETE cleared `vec_chunks` first.
-fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<()> {
+fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<embedder::EmbedResult> {
     let pending: i64 = conn.query_row(
         "SELECT COUNT(*) FROM qa_chunks c \
          WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
@@ -357,7 +410,7 @@ fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<()> 
         |r| r.get(0),
     )?;
     if pending == 0 {
-        return Ok(());
+        return Ok(embedder::EmbedResult::default());
     }
     let pending_usize = usize::try_from(pending).expect("chunk count fits in usize");
     let sp = Spinner::new("Embedding chunks...");
@@ -371,9 +424,10 @@ fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<()> 
     // A mid-run batch failure is non-fatal: chunks already embedded are committed,
     // the rest stay pending, and the FTS index is complete and queryable. The next
     // `recall index` retries the remaining pending via the NOT EXISTS gate, so we
-    // warn rather than fail. (Surfacing the stop in `--json` is tracked in #130.)
-    result.warn_if_stopped();
-    Ok(())
+    // warn rather than fail. The stop is also surfaced in the index `--json`
+    // envelope via `failed_count` (index_command_output).
+    result.warn_if_batches_failed();
+    Ok(result)
 }
 
 fn run_model_download() -> Result<()> {
@@ -976,8 +1030,8 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     init_subscriber(default_filter);
 
     match cli.command {
-        Some(Command::Index) => run_index(&cli.db_path).map(|()| no_payload()),
-        Some(Command::Rebuild) => run_rebuild(&cli.db_path).map(|()| no_payload()),
+        Some(Command::Index) => run_index(&cli.db_path).map(|o| index_command_output(&o)),
+        Some(Command::Rebuild) => run_rebuild(&cli.db_path).map(|o| index_command_output(&o)),
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
@@ -1725,118 +1779,149 @@ mod tests {
     }
 
     /// Two temp dirs that do not exist on disk. `collect_sources` gates session
-    /// scanning on `is_dir()` (indexer.rs:269), so passing absent dirs makes
-    /// `index_from_dirs` a guaranteed no-op — directly-seeded qa_chunks then drive
-    /// the embed step alone (force=false never deletes; indexer.rs:329).
+    /// scanning on `is_dir()` (indexer.rs:269), so `index_from_dirs` scans no
+    /// files — but its orphan cleanup still deletes any hand-seeded session
+    /// whose file_path has no on-disk source, chunks included. Use only where
+    /// sessions come from a real source dir (or none); embed-step tests call
+    /// `embed_all_pending` directly instead.
     fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
         (root.join("no_claude"), root.join("no_codex"))
     }
 
-    // T-001 (FR-002): index_and_report_with embeds every pending chunk when a
-    // model loads. Given 3 directly-seeded un-embedded chunks and a MockEmbedder
-    // loader, after index the pending set (NOT EXISTS vec_chunks) is empty.
+    // T-001 (FR-002): embed_all_pending embeds every pending chunk when a model
+    // is present. Given 3 directly-seeded un-embedded chunks, the run embeds all
+    // 3 (vec_chunks gains 3 rows; the NOT EXISTS pending set empties). Calls
+    // embed_all_pending directly: the embed step is the unit under test, and
+    // index_from_dirs' orphan cleanup deletes hand-seeded sessions (no on-disk
+    // source), which would silently empty the pending set before embedding.
     // Perspective: equivalence (the "model present, pending > 0" class).
     #[test]
-    fn index_and_report_with_embeds_all_pending_chunks() {
-        let src = tempfile::TempDir::new().unwrap();
-        let (claude_dir, codex_dir) = absent_source_dirs(src.path());
-
+    fn embed_all_pending_embeds_every_pending_chunk() {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        for i in 1..=3 {
             conn.execute(
-                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-                [],
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![i, format!("pending content {i}")],
             )
             .unwrap();
-            for i in 1..=3 {
-                conn.execute(
-                    "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                     VALUES (?1, 's1', ?2, 0)",
-                    rusqlite::params![i, format!("pending content {i}")],
-                )
-                .unwrap();
-            }
         }
 
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let result = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
 
-        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(result.embedded, 3, "every pending chunk embeds");
+        assert_eq!(result.failed_count, 0, "a working embedder fails nothing");
+        assert_eq!(pending_embed_count(&conn), 0, "the pending set empties");
+        assert_eq!(vec_chunk_count(&conn), 3, "each chunk gains a vec row");
+    }
+
+    // T-010 (FR-002, FR-004): a partial embed failure flows through
+    // embed_all_pending — it tallies the failed batch, runs
+    // warn_if_batches_failed (the tracing-warn path), and stays Ok so the index
+    // is non-fatal. Given 3 pending chunks where 'x' poisons their single batch,
+    // the run reports embedded=0, failed_count=3, carries the first batch error
+    // for the --json note, and leaves the batch pending for the next run.
+    // Perspective: error (the failing-embedder arm) + state (EmbedResult tally).
+    #[test]
+    fn embed_all_pending_partial_failure_reports_failed_count() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (1, 's1', 'x', 0)",
+            [],
+        )
+        .unwrap();
+        for i in 2..=3 {
+            conn.execute(
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![i, format!("pending content {i}")],
+            )
+            .unwrap();
+        }
+
+        let result =
+            embed_all_pending(&mut conn, &embedder::MockEmbedder::failing_on_text("x")).unwrap();
+
+        assert_eq!(
+            result.embedded, 0,
+            "the poisoned single batch embeds nothing"
+        );
+        assert_eq!(
+            result.failed_count, 3,
+            "the whole 3-chunk batch is reported failed"
+        );
+        let err = result.first_error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("poison text"),
+            "the first batch error is carried up for the --json note, got: {err:?}"
+        );
         assert_eq!(
             pending_embed_count(&conn),
-            0,
-            "index with a loadable model must embed every pending chunk"
+            3,
+            "the failed batch stays pending for the next run"
         );
     }
 
-    // T-002 (FR-003): embedding is incremental — a second index re-embeds nothing.
-    // Given 1 already-embedded chunk and 1 new pending chunk, the first index
-    // embeds the new one; the second leaves the vec_chunks count unchanged (the
-    // NOT EXISTS gate skips both). Perspective: hazard (re-run idempotence) +
-    // boundary (the already-embedded vs pending split).
+    // T-002 (FR-003): embedding is incremental — a second run re-embeds nothing.
+    // Given 1 already-embedded chunk and 1 new pending chunk, the first
+    // embed_all_pending embeds exactly the pending one (vec 1→2); the second
+    // leaves the count unchanged (the NOT EXISTS gate skips both).
+    // Perspective: hazard (re-run idempotence) + boundary (the already-embedded
+    // vs pending split).
     #[test]
-    fn index_and_report_with_reembeds_nothing_on_second_run() {
-        let src = tempfile::TempDir::new().unwrap();
-        let (claude_dir, codex_dir) = absent_source_dirs(src.path());
-
+    fn embed_all_pending_reembeds_nothing_on_second_run() {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        // chunk 1 pre-embedded, chunk 2 pending.
+        for (id, content) in [(1, "already embedded"), (2, "new pending")] {
             conn.execute(
-                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-                [],
-            )
-            .unwrap();
-            // chunk 1 pre-embedded, chunk 2 pending.
-            for (id, content) in [(1, "already embedded"), (2, "new pending")] {
-                conn.execute(
-                    "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                     VALUES (?1, 's1', ?2, 0)",
-                    rusqlite::params![id, content],
-                )
-                .unwrap();
-            }
-            let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
-            conn.execute(
-                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-                [embedder::f32_as_bytes(&emb)],
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, 0)",
+                rusqlite::params![id, content],
             )
             .unwrap();
         }
+        let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+            [embedder::f32_as_bytes(&emb)],
+        )
+        .unwrap();
 
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let after_first = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            assert_eq!(
-                pending_embed_count(&conn),
-                0,
-                "first index must embed the one new pending chunk"
-            );
-            vec_chunk_count(&conn)
-        };
-
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let after_second = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
+        let first = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
         assert_eq!(
-            after_second, after_first,
-            "a second index must re-embed nothing (NOT EXISTS vec_chunks gate)"
+            first.embedded, 1,
+            "the first run embeds only the pending chunk"
+        );
+        assert_eq!(vec_chunk_count(&conn), 2, "vec gains exactly the new chunk");
+
+        let second = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        assert_eq!(second.embedded, 0, "the second run re-embeds nothing");
+        assert_eq!(
+            vec_chunk_count(&conn),
+            2,
+            "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
         );
     }
 
@@ -1990,6 +2075,195 @@ mod tests {
         assert!(
             note.contains("recall model download"),
             "the degraded note must name `recall model download` to guide the user, got: {note}"
+        );
+    }
+
+    // -- Phase 2 (D2, AC-4..7): index_command_output builds the --json envelope --
+    //
+    // index_command_output(&IndexOutcome) -> CommandOutput is the pure seam the Spec
+    // defines (FR-005): the dispatch maps run_index's IndexOutcome through it instead
+    // of no_payload(), so degradation reaches the --json envelope. Testing the pure
+    // function directly needs no DB, loader, or process env — every branch is driven
+    // by an IndexOutcome literal. The two degradations are exclusive (Spec排他):
+    // embed-stop has degraded_note=None + failed_count>0; model-absent has
+    // degraded_note=Some + failed_count=0.
+
+    /// An embed-stop outcome: the model loaded and embedded some chunks, but a batch
+    /// failed, so failed_count>0 and there is a first_error but no degraded_note.
+    fn embed_stop_outcome() -> IndexOutcome {
+        IndexOutcome {
+            degraded_note: None,
+            embedded: 5,
+            failed_count: 3,
+            first_error: Some("batch: mock failure".to_owned()),
+        }
+    }
+
+    /// A model-absent outcome: embedding was skipped, so failed_count=0 and the
+    /// degraded_note names `recall model download`.
+    fn model_absent_outcome() -> IndexOutcome {
+        IndexOutcome {
+            degraded_note: Some("note: run `recall model download` to enable.".to_owned()),
+            embedded: 0,
+            failed_count: 0,
+            first_error: None,
+        }
+    }
+
+    /// A fully successful outcome: the model loaded and every chunk embedded, so no
+    /// degraded_note, no failures, no error.
+    fn success_outcome() -> IndexOutcome {
+        IndexOutcome {
+            degraded_note: None,
+            embedded: 8,
+            failed_count: 0,
+            first_error: None,
+        }
+    }
+
+    // T-003 (FR-005, FR-006, FR-008): an embed-stop index surfaces degraded:true with
+    // a note naming the failure and the retry command, and carries both magnitudes
+    // in the payload. Given failed_count>0 + degraded_note=None,
+    // index_command_output sets degraded:true, notes[0] names the failed chunk
+    // count, the first batch error, and `recall index` (retry guidance), and the
+    // payload reports failed_count and embedded (what did land before the stop).
+    // Perspective: branch (the embed-stop arm) + error (a partial failure must be
+    // visible, not reported as success).
+    #[test]
+    fn index_command_output_surfaces_embed_stop_with_failed_count_and_retry() {
+        let out = index_command_output(&embed_stop_outcome());
+
+        assert!(
+            out.degraded,
+            "an embed-stop index is degraded: --json must not report it as a clean success"
+        );
+        assert!(
+            out.notes[0].contains("3 chunk"),
+            "the note must name how many chunks failed, got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.notes[0].contains("recall index"),
+            "the note must guide the agent to retry via `recall index`, got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.notes[0].contains("mock failure"),
+            "the note carries the first batch error, not the unknown-error fallback, got: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            out.data["failed_count"], 3,
+            "the payload carries the failure magnitude, not just a bool"
+        );
+        assert_eq!(
+            out.data["embedded"], 5,
+            "the payload reports how many chunks did embed despite the stop"
+        );
+    }
+
+    // T-004 (FR-007): a model-absent index surfaces degraded:true with the
+    // model-download note in --json (previously stderr-only). Given
+    // degraded_note=Some(model download) + failed_count=0, index_command_output sets
+    // degraded:true and a note naming `recall model download`.
+    // Perspective: branch (the model-absent arm, exclusive with embed-stop).
+    #[test]
+    fn index_command_output_surfaces_model_absent_download_note() {
+        let out = index_command_output(&model_absent_outcome());
+
+        assert!(
+            out.degraded,
+            "a model-absent index is degraded: embedding was skipped"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("recall model download")),
+            "the model-absent note must reach --json (not stderr only), got: {:?}",
+            out.notes
+        );
+    }
+
+    // T-005 (FR-006, FR-008, FR-009, FR-010): a fully successful index is not
+    // degraded and carries failed_count=0. Given embedded>0 + failed_count=0 +
+    // degraded_note=None, index_command_output sets degraded:false, notes:[], and
+    // data.failed_count==0.
+    // Perspective: branch (the success arm) + boundary (failed_count at its zero edge).
+    #[test]
+    fn index_command_output_clean_success_is_not_degraded() {
+        let out = index_command_output(&success_outcome());
+
+        assert!(!out.degraded, "a fully embedded index is not degraded");
+        assert!(
+            out.notes.is_empty(),
+            "a clean success carries no notes, got: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            out.data["failed_count"], 0,
+            "the payload reports zero failures on success"
+        );
+        assert_eq!(
+            out.data["embedded"], 8,
+            "the payload reports how many chunks were embedded on success"
+        );
+    }
+
+    // T-006 (FR-009): degraded co-varies with notes across every outcome —
+    // degraded:true ⟺ notes non-empty — replicating search_degraded_state's
+    // invariant so the bool and the text never disagree. Checked over all three
+    // outcomes (embed-stop, model-absent, success).
+    // Perspective: combination (the (degraded, notes_empty) decision table: the
+    // (true, empty) and (false, non-empty) rows are the contradictions this forbids).
+    #[test]
+    fn index_command_output_degraded_covaries_with_notes() {
+        for outcome in [
+            embed_stop_outcome(),
+            model_absent_outcome(),
+            success_outcome(),
+        ] {
+            let out = index_command_output(&outcome);
+            assert_eq!(
+                out.degraded,
+                !out.notes.is_empty(),
+                "degraded must equal notes-non-empty (degraded={}, notes={:?})",
+                out.degraded,
+                out.notes
+            );
+        }
+    }
+
+    // T-009 (FR-006): the embed-stop note sanitizes and bounds first_error — control
+    // chars are stripped (matching every other envelope-bound string) and the error
+    // is capped so a verbose MLX error cannot bloat the note. The retry guidance
+    // must survive the capping.
+    // Perspective: boundary (an error far over the cap) + hazard (ANSI escapes
+    // forwarded raw into an agent-parsed channel).
+    #[test]
+    fn index_command_output_sanitizes_and_bounds_first_error_in_note() {
+        let outcome = IndexOutcome {
+            degraded_note: None,
+            embedded: 0,
+            failed_count: 2,
+            first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
+        };
+
+        let out = index_command_output(&outcome);
+
+        assert!(
+            !out.notes[0].contains('\x1b'),
+            "control chars are stripped from the note, got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.notes[0].len() < 200,
+            "a verbose error is capped, got len {}",
+            out.notes[0].len()
+        );
+        assert!(
+            out.notes[0].contains("rerun `recall index`"),
+            "the retry guidance survives the capping, got: {:?}",
+            out.notes
         );
     }
 
