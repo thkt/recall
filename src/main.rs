@@ -402,31 +402,27 @@ where
     }
 }
 
-/// Embed every chunk absent from `vec_chunks`. Incremental by the `NOT EXISTS`
-/// gate inside `embed_recent_chunks`, so a re-index embeds only new chunks; a
-/// `rebuild` re-embeds all because its `force` DELETE cleared `vec_chunks` first.
+/// Embed every chunk absent from `vec_chunks`. Incremental by the one-pass
+/// pending gate (`embedder::pending_chunks`), so a re-index embeds only new
+/// chunks; a `rebuild` re-embeds all because its `force` DELETE cleared
+/// `vec_chunks` first. The pending list is collected once and fed straight to
+/// `embed_chunks` — a separate COUNT would re-scan vec_chunks (#138).
 fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<embedder::EmbedResult> {
-    let pending: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM qa_chunks c \
-         WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
-        [],
-        |r| r.get(0),
-    )?;
-    if pending == 0 {
+    let pending = embedder::pending_chunks(conn, usize::MAX)?;
+    if pending.is_empty() {
         return Ok(embedder::EmbedResult::default());
     }
-    let pending_usize = usize::try_from(pending).expect("chunk count fits in usize");
     let sp = Spinner::new("Embedding chunks...");
-    let result = embedder::embed_recent_chunks(
+    let result = embedder::embed_chunks(
         conn,
         embedder,
-        pending_usize,
+        &pending,
         Some(&|done, total| sp.set_message(&format!("Embedding chunks... {done}/{total}"))),
     )?;
     sp.finish(&format!("Embedded {} chunks", result.embedded));
     // A mid-run batch failure is non-fatal: chunks already embedded are committed,
     // the rest stay pending, and the FTS index is complete and queryable. The next
-    // `recall index` retries the remaining pending via the NOT EXISTS gate, so we
+    // `recall index` retries the remaining pending via the pending gate, so we
     // warn rather than fail. The stop is also surfaced in the index `--json`
     // envelope via `failed_count` (index_command_output).
     result.warn_if_batches_failed();
