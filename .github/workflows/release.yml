@@ -135,11 +135,22 @@ jobs:
             exit 1
           fi
 
+          # Locate the archive without assuming the extraction layout:
+          # upload-artifact v7 x download-artifact v8 changed it and broke the
+          # previous hard-coded artifacts/<name>/<name>.tar.gz path (v0.8.0,
+          # run 26935402876), while the release job's glob kept working.
+          ARCHIVE=$(find artifacts -name 'recall-aarch64-apple-darwin.tar.gz' -type f | head -1)
+          if [ -z "$ARCHIVE" ]; then
+            echo "::error::recall-aarch64-apple-darwin.tar.gz not found under artifacts/"
+            ls -R artifacts
+            exit 1
+          fi
+
           # Calculate checksum (Apple Silicon only; mlx backend requires Metal)
-          SHA_AARCH64_DARWIN=$(sha256sum artifacts/recall-aarch64-apple-darwin/recall-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          SHA_AARCH64_DARWIN=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
 
           # Verify macOS archive contains mlx.metallib
-          tar tzf artifacts/recall-aarch64-apple-darwin/recall-aarch64-apple-darwin.tar.gz | grep -q mlx.metallib \
+          tar tzf "$ARCHIVE" | grep -q mlx.metallib \
             || { echo "::error::mlx.metallib missing from macOS archive"; exit 1; }
 
           # Generate Formula inline (self-contained; no tap-side template dependency)
