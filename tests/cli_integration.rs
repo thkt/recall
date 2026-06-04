@@ -398,13 +398,15 @@ fn show_without_json_keeps_human_output() {
     );
 }
 
-// T-CLI018: a side-effect command (`index`) with `--json` emits the no_payload
-// envelope — data:null, degraded:false, empty notes — and exits 0. Pins the
-// machine contract for commands that produce no result payload (the only source
-// of `data:null` in the envelope). Progress spinners go to stderr, so stdout is
-// exactly the one envelope; parsed as JSON, not substring-matched.
+// T-CLI018 (#130 D2/FR-008): `index --json` emits a structured embed summary —
+// `data` carries `{ embedded, failed_count }` (no longer null) so an agent reads
+// how much embedding happened, and exits 0. An empty index embeds nothing and
+// fails nothing regardless of whether the model is present, so the counts are a
+// deterministic 0/0; the degraded flag and notes depend on model presence and are
+// covered deterministically by the `index_command_output` unit tests (T-003..006).
+// Progress spinners go to stderr, so stdout is exactly the one envelope.
 #[test]
-fn index_json_emits_null_data_envelope() {
+fn index_json_emits_structured_embed_summary() {
     let dir = TempDir::new().unwrap();
     let out = recall(dir.path())
         .args(["index", "--json"])
@@ -414,19 +416,15 @@ fn index_json_emits_null_data_envelope() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
-    assert!(
-        v["data"].is_null(),
-        "a side-effect command must emit data:null, got: {stdout}"
+    assert_eq!(
+        v["data"]["embedded"],
+        serde_json::json!(0),
+        "an empty index embeds nothing, got: {stdout}"
     );
     assert_eq!(
-        v["degraded"],
-        serde_json::json!(false),
-        "index is not a degraded path, got: {stdout}"
-    );
-    assert_eq!(
-        v["notes"],
-        serde_json::json!([]),
-        "index carries no notes, got: {stdout}"
+        v["data"]["failed_count"],
+        serde_json::json!(0),
+        "an empty index has no embed failures, got: {stdout}"
     );
 }
 
