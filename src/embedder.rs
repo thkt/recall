@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::result::Result as StdResult;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +9,6 @@ use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
 use rusqlite::Connection;
-use rusqlite::types::ToSql;
 use tracing::warn;
 
 #[derive(Default)]
@@ -40,7 +40,7 @@ pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
     bytemuck::cast_slice(v)
 }
 
-fn embed_chunks(
+pub(crate) fn embed_chunks(
     conn: &mut Connection,
     embedder: &dyn Embed,
     chunks: &[(i64, String)],
@@ -64,7 +64,7 @@ fn embed_chunks(
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
                 // Idempotent replay guard for stale concurrent work that reached
-                // this tx after the NOT EXISTS pending query. Batched into one
+                // this tx after the pending query. Batched into one
                 // IN-delete: vec0's +chunk_id is an unindexed auxiliary column, so
                 // each `DELETE WHERE chunk_id = ?` is a full O(N) scan (EXPLAIN
                 // reports "SCAN vec_chunks VIRTUAL TABLE") — per-chunk deletes were
@@ -96,7 +96,7 @@ fn embed_chunks(
                 // Skip the failed batch and keep going: a poison chunk fails its
                 // whole ≤128-batch (all-or-nothing) but must not block the rest of
                 // the backlog. The chunks stay pending (no tx committed here) for
-                // the next index to retry via the NOT EXISTS gate.
+                // the next index to retry via the pending gate.
                 failed_count += batch_idx.len();
                 if first_error.is_none() {
                     first_error = Some(format!("batch: {e}"));
@@ -112,45 +112,55 @@ fn embed_chunks(
     })
 }
 
-fn query_and_embed(
-    conn: &mut Connection,
-    embedder: &dyn Embed,
-    sql: &str,
-    params: &[&dyn ToSql],
-    on_progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<EmbedResult> {
-    let missing: Vec<(i64, String)> = {
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params, |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        rows.collect::<StdResult<Vec<_>, _>>()?
+/// Collect up to `budget` chunks that have no `vec_chunks` row, newest first.
+///
+/// One pass over each table (#138): the previous correlated `NOT EXISTS` form
+/// re-scanned vec_chunks per qa_chunks row — its `+chunk_id` is an unindexed
+/// auxiliary column (see the DELETE note in `embed_chunks`), so at 38k chunks
+/// that was O(N×M) ≈ 15-20 minutes of silence before the first batch.
+pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<(i64, String)>> {
+    if budget == 0 {
+        return Ok(Vec::new());
+    }
+
+    let embedded: HashSet<i64> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT chunk_id FROM vec_chunks")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<StdResult<_, _>>()?
     };
 
-    embed_chunks(conn, embedder, &missing, on_progress)
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.content FROM qa_chunks c \
+         ORDER BY c.timestamp DESC NULLS LAST",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        if embedded.contains(&id) {
+            // Skip without decoding content; sqlite materializes only the
+            // columns a row actually reads.
+            return Ok(None);
+        }
+        Ok(Some((id, row.get::<_, String>(1)?)))
+    })?;
+    let missing: Vec<(i64, String)> = rows
+        .filter_map(StdResult::transpose)
+        .take(budget)
+        .collect::<StdResult<_, _>>()?;
+    Ok(missing)
 }
 
+/// Test-only composition of the production pair (`pending_chunks` →
+/// `embed_chunks`); `embed_all_pending` (main.rs) calls the pair directly so
+/// the empty-pending case can skip the Spinner.
+#[cfg(test)]
 pub(crate) fn embed_recent_chunks(
     conn: &mut Connection,
     embedder: &dyn Embed,
     budget: usize,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
-    if budget == 0 {
-        return Ok(EmbedResult::default());
-    }
-
-    let budget_i64 = budget as i64;
-    query_and_embed(
-        conn,
-        embedder,
-        "SELECT c.id, c.content FROM qa_chunks c \
-         WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id) \
-         ORDER BY c.timestamp DESC NULLS LAST \
-         LIMIT ?",
-        &[&budget_i64 as &dyn ToSql],
-        on_progress,
-    )
+    let missing = pending_chunks(conn, budget)?;
+    embed_chunks(conn, embedder, &missing, on_progress)
 }
 
 /// Returns deterministic 768-dim vectors derived from text bytes.
@@ -550,5 +560,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(pending, 0, "no chunk is left behind after the retry");
+    }
+
+    // #138: budget truncation must keep the newest chunks. With 3 pending chunks
+    // at distinct timestamps and budget 1, the embedded row is the one with the
+    // newest timestamp (ORDER BY timestamp DESC NULLS LAST). Pins the selection
+    // order across the one-pass rewrite of the pending query.
+    // Perspective: boundary (budget < pending).
+    #[test]
+    fn test_embed_recent_chunks_budget_prefers_newest_chunk() {
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        for (id, ts) in [(1_i64, 100_i64), (2, 300), (3, 200)] {
+            conn.execute(
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+                 VALUES (?1, 's1', ?2, ?3)",
+                rusqlite::params![id, format!("content_{id}"), ts],
+            )
+            .unwrap();
+        }
+
+        let embedder = MockEmbedder::new();
+        let result = embed_recent_chunks(&mut conn, &embedder, 1, None).unwrap();
+
+        assert_eq!(result.embedded, 1, "budget 1 embeds exactly one chunk");
+        let embedded_id: i64 = conn
+            .query_row("SELECT chunk_id FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            embedded_id, 2,
+            "budget 1 must pick the chunk with the newest timestamp (ts=300)"
+        );
     }
 }
