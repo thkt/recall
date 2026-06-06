@@ -2078,6 +2078,93 @@ mod tests {
         );
     }
 
+    // D5 (#130): the index context was only tested with NotInstalled; pin the
+    // other loader-failure variants. BackendUnavailable and ProbeFailed share
+    // one equivalence class (amici's user_note renders both as "unavailable",
+    // re-downloading would not help), so both must carry that note and skip
+    // embedding. The `record_degraded` half of D5 is covered by the loader's
+    // own test (try_load_embedder_cached_records_degraded_non_install_failure);
+    // production wires that loader in via index_and_report.
+    #[test]
+    fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
+        for reason in [
+            DegradedReason::BackendUnavailable,
+            DegradedReason::ProbeFailed,
+        ] {
+            let src = tempfile::TempDir::new().unwrap();
+            let claude_dir = src.path().join("claude");
+            let (_, codex_dir) = absent_source_dirs(src.path());
+            seed_claude_source(&claude_dir);
+
+            let db_dir = tempfile::TempDir::new().unwrap();
+            let db_path = db_dir.path().join("recall.db");
+
+            let opts = indexer::IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            };
+            let outcome = index_and_report_with(&Some(db_path), &opts, || Err(reason))
+                .expect("a degraded index must succeed");
+
+            let note = outcome
+                .degraded_note
+                .unwrap_or_else(|| panic!("{reason:?} must carry a degraded note"));
+            assert!(
+                note.contains("unavailable"),
+                "{reason:?} must report unavailability (not a download hint), got: {note}"
+            );
+            assert!(
+                !note.to_lowercase().contains("download"),
+                "{reason:?} is not repaired by re-downloading, so the note must not \
+                 suggest it (that hint belongs to NotInstalled), got: {note}"
+            );
+            assert_eq!(outcome.embedded, 0, "{reason:?} skips embedding");
+            assert_eq!(outcome.failed_count, 0, "{reason:?} fails no batches");
+        }
+    }
+
+    // D6 (#130): Err(Disabled) yields the same IndexOutcome as a no-op success
+    // (degraded_note=None, all counters zero) — a caller-level opt-out is not a
+    // degradation, matching the search channel's contract (search_degraded_state
+    // returns (false, []) for Disabled). Production never constructs Disabled
+    // today (amici's loaders never return it and recall has no opt-out switch);
+    // this pin makes the collision explicit for whoever adds that switch.
+    #[test]
+    fn index_and_report_with_disabled_loader_is_indistinguishable_from_success() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome =
+            index_and_report_with(&Some(db_path), &opts, || Err(DegradedReason::Disabled))
+                .expect("a disabled-embedder index must succeed");
+
+        assert_eq!(
+            outcome.degraded_note, None,
+            "opt-out is not a degradation: no note is carried"
+        );
+        assert_eq!(outcome.embedded, 0, "a disabled embedder embeds nothing");
+        assert_eq!(
+            outcome.failed_count, 0,
+            "a disabled embedder fails no batches"
+        );
+        let envelope = index_command_output(&outcome);
+        assert!(
+            !envelope.degraded,
+            "the --json envelope reports a disabled embedder as non-degraded"
+        );
+    }
+
     // -- Phase 2 (D2, AC-4..7): index_command_output builds the --json envelope --
     //
     // index_command_output(&IndexOutcome) -> CommandOutput is the pure seam the Spec

@@ -12,7 +12,11 @@ const FTS_TOKENIZER: &str = "trigram";
 pub fn open_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
     let mut conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    // 30s, not 5s: the FTS index pass holds one write tx for 3-12s on a full
+    // tree (#130 D3, measured at 38k chunks), so concurrent SessionEnd hooks
+    // lost their run to SQLITE_BUSY at 5s. 30s absorbs the longest observed
+    // window; hooks run in the background, so the wait is invisible.
+    conn.busy_timeout(Duration::from_secs(30))?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     create_schema(&mut conn)?;

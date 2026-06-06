@@ -505,6 +505,8 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
     use crate::db::setup_test_db;
     use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks};
@@ -547,6 +549,131 @@ mod tests {
         .unwrap();
         assert_eq!(stats2.indexed, 0);
         assert_eq!(stats2.total_sessions, 1);
+    }
+
+    // TC-003 (#130): the production steady state is a hook re-indexing an
+    // already-indexed tree. Beyond `indexed == 0` (parse skip, pinned above),
+    // the DB content must be byte-stable: no duplicate chunks, no FTS growth,
+    // no re-created sessions.
+    #[test]
+    fn test_index_from_dirs_steady_state_keeps_db_stable() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("s.jsonl"),
+            concat!(
+                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"steady question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":"steady answer"},"timestamp":"2026-03-01T00:00:01Z"}"#,
+            ),
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+        let opts = IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+
+        index_from_dirs(&mut conn, &opts).unwrap();
+        index_chunks(&mut conn).unwrap();
+        let counts = |conn: &Connection| -> (i64, i64, i64, i64) {
+            let m = conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+                .unwrap();
+            let c = conn
+                .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+                .unwrap();
+            let s = conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            let v = conn
+                .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+                .unwrap();
+            (m, c, s, v)
+        };
+        let before = counts(&conn);
+
+        let stats = index_from_dirs(&mut conn, &opts).unwrap();
+        index_chunks(&mut conn).unwrap();
+
+        assert_eq!(stats.indexed, 0, "an unchanged tree re-parses nothing");
+        assert_eq!(
+            counts(&conn),
+            before,
+            "re-index of an unchanged tree must not grow or rewrite the DB"
+        );
+    }
+
+    // TC-004 (#130): mtime-forward re-index is the self-heal core — a session
+    // file appended after indexing (the tail of a live session) must be
+    // re-parsed, surface the new message, and replace its chunks without
+    // duplicating the session.
+    #[test]
+    fn test_index_from_dirs_reindexes_appended_file() {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        fs::create_dir_all(&claude_dir).unwrap();
+        let file = claude_dir.join("s.jsonl");
+        fs::write(
+            &file,
+            concat!(
+                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"first question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+        let opts = IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_from_dirs(&mut conn, &opts).unwrap();
+
+        // Append a turn and push mtime clearly past the 0.001s freshness epsilon.
+        let mut all = fs::read_to_string(&file).unwrap();
+        all.push_str(
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":"appended answer"},"timestamp":"2026-03-01T00:00:01Z"}"#,
+        );
+        fs::write(&file, all).unwrap();
+        let f = fs::OpenOptions::new().append(true).open(&file).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
+        drop(f);
+
+        let stats = index_from_dirs(&mut conn, &opts).unwrap();
+
+        assert_eq!(stats.indexed, 1, "the appended file must be re-parsed");
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            sessions, 1,
+            "re-index upserts the session, not duplicates it"
+        );
+        let appended: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE messages MATCH 'appended answer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(appended, 1, "the appended message must be searchable");
+        let original: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE messages MATCH 'first question'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            original, 1,
+            "re-parsing the appended file must keep the original message searchable"
+        );
     }
 
     fn index_one_claude_session(content: &str) -> Option<String> {
