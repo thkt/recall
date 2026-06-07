@@ -1,7 +1,6 @@
 .yomu/
 .claude/
 .playwright-cli/
-docs/
 target/
 workspace/
 
