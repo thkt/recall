@@ -615,8 +615,7 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
             timestamp: row.get(5)?,
         })
     })?;
-    let matches: Vec<parser::SessionData> =
-        collect_rows::<_, parser::SessionData, Vec<parser::SessionData>, Error>(rows)?;
+    let matches: Vec<parser::SessionData> = collect_rows::<_, _, _, Error>(rows)?;
 
     if matches.is_empty() {
         return Err(RecallError::Usage(format!("No session found matching '{session_id}'")).into());
@@ -635,8 +634,7 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
     let mut msg_stmt =
         conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
     let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let messages: Vec<(String, String)> =
-        collect_rows::<_, (String, String), Vec<(String, String)>, Error>(rows)?;
+    let messages: Vec<(String, String)> = collect_rows::<_, _, _, Error>(rows)?;
 
     // Writes to an in-memory Vec are infallible; the pipe is only touched later
     // by the single emit_success -> emit_success_to write path.
