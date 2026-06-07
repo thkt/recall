@@ -449,7 +449,14 @@ pub(crate) struct ChunkStats {
 
 /// Chunks every un-chunked session inside a single transaction. `on_progress`
 /// receives `(done_sessions, total_sessions)` after each session — session
-/// units, unlike `embed_chunks` whose callback counts chunks.
+/// units, unlike `embed_chunks` whose callback counts chunks. Progress counts
+/// staged work, not durable state: the callback fires before the final commit,
+/// whereas `embed_chunks` commits each batch before firing.
+///
+/// # Panics
+///
+/// Propagates a panic from `on_progress`; the unwind drops the open
+/// transaction and rusqlite rolls back every staged chunk.
 pub(crate) fn index_chunks(
     conn: &mut Connection,
     on_progress: Option<&dyn Fn(usize, usize)>,
@@ -1075,6 +1082,34 @@ mod tests {
         // s2 has no messages (0 chunks) yet still counts toward done/total.
         assert_eq!(calls.into_inner().unwrap(), vec![(1, 2), (2, 2)]);
         assert_eq!(stats.chunks_created, 1);
+    }
+
+    #[test]
+    fn test_index_chunks_progress_callback_silent_when_all_chunked() {
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f1', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
+            [],
+        )
+        .unwrap();
+        index_chunks(&mut conn, None).unwrap();
+
+        // Every session is chunked, so the empty early-return must not
+        // invoke the callback even when one is supplied.
+        let calls = Mutex::new(Vec::new());
+        let stats = index_chunks(
+            &mut conn,
+            Some(&|done, total| calls.lock().unwrap().push((done, total))),
+        )
+        .unwrap();
+
+        assert_eq!(stats.chunks_created, 0);
+        assert_eq!(calls.into_inner().unwrap(), Vec::<(usize, usize)>::new());
     }
 
     #[test]
