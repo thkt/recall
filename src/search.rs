@@ -307,7 +307,6 @@ fn score_and_sort(
     let mut results: Vec<(SearchResult, f64)> = candidates
         .into_iter()
         .map(|(rank, result)| {
-            let recency_boost = hybrid::recency_decay(now_ms, result.session.timestamp);
             // bm25 rank is negative (lower = better), so the (1 + w*boost)
             // multiplier amplifies magnitude and recent sessions sort earlier
             // (ascending). Intentionally asymmetric with the hybrid path
@@ -315,6 +314,11 @@ fn score_and_sort(
             // exactly 0.0 would nullify the blend but is unreachable with
             // trigram FTS (#119: needs a trigram in exactly N/2 of all rows;
             // verified absent on the live index).
+            debug_assert!(
+                rank < 0.0,
+                "FTS bm25 rank must be negative; rank={rank} would nullify the recency blend or invert ordering"
+            );
+            let recency_boost = hybrid::recency_decay(now_ms, result.session.timestamp);
             let blended_rank = rank * (1.0 + RECENCY_BOOST_WEIGHT * recency_boost);
             (result, blended_rank)
         })
@@ -1093,7 +1097,8 @@ mod tests {
     #[test]
     fn test_score_and_sort_prefers_recent_on_equal_rank() {
         let now_ms = 1_750_000_000_000_i64;
-        let old_ts = now_ms - 90 * 24 * 60 * 60 * 1000; // ~3 half-lives back
+        // exactly 3 half-lives back (3 x RECENCY_HALF_LIFE_DAYS), decay = 0.125
+        let old_ts = now_ms - 90 * MS_PER_DAY;
         let candidates = vec![
             (-1.0, make_result("old", old_ts)),
             (-1.0, make_result("recent", now_ms)),
@@ -1101,6 +1106,21 @@ mod tests {
         let results = score_and_sort(candidates, now_ms, 10);
         assert_eq!(results[0].session.session_id, "recent");
         assert_eq!(results[1].session.session_id, "old");
+    }
+
+    // T-119b: a None-timestamp candidate gets recency_decay = 0.0, so the
+    // blend is a no-op and it sorts after an equal-rank dated candidate.
+    // None timestamps are production-reachable (sessions whose JSONL has no
+    // parseable ISO timestamp line are stored with a NULL timestamp).
+    #[test]
+    fn test_score_and_sort_sorts_none_timestamp_last_on_equal_rank() {
+        let now_ms = 1_750_000_000_000_i64;
+        let mut no_ts = make_result("no-ts", now_ms);
+        no_ts.session.timestamp = None;
+        let candidates = vec![(-1.0, no_ts), (-1.0, make_result("dated", now_ms))];
+        let results = score_and_sort(candidates, now_ms, 10);
+        assert_eq!(results[0].session.session_id, "dated");
+        assert_eq!(results[1].session.session_id, "no-ts");
     }
 
     #[test]
