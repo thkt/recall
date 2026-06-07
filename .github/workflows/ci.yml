@@ -92,7 +92,7 @@ jobs:
           /tmp/pytest-venv/bin/pip install --quiet pytest
           /tmp/pytest-venv/bin/python -m pytest .github/scripts/test_filter_lcov_cfg_test.py -q
 
-      - name: Exclude inline Rust test code from coverage
+      - name: Strip cfg(test) blocks from lcov via filter script
         run: |
           python3 .github/scripts/filter_lcov_cfg_test.py \
             lcov.info \

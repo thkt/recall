@@ -186,6 +186,29 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
     (dir, conn)
 }
 
+/// Seeds the minimal valid session row used across test modules. Centralizes
+/// the 8-column positional INSERT so a schema change breaks one helper, not
+/// every fixture (#24 broke them all when session_type was added).
+#[cfg(test)]
+pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
+    conn.execute(
+        "INSERT INTO sessions VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+        [session_id],
+    )
+    .unwrap();
+}
+
+/// Seeds one qa_chunk for the default test session `s1` with timestamp 0.
+/// Sites that need another session or a real timestamp keep their inline INSERT.
+#[cfg(test)]
+pub(crate) fn seed_chunk(conn: &Connection, id: i64, content: &str) {
+    conn.execute(
+        "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, 's1', ?2, 0)",
+        rusqlite::params![id, content],
+    )
+    .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
