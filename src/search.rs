@@ -308,11 +308,14 @@ fn score_and_sort(
         .into_iter()
         .map(|(rank, result)| {
             let recency_boost = hybrid::recency_decay(now_ms, result.session.timestamp);
-            let blended_rank = if rank == 0.0 {
-                -recency_boost
-            } else {
-                rank * (1.0 + RECENCY_BOOST_WEIGHT * recency_boost)
-            };
+            // bm25 rank is negative (lower = better), so the (1 + w*boost)
+            // multiplier amplifies magnitude and recent sessions sort earlier
+            // (ascending). Intentionally asymmetric with the hybrid path
+            // (apply_recency_boost: positive RRF scores, descending). A rank of
+            // exactly 0.0 would nullify the blend but is unreachable with
+            // trigram FTS (#119: needs a trigram in exactly N/2 of all rows;
+            // verified absent on the live index).
+            let blended_rank = rank * (1.0 + RECENCY_BOOST_WEIGHT * recency_boost);
             (result, blended_rank)
         })
         .collect();
@@ -1083,6 +1086,21 @@ mod tests {
             .collect();
         let results = score_and_sort(candidates, now_ms, 3);
         assert_eq!(results.len(), 3);
+    }
+
+    // T-119: the recency blend amplifies negative bm25 ranks, so equal-rank
+    // candidates sort recent-first under the ascending sort.
+    #[test]
+    fn test_score_and_sort_prefers_recent_on_equal_rank() {
+        let now_ms = 1_750_000_000_000_i64;
+        let old_ts = now_ms - 90 * 24 * 60 * 60 * 1000; // ~3 half-lives back
+        let candidates = vec![
+            (-1.0, make_result("old", old_ts)),
+            (-1.0, make_result("recent", now_ms)),
+        ];
+        let results = score_and_sort(candidates, now_ms, 10);
+        assert_eq!(results[0].session.session_id, "recent");
+        assert_eq!(results[1].session.session_id, "old");
     }
 
     #[test]
