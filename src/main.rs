@@ -375,7 +375,10 @@ where
     sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
 
     let sp = Spinner::new("Creating chunks...");
-    let chunk_stats = indexer::index_chunks(&mut conn)?;
+    let on_progress = |done: usize, total: usize| {
+        sp.set_message(&format!("Creating chunks... {done}/{total} sessions"));
+    };
+    let chunk_stats = indexer::index_chunks(&mut conn, Some(&on_progress))?;
     if chunk_stats.chunks_created > 0 {
         sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {

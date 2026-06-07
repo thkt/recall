@@ -447,7 +447,20 @@ pub(crate) struct ChunkStats {
     pub chunks_created: usize,
 }
 
-pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
+/// Chunks every un-chunked session inside a single transaction. `on_progress`
+/// receives `(done_sessions, total_sessions)` after each session — session
+/// units, unlike `embed_chunks` whose callback counts chunks. Progress counts
+/// staged work, not durable state: the callback fires before the final commit,
+/// whereas `embed_chunks` commits each batch before firing.
+///
+/// # Panics
+///
+/// Propagates a panic from `on_progress`; the unwind drops the open
+/// transaction and rusqlite rolls back every staged chunk.
+pub(crate) fn index_chunks(
+    conn: &mut Connection,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<ChunkStats> {
     let sessions: Vec<(String, Option<i64>)> = {
         let mut stmt = conn.prepare(
             "SELECT s.session_id, s.timestamp FROM sessions s \
@@ -465,9 +478,10 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
 
     info!(count = sessions.len(), "Chunking sessions");
 
+    let total = sessions.len();
     let tx = conn.transaction()?;
     let mut chunks_created = 0;
-    for (session_id, timestamp) in &sessions {
+    for (done, (session_id, timestamp)) in sessions.iter().enumerate() {
         let messages = {
             let mut stmt = tx.prepare_cached(
                 "SELECT role, text FROM messages WHERE session_id = ? ORDER BY rowid",
@@ -496,6 +510,10 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
             )?;
             chunks_created += 1;
         }
+
+        if let Some(cb) = &on_progress {
+            cb(done + 1, total);
+        }
     }
 
     tx.commit()?;
@@ -505,6 +523,7 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
 
     use super::*;
@@ -578,7 +597,7 @@ mod tests {
         };
 
         index_from_dirs(&mut conn, &opts).unwrap();
-        index_chunks(&mut conn).unwrap();
+        index_chunks(&mut conn, None).unwrap();
         let counts = |conn: &Connection| -> (i64, i64, i64, i64) {
             let m = conn
                 .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
@@ -597,7 +616,7 @@ mod tests {
         let before = counts(&conn);
 
         let stats = index_from_dirs(&mut conn, &opts).unwrap();
-        index_chunks(&mut conn).unwrap();
+        index_chunks(&mut conn, None).unwrap();
 
         assert_eq!(stats.indexed, 0, "an unchanged tree re-parses nothing");
         assert_eq!(
@@ -789,7 +808,7 @@ mod tests {
         assert_eq!(stats.indexed, 1);
 
         // Populate qa_chunks + vec_chunks before force reindex
-        index_chunks(&mut conn).unwrap();
+        index_chunks(&mut conn, None).unwrap();
         let embedder = MockEmbedder::new();
         embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
         let qa_before: i64 = conn
@@ -852,7 +871,7 @@ mod tests {
         assert_eq!(stats.total_sessions, 2);
 
         // Create chunks + embeddings for session2 before deleting the file
-        index_chunks(&mut conn).unwrap();
+        index_chunks(&mut conn, None).unwrap();
         let embedder = MockEmbedder::new();
         embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
         let chunks_before: i64 = conn
@@ -1027,11 +1046,70 @@ mod tests {
         )
         .unwrap();
 
-        let stats1 = index_chunks(&mut conn).unwrap();
+        let stats1 = index_chunks(&mut conn, None).unwrap();
         assert_eq!(stats1.chunks_created, 1);
 
-        let stats2 = index_chunks(&mut conn).unwrap();
+        let stats2 = index_chunks(&mut conn, None).unwrap();
         assert_eq!(stats2.chunks_created, 0);
+    }
+
+    #[test]
+    fn test_index_chunks_progress_callback_counts_sessions() {
+        let (_dir, mut conn) = setup_test_db();
+        for (sid, file) in [("s1", "/f1"), ("s2", "/f2")] {
+            conn.execute(
+                "INSERT INTO sessions VALUES (?1, 'claude', ?2, '/p', 'slug', 0, 0.0, NULL)",
+                rusqlite::params![sid, file],
+            )
+            .unwrap();
+        }
+        for (role, text) in [("user", "hello"), ("assistant", "hi there")] {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES ('s1', ?1, ?2)",
+                rusqlite::params![role, text],
+            )
+            .unwrap();
+        }
+
+        let calls = Mutex::new(Vec::new());
+        let stats = index_chunks(
+            &mut conn,
+            Some(&|done, total| calls.lock().unwrap().push((done, total))),
+        )
+        .unwrap();
+
+        // Progress advances per session processed, not per chunk created:
+        // s2 has no messages (0 chunks) yet still counts toward done/total.
+        assert_eq!(calls.into_inner().unwrap(), vec![(1, 2), (2, 2)]);
+        assert_eq!(stats.chunks_created, 1);
+    }
+
+    #[test]
+    fn test_index_chunks_progress_callback_silent_when_all_chunked() {
+        let (_dir, mut conn) = setup_test_db();
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'claude', '/f1', '/p', 'slug', 0, 0.0, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
+            [],
+        )
+        .unwrap();
+        index_chunks(&mut conn, None).unwrap();
+
+        // Every session is chunked, so the empty early-return must not
+        // invoke the callback even when one is supplied.
+        let calls = Mutex::new(Vec::new());
+        let stats = index_chunks(
+            &mut conn,
+            Some(&|done, total| calls.lock().unwrap().push((done, total))),
+        )
+        .unwrap();
+
+        assert_eq!(stats.chunks_created, 0);
+        assert_eq!(calls.into_inner().unwrap(), Vec::<(usize, usize)>::new());
     }
 
     #[test]
@@ -1106,7 +1184,7 @@ mod tests {
             },
         )
         .unwrap();
-        index_chunks(&mut conn).unwrap();
+        index_chunks(&mut conn, None).unwrap();
 
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
@@ -1159,7 +1237,7 @@ mod tests {
             )
             .unwrap();
         }
-        index_chunks(&mut conn).unwrap();
+        index_chunks(&mut conn, None).unwrap();
 
         let chunk_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
