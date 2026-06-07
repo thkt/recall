@@ -1803,18 +1803,9 @@ mod tests {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
         let mut conn = open_or_create_db(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        db::seed_session(&conn, "s1");
         for i in 1..=3 {
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (?1, 's1', ?2, 0)",
-                rusqlite::params![i, format!("pending content {i}")],
-            )
-            .unwrap();
+            db::seed_chunk(&conn, i, &format!("pending content {i}"));
         }
 
         let result = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
@@ -1837,24 +1828,10 @@ mod tests {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
         let mut conn = open_or_create_db(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (1, 's1', 'x', 0)",
-            [],
-        )
-        .unwrap();
+        db::seed_session(&conn, "s1");
+        db::seed_chunk(&conn, 1, "x");
         for i in 2..=3 {
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (?1, 's1', ?2, 0)",
-                rusqlite::params![i, format!("pending content {i}")],
-            )
-            .unwrap();
+            db::seed_chunk(&conn, i, &format!("pending content {i}"));
         }
 
         let result =
@@ -1891,19 +1868,10 @@ mod tests {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
         let mut conn = open_or_create_db(&db_path).unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        db::seed_session(&conn, "s1");
         // chunk 1 pre-embedded, chunk 2 pending.
         for (id, content) in [(1, "already embedded"), (2, "new pending")] {
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (?1, 's1', ?2, 0)",
-                rusqlite::params![id, content],
-            )
-            .unwrap();
+            db::seed_chunk(&conn, id, content);
         }
         let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
         conn.execute(
@@ -2398,20 +2366,11 @@ mod tests {
             let conn = open_or_create_db(&db_path).unwrap();
             // A session is required so search_idle_message does not short-circuit
             // before run_search_with reaches the embedder branch under test.
-            conn.execute(
-                "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-                [],
-            )
-            .unwrap();
+            db::seed_session(&conn, "s1");
             // One pending chunk: the removed post-search embed warmed the most-recent
             // pending chunks regardless of which results matched, so a retained embed
             // call would push vec_chunks to 1. Asserting 0 proves the call is gone.
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (1, 's1', 'pending content', 0)",
-                [],
-            )
-            .unwrap();
+            db::seed_chunk(&conn, 1, "pending content");
         }
 
         run_search_with(

@@ -273,7 +273,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::db::setup_test_db;
+    use crate::db::{seed_chunk, seed_session, setup_test_db};
 
     #[test]
     fn test_embed_recent_chunks_budget_zero() {
@@ -287,18 +287,9 @@ mod tests {
     #[test]
     fn test_embed_chunks_progress_callback() {
         let (_dir, mut conn) = setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_session(&conn, "s1");
         for i in 0..3 {
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (?1, 's1', ?2, 0)",
-                rusqlite::params![i + 1, format!("content {i}")],
-            )
-            .unwrap();
+            seed_chunk(&conn, i + 1, &format!("content {i}"));
         }
 
         let embedder = MockEmbedder::new();
@@ -328,17 +319,8 @@ mod tests {
     #[test]
     fn test_embed_chunks_replaces_existing_vectors_for_stale_pending_work() {
         let (_dir, mut conn) = setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (1, 's1', 'content 0', 0)",
-            [],
-        )
-        .unwrap();
+        seed_session(&conn, "s1");
+        seed_chunk(&conn, 1, "content 0");
 
         let embedder = MockEmbedder::new();
         let chunks: Vec<(i64, String)> = vec![(1, "content 0".into())];
@@ -362,18 +344,9 @@ mod tests {
     /// a test controls each chunk's text (and thus its length-sort batch). Returns
     /// nothing; the rows live in `conn`.
     fn seed_chunks(conn: &Connection, count: usize, content: impl Fn(i64) -> String) {
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_session(conn, "s1");
         for id in 1..=count as i64 {
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (?1, 's1', ?2, 0)",
-                rusqlite::params![id, content(id)],
-            )
-            .unwrap();
+            seed_chunk(conn, id, &content(id));
         }
     }
 
@@ -397,12 +370,7 @@ mod tests {
         // Ascending length-sort puts "x" at index 0 → batch 1 (with 127 healthy);
         // the single remaining healthy chunk is batch 2.
         seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (129, 's1', 'x', 0)",
-            [],
-        )
-        .unwrap();
+        seed_chunk(&conn, 129, "x");
 
         let chunks: Vec<(i64, String)> = {
             let mut stmt = conn
@@ -444,12 +412,7 @@ mod tests {
     fn test_embed_chunks_failed_batch_leaves_chunks_pending() {
         let (_dir, mut conn) = setup_test_db();
         seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (129, 's1', 'x', 0)",
-            [],
-        )
-        .unwrap();
+        seed_chunk(&conn, 129, "x");
 
         let chunks: Vec<(i64, String)> = {
             let mut stmt = conn
@@ -528,12 +491,7 @@ mod tests {
     fn test_embed_recent_chunks_second_run_embeds_previously_failed_batch() {
         let (_dir, mut conn) = setup_test_db();
         seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (129, 's1', 'x', 0)",
-            [],
-        )
-        .unwrap();
+        seed_chunk(&conn, 129, "x");
 
         // Run 1: the poison strands batch 1 (its accounting is T-001/T-002's job).
         let poisoned = MockEmbedder::failing_on_text("x");
@@ -570,11 +528,7 @@ mod tests {
     #[test]
     fn test_embed_recent_chunks_budget_prefers_newest_chunk() {
         let (_dir, mut conn) = setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_session(&conn, "s1");
         for (id, ts) in [(1_i64, 100_i64), (2, 300), (3, 200)] {
             conn.execute(
                 "INSERT INTO qa_chunks (id, session_id, content, timestamp) \

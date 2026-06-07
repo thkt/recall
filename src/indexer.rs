@@ -527,7 +527,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use super::*;
-    use crate::db::setup_test_db;
+    use crate::db::{seed_session, setup_test_db};
     use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks};
     use tempfile::TempDir;
 
@@ -1056,13 +1056,8 @@ mod tests {
     #[test]
     fn test_index_chunks_progress_callback_counts_sessions() {
         let (_dir, mut conn) = setup_test_db();
-        for (sid, file) in [("s1", "/f1"), ("s2", "/f2")] {
-            conn.execute(
-                "INSERT INTO sessions VALUES (?1, 'claude', ?2, '/p', 'slug', 0, 0.0, NULL)",
-                rusqlite::params![sid, file],
-            )
-            .unwrap();
-        }
+        seed_session(&conn, "s1");
+        seed_session(&conn, "s2");
         for (role, text) in [("user", "hello"), ("assistant", "hi there")] {
             conn.execute(
                 "INSERT INTO messages (session_id, role, text) VALUES ('s1', ?1, ?2)",
@@ -1087,11 +1082,7 @@ mod tests {
     #[test]
     fn test_index_chunks_progress_callback_silent_when_all_chunked() {
         let (_dir, mut conn) = setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f1', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_session(&conn, "s1");
         conn.execute(
             "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
             [],
@@ -1219,11 +1210,7 @@ mod tests {
     fn test_embed_chunks_continues_past_failed_batch_and_counts_remainder() {
         let (_dir, mut conn) = setup_test_db();
 
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
+        seed_session(&conn, "s1");
         let message_count = EMBED_BATCH_SIZE + 10;
         for i in 0..message_count {
             conn.execute(
