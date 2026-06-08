@@ -11,16 +11,84 @@ diff coverage gate.
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 
+def _scan_line(line: str, state):
+    """Count code-context braces in one line, carrying string state across lines.
+
+    `state` is None in code context, "str" inside a normal "..." string, or an
+    int n inside a raw string with n hashes (carried across lines so multi-line
+    strings are handled). Braces inside string literals, char literals, and line
+    comments are ignored so a stray `{` in `write!("{{")` or `'{'` does not
+    corrupt the cfg(test) range scan. Block comments (`/* */`) are intentionally
+    unhandled: no recall source uses them inside `#[cfg(test)]` items. A brace in
+    one is counted as code, so an unbalanced `/* { */` over-extends a range
+    exactly as the pre-refactor raw counter did -- never worse, but not fixed.
+    Returns (delta, state).
+    """
+    delta = 0
+    i = 0
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if state == "str":
+            if c == "\\":
+                i += 2
+            elif c == '"':
+                state = None
+                i += 1
+            else:
+                i += 1
+            continue
+        if isinstance(state, int):  # raw string with `state` hashes
+            if c == '"' and line[i + 1 : i + 1 + state] == "#" * state:
+                i += 1 + state
+                state = None
+            else:
+                i += 1
+            continue
+        if c == '"':  # normal string opens
+            state = "str"
+            i += 1
+        elif c == "r" and i + 1 < n and line[i + 1] in '#"':  # raw string?
+            j = i + 1
+            while j < n and line[j] == "#":
+                j += 1
+            if j < n and line[j] == '"':
+                state = j - (i + 1)  # hash count (0 for r"...")
+                i = j + 1
+            else:
+                i += 1  # raw identifier r#ident, not a raw string
+        elif c == "'":
+            if i + 1 < n and line[i + 1] == "\\":  # escaped char '\n' '\u{7b}'
+                j = i + 3
+                while j < n and line[j] != "'":
+                    j += 1
+                i = j + 1
+            elif i + 2 < n and line[i + 2] == "'":  # simple char 'X' incl '{'
+                i += 3
+            else:  # lifetime 'a / 'static: treat ' as ordinary
+                i += 1
+        elif c == "/" and i + 1 < n and line[i + 1] == "/":  # line comment
+            break
+        elif c == "{":
+            delta += 1
+            i += 1
+        elif c == "}":
+            delta -= 1
+            i += 1
+        else:
+            i += 1
+    return delta, state
+
+
 def brace_delta(line: str) -> int:
-    # NOTE: counts raw `{`/`}` including those inside string literals, char
-    # literals, and comments. This miscounts lines like `write!(buf, "{{")`, but
-    # no current recall source triggers it (multi-line raw-string JSON braces in
-    # the tests are balanced and net to zero). A correct fix needs a Rust
-    # tokenizer; tracked as a followup. See test_filter_lcov_cfg_test.py xfails.
-    return line.count("{") - line.count("}")
+    # Single-line net brace count in code context (no carried state). Thin
+    # wrapper over the stateful core for callers that scan a line in isolation.
+    delta, _ = _scan_line(line, None)
+    return delta
 
 
 def cfg_test_ranges(path: Path) -> set[int]:
@@ -46,9 +114,11 @@ def cfg_test_ranges(path: Path) -> set[int]:
         balance = 0
         end_idx = item_idx
         saw_block = False
+        state = None
         while end_idx < len(lines):
-            balance += brace_delta(lines[end_idx])
-            if "{" in lines[end_idx]:
+            delta, state = _scan_line(lines[end_idx], state)
+            balance += delta
+            if balance > 0:
                 saw_block = True
             if saw_block and balance <= 0:
                 break
@@ -153,18 +223,71 @@ def render_record(record: list[str], ignored: set[int]) -> list[str]:
     return output
 
 
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _check_source_resolvable(source: Path, repo_root: Path) -> bool:
+    # Decide whether `source` should be scanned for cfg(test) ranges.
+    #   non-.rs          -> scan (cfg_test_ranges returns set() anyway).
+    #   .rs outside root -> skip WITHOUT reading. An external/registry dep cannot
+    #                       affect the gate (diff-cover scores only this repo's
+    #                       changed lines), and skipping avoids reading an
+    #                       out-of-tree path even when it exists (a traversed SF).
+    #   .rs under root,
+    #     missing        -> OPS-006: SF path resolution is broken and test code
+    #                       would leak into the gate. Fail loud.
+    if source.suffix != ".rs":
+        return True
+    if not _is_under(source, repo_root):
+        print(f"warning: skipping out-of-root source: {source}", file=sys.stderr)
+        return False
+    if not source.exists():
+        raise FileNotFoundError(
+            f"SF source under repo root does not exist: {source} (repo_root={repo_root}). "
+            "Path resolution is broken; test code would leak into the coverage gate."
+        )
+    return True
+
+
+def _validate_filtered(filtered: list[str], sf_count: int, input_path: Path) -> None:
+    # ENC-002: diff-cover treats an empty / record-less tracefile as 100%
+    # covered, so an over-aggressive filter that drops every record would
+    # silently disable the gate. Require at least one SF and one end_of_record
+    # per SF.
+    if sf_count == 0:
+        raise ValueError(
+            f"filtered lcov has no SF records; coverage input {input_path} "
+            "was empty or unparsable"
+        )
+    eor_count = filtered.count("end_of_record")
+    if eor_count != sf_count:
+        raise ValueError(
+            f"filtered lcov record mismatch for {input_path}: "
+            f"{sf_count} SF but {eor_count} end_of_record"
+        )
+
+
 def filter_lcov(input_path: Path, output_path: Path, repo_root: Path) -> None:
     filtered: list[str] = []
     record: list[str] = []
     ignored: set[int] = set()
+    sf_count = 0
 
     for line in input_path.read_text(encoding="utf-8").splitlines():
         if line.startswith("SF:"):
+            sf_count += 1
             record = [line]
             source = Path(line[3:])
             if not source.is_absolute():
                 source = repo_root / source
-            ignored = cfg_test_ranges(source)
+            if _check_source_resolvable(source, repo_root):
+                ignored = cfg_test_ranges(source)
+            else:
+                ignored = set()
             continue
 
         if line == "end_of_record":
@@ -178,6 +301,7 @@ def filter_lcov(input_path: Path, output_path: Path, repo_root: Path) -> None:
         else:
             filtered.append(line)
 
+    _validate_filtered(filtered, sf_count, input_path)
     output_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
 
 
