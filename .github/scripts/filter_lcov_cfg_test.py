@@ -132,20 +132,28 @@ def cfg_test_ranges(path: Path) -> set[int]:
     return ignored
 
 
-def parse_line_number(record: str) -> int | None:
+# The lcov record parsers below are tightly coupled to cargo llvm-cov's line
+# format (DA:<line>,<hit>  FN:<line>,<name>  FNDA:<count>,<name>). A parse failure
+# means that format contract is violated (tool upgrade, truncation, corruption),
+# so the filter's output can no longer be trusted. Fail loud rather than default
+# silently: a None/0 default would skew the gate in an unverifiable direction (a
+# dropped line number leaves test code in; a defaulted hit count marks a covered
+# line uncovered). This differs from ENC-002/OPS-006, which guard against
+# gate-weakening specifically; here the contract itself is the invariant.
+def parse_line_number(record: str) -> int:
     try:
         return int(record.split(":", 1)[1].split(",", 1)[0])
-    except (IndexError, ValueError):
-        return None
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"malformed lcov record: {record!r}") from e
 
 
-def parse_fn(record: str) -> tuple[int | None, str]:
+def parse_fn(record: str) -> tuple[int, str]:
     try:
         payload = record.split(":", 1)[1]
         line, name = payload.split(",", 1)
         return int(line), name
-    except (IndexError, ValueError):
-        return None, ""
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"malformed lcov FN record: {record!r}") from e
 
 
 def parse_fnda(record: str) -> tuple[int, str]:
@@ -153,8 +161,8 @@ def parse_fnda(record: str) -> tuple[int, str]:
         payload = record.split(":", 1)[1]
         count, name = payload.split(",", 1)
         return int(count), name
-    except (IndexError, ValueError):
-        return 0, ""
+    except (IndexError, ValueError) as e:
+        raise ValueError(f"malformed lcov FNDA record: {record!r}") from e
 
 
 def render_record(record: list[str], ignored: set[int]) -> list[str]:
@@ -174,8 +182,8 @@ def render_record(record: list[str], ignored: set[int]) -> list[str]:
             line_count += 1
             try:
                 hit_count = int(entry.split(",", 2)[1])
-            except (IndexError, ValueError):
-                hit_count = 0
+            except (IndexError, ValueError) as e:
+                raise ValueError(f"malformed lcov DA record: {entry!r}") from e
             if hit_count > 0:
                 line_hit += 1
             output.append(entry)
@@ -257,7 +265,10 @@ def _validate_filtered(filtered: list[str], sf_count: int, input_path: Path) -> 
     # ENC-002: diff-cover treats an empty / record-less tracefile as 100%
     # covered, so an over-aggressive filter that drops every record would
     # silently disable the gate. Require at least one SF and one end_of_record
-    # per SF.
+    # per SF. The mismatch branch is defense-in-depth: it backstops the invariant
+    # that the filtered output carries exactly one end_of_record per SF, catching
+    # any upstream record-accounting bug regardless of cause (the orphan check
+    # above already handles a truncated trailing record).
     if sf_count == 0:
         raise ValueError(
             f"filtered lcov has no SF records; coverage input {input_path} "
@@ -301,6 +312,10 @@ def filter_lcov(input_path: Path, output_path: Path, repo_root: Path) -> None:
         else:
             filtered.append(line)
 
+    if record:
+        raise ValueError(
+            f"truncated lcov: SF record not terminated by end_of_record in {input_path}"
+        )
     _validate_filtered(filtered, sf_count, input_path)
     output_path.write_text("\n".join(filtered) + "\n", encoding="utf-8")
 
