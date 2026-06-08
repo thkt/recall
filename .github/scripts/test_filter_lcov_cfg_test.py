@@ -219,14 +219,32 @@ def test_filter_lcov_skips_existing_out_of_root_source(tmp_path, capsys):
     assert "DA:1,1" in out.read_text(encoding="utf-8")
 
 
-def test_filter_lcov_raises_on_sf_eor_mismatch(tmp_path):
-    # ENC-002 mismatch branch: an SF record with no end_of_record (truncated
-    # input) yields sf_count=1 but eor_count=0; the guard must fire (distinct
-    # from the empty-input branch).
+def test_filter_lcov_raises_on_orphan_record(tmp_path):
+    # Item 2 (EOF-orphan): an SF record with no terminating end_of_record
+    # (truncated input) leaves a non-empty record after the loop. The explicit
+    # orphan check fires -- earlier and with a clearer message than _validate's
+    # SF/end_of_record mismatch guard (which now only backs render_record's
+    # one-end_of_record-per-SF invariant). The match pins the orphan branch.
     (tmp_path / "real.rs").write_text("pub fn f() -> i32 { 1 }\n", encoding="utf-8")
     lcov = tmp_path / "in.info"
     lcov.write_text("SF:real.rs\nDA:1,1\n", encoding="utf-8")  # no end_of_record
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="not terminated by end_of_record"):
+        filter_lcov(lcov, tmp_path / "out.info", tmp_path)
+
+
+def test_filter_lcov_raises_on_mid_stream_orphan(tmp_path):
+    # _validate defense-in-depth (reachable): a record lacking end_of_record
+    # before the next SF (mid-stream orphan, not a trailing truncation) is missed
+    # by the orphan check -- the new SF resets record -- but trips _validate's
+    # SF / end_of_record count mismatch (2 SF, 1 end_of_record). Pins the backstop
+    # branch as reachable, refuting a "dead code" reading.
+    (tmp_path / "a.rs").write_text("pub fn a() -> i32 { 1 }\n", encoding="utf-8")
+    (tmp_path / "b.rs").write_text("pub fn b() -> i32 { 1 }\n", encoding="utf-8")
+    lcov = tmp_path / "in.info"
+    lcov.write_text(
+        "SF:a.rs\nDA:1,1\nSF:b.rs\nDA:1,1\nend_of_record\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="record mismatch"):
         filter_lcov(lcov, tmp_path / "out.info", tmp_path)
 
 
@@ -241,3 +259,111 @@ def test_brace_delta_escaped_quote_char():
     # '\'' is an escaped-single-quote char literal; the scanner must skip it and
     # still count a real trailing brace.
     assert brace_delta(r"    let q = '\''; baz() {") == 1
+
+
+def _cfg_test_src_with_ignored_line5(tmp_path: Path) -> Path:
+    # A source whose cfg(test) block (lines 3-6) makes line 5 an ignored line,
+    # while line 1 is production. Shared by the render_record FN/BRDA tests.
+    src = tmp_path / "real.rs"
+    src.write_text(
+        "pub fn prod() -> i32 { 1 }\n"  # 1 production
+        "\n"  # 2
+        "#[cfg(test)]\n"  # 3
+        "mod tests {\n"  # 4
+        "    fn t() {}\n"  # 5 ignored
+        "}\n",  # 6
+        encoding="utf-8",
+    )
+    return src
+
+
+def test_render_record_drops_fn_and_fnda_for_ignored_function(tmp_path):
+    # render_record FN/FNDA path: a FN declared on an ignored (cfg(test)) line is
+    # dropped and its name recorded in skipped_functions, so the matching FNDA is
+    # also dropped. FNF/FNH reflect only the surviving production function.
+    _cfg_test_src_with_ignored_line5(tmp_path)
+    lcov = tmp_path / "in.info"
+    lcov.write_text(
+        "SF:real.rs\n"
+        "FN:1,prod\n"
+        "FN:5,t\n"  # line 5 ignored -> recorded in skipped_functions
+        "FNDA:3,prod\n"
+        "FNDA:0,t\n"  # name in skipped_functions -> dropped
+        "DA:1,3\n"
+        "DA:5,0\n"  # ignored line -> dropped
+        "end_of_record\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.info"
+    filter_lcov(lcov, out, tmp_path)
+    text = out.read_text(encoding="utf-8")
+    assert "FN:1,prod" in text and "FNDA:3,prod" in text
+    assert "FN:5,t" not in text  # ignored-line FN dropped
+    assert "FNDA:0,t" not in text  # FNDA for a skipped function dropped
+    assert "FNF:1" in text and "FNH:1" in text  # one production fn, hit
+    assert "DA:5,0" not in text  # ignored DA dropped
+
+
+def test_render_record_branch_coverage_taken_and_ignored(tmp_path):
+    # render_record BRDA path: taken "-"/"0" is not a hit, any other value is; a
+    # BRDA on an ignored line is dropped. BRF/BRH count only surviving branches.
+    _cfg_test_src_with_ignored_line5(tmp_path)
+    lcov = tmp_path / "in.info"
+    lcov.write_text(
+        "SF:real.rs\n"
+        "DA:1,3\n"
+        "BRDA:1,0,0,3\n"  # taken 3 -> hit
+        "BRDA:1,0,1,0\n"  # taken 0 -> not hit
+        "BRDA:1,0,2,-\n"  # taken - -> not hit
+        "BRDA:5,0,0,1\n"  # line 5 ignored -> dropped
+        "end_of_record\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "out.info"
+    filter_lcov(lcov, out, tmp_path)
+    text = out.read_text(encoding="utf-8")
+    assert "BRDA:1,0,0,3" in text and "BRDA:1,0,1,0" in text and "BRDA:1,0,2,-" in text
+    assert "BRDA:5,0,0,1" not in text  # ignored-line branch dropped
+    assert "BRF:3" in text  # three surviving branches on line 1
+    assert "BRH:1" in text  # only the taken=3 branch is a hit
+
+
+def test_filter_lcov_raises_on_malformed_da_line_number(tmp_path):
+    # Item 1 (format-contract): a DA record whose line field is non-numeric means
+    # the cargo llvm-cov format assumption is violated; fail loud instead of
+    # silently passing the record through with a None line number.
+    (tmp_path / "real.rs").write_text("pub fn f() -> i32 { 1 }\n", encoding="utf-8")
+    lcov = tmp_path / "in.info"
+    lcov.write_text("SF:real.rs\nDA:abc,1\nend_of_record\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed lcov record"):
+        filter_lcov(lcov, tmp_path / "out.info", tmp_path)
+
+
+def test_filter_lcov_raises_on_malformed_fn_line_number(tmp_path):
+    # Item 1: a FN record with a non-numeric line field is a format violation.
+    (tmp_path / "real.rs").write_text("pub fn f() -> i32 { 1 }\n", encoding="utf-8")
+    lcov = tmp_path / "in.info"
+    lcov.write_text("SF:real.rs\nFN:xyz,f\nDA:1,1\nend_of_record\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed lcov FN record"):
+        filter_lcov(lcov, tmp_path / "out.info", tmp_path)
+
+
+def test_filter_lcov_raises_on_malformed_fnda_count(tmp_path):
+    # Item 1: a FNDA record with a non-numeric hit count is a format violation.
+    (tmp_path / "real.rs").write_text("pub fn f() -> i32 { 1 }\n", encoding="utf-8")
+    lcov = tmp_path / "in.info"
+    lcov.write_text(
+        "SF:real.rs\nFN:1,f\nFNDA:foo,f\nDA:1,1\nend_of_record\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="malformed lcov FNDA record"):
+        filter_lcov(lcov, tmp_path / "out.info", tmp_path)
+
+
+def test_filter_lcov_raises_on_malformed_da_hit_count(tmp_path):
+    # Item 1: a DA record with a non-numeric hit count (second field) is a format
+    # violation; render_record must fail loud rather than default the count to 0.
+    (tmp_path / "real.rs").write_text("pub fn f() -> i32 { 1 }\n", encoding="utf-8")
+    lcov = tmp_path / "in.info"
+    lcov.write_text("SF:real.rs\nDA:1,bar\nend_of_record\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed lcov DA record"):
+        filter_lcov(lcov, tmp_path / "out.info", tmp_path)
