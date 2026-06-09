@@ -684,6 +684,9 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
 
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
+    let model_ok = cached_artifacts(ModelId::DEFAULT)
+        .map(|opt| opt.is_some())
+        .unwrap_or(false);
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
         cli_info("run `recall index` to create the index.");
@@ -693,7 +696,7 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
                 "sessions": 0,
                 "qa_chunks": 0,
                 "embedded": 0,
-                "model_ready": false,
+                "model_ready": model_ok,
             }),
         ));
     }
@@ -703,10 +706,6 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
     let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
     let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?;
-
-    let model_ok = cached_artifacts(ModelId::DEFAULT)
-        .map(|opt| opt.is_some())
-        .unwrap_or(false);
 
     // Writes to an in-memory Vec are infallible, so the io::Result is discarded.
     let mut buf = Vec::new();

@@ -456,8 +456,9 @@ fn rebuild_json_emits_structured_embed_summary() {
 }
 
 // T-CLI019: `status --json` against a never-created index reports zero counters
-// with model_ready:false as a success envelope, exit 0 — the no-database branch
-// of run_status. Pairs with T-CLI013, which runs `index` first (the live path).
+// with model_ready reflecting cached artifact state (false in test environment
+// since no artifacts exist) — the no-database branch of run_status.
+// Pairs with T-CLI013, which runs `index` first (the live path).
 #[test]
 fn status_json_without_index_reports_zero_counts() {
     let dir = TempDir::new().unwrap();
