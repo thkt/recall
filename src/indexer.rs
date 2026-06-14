@@ -16,7 +16,13 @@ use crate::parser::{
     Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session,
 };
 
-type SessionEntry = (String, Option<f64>);
+struct SessionEntry {
+    session_id: String,
+    /// `None` when the stored source string is unrecognized — such a row is
+    /// preserved by orphan cleanup since its origin root can't be confirmed scanned.
+    source: Option<Source>,
+    mtime: Option<f64>,
+}
 
 pub struct IndexStats {
     pub indexed: usize,
@@ -24,6 +30,17 @@ pub struct IndexStats {
     pub first_error: Option<String>,
     pub total_sessions: usize,
     pub elapsed_secs: f64,
+    /// Sources whose root was not scanned this run yet still hold sessions in
+    /// the DB. Those sessions were preserved (not cleaned) because the missing
+    /// root can't prove their files were deleted (#165). Surfaced so a silent
+    /// preservation — a root outage masking real deletions — stays visible.
+    pub skipped_roots: Vec<SkippedRoot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedRoot {
+    pub source: Source,
+    pub preserved_sessions: usize,
 }
 
 impl IndexStats {
@@ -102,16 +119,18 @@ fn upsert_session(
 ) -> Result<()> {
     let cached = ctx.existing.get(fpath_str);
 
-    if let Some((old_sid, _)) = cached {
-        ctx.tx
-            .execute("DELETE FROM sessions WHERE session_id = ?", [old_sid])?;
-        delete_session_dependents(ctx.tx, old_sid)?;
+    if let Some(entry) = cached {
+        ctx.tx.execute(
+            "DELETE FROM sessions WHERE session_id = ?",
+            [&entry.session_id],
+        )?;
+        delete_session_dependents(ctx.tx, &entry.session_id)?;
     }
 
     // New session_id differs from cached — clean up any orphaned messages under the new ID
     // (e.g. left over from a renamed file that previously used it).
     let same_session_id =
-        matches!(cached, Some((old_sid, _)) if *old_sid == parsed.metadata.session_id);
+        matches!(cached, Some(entry) if entry.session_id == parsed.metadata.session_id);
     if !same_session_id {
         ctx.tx.execute(
             "DELETE FROM messages WHERE session_id = ?",
@@ -185,8 +204,9 @@ fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f
 
     // Epsilon 0.001s tolerates filesystem mtime rounding (HFS+ 1s, ext4 nano→f64).
     if let Some(new_mt) = mtime
-        && let Some((_, Some(old_mt))) = ctx.existing.get(&fpath_str)
-        && (*old_mt - new_mt).abs() < 0.001
+        && let Some(entry) = ctx.existing.get(&fpath_str)
+        && let Some(old_mt) = entry.mtime
+        && (old_mt - new_mt).abs() < 0.001
     {
         return None;
     }
@@ -250,15 +270,21 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
     resolve_codex_dir_with(home, |key| env::var_os(key))
 }
 
-fn collect_sources(opts: &IndexOptions) -> Vec<(PathBuf, Source)> {
+/// Returns the discovered files and the set of sources whose root was
+/// successfully enumerated this run. A missing or unreadable root is absent
+/// from the set so orphan cleanup never treats its sessions as deleted (#165).
+fn collect_sources(opts: &IndexOptions) -> (Vec<(PathBuf, Source)>, HashSet<Source>) {
     let mut sources = Vec::new();
-    if opts.claude_dir.is_dir() {
-        collect_jsonl_files(opts.claude_dir, &mut sources, Source::Claude);
+    let mut scanned = HashSet::new();
+    if opts.claude_dir.is_dir()
+        && collect_jsonl_files(opts.claude_dir, &mut sources, Source::Claude)
+    {
+        scanned.insert(Source::Claude);
     }
-    if opts.codex_dir.is_dir() {
-        collect_jsonl_files(opts.codex_dir, &mut sources, Source::Codex);
+    if opts.codex_dir.is_dir() && collect_jsonl_files(opts.codex_dir, &mut sources, Source::Codex) {
+        scanned.insert(Source::Codex);
     }
-    sources
+    (sources, scanned)
 }
 
 fn index_all(
@@ -307,7 +333,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     } else {
         load_existing_sessions(conn)?
     };
-    let sources = collect_sources(opts);
+    let (sources, scanned) = collect_sources(opts);
 
     info!(count = sources.len(), "Found source files");
 
@@ -328,7 +354,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         existing: &existing,
     };
     let (indexed, parse_errors, first_error) = index_all(&ctx, &sources)?;
-    cleanup_orphans(&tx, &existing, &sources, indexed)?;
+    cleanup_orphans(&tx, &existing, &sources, &scanned, indexed)?;
     tx.commit().context("Failed to commit transaction")?;
 
     finalize_fts(conn, indexed, opts.force)?;
@@ -344,22 +370,63 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         first_error,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
+        skipped_roots: summarize_skipped_roots(&existing, &sources, &scanned),
     })
 }
 
+/// Counts, per source whose root was not scanned this run, how many existing
+/// sessions were preserved from orphan cleanup. Only rows whose file is absent
+/// from `sources` are counted — mirroring the deletion condition in
+/// `cleanup_orphans` — so a partially-failed scan that re-indexed some files of
+/// the source does not over-report the at-risk magnitude. Sources with zero
+/// preserved rows are omitted so a user who simply never used one tool sees no
+/// noise. `None`-source rows are excluded by construction (they match neither
+/// variant), consistent with cleanup_orphans preserving them unconditionally.
+fn summarize_skipped_roots(
+    existing: &HashMap<String, SessionEntry>,
+    sources: &[(PathBuf, Source)],
+    scanned: &HashSet<Source>,
+) -> Vec<SkippedRoot> {
+    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
+    [Source::Claude, Source::Codex]
+        .into_iter()
+        .filter(|s| !scanned.contains(s))
+        .filter_map(|source| {
+            let preserved_sessions = existing
+                .iter()
+                .filter(|(fp, e)| {
+                    e.source == Some(source) && !source_paths.contains(Path::new(fp.as_str()))
+                })
+                .count();
+            (preserved_sessions > 0).then_some(SkippedRoot {
+                source,
+                preserved_sessions,
+            })
+        })
+        .collect()
+}
+
 fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEntry>> {
-    let mut stmt = conn.prepare("SELECT file_path, session_id, mtime FROM sessions")?;
+    let mut stmt = conn.prepare("SELECT file_path, session_id, source, mtime FROM sessions")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, Option<f64>>(2)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<f64>>(3)?,
         ))
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (fp, sid, mt) = row?;
-        map.insert(fp, (sid, mt));
+        let (fp, sid, src, mt) = row?;
+        map.insert(
+            fp,
+            SessionEntry {
+                session_id: sid,
+                source: Source::from_db(&src),
+                mtime: mt,
+            },
+        );
     }
     Ok(map)
 }
@@ -368,20 +435,29 @@ fn cleanup_orphans(
     tx: &Transaction,
     existing: &HashMap<String, SessionEntry>,
     sources: &[(PathBuf, Source)],
+    scanned: &HashSet<Source>,
     indexed: usize,
 ) -> Result<()> {
     if existing.is_empty() || (indexed == 0 && sources.len() == existing.len()) {
         return Ok(());
     }
     let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
-    for (fp, (sid, _)) in existing {
+    for (fp, entry) in existing {
+        // Only a successfully scanned root proves its files were deleted. A row
+        // whose source root was missing or unreadable this run is preserved, not
+        // treated as orphaned — otherwise a transient root outage wipes the index
+        // (#165). A `None` source (unrecognized DB value) is likewise preserved.
+        let scanned_here = entry.source.is_some_and(|s| scanned.contains(&s));
+        if !scanned_here {
+            continue;
+        }
         if !source_paths.contains(Path::new(fp.as_str())) {
             let deleted = tx.execute(
                 "DELETE FROM sessions WHERE session_id = ? AND file_path = ?",
-                rusqlite::params![sid, fp],
+                rusqlite::params![entry.session_id, fp],
             )?;
             if deleted > 0 {
-                delete_session_dependents(tx, sid)?;
+                delete_session_dependents(tx, &entry.session_id)?;
             }
         }
     }
@@ -390,8 +466,13 @@ fn cleanup_orphans(
 
 const MAX_DIR_DEPTH: usize = 10;
 
-fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source) {
-    collect_jsonl_files_inner(dir, out, source, 0);
+/// Returns whether the whole tree was successfully enumerated. `collect_sources`
+/// uses this to decide if the root counts as scanned: only a fully-read tree
+/// proves which files are absent, so orphan cleanup may delete its missing rows.
+/// Any failure — the root itself, a nested subdirectory, or a depth-limit
+/// truncation — yields `false`, preserving the source's rows this run (#165).
+fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source) -> bool {
+    collect_jsonl_files_inner(dir, out, source, 0)
 }
 
 fn collect_jsonl_files_inner(
@@ -399,22 +480,25 @@ fn collect_jsonl_files_inner(
     out: &mut Vec<(PathBuf, Source)>,
     source: Source,
     depth: usize,
-) {
+) -> bool {
     if depth >= MAX_DIR_DEPTH {
         debug!(
             max_depth = MAX_DIR_DEPTH,
             path = %dir.display(),
             "depth limit reached"
         );
-        return;
+        // Truncation means files below this depth went unseen, so the tree is
+        // not fully enumerated — report incomplete to keep cleanup off this source.
+        return false;
     }
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             warn!(path = %dir.display(), error = %e, "cannot read dir");
-            return;
+            return false;
         }
     };
+    let mut fully_read = true;
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -436,11 +520,12 @@ fn collect_jsonl_files_inner(
         }
         let path = entry.path();
         if ft.is_dir() {
-            collect_jsonl_files_inner(&path, out, source, depth + 1);
+            fully_read &= collect_jsonl_files_inner(&path, out, source, depth + 1);
         } else if path.extension().is_some_and(|ext| ext == "jsonl") {
             out.push((path, source));
         }
     }
+    fully_read
 }
 
 pub(crate) struct ChunkStats {
@@ -923,6 +1008,342 @@ mod tests {
         assert!(
             vecs_for_session1 < vecs_before,
             "orphan cleanup should remove session2 vec_chunks: before={vecs_before}, after={vecs_for_session1}"
+        );
+    }
+
+    // Seeds one claude session and one codex session into a populated DB and
+    // returns (tmp, claude_dir, codex_dir). Used by the #165 regression tests.
+    fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("c.jsonl"),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"claude turn"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex_sessions");
+        let day_dir = codex_dir.join("2026/04/27");
+        fs::create_dir_all(&day_dir).unwrap();
+        fs::write(
+            day_dir.join("s1.jsonl"),
+            "{\"timestamp\":\"2026-04-27T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-s1\",\"cwd\":\"/proj\"}}\n{\"timestamp\":\"2026-04-27T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex turn\"}]}}",
+        )
+        .unwrap();
+        let stats = index_from_dirs(
+            conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.total_sessions, 2, "seed should index both sessions");
+        (tmp, claude_dir, codex_dir)
+    }
+
+    // #165: a refresh where every source root is missing must not be read as
+    // proof that all indexed files were deleted. The existing rows survive.
+    #[test]
+    fn test_missing_source_roots_preserve_existing_index() {
+        let (_dir, mut conn) = setup_test_db();
+        let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+
+        let gone_claude = tmp.path().join("missing_claude");
+        let gone_codex = tmp.path().join("missing_codex");
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &gone_claude,
+                codex_dir: &gone_codex,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.total_sessions, 2,
+            "missing source roots must not delete existing sessions"
+        );
+        assert_eq!(
+            stats.skipped_roots.len(),
+            2,
+            "both unscanned roots with preserved sessions must be reported"
+        );
+    }
+
+    // #165: with one root scanned and the other missing, cleanup is selective —
+    // a file deleted under the scanned root is removed, while the missing root's
+    // session is preserved (its absence is unproven).
+    #[test]
+    fn test_partial_missing_root_preserves_unscanned_source_only() {
+        let (_dir, mut conn) = setup_test_db();
+        let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+
+        // Legitimately delete the claude file; point codex at a missing root.
+        fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+        let gone_codex = tmp.path().join("missing_codex");
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &gone_codex,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.total_sessions, 1,
+            "the deleted claude file is cleaned, the unscanned codex session is kept"
+        );
+        let surviving_source: String = conn
+            .query_row("SELECT source FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            surviving_source, "codex",
+            "the surviving session must be the one whose root was not scanned"
+        );
+    }
+
+    // #165 high-severity variant: a root that exists but cannot be read
+    // (e.g. permission denied) yields zero sources without proving deletion.
+    // `is_dir()` is true, so the fix must gate cleanup on read success.
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_source_root_preserves_index() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, mut conn) = setup_test_db();
+        let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+        // Strip all permissions so read_dir fails while is_dir() still succeeds.
+        let locked = fs::metadata(&claude_dir).unwrap().permissions();
+        let mut zero = locked.clone();
+        zero.set_mode(0o000);
+        fs::set_permissions(&claude_dir, zero).unwrap();
+
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        );
+
+        // Restore permissions before asserting so TempDir cleanup always works.
+        fs::set_permissions(&claude_dir, locked).unwrap();
+        let stats = stats.unwrap();
+
+        assert_eq!(
+            stats.total_sessions, 2,
+            "an unreadable root must preserve its sessions, not wipe them"
+        );
+    }
+
+    // #165 (CHX-1): a root whose top level reads fine but holds an unreadable
+    // nested subdirectory is only partially enumerated. Files under the locked
+    // subtree appear absent, so the source must be preserved, not deleted.
+    #[cfg(unix)]
+    #[test]
+    fn test_unreadable_child_subdir_preserves_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, mut conn) = setup_test_db();
+        let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+        // Lock the codex year subdir: read_dir(codex_dir) lists it, but
+        // descending into it fails, so codex's tree is not fully enumerated.
+        let locked_subdir = codex_dir.join("2026");
+        let orig = fs::metadata(&locked_subdir).unwrap().permissions();
+        let mut zero = orig.clone();
+        zero.set_mode(0o000);
+        fs::set_permissions(&locked_subdir, zero).unwrap();
+
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        );
+
+        fs::set_permissions(&locked_subdir, orig).unwrap();
+        let stats = stats.unwrap();
+
+        assert_eq!(
+            stats.total_sessions, 2,
+            "an unreadable nested subdir must preserve the whole source's rows"
+        );
+    }
+
+    // #165 negative control: with both roots present and readable, deleting a
+    // file under a scanned root still removes its session AND cascades to its
+    // messages and qa_chunks — the fix narrows cleanup, it does not disable it.
+    #[test]
+    fn test_deleted_file_under_scanned_root_cascades_cleanup() {
+        let (_dir, mut conn) = setup_test_db();
+        let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+        let claude_sid: String = conn
+            .query_row(
+                "SELECT session_id FROM sessions WHERE source = 'claude'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let msgs_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                [&claude_sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            msgs_before > 0,
+            "seed should leave messages for the session"
+        );
+
+        // Delete the claude file; both roots stay present and readable.
+        fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.total_sessions, 1,
+            "the deleted file's session must be cleaned when its root was scanned"
+        );
+        let surviving_source: String = conn
+            .query_row("SELECT source FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(surviving_source, "codex", "only the codex session survives");
+
+        let msgs_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+                [&claude_sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            msgs_after, 0,
+            "cleanup must cascade to the session's messages"
+        );
+        let chunks_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM qa_chunks WHERE session_id = ?",
+                [&claude_sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            chunks_after, 0,
+            "cleanup must cascade to the session's qa_chunks"
+        );
+        assert!(
+            stats.skipped_roots.is_empty(),
+            "no root was skipped, so nothing should be reported as preserved"
+        );
+    }
+
+    // #165 follow-up: a skipped root that preserved sessions is reported so the
+    // silent preservation stays visible to the operator.
+    #[test]
+    fn test_skipped_root_reports_preserved_count() {
+        let (_dir, mut conn) = setup_test_db();
+        let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+
+        let gone_codex = tmp.path().join("missing_codex");
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &gone_codex,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.skipped_roots.len(),
+            1,
+            "only the missing codex root should be reported"
+        );
+        let reported = &stats.skipped_roots[0];
+        assert_eq!(reported.source, Source::Codex);
+        assert_eq!(
+            reported.preserved_sessions, 1,
+            "the one preserved codex session must be counted"
+        );
+    }
+
+    // #165 CHX-1 regression: when an unscanned source holds BOTH a re-indexed
+    // present file and a preserved absent file, only the absent row is at risk.
+    // Counting every row of the source would over-report the preserved magnitude.
+    #[cfg(unix)]
+    #[test]
+    fn test_skipped_root_counts_only_file_absent_rows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, mut conn) = setup_test_db();
+        let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+        // Add a second codex session at the root level (outside 2026), so it
+        // stays readable — hence re-indexed and present — when 2026 is locked.
+        fs::write(
+            codex_dir.join("top.jsonl"),
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-top\",\"cwd\":\"/proj\"}}\n{\"timestamp\":\"2026-05-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex top turn\"}]}}",
+        )
+        .unwrap();
+        index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+
+        // Lock the year subdir: top.jsonl is re-read (present in sources),
+        // s1.jsonl is not (preserved). The codex tree is not fully enumerated,
+        // so codex is unscanned and reported.
+        let locked_subdir = codex_dir.join("2026");
+        let orig = fs::metadata(&locked_subdir).unwrap().permissions();
+        let mut zero = orig.clone();
+        zero.set_mode(0o000);
+        fs::set_permissions(&locked_subdir, zero).unwrap();
+
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        );
+
+        fs::set_permissions(&locked_subdir, orig).unwrap();
+        let stats = stats.unwrap();
+
+        let codex = stats
+            .skipped_roots
+            .iter()
+            .find(|s| s.source == Source::Codex)
+            .expect("codex tree was not fully scanned, so it must be reported");
+        assert_eq!(
+            codex.preserved_sessions, 1,
+            "only the file-absent s1 row is at risk; the re-indexed top row must not inflate the count"
         );
     }
 
