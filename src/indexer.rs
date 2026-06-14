@@ -30,6 +30,16 @@ pub struct IndexStats {
     pub first_error: Option<String>,
     pub total_sessions: usize,
     pub elapsed_secs: f64,
+    /// Sources whose root was not scanned this run yet still hold sessions in
+    /// the DB. Those sessions were preserved (not cleaned) because the missing
+    /// root can't prove their files were deleted (#165). Surfaced so a silent
+    /// preservation — a root outage masking real deletions — stays visible.
+    pub skipped_roots: Vec<SkippedRoot>,
+}
+
+pub struct SkippedRoot {
+    pub source: Source,
+    pub preserved_sessions: usize,
 }
 
 impl IndexStats {
@@ -359,7 +369,31 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         first_error,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
+        skipped_roots: summarize_skipped_roots(&existing, &scanned),
     })
+}
+
+/// Counts, per source whose root was not scanned this run, how many existing
+/// sessions were preserved from orphan cleanup. Sources with zero preserved
+/// rows are omitted so a user who simply never used one tool sees no noise.
+fn summarize_skipped_roots(
+    existing: &HashMap<String, SessionEntry>,
+    scanned: &HashSet<Source>,
+) -> Vec<SkippedRoot> {
+    [Source::Claude, Source::Codex]
+        .into_iter()
+        .filter(|s| !scanned.contains(s))
+        .filter_map(|source| {
+            let preserved_sessions = existing
+                .values()
+                .filter(|e| e.source == Some(source))
+                .count();
+            (preserved_sessions > 0).then_some(SkippedRoot {
+                source,
+                preserved_sessions,
+            })
+        })
+        .collect()
 }
 
 fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEntry>> {
@@ -1200,6 +1234,41 @@ mod tests {
         assert_eq!(
             chunks_after, 0,
             "cleanup must cascade to the session's qa_chunks"
+        );
+        assert!(
+            stats.skipped_roots.is_empty(),
+            "no root was skipped, so nothing should be reported as preserved"
+        );
+    }
+
+    // #165 follow-up: a skipped root that preserved sessions is reported so the
+    // silent preservation stays visible to the operator.
+    #[test]
+    fn test_skipped_root_reports_preserved_count() {
+        let (_dir, mut conn) = setup_test_db();
+        let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+
+        let gone_codex = tmp.path().join("missing_codex");
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &gone_codex,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            stats.skipped_roots.len(),
+            1,
+            "only the missing codex root should be reported"
+        );
+        let reported = &stats.skipped_roots[0];
+        assert_eq!(reported.source, Source::Codex);
+        assert_eq!(
+            reported.preserved_sessions, 1,
+            "the one preserved codex session must be counted"
         );
     }
 

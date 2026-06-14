@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use amici::cli::exit_code::codes;
-use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand};
+use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand, warning};
 use amici::logging::init_subscriber;
 use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
 use amici::model::{EmbedderDegraded, download_and_verify_model, record_degraded};
@@ -373,6 +373,13 @@ where
         format!("{} sessions up to date", stats.total_sessions)
     };
     sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
+    for skipped in &stats.skipped_roots {
+        warning(&format!(
+            "{} root unavailable — preserved {} existing session(s); run with --force once the root is back to reconcile deletions",
+            skipped.source.as_str(),
+            skipped.preserved_sessions
+        ));
+    }
 
     let sp = Spinner::new("Creating chunks...");
     let on_progress = |done: usize, total: usize| {
