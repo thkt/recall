@@ -747,6 +747,84 @@ fn test_skipped_root_counts_only_file_absent_rows() {
     );
 }
 
+// #185 T-185-1: a present root that fails to fully enumerate must surface even
+// when nothing was preserved (an empty DB / first index). The partial read
+// silently dropped files, which is the under-index this signal exists to catch.
+#[cfg(unix)]
+#[test]
+fn test_incomplete_enumeration_surfaces_with_empty_db() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    // claude root: present and empty, so it scans cleanly (not skipped).
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+    // codex root: present, but its only subtree is unreadable, so the tree is
+    // not fully enumerated and no codex file is indexed (preserved stays 0).
+    let codex_dir = tmp.path().join("codex_sessions");
+    let locked_subdir = codex_dir.join("2026");
+    fs::create_dir_all(&locked_subdir).unwrap();
+    fs::write(
+            locked_subdir.join("s1.jsonl"),
+            "{\"timestamp\":\"2026-04-27T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-s1\",\"cwd\":\"/proj\"}}",
+        )
+        .unwrap();
+    let orig = fs::metadata(&locked_subdir).unwrap().permissions();
+    let mut zero = orig.clone();
+    zero.set_mode(0o000);
+    fs::set_permissions(&locked_subdir, zero).unwrap();
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+    );
+
+    fs::set_permissions(&locked_subdir, orig).unwrap();
+    let stats = stats.unwrap();
+
+    let codex = stats
+        .skipped_roots
+        .iter()
+        .find(|s| s.source == Source::Codex)
+        .expect("an incompletely enumerated root must surface even with nothing preserved");
+    assert_eq!(
+        codex.preserved_sessions, 0,
+        "an empty DB has no rows to preserve"
+    );
+    assert_eq!(codex.reason, SkippedReason::IncompleteEnumeration);
+}
+
+// #185 T-185-2: a missing root with nothing preserved is a tool the user never
+// ran, so it must stay silent (the suppressed false side of the MissingRoot
+// gate, covering the changed branch for the #49/#121 diff-cover gate).
+#[test]
+fn test_missing_root_with_no_preserved_rows_is_silent() {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let gone_claude = tmp.path().join("missing_claude");
+    let gone_codex = tmp.path().join("missing_codex");
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &gone_claude,
+            codex_dir: &gone_codex,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        stats.skipped_roots.is_empty(),
+        "missing roots with no preserved sessions must not be reported as noise"
+    );
+}
+
 // #183 T-003: both reasons render distinct remediation wording and machine
 // tags. Calling both variants directly keeps every match arm DA>0 without
 // constructing an APFS-unreachable failure (the #49/#121 coverage trap).
@@ -770,6 +848,31 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
     assert_eq!(
         SkippedReason::IncompleteEnumeration.as_str(),
         "incomplete_enumeration"
+    );
+}
+
+// #185 T-185-3: with nothing preserved, the incomplete-enumeration note must
+// drop the "preserved N / reconcile deletions" framing (there is nothing to
+// reconcile) yet still advise fixing access. Calling the variant directly keeps
+// the new preserved==0 match arm DA>0 deterministically (#49/#121 trap).
+#[test]
+fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
+    let note = SkippedReason::IncompleteEnumeration.note("claude", 0);
+    assert!(
+        note.contains("some sessions may be missing"),
+        "a zero-preserved partial read must warn about missing sessions: {note}"
+    );
+    assert!(
+        note.contains("permissions and access"),
+        "it must still advise fixing access: {note}"
+    );
+    assert!(
+        !note.contains("reconcile any real deletions"),
+        "with nothing preserved there are no deletions to reconcile: {note}"
+    );
+    assert!(
+        !note.contains("preserved 0"),
+        "the self-contradictory 'preserved 0' phrasing must not appear: {note}"
     );
 }
 
