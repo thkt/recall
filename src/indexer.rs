@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, DirEntry};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::time::{Instant, UNIX_EPOCH};
@@ -502,19 +503,29 @@ fn collect_jsonl_files_inner(
             return false;
         }
     };
+    collect_from_entries(entries, dir, out, source, depth)
+}
+
+/// Classifies each directory entry, returning whether every entry was read.
+/// Taking the entry iterator as an argument lets tests inject an `Err` item to
+/// exercise the per-entry failure path, which a real APFS filesystem never
+/// triggers (readdir returns d_type, so `file_type()` makes no syscall). A
+/// `DirEntry` or `file_type()` failure leaves the entry unseen, so it flips
+/// `fully_read` to keep `cleanup_orphans` off this source's rows (#181).
+fn collect_from_entries(
+    entries: impl Iterator<Item = io::Result<DirEntry>>,
+    dir: &Path,
+    out: &mut Vec<(PathBuf, Source)>,
+    source: Source,
+    depth: usize,
+) -> bool {
     let mut fully_read = true;
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
+        let (entry, ft) = match entry.and_then(|e| e.file_type().map(|ft| (e, ft))) {
+            Ok(pair) => pair,
             Err(e) => {
                 warn!(path = %dir.display(), error = %e, "cannot read entry");
-                continue;
-            }
-        };
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(e) => {
-                warn!(path = %entry.path().display(), error = %e, "cannot get file type");
+                fully_read = false;
                 continue;
             }
         };
