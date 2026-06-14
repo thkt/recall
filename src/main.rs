@@ -343,11 +343,11 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         ));
     }
     for skipped in &outcome.skipped_roots {
-        notes.push(format!(
-            "{src} root unavailable — preserved {n} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions",
-            src = skipped.source.as_str(),
-            n = skipped.preserved_sessions,
-        ));
+        notes.push(
+            skipped
+                .reason
+                .note(skipped.source.as_str(), skipped.preserved_sessions),
+        );
     }
     let degraded = !notes.is_empty();
     let skipped_roots: Vec<_> = outcome
@@ -357,6 +357,7 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
             serde_json::json!({
                 "source": s.source.as_str(),
                 "preserved_sessions": s.preserved_sessions,
+                "reason": s.reason.as_str(),
             })
         })
         .collect();
@@ -398,11 +399,11 @@ where
     };
     sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
     for skipped in &stats.skipped_roots {
-        warning(&format!(
-            "{} root unavailable — preserved {} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions",
-            skipped.source.as_str(),
-            skipped.preserved_sessions
-        ));
+        warning(
+            &skipped
+                .reason
+                .note(skipped.source.as_str(), skipped.preserved_sessions),
+        );
     }
     let skipped_roots = stats.skipped_roots;
 
@@ -2426,6 +2427,7 @@ mod tests {
             skipped_roots: vec![indexer::SkippedRoot {
                 source: parser::Source::Codex,
                 preserved_sessions: 2,
+                reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
         };
 
@@ -2442,6 +2444,13 @@ mod tests {
             "the note must name the source, the preserved count, and the reconcile command, got: {:?}",
             out.notes
         );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("permissions and access")),
+            "an incomplete-enumeration root must surface the access remedy, not the missing-root wording, got: {:?}",
+            out.notes
+        );
         assert_eq!(
             out.data["skipped_roots"][0]["source"], "codex",
             "the payload carries the skipped source, not just prose"
@@ -2449,6 +2458,10 @@ mod tests {
         assert_eq!(
             out.data["skipped_roots"][0]["preserved_sessions"], 2,
             "the payload carries the preserved magnitude an agent can act on"
+        );
+        assert_eq!(
+            out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
+            "the payload carries the machine-readable skip cause so an agent picks the right remedy"
         );
     }
 
