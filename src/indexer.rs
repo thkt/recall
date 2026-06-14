@@ -60,6 +60,9 @@ enum IndexOutcome {
 struct IndexContext<'a> {
     tx: &'a Transaction<'a>,
     existing: &'a HashMap<String, SessionEntry>,
+    /// Force re-index: `check_freshness` must not skip an mtime-unchanged file,
+    /// so every present file is re-parsed and its chunks/embeddings rebuilt.
+    force: bool,
 }
 
 pub(crate) struct IndexOptions<'a> {
@@ -203,7 +206,10 @@ fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f
     };
 
     // Epsilon 0.001s tolerates filesystem mtime rounding (HFS+ 1s, ext4 nano→f64).
-    if let Some(new_mt) = mtime
+    // Force bypasses the skip so a `rebuild` re-parses every present file even
+    // when its mtime is unchanged.
+    if !ctx.force
+        && let Some(new_mt) = mtime
         && let Some(entry) = ctx.existing.get(&fpath_str)
         && let Some(old_mt) = entry.mtime
         && (old_mt - new_mt).abs() < 0.001
@@ -328,22 +334,19 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     // Always full-scan: file-level mtime checks in check_freshness keep indexing
     // incremental. A directory-mtime skip optimization here used to miss new files
     // added to existing deep dirs (Codex Y/M/D, Claude subagents) — #52 / #70.
-    let existing = if opts.force {
-        HashMap::new()
-    } else {
-        load_existing_sessions(conn)?
-    };
+    //
+    // `existing` is loaded even under force so deletion flows through the
+    // source-keyed `cleanup_orphans` (#165): a blanket `DELETE FROM ...` before
+    // re-scan would wipe a missing root's sessions before the scan can prove they
+    // were deleted, destroying the index on a transient root outage (#177). Force
+    // instead re-indexes every present file (mtime skip bypassed via `ctx.force`)
+    // while cleanup removes only rows whose scanned root confirms their absence.
+    let existing = load_existing_sessions(conn)?;
     let (sources, scanned) = collect_sources(opts);
 
     info!(count = sources.len(), "Found source files");
 
     let tx = conn.transaction().context("Failed to begin transaction")?;
-    if opts.force {
-        tx.execute_batch(
-            "DELETE FROM vec_chunks; DELETE FROM qa_chunks; \
-             DELETE FROM sessions; DELETE FROM messages;",
-        )?;
-    }
     tx.execute(
         "INSERT INTO messages(messages, rank) VALUES('automerge', 0)",
         [],
@@ -352,6 +355,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     let ctx = IndexContext {
         tx: &tx,
         existing: &existing,
+        force: opts.force,
     };
     let (indexed, parse_errors, first_error) = index_all(&ctx, &sources)?;
     cleanup_orphans(&tx, &existing, &sources, &scanned, indexed)?;

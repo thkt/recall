@@ -366,8 +366,8 @@ fn test_orphan_cleanup_removes_deleted_files() {
     );
 
     fs::remove_file(&f2).unwrap();
-    // force: false exercises cleanup_orphans (force: true bulk-deletes everything,
-    // which would make the cascade assertion a false pass)
+    // force: false exercises cleanup_orphans on the incremental path; force: true
+    // takes the same source-keyed cleanup, so either flag drives this cascade.
     let stats2 = index_from_dirs(
         &mut conn,
         &IndexOptions {
@@ -734,6 +734,209 @@ fn test_skipped_root_counts_only_file_absent_rows() {
     assert_eq!(
         codex.preserved_sessions, 1,
         "only the file-absent s1 row is at risk; the re-indexed top row must not inflate the count"
+    );
+}
+
+// #177: `rebuild` (force) with a missing source root must not destroy that
+// root's index. The force path used to bulk-delete every table before re-scan,
+// so a transient root outage wiped the preserved root's sessions and their
+// embeddings unrecoverably. The fix removes the blanket delete and routes force
+// deletion through the same source-keyed cleanup as #165: the present root is
+// genuinely rebuilt while the missing root's rows survive.
+#[test]
+fn test_force_rebuild_preserves_missing_source_root() {
+    let (_dir, mut conn) = setup_test_db();
+    let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+
+    // Build chunks + embeddings for both seeded sessions so the data-loss is
+    // observable at the embedding layer, not just the session row.
+    index_chunks(&mut conn, None).unwrap();
+    let embedder = MockEmbedder::new();
+    embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
+    let codex_vecs_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id IN \
+             (SELECT id FROM qa_chunks WHERE session_id = 's1')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        codex_vecs_before > 0,
+        "the codex session must have embeddings before the rebuild"
+    );
+
+    // Rebuild (force) while the codex root is missing.
+    let gone_codex = tmp.path().join("missing_codex");
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &gone_codex,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        stats.total_sessions, 2,
+        "force rebuild with a missing root must preserve that root's session"
+    );
+    let codex_vecs_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id IN \
+             (SELECT id FROM qa_chunks WHERE session_id = 's1')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        codex_vecs_after, codex_vecs_before,
+        "the missing root's embeddings must survive the rebuild unchanged"
+    );
+    // The present claude root is genuinely rebuilt: its chunks are cleared,
+    // awaiting re-embed — force is not silently downgraded to incremental.
+    let claude_chunks_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'c'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        claude_chunks_after, 0,
+        "the present root is rebuilt: its chunks are cleared for re-embed"
+    );
+    assert_eq!(
+        stats.skipped_roots.len(),
+        1,
+        "the missing codex root must be reported as preserved"
+    );
+    assert_eq!(stats.skipped_roots[0].source, Source::Codex);
+}
+
+// #177 worst case: a force rebuild where BOTH source roots are missing must not
+// wipe the index. With nothing successfully scanned, every session and its
+// embeddings survive and both roots are reported as preserved.
+#[test]
+fn test_force_rebuild_all_roots_missing_preserves_index() {
+    let (_dir, mut conn) = setup_test_db();
+    let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+
+    index_chunks(&mut conn, None).unwrap();
+    let embedder = MockEmbedder::new();
+    embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
+    let vecs_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert!(vecs_before > 0, "both sessions must have embeddings first");
+
+    let gone_claude = tmp.path().join("missing_claude");
+    let gone_codex = tmp.path().join("missing_codex");
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: true,
+            claude_dir: &gone_claude,
+            codex_dir: &gone_codex,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        stats.total_sessions, 2,
+        "both sessions must survive when neither root is scannable"
+    );
+    let vecs_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        vecs_after, vecs_before,
+        "every embedding must survive a force rebuild with both roots missing"
+    );
+    assert_eq!(
+        stats.skipped_roots.len(),
+        2,
+        "both missing roots must be reported as preserved"
+    );
+}
+
+// #177 force-path cascade: the two missing-root force tests above exit
+// cleanup_orphans early (the absent root is unscanned, so its rows are
+// preserved). This pins the other branch — a force rebuild where both roots
+// are scanned and a file genuinely vanished must still delete that session and
+// cascade to its messages and qa_chunks, exactly as the incremental path does.
+#[test]
+fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+    let claude_sid: String = conn
+        .query_row(
+            "SELECT session_id FROM sessions WHERE source = 'claude'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let msgs_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            [&claude_sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        msgs_before > 0,
+        "seed should leave messages for the session"
+    );
+
+    // Delete the claude file; both roots stay present and readable, so both
+    // are scanned and the deleted row is delete-eligible under force.
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        stats.total_sessions, 1,
+        "force must clean the deleted file's session when its root was scanned"
+    );
+    let surviving_source: String = conn
+        .query_row("SELECT source FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(surviving_source, "codex", "only the codex session survives");
+
+    let msgs_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            [&claude_sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        msgs_after, 0,
+        "force cleanup must cascade to the session's messages"
+    );
+    let chunks_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = ?",
+            [&claude_sid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        chunks_after, 0,
+        "force cleanup must cascade to the session's qa_chunks"
+    );
+    assert!(
+        stats.skipped_roots.is_empty(),
+        "both roots were scanned, so nothing should be reported as preserved"
     );
 }
 

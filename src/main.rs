@@ -65,7 +65,8 @@ struct Cli {
 enum Command {
     /// Parse and chunk new session logs (incremental). No model calls.
     Index,
-    /// Drop the index and rebuild from all sessions. No model calls.
+    /// Re-parse and re-embed every present session; a missing or unreadable
+    /// source root keeps its existing index. No model calls.
     Rebuild,
     /// Manage the embedding model.
     #[command(subcommand)]
@@ -440,8 +441,9 @@ where
 
 /// Embed every chunk absent from `vec_chunks`. Incremental by the one-pass
 /// pending gate (`embedder::pending_chunks`), so a re-index embeds only new
-/// chunks; a `rebuild` re-embeds all because its `force` DELETE cleared
-/// `vec_chunks` first. The pending list is collected once and fed straight to
+/// chunks; a `rebuild` re-embeds every present session because it re-parses each
+/// one and replaces its chunks, leaving them pending. The pending list is
+/// collected once and fed straight to
 /// `embed_chunks` — a separate COUNT would re-scan vec_chunks (#138).
 fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<embedder::EmbedResult> {
     let pending = embedder::pending_chunks(conn, usize::MAX)?;
@@ -1974,8 +1976,8 @@ mod tests {
             );
         }
 
-        // rebuild: force=true drops vec_chunks/qa_chunks/sessions/messages, then
-        // re-scans the source dir and re-embeds.
+        // rebuild: force=true re-parses every present session and replaces its
+        // chunks/embeddings; missing source roots keep their existing index.
         let rebuild_opts = indexer::IndexOptions {
             force: true,
             claude_dir: &claude_dir,
