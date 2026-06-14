@@ -660,31 +660,21 @@ pub(crate) fn index_chunks(
     let tx = conn.transaction()?;
     let mut chunks_created = 0;
     for (done, (session_id, timestamp)) in sessions.iter().enumerate() {
-        let messages = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT role, text FROM messages WHERE session_id = ? ORDER BY rowid",
-            )?;
-            let rows = stmt.query_map([session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let mut msgs = Vec::new();
-            for r in rows {
-                let (role_str, text) = r?;
-                let Some(role) = Role::from_db(&role_str) else {
-                    debug!(role = %role_str, session_id, "unknown role");
-                    continue;
-                };
-                msgs.push(Message { role, text });
-            }
-            msgs
-        };
+        let messages = read_session_messages(&tx, session_id)?;
 
         let chunks = chunker::chunk_messages(session_id, &messages, *timestamp);
 
         for chunk in &chunks {
             tx.execute(
-                "INSERT INTO qa_chunks (session_id, content, timestamp) VALUES (?1, ?2, ?3)",
-                rusqlite::params![chunk.session_id, chunk.content, chunk.timestamp],
+                "INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    chunk.session_id,
+                    chunk.content,
+                    chunk.timestamp,
+                    chunk.src_rowid_lo,
+                    chunk.src_rowid_hi
+                ],
             )?;
             chunks_created += 1;
         }
@@ -697,6 +687,100 @@ pub(crate) fn index_chunks(
     tx.commit()?;
 
     Ok(ChunkStats { chunks_created })
+}
+
+/// Read a session's messages in rowid order, paired with their fts5 rowid. The
+/// rowid feeds the chunker's source range (#192) and is the same rowid the search
+/// JOIN resolves an FTS hit against. Unknown roles are skipped (recall only writes
+/// user/assistant, so this is defensive), and their rowids never enter a range.
+fn read_session_messages(tx: &Transaction, session_id: &str) -> Result<Vec<(i64, Message)>> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT rowid, role, text FROM messages WHERE session_id = ? ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map([session_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut msgs = Vec::new();
+    for r in rows {
+        let (rowid, role_str, text) = r?;
+        let Some(role) = Role::from_db(&role_str) else {
+            debug!(role = %role_str, session_id, "unknown role");
+            continue;
+        };
+        msgs.push((rowid, Message { role, text }));
+    }
+    Ok(msgs)
+}
+
+/// Link pre-#192 chunks (NULL src_rowid_lo/hi) to their source message rowid range
+/// without a re-embed. For each session holding an unlinked chunk, re-run the
+/// deterministic chunker over its messages and zip the re-derived ranges onto the
+/// stored chunks by qa_chunks.id ascending (= original insertion order). Only
+/// sessions whose re-derived chunk count equals the stored count are updated; a
+/// mismatch (chunker logic changed since the session was indexed) leaves the rows
+/// NULL so they keep resolving via the instr fallback rather than risk a
+/// mis-aligned range. The count check guards only against count drift, not against
+/// a count-preserving re-grouping; the chunker is a deterministic single pass
+/// (user + one adjacent assistant), so no such variant exists today, and `rebuild`
+/// is the escape hatch if one is ever introduced. Returns the number of sessions
+/// backfilled. A no-op once every row is linked, since the NULL-row scan then
+/// finds no session.
+pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
+    let sessions: Vec<(String, Option<i64>)> = {
+        let null_row_sessions_sql = "SELECT DISTINCT s.session_id, s.timestamp FROM sessions s \
+             JOIN qa_chunks c ON c.session_id = s.session_id \
+             WHERE c.src_rowid_lo IS NULL";
+        let mut stmt = conn.prepare(null_row_sessions_sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        rows.collect::<StdResult<Vec<_>, _>>()?
+    };
+
+    if sessions.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    let mut backfilled = 0;
+    for (session_id, timestamp) in &sessions {
+        let messages = read_session_messages(&tx, session_id)?;
+        let chunks = chunker::chunk_messages(session_id, &messages, *timestamp);
+
+        let ids: Vec<i64> = {
+            let mut stmt =
+                tx.prepare_cached("SELECT id FROM qa_chunks WHERE session_id = ? ORDER BY id")?;
+            let rows = stmt.query_map([session_id], |row| row.get::<_, i64>(0))?;
+            rows.collect::<StdResult<Vec<_>, _>>()?
+        };
+
+        // Count mismatch makes the id-order zip unsafe (a chunk would inherit
+        // another group's rowid range), so skip the session and keep NULL. It
+        // means the chunker re-derived a different grouping than the one stored
+        // (chunker logic drift since the session was indexed); log it so the
+        // permanent instr-fallback degradation is observable rather than silent.
+        let (stored, rederived) = (ids.len(), chunks.len());
+        if stored != rederived {
+            debug!(%session_id, stored, rederived, "rowid backfill skipped: count mismatch");
+            continue;
+        }
+
+        for (id, chunk) in ids.iter().zip(chunks.iter()) {
+            tx.execute(
+                "UPDATE qa_chunks SET src_rowid_lo = ?1, src_rowid_hi = ?2 WHERE id = ?3",
+                rusqlite::params![chunk.src_rowid_lo, chunk.src_rowid_hi, id],
+            )?;
+        }
+        backfilled += 1;
+    }
+
+    tx.commit()?;
+
+    Ok(backfilled)
 }
 
 #[cfg(test)]

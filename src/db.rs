@@ -40,6 +40,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     migrate_fts_if_needed(conn)?;
     migrate_vec_chunks_if_needed(conn)?;
     migrate_qa_chunks_if_needed(conn)?;
+    migrate_qa_chunk_rowid_link_if_needed(conn)?;
     migrate_session_type_if_needed(conn)?;
 
     // embedded_chunk_ids (a removed ledger) was dropped inside two separate
@@ -66,7 +67,9 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             id INTEGER PRIMARY KEY,
             session_id TEXT NOT NULL,
             content TEXT NOT NULL,
-            timestamp INTEGER
+            timestamp INTEGER,
+            src_rowid_lo INTEGER,
+            src_rowid_hi INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);",
     )?;
@@ -132,6 +135,28 @@ fn migrate_qa_chunks_if_needed(conn: &mut Connection) -> Result<()> {
              ALTER TABLE qa_chunks DROP COLUMN chunk_hash;
              ALTER TABLE qa_chunks DROP COLUMN user_text;
              ALTER TABLE qa_chunks DROP COLUMN assistant_text;",
+        )?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+/// Add src_rowid_lo/hi to pre-#192 databases. ALTER ... ADD COLUMN keeps every
+/// existing row with the two columns NULL, so legacy chunks route through the
+/// instr fallback in fetch_chunks. qa_chunks.id is unchanged, so vec_chunks
+/// embeddings survive without a re-embed. `backfill_rowid_ranges` (indexer)
+/// populates the NULL rows on the next `recall index`.
+fn migrate_qa_chunk_rowid_link_if_needed(conn: &mut Connection) -> Result<()> {
+    let Some(sql) = table_def(conn, "qa_chunks")? else {
+        return Ok(());
+    };
+
+    if !sql.contains("src_rowid_lo") {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "ALTER TABLE qa_chunks ADD COLUMN src_rowid_lo INTEGER;
+             ALTER TABLE qa_chunks ADD COLUMN src_rowid_hi INTEGER;",
         )?;
         tx.commit()?;
     }

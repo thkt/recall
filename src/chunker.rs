@@ -5,6 +5,13 @@ pub(crate) struct QAChunk {
     /// Embedding content: user_text [+ "\n" + assistant_text]. Prefix added by embedder.
     pub content: String,
     pub timestamp: Option<i64>,
+    /// Source message rowid range (#192): lo = user message rowid, hi = adjacent
+    /// assistant message rowid (or lo when user-only). fetch_chunks resolves an
+    /// FTS hit to its owning chunk via `m.rowid BETWEEN lo AND hi`; this replaces
+    /// the instr substring guess for linked chunks, while legacy NULL-range rows
+    /// still fall back to instr. Split-siblings of one message share one range.
+    pub src_rowid_lo: i64,
+    pub src_rowid_hi: i64,
 }
 
 /// Max content bytes per chunk (~4000-5000 tokens, well under model's 8192 limit).
@@ -83,14 +90,14 @@ fn find_split_boundary(text: &str, max_bytes: usize) -> usize {
 /// - empty messages → empty list
 pub(crate) fn chunk_messages(
     session_id: &str,
-    messages: &[Message],
+    messages: &[(i64, Message)],
     timestamp: Option<i64>,
 ) -> Vec<QAChunk> {
     let mut chunks = Vec::new();
     let mut i = 0;
 
     while i < messages.len() {
-        let msg = &messages[i];
+        let (lo, msg) = (messages[i].0, &messages[i].1);
 
         if msg.role != Role::User {
             // Skip assistant without preceding user
@@ -103,9 +110,14 @@ pub(crate) fn chunk_messages(
             continue;
         }
 
-        let assistant_text = if i + 1 < messages.len() && messages[i + 1].role == Role::Assistant {
+        // hi defaults to the user rowid (user-only group), extended to the
+        // adjacent assistant rowid when one is consumed below.
+        let mut hi = lo;
+        let assistant_text = if i + 1 < messages.len() && messages[i + 1].1.role == Role::Assistant
+        {
             i += 1;
-            let text = messages[i].text.as_str();
+            hi = messages[i].0;
+            let text = messages[i].1.text.as_str();
             if text.is_empty() { None } else { Some(text) }
         } else {
             None
@@ -117,6 +129,8 @@ pub(crate) fn chunk_messages(
                 session_id: session_id.to_owned(),
                 content,
                 timestamp,
+                src_rowid_lo: lo,
+                src_rowid_hi: hi,
             });
         }
 
