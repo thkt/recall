@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::date;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub enum Source {
     Claude,
     Codex,
