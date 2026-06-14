@@ -1032,6 +1032,39 @@ fn test_collect_skips_symlinks() {
     assert!(files[0].0.ends_with("real.jsonl"));
 }
 
+// #181: a per-entry read failure (DirEntry or file_type() error) leaves that
+// entry unseen, so the enumeration must report incomplete (false) — otherwise
+// the source counts as scanned and cleanup_orphans deletes the unseen file's
+// row. APFS never triggers this path (readdir returns d_type), so the only way
+// to cover the merged error arm is to inject an Err item directly. The Err is
+// chained FIRST so that real.jsonl is read after it: collecting the file proves
+// the error arm only suppresses cleanup and lets enumeration continue (a `break`
+// or early `return` in place of `continue` would yield an empty `files`).
+#[test]
+fn test_collect_from_entries_incomplete_on_entry_error_still_collects() {
+    use std::{io, iter};
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(tmp.path().join("real.jsonl"), "{}").unwrap();
+
+    let entries =
+        iter::once(Err(io::Error::other("injected"))).chain(fs::read_dir(tmp.path()).unwrap());
+
+    let mut files = Vec::new();
+    let fully_read = collect_from_entries(entries, tmp.path(), &mut files, Source::Claude, 0);
+
+    assert!(
+        !fully_read,
+        "a per-entry error must mark the tree as not fully enumerated"
+    );
+    assert_eq!(
+        files.len(),
+        1,
+        "the readable jsonl is still collected despite the failed entry"
+    );
+    assert!(files[0].0.ends_with("real.jsonl"));
+}
+
 #[test]
 fn test_011_index_chunks_incremental() {
     let (_dir, mut conn) = setup_test_db();
