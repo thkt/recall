@@ -42,6 +42,40 @@ pub struct IndexStats {
 pub struct SkippedRoot {
     pub source: Source,
     pub preserved_sessions: usize,
+    pub reason: SkippedReason,
+}
+
+/// Why a source root was skipped this run, so the operator-facing surface can
+/// give the right remediation instead of one fixed message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedReason {
+    /// Root path does not exist as a directory (#165/#177). Remedy: restore the root.
+    MissingRoot,
+    /// Root exists but the tree could not be fully enumerated — a permission/access
+    /// failure on the root or a child, a read_dir error, or a depth-limit truncation
+    /// (#181). Remedy: fix the directory's permissions/access, not wait for the root.
+    IncompleteEnumeration,
+}
+
+impl SkippedReason {
+    // pub(crate): main.rs (a different module) calls both methods to render the surface.
+    pub(crate) fn note(self, source: &str, preserved: usize) -> String {
+        match self {
+            SkippedReason::MissingRoot => format!(
+                "{source} root unavailable — preserved {preserved} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions"
+            ),
+            SkippedReason::IncompleteEnumeration => format!(
+                "{source} root could not be fully read — preserved {preserved} existing session(s); check the directory's permissions and access, then re-run `recall index` to reconcile any real deletions"
+            ),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SkippedReason::MissingRoot => "missing_root",
+            SkippedReason::IncompleteEnumeration => "incomplete_enumeration",
+        }
+    }
 }
 
 impl IndexStats {
@@ -277,21 +311,39 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
     resolve_codex_dir_with(home, |key| env::var_os(key))
 }
 
-/// Returns the discovered files and the set of sources whose root was
-/// successfully enumerated this run. A missing or unreadable root is absent
-/// from the set so orphan cleanup never treats its sessions as deleted (#165).
-fn collect_sources(opts: &IndexOptions) -> (Vec<(PathBuf, Source)>, HashSet<Source>) {
-    let mut sources = Vec::new();
-    let mut scanned = HashSet::new();
-    if opts.claude_dir.is_dir()
-        && collect_jsonl_files(opts.claude_dir, &mut sources, Source::Claude)
-    {
-        scanned.insert(Source::Claude);
+/// The outcome of scanning the source roots: the discovered files, the sources
+/// whose root was fully enumerated (`scanned` — only these are eligible for
+/// orphan cleanup so a missing/unreadable root never has its sessions deleted,
+/// #165), and the sources that were skipped with why (`skipped`).
+struct ScanOutcome {
+    sources: Vec<(PathBuf, Source)>,
+    scanned: HashSet<Source>,
+    skipped: HashMap<Source, SkippedReason>,
+}
+
+fn collect_sources(opts: &IndexOptions) -> ScanOutcome {
+    let mut out = ScanOutcome {
+        sources: Vec::new(),
+        scanned: HashSet::new(),
+        skipped: HashMap::new(),
+    };
+    classify_root(opts.claude_dir, Source::Claude, &mut out);
+    classify_root(opts.codex_dir, Source::Codex, &mut out);
+    out
+}
+
+/// Classifies one root: missing (no dir), scanned (fully enumerated), or
+/// incompletely enumerated. A skipped root records why so the surface can give
+/// the matching remedy. `classify_root` dedups the two call sites (claude/codex).
+fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {
+    if !dir.is_dir() {
+        out.skipped.insert(source, SkippedReason::MissingRoot);
+    } else if collect_jsonl_files(dir, &mut out.sources, source) {
+        out.scanned.insert(source);
+    } else {
+        out.skipped
+            .insert(source, SkippedReason::IncompleteEnumeration);
     }
-    if opts.codex_dir.is_dir() && collect_jsonl_files(opts.codex_dir, &mut sources, Source::Codex) {
-        scanned.insert(Source::Codex);
-    }
-    (sources, scanned)
 }
 
 fn index_all(
@@ -343,7 +395,8 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     // instead re-indexes every present file (mtime skip bypassed via `ctx.force`)
     // while cleanup removes only rows whose scanned root confirms their absence.
     let existing = load_existing_sessions(conn)?;
-    let (sources, scanned) = collect_sources(opts);
+    let scan = collect_sources(opts);
+    let sources = &scan.sources;
 
     info!(count = sources.len(), "Found source files");
 
@@ -358,8 +411,8 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         existing: &existing,
         force: opts.force,
     };
-    let (indexed, parse_errors, first_error) = index_all(&ctx, &sources)?;
-    cleanup_orphans(&tx, &existing, &sources, &scanned, indexed)?;
+    let (indexed, parse_errors, first_error) = index_all(&ctx, sources)?;
+    cleanup_orphans(&tx, &existing, sources, &scan.scanned, indexed)?;
     tx.commit().context("Failed to commit transaction")?;
 
     finalize_fts(conn, indexed, opts.force)?;
@@ -375,7 +428,7 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         first_error,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
-        skipped_roots: summarize_skipped_roots(&existing, &sources, &scanned),
+        skipped_roots: summarize_skipped_roots(&existing, sources, &scan.skipped),
     })
 }
 
@@ -390,13 +443,13 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
 fn summarize_skipped_roots(
     existing: &HashMap<String, SessionEntry>,
     sources: &[(PathBuf, Source)],
-    scanned: &HashSet<Source>,
+    skipped: &HashMap<Source, SkippedReason>,
 ) -> Vec<SkippedRoot> {
     let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
     [Source::Claude, Source::Codex]
         .into_iter()
-        .filter(|s| !scanned.contains(s))
         .filter_map(|source| {
+            let reason = *skipped.get(&source)?;
             let preserved_sessions = existing
                 .iter()
                 .filter(|(fp, e)| {
@@ -406,6 +459,7 @@ fn summarize_skipped_roots(
             (preserved_sessions > 0).then_some(SkippedRoot {
                 source,
                 preserved_sessions,
+                reason,
             })
         })
         .collect()
@@ -487,7 +541,7 @@ fn collect_jsonl_files_inner(
     depth: usize,
 ) -> bool {
     if depth >= MAX_DIR_DEPTH {
-        debug!(
+        warn!(
             max_depth = MAX_DIR_DEPTH,
             path = %dir.display(),
             "depth limit reached"

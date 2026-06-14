@@ -675,6 +675,11 @@ fn test_skipped_root_reports_preserved_count() {
         reported.preserved_sessions, 1,
         "the one preserved codex session must be counted"
     );
+    assert_eq!(
+        reported.reason,
+        SkippedReason::MissingRoot,
+        "an absent root must be classified as missing, not incomplete enumeration"
+    );
 }
 
 // #165 CHX-1 regression: when an unscanned source holds BOTH a re-indexed
@@ -734,6 +739,108 @@ fn test_skipped_root_counts_only_file_absent_rows() {
     assert_eq!(
         codex.preserved_sessions, 1,
         "only the file-absent s1 row is at risk; the re-indexed top row must not inflate the count"
+    );
+    assert_eq!(
+        codex.reason,
+        SkippedReason::IncompleteEnumeration,
+        "a present root whose subtree could not be read is incomplete enumeration, not a missing root"
+    );
+}
+
+// #183 T-003: both reasons render distinct remediation wording and machine
+// tags. Calling both variants directly keeps every match arm DA>0 without
+// constructing an APFS-unreachable failure (the #49/#121 coverage trap).
+#[test]
+fn test_skipped_reason_note_and_tag_differ_per_variant() {
+    let missing = SkippedReason::MissingRoot.note("codex", 3);
+    assert!(
+        missing.contains("once the root is back"),
+        "a missing root must advise waiting for the root to return: {missing}"
+    );
+    let incomplete = SkippedReason::IncompleteEnumeration.note("claude", 2);
+    assert!(
+        incomplete.contains("permissions and access"),
+        "incomplete enumeration must advise fixing access, not waiting: {incomplete}"
+    );
+    assert!(
+        !incomplete.contains("once the root is back"),
+        "incomplete enumeration must not reuse the missing-root remedy"
+    );
+    assert_eq!(SkippedReason::MissingRoot.as_str(), "missing_root");
+    assert_eq!(
+        SkippedReason::IncompleteEnumeration.as_str(),
+        "incomplete_enumeration"
+    );
+}
+
+// #183 T-004 (CHX-1 regression): the count-based early-return in cleanup_orphans
+// must not mask a real deletion when an unrelated new file enters the same scan.
+// existing {s1 codex, claude rows}; on disk the claude file is gone but a new
+// claude file appears, so indexed>0 and the early-return guard stays off — the
+// absent claude row must be deleted, not preserved by the early return.
+#[test]
+fn test_cleanup_deletes_real_orphan_when_new_file_added() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+    // The regression this test guards depends on the early-return's count-equality
+    // half (sources.len() == existing.len()) being TRUE at cleanup, so only the
+    // `indexed == 0` term keeps the guard off (the CHX-1 shape). That requires the
+    // seed to hold exactly 2 sessions and the swap below to keep on-disk count at 2.
+    // Anchor it so the test fails loudly if the shared seed later drifts, rather
+    // than silently degrading into a plain cleanup test.
+    let seeded: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        seeded, 2,
+        "T-004 needs exactly 2 seeded sessions to reach the guard's count-equality branch"
+    );
+
+    // The originally-seeded claude file is gone; replace it with a brand-new one
+    // so the claude root is fully scanned with a non-empty, different file set.
+    for entry in fs::read_dir(&claude_dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            fs::remove_file(&path).unwrap();
+        }
+    }
+    fs::write(
+            claude_dir.join("fresh.jsonl"),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"fresh claude turn"},"timestamp":"2026-07-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+    )
+    .unwrap();
+
+    assert!(stats.indexed > 0, "the new claude file must be indexed");
+    assert!(
+        stats.skipped_roots.is_empty(),
+        "both roots are present and fully scanned, so nothing is skipped"
+    );
+    let claude_remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'claude'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        claude_remaining, 1,
+        "the absent original claude session must be deleted; only the fresh one remains \
+         (if the early-return masked the deletion, the original row would inflate this to 2)"
+    );
+    assert_eq!(
+        stats.total_sessions, 2,
+        "codex-s1 is preserved and the claude orphan is swapped for fresh: 1 codex + 1 claude"
     );
 }
 
