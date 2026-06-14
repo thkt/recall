@@ -835,6 +835,21 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
         missing.contains("once the root is back"),
         "a missing root must advise waiting for the root to return: {missing}"
     );
+    assert!(
+        !missing.contains("reconcile any real deletions"),
+        "the missing-root note must use forward-looking framing, not past-tense deletions (#187): {missing}"
+    );
+    // Mirror the IncompleteEnumeration preserved>0 test: the negative guard alone
+    // only blocks the one historical phrase, so pin the new forward-looking content
+    // positively too, else a revert that drops it (OPS-01 harmonization) goes unseen.
+    assert!(
+        missing.contains("none deleted this run"),
+        "the missing-root note must state nothing was deleted this run (#187): {missing}"
+    );
+    assert!(
+        missing.contains("full scan can reconcile"),
+        "the missing-root note must frame reconcile as a future full scan (#187): {missing}"
+    );
     let incomplete = SkippedReason::IncompleteEnumeration.note("claude", 2);
     assert!(
         incomplete.contains("permissions and access"),
@@ -873,6 +888,31 @@ fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
     assert!(
         !note.contains("preserved 0"),
         "the self-contradictory 'preserved 0' phrasing must not appear: {note}"
+    );
+}
+
+// #187: with rows preserved, the reconcile clause is forward-looking — it points
+// at the next full scan, not deletions that already happened. The note must say
+// nothing was deleted this run and frame the reconcile as a future scan, so the
+// audit-style misreading ("reconcile any real deletions" = deletions occurred)
+// cannot recur. Calling the variant directly keeps the arm DA>0 (#49/#121 trap).
+#[test]
+fn test_incomplete_note_at_nonzero_preserved_frames_reconcile_as_future() {
+    let note = SkippedReason::IncompleteEnumeration.note("claude", 2);
+    assert!(
+        note.contains("none deleted this run"),
+        "a preserved partial read must state nothing was deleted this run: {note}"
+    );
+    assert!(
+        note.contains("next full scan"),
+        "the reconcile must be framed as a future scan, not a past deletion: {note}"
+    );
+    // Mirror the preserved==0 guard (test_incomplete_note_at_zero_preserved_omits_reconcile):
+    // a positive-only test would still pass if the old past-tense clause were re-added
+    // alongside the new one, so block the exact banned phrase from returning.
+    assert!(
+        !note.contains("reconcile any real deletions"),
+        "the old past-tense deletion framing must not re-appear: {note}"
     );
 }
 

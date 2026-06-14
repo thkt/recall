@@ -61,8 +61,11 @@ impl SkippedReason {
     // pub(crate): main.rs (a different module) calls both methods to render the surface.
     pub(crate) fn note(self, source: &str, preserved: usize) -> String {
         match self {
+            // Like IncompleteEnumeration, a missing root never enters `scanned`,
+            // so cleanup_orphans skips it and nothing is deleted this run; the
+            // reconcile is forward-looking, deferred to a later full scan (#187).
             SkippedReason::MissingRoot => format!(
-                "{source} root unavailable — preserved {preserved} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions"
+                "{source} root unavailable — preserved {preserved} existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions"
             ),
             // With nothing preserved (e.g. a first index where the partial read
             // means some files were never seen), the "preserved N / reconcile
@@ -70,8 +73,12 @@ impl SkippedReason {
             SkippedReason::IncompleteEnumeration if preserved == 0 => format!(
                 "{source} root could not be fully read; some sessions may be missing from the index. check the directory's permissions and access, then re-run `recall index`"
             ),
+            // preserved>0: the reconcile is forward-looking. Nothing is deleted
+            // this run (the source never enters `scanned`, so cleanup_orphans
+            // skips it); the wording points at the next full scan so it does not
+            // read as deletions that already happened (#187).
             SkippedReason::IncompleteEnumeration => format!(
-                "{source} root could not be fully read — preserved {preserved} existing session(s); check the directory's permissions and access, then re-run `recall index` to reconcile any real deletions"
+                "{source} root could not be fully read — preserved {preserved} existing session(s), none deleted this run; check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions"
             ),
         }
     }
