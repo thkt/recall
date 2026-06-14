@@ -353,10 +353,18 @@ fn fetch_chunks(
     // session, so it scans only that session's handful of chunks (idx_qa_chunks_session).
     // `ORDER BY rank` picks the most relevant matched message when several match,
     // instead of an arbitrary rowid-ordered one.
-    let chunk_match_sql = "SELECT c.content FROM qa_chunks c \
+    // Uniqueness guard (#118): return the chunk only when exactly one chunk in the
+    // session contains the matched text. `HAVING COUNT(*) = 1` makes the empty/0
+    // and ambiguous/2+ cases yield no row (→ snippet fallback below); `MAX(content)`
+    // simply unwraps the single matching row. This drops the arbitrary `LIMIT 1`,
+    // so a short matched text (e.g. "yes") that instr-collides with another chunk
+    // no longer returns a chunk that is not the matched message's home; an honest
+    // multi-chunk echo collapses to the snippet the same way (correctness > full
+    // chunk, the snippet always contains the match).
+    let chunk_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
         JOIN (SELECT text FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
           ON instr(c.content, m.text) > 0 \
-        WHERE c.session_id = ?2 LIMIT 1";
+        WHERE c.session_id = ?2 HAVING COUNT(*) = 1";
     let mut chunk_match_stmt = conn.prepare(chunk_match_sql)?;
     // Fallback when no single chunk contains the matched message (e.g. the message
     // was split across chunks, or the session has no qa_chunks): the 20-token snippet.

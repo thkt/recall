@@ -188,6 +188,61 @@ fn test_fts_hit_selects_highest_ranked_message_chunk() {
     );
 }
 
+// T-118 (#118): a short matched message text that instr-collides with multiple
+// chunks in the same session is ambiguous. The old `instr ... LIMIT 1` returned
+// an arbitrary rowid-ordered chunk (here UNRELATED_BODY), which need not be the
+// matched message's home chunk. The uniqueness guard (HAVING COUNT(*) = 1) sees
+// the collision (count = 2) and falls back to the match-centered snippet, which
+// always contains the match and never a wrong chunk.
+#[test]
+fn test_fts_short_hit_ambiguous_chunk_falls_back_to_snippet() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s1", "user", "yes");
+    // Two chunks in the same session both contain the substring "yes" and are
+    // equally noise: neither is the matched message's home. rowid 1 (inserted
+    // first) is the arbitrary winner of the old `LIMIT 1`.
+    insert_chunk_with_embedding(&conn, 1, "s1", "yes — COLLIDING_BODY_A", 1709251200000);
+    insert_chunk_with_embedding(&conn, 2, "s1", "yes — COLLIDING_BODY_B", 1709251200000);
+
+    let results = search(&conn, "yes", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("**")
+            && !excerpt.contains("COLLIDING_BODY_A")
+            && !excerpt.contains("COLLIDING_BODY_B"),
+        "ambiguous short-text hit must fall back to the match-centered snippet, \
+         not either arbitrary colliding chunk: {excerpt:?}"
+    );
+}
+
+// T-118b (#118): the count=1 acceptance side of the `HAVING COUNT(*) = 1` guard.
+// A session with several chunks where exactly one contains the matched text must
+// still return that whole chunk (not the snippet). T-001/T-002 only have a single
+// chunk, so they pass even if the guard over-suppressed multi-chunk count=1; this
+// pins the guard's lower boundary against a regression like `HAVING COUNT(*) > 1`.
+#[test]
+fn test_fts_hit_returns_unique_chunk_among_multiple() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s1", "user", "needle phrase");
+    // Only chunk 1 contains "needle phrase"; chunk 2 is unrelated noise, so the
+    // matched text instr-matches exactly one chunk → count=1.
+    insert_chunk_with_embedding(&conn, 1, "s1", "needle phrase — HOME_BODY", 1709251200000);
+    insert_chunk_with_embedding(&conn, 2, "s1", "unrelated topic NOISE_BODY", 1709251200000);
+
+    let results = search(&conn, "needle", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("HOME_BODY") && !excerpt.contains("**"),
+        "count=1 must return the full home chunk, not over-suppress to a snippet: {excerpt:?}"
+    );
+}
+
 #[test]
 fn test_search_no_match() {
     let (_dir, conn) = setup_test_db();
