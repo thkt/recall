@@ -37,6 +37,7 @@ pub struct IndexStats {
     pub skipped_roots: Vec<SkippedRoot>,
 }
 
+#[derive(Debug, Clone)]
 pub struct SkippedRoot {
     pub source: Source,
     pub preserved_sessions: usize,
@@ -369,24 +370,33 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         first_error,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
-        skipped_roots: summarize_skipped_roots(&existing, &scanned),
+        skipped_roots: summarize_skipped_roots(&existing, &sources, &scanned),
     })
 }
 
 /// Counts, per source whose root was not scanned this run, how many existing
-/// sessions were preserved from orphan cleanup. Sources with zero preserved
-/// rows are omitted so a user who simply never used one tool sees no noise.
+/// sessions were preserved from orphan cleanup. Only rows whose file is absent
+/// from `sources` are counted — mirroring the deletion condition in
+/// `cleanup_orphans` — so a partially-failed scan that re-indexed some files of
+/// the source does not over-report the at-risk magnitude. Sources with zero
+/// preserved rows are omitted so a user who simply never used one tool sees no
+/// noise. `None`-source rows are excluded by construction (they match neither
+/// variant), consistent with cleanup_orphans preserving them unconditionally.
 fn summarize_skipped_roots(
     existing: &HashMap<String, SessionEntry>,
+    sources: &[(PathBuf, Source)],
     scanned: &HashSet<Source>,
 ) -> Vec<SkippedRoot> {
+    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
     [Source::Claude, Source::Codex]
         .into_iter()
         .filter(|s| !scanned.contains(s))
         .filter_map(|source| {
             let preserved_sessions = existing
-                .values()
-                .filter(|e| e.source == Some(source))
+                .iter()
+                .filter(|(fp, e)| {
+                    e.source == Some(source) && !source_paths.contains(Path::new(fp.as_str()))
+                })
                 .count();
             (preserved_sessions > 0).then_some(SkippedRoot {
                 source,
@@ -1056,6 +1066,11 @@ mod tests {
             stats.total_sessions, 2,
             "missing source roots must not delete existing sessions"
         );
+        assert_eq!(
+            stats.skipped_roots.len(),
+            2,
+            "both unscanned roots with preserved sessions must be reported"
+        );
     }
 
     // #165: with one root scanned and the other missing, cleanup is selective —
@@ -1269,6 +1284,66 @@ mod tests {
         assert_eq!(
             reported.preserved_sessions, 1,
             "the one preserved codex session must be counted"
+        );
+    }
+
+    // #165 CHX-1 regression: when an unscanned source holds BOTH a re-indexed
+    // present file and a preserved absent file, only the absent row is at risk.
+    // Counting every row of the source would over-report the preserved magnitude.
+    #[cfg(unix)]
+    #[test]
+    fn test_skipped_root_counts_only_file_absent_rows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, mut conn) = setup_test_db();
+        let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+        // Add a second codex session at the root level (outside 2026), so it
+        // stays readable — hence re-indexed and present — when 2026 is locked.
+        fs::write(
+            codex_dir.join("top.jsonl"),
+            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-top\",\"cwd\":\"/proj\"}}\n{\"timestamp\":\"2026-05-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex top turn\"}]}}",
+        )
+        .unwrap();
+        index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        )
+        .unwrap();
+
+        // Lock the year subdir: top.jsonl is re-read (present in sources),
+        // s1.jsonl is not (preserved). The codex tree is not fully enumerated,
+        // so codex is unscanned and reported.
+        let locked_subdir = codex_dir.join("2026");
+        let orig = fs::metadata(&locked_subdir).unwrap().permissions();
+        let mut zero = orig.clone();
+        zero.set_mode(0o000);
+        fs::set_permissions(&locked_subdir, zero).unwrap();
+
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            },
+        );
+
+        fs::set_permissions(&locked_subdir, orig).unwrap();
+        let stats = stats.unwrap();
+
+        let codex = stats
+            .skipped_roots
+            .iter()
+            .find(|s| s.source == Source::Codex)
+            .expect("codex tree was not fully scanned, so it must be reported");
+        assert_eq!(
+            codex.preserved_sessions, 1,
+            "only the file-absent s1 row is at risk; the re-indexed top row must not inflate the count"
         );
     }
 

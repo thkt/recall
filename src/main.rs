@@ -300,6 +300,11 @@ struct IndexOutcome {
     embedded: usize,
     failed_count: usize,
     first_error: Option<String>,
+    /// Source roots that were missing/unreadable this run while still holding
+    /// preserved sessions in the DB (#165). Carried into the `--json` envelope so
+    /// an agent reading the machine path — not just the human stderr warning —
+    /// learns a root outage may be masking real deletions.
+    skipped_roots: Vec<indexer::SkippedRoot>,
 }
 
 /// Build the `--json` envelope for an index run from its [`IndexOutcome`],
@@ -336,10 +341,28 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
             n = outcome.failed_count,
         ));
     }
+    for skipped in &outcome.skipped_roots {
+        notes.push(format!(
+            "{src} root unavailable — preserved {n} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions",
+            src = skipped.source.as_str(),
+            n = skipped.preserved_sessions,
+        ));
+    }
     let degraded = !notes.is_empty();
+    let skipped_roots: Vec<_> = outcome
+        .skipped_roots
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "source": s.source.as_str(),
+                "preserved_sessions": s.preserved_sessions,
+            })
+        })
+        .collect();
     let data = serde_json::json!({
         "embedded": outcome.embedded,
         "failed_count": outcome.failed_count,
+        "skipped_roots": skipped_roots,
     });
     CommandOutput::with_notes(String::new(), data, degraded, notes)
 }
@@ -375,11 +398,12 @@ where
     sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
     for skipped in &stats.skipped_roots {
         warning(&format!(
-            "{} root unavailable — preserved {} existing session(s); run with --force once the root is back to reconcile deletions",
+            "{} root unavailable — preserved {} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions",
             skipped.source.as_str(),
             skipped.preserved_sessions
         ));
     }
+    let skipped_roots = stats.skipped_roots;
 
     let sp = Spinner::new("Creating chunks...");
     let on_progress = |done: usize, total: usize| {
@@ -403,10 +427,12 @@ where
                 embedded: result.embedded,
                 failed_count: result.failed_count,
                 first_error: result.first_error,
+                skipped_roots,
             })
         }
         Err(reason) => Ok(IndexOutcome {
             degraded_note: search_degraded_note(reason),
+            skipped_roots,
             ..IndexOutcome::default()
         }),
     }
@@ -1973,6 +1999,53 @@ mod tests {
         );
     }
 
+    // #165 follow-up (SF4-JSON, end-to-end): a source root that vanishes between
+    // runs preserves its existing session AND threads the skipped root into the
+    // returned IndexOutcome, so index_command_output can surface it on the --json
+    // path (the stderr warning loop runs as the human-path side effect). Given a DB
+    // seeded from a claude source, a second index pointed at a now-missing claude
+    // dir returns skipped_roots naming claude with its one preserved session.
+    // Perspective: state (a present→missing root transition) + hazard (a root
+    // outage dropped from the outcome would hide the masked deletions #165 names).
+    #[test]
+    fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        // Second run: the claude root has vanished. Its session must be preserved
+        // and reported, not deleted.
+        let gone_claude = src.path().join("claude_gone");
+        let missing_opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &gone_claude,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path), &missing_opts, mock_loader).unwrap();
+
+        assert_eq!(
+            outcome.skipped_roots.len(),
+            1,
+            "the missing claude root must be threaded into the outcome"
+        );
+        assert_eq!(outcome.skipped_roots[0].source, parser::Source::Claude);
+        assert_eq!(
+            outcome.skipped_roots[0].preserved_sessions, 1,
+            "the one preserved claude session must be counted"
+        );
+    }
+
     // -- Phase 2 (AC-4): model-less index degrades, never aborts (FR-004a/004b) --
     //
     // index_and_report_with returns Result<IndexOutcome> carrying the degraded note
@@ -2159,6 +2232,7 @@ mod tests {
             embedded: 5,
             failed_count: 3,
             first_error: Some("batch: mock failure".to_owned()),
+            skipped_roots: Vec::new(),
         }
     }
 
@@ -2170,6 +2244,7 @@ mod tests {
             embedded: 0,
             failed_count: 0,
             first_error: None,
+            skipped_roots: Vec::new(),
         }
     }
 
@@ -2181,6 +2256,7 @@ mod tests {
             embedded: 8,
             failed_count: 0,
             first_error: None,
+            skipped_roots: Vec::new(),
         }
     }
 
@@ -2309,6 +2385,7 @@ mod tests {
             embedded: 0,
             failed_count: 2,
             first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
+            skipped_roots: Vec::new(),
         };
 
         let out = index_command_output(&outcome);
@@ -2327,6 +2404,49 @@ mod tests {
             out.notes[0].contains("rerun `recall index`"),
             "the retry guidance survives the capping, got: {:?}",
             out.notes
+        );
+    }
+
+    // #165 follow-up (SF4-JSON): a skipped source root reaches the --json envelope,
+    // not just the human stderr warning. Given skipped_roots non-empty,
+    // index_command_output sets degraded:true (co-varying with notes), emits a note
+    // naming the source and preserved count, and carries the structured magnitude in
+    // data.skipped_roots so an agent reads it without parsing prose.
+    // Perspective: branch (the skipped-root arm) + hazard (a root outage masking real
+    // deletions must be visible on the machine path #165 names as its audience).
+    #[test]
+    fn index_command_output_surfaces_skipped_root_in_json() {
+        let outcome = IndexOutcome {
+            degraded_note: None,
+            embedded: 4,
+            failed_count: 0,
+            first_error: None,
+            skipped_roots: vec![indexer::SkippedRoot {
+                source: parser::Source::Codex,
+                preserved_sessions: 2,
+            }],
+        };
+
+        let out = index_command_output(&outcome);
+
+        assert!(
+            out.degraded,
+            "a skipped root is a degradation: --json must not report it as a clean success"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("codex") && n.contains("2") && n.contains("recall index")),
+            "the note must name the source, the preserved count, and the reconcile command, got: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            out.data["skipped_roots"][0]["source"], "codex",
+            "the payload carries the skipped source, not just prose"
+        );
+        assert_eq!(
+            out.data["skipped_roots"][0]["preserved_sessions"], 2,
+            "the payload carries the preserved magnitude an agent can act on"
         );
     }
 
