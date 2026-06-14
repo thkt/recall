@@ -2465,6 +2465,45 @@ mod tests {
         );
     }
 
+    // #185 T-185-4: with nothing preserved, the structured note channel (the
+    // `notes` rendering, separate from the warn! log) must carry the missing-
+    // sessions wording and drop the reconcile-deletions framing.
+    #[test]
+    fn index_command_note_for_zero_preserved_incomplete_root_omits_reconcile() {
+        let outcome = IndexOutcome {
+            degraded_note: None,
+            embedded: 0,
+            failed_count: 0,
+            first_error: None,
+            skipped_roots: vec![indexer::SkippedRoot {
+                source: parser::Source::Claude,
+                preserved_sessions: 0,
+                reason: indexer::SkippedReason::IncompleteEnumeration,
+            }],
+        };
+
+        let out = index_command_output(&outcome);
+
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("claude") && n.contains("some sessions may be missing")),
+            "a zero-preserved incomplete root must warn that sessions may be missing, got: {:?}",
+            out.notes
+        );
+        assert!(
+            !out.notes
+                .iter()
+                .any(|n| n.contains("reconcile any real deletions")),
+            "with nothing preserved the note must not promise to reconcile deletions, got: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
+            "the payload still carries the machine-readable cause at zero preserved"
+        );
+    }
+
     // -- Phase 3 (AC-1): search is read-only — it embeds nothing (FR-001) --
     //
     // Seam choice: model-less, try_load_embedder_cached returns Err(NotInstalled)

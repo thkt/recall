@@ -64,6 +64,12 @@ impl SkippedReason {
             SkippedReason::MissingRoot => format!(
                 "{source} root unavailable — preserved {preserved} existing session(s); re-run `recall index` once the root is back to reconcile any real deletions"
             ),
+            // With nothing preserved (e.g. a first index where the partial read
+            // means some files were never seen), the "preserved N / reconcile
+            // deletions" framing is self-contradictory, so drop it (#185).
+            SkippedReason::IncompleteEnumeration if preserved == 0 => format!(
+                "{source} root could not be fully read; some sessions may be missing from the index. check the directory's permissions and access, then re-run `recall index`"
+            ),
             SkippedReason::IncompleteEnumeration => format!(
                 "{source} root could not be fully read — preserved {preserved} existing session(s); check the directory's permissions and access, then re-run `recall index` to reconcile any real deletions"
             ),
@@ -436,10 +442,12 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
 /// sessions were preserved from orphan cleanup. Only rows whose file is absent
 /// from `sources` are counted — mirroring the deletion condition in
 /// `cleanup_orphans` — so a partially-failed scan that re-indexed some files of
-/// the source does not over-report the at-risk magnitude. Sources with zero
-/// preserved rows are omitted so a user who simply never used one tool sees no
-/// noise. `None`-source rows are excluded by construction (they match neither
-/// variant), consistent with cleanup_orphans preserving them unconditionally.
+/// the source does not over-report the at-risk magnitude. A `MissingRoot` with
+/// zero preserved rows is omitted so a user who simply never used one tool sees
+/// no noise; an `IncompleteEnumeration` always surfaces regardless of preserved
+/// count, since the partial read itself is the silent-under-index signal (#185).
+/// `None`-source rows are excluded by construction (they match neither variant),
+/// consistent with cleanup_orphans preserving them unconditionally.
 fn summarize_skipped_roots(
     existing: &HashMap<String, SessionEntry>,
     sources: &[(PathBuf, Source)],
@@ -456,7 +464,16 @@ fn summarize_skipped_roots(
                     e.source == Some(source) && !source_paths.contains(Path::new(fp.as_str()))
                 })
                 .count();
-            (preserved_sessions > 0).then_some(SkippedRoot {
+            // MissingRoot + 0 preserved = a tool the user never ran; staying
+            // silent suppresses noise (#165). IncompleteEnumeration is a present
+            // root that failed to read, so surface it even with nothing preserved
+            // — that case (#185) is exactly the silent under-index this exists to
+            // catch. The asymmetry is intentional.
+            let emit = match reason {
+                SkippedReason::MissingRoot => preserved_sessions > 0,
+                SkippedReason::IncompleteEnumeration => true,
+            };
+            emit.then_some(SkippedRoot {
                 source,
                 preserved_sessions,
                 reason,
