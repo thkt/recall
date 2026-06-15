@@ -1061,6 +1061,123 @@ fn test_hybrid_search_merges_fts_and_vector() {
 }
 
 #[test]
+fn test_short_query_runs_vector_search_when_fts_has_no_trigram_term() {
+    // #164: a 2-char query ("ui") has no trigram-indexable FTS term, so
+    // `clean_for_trigram` yields None. The bug returned early there, skipping vector
+    // search even with embeddings present. The fix lets the vector path answer.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // s1: an FTS-indexed message with no word/trigram starting "ui", so the query
+    // cannot expand to a trigram term and cannot match s1 via FTS.
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "completely separate gardening notes");
+
+    // s2: no FTS message, only a vec_chunk whose content equals the query, so the
+    // MockEmbedder produces an exact-match vector.
+    insert_session(&conn, "s2", "claude", "/proj", now_ms);
+    insert_chunk_with_embedding(&conn, 1, "s2", "ui", now_ms);
+
+    // Precondition: the query produces no trigram FTS query (drives the #164 branch).
+    let matched = prepare_match_query(
+        &conn,
+        "ui",
+        "messages_vocab",
+        &QueryNormalizationConfig::disabled(),
+    )
+    .unwrap();
+    assert!(
+        clean_for_trigram(&matched).is_none(),
+        "test precondition: short query must yield no trigram FTS query"
+    );
+
+    let opts = SearchOptions {
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+
+    // FTS-only (no embedder): no trigram term means no FTS candidate, so empty.
+    // This is the pre-fix behavior, preserved when no embeddings exist.
+    let fts_only = search(&conn, "ui", &opts).unwrap();
+    assert!(
+        fts_only.is_empty(),
+        "FTS-only short query must return no results, got: {:?}",
+        fts_only
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    // With an embedder, vector search now runs and finds s2 by meaning.
+    let embedder = MockEmbedder::new();
+    let results = search_with_embedder(&conn, "ui", &opts, Some(&embedder)).unwrap();
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"s2"),
+        "short query must reach vector search and find s2, got: {ids:?}"
+    );
+
+    // The vec-only hit exposes its chunk content, not an empty excerpt — the
+    // fts_query=None path skips the MATCH snippet tiers and uses the vec chunk.
+    let s2 = results
+        .iter()
+        .find(|r| r.session.session_id == "s2")
+        .unwrap();
+    assert!(
+        s2.excerpt.contains("ui"),
+        "vector-only excerpt must contain chunk content, got: {:?}",
+        s2.excerpt
+    );
+}
+
+#[test]
+fn test_empty_and_whitespace_queries_return_empty_even_with_embedder_and_vec_data() {
+    // #164 constraint: "truly empty or whitespace-only queries should still return
+    // no results." Removing the short-query early return must not break this, even
+    // though an embedder and vec data are present (the condition that now lets short
+    // queries through to the vector path). These two cases are caught earlier by the
+    // NoSearchableTerms / EmptyInput arm, before the vector fall-through.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // A vec chunk so has_vec_data() is true and the embedder branch is taken.
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_chunk_with_embedding(&conn, 1, "s1", "some indexed content", now_ms);
+
+    let opts = SearchOptions {
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+    let embedder = MockEmbedder::new();
+
+    for query in ["", "   "] {
+        let results = search_with_embedder(&conn, query, &opts, Some(&embedder)).unwrap();
+        assert!(
+            results.is_empty(),
+            "query {query:?} must return no results, got: {:?}",
+            results
+                .iter()
+                .map(|r| r.session.session_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Deliberate scope decision (#164): a non-empty query with no trigram term —
+    // including punctuation-only — DOES reach vector search. The issue scopes the
+    // fix as "let vector search run for non-empty queries"; the pre-fix empty result
+    // for "..." was an incidental effect of the removed early return, not a promise.
+    // Pinned so a future "re-fix" that re-adds an empty-on-punctuation gate is caught.
+    let punct = search_with_embedder(&conn, "...", &opts, Some(&embedder)).unwrap();
+    assert!(
+        !punct.is_empty(),
+        "non-empty punctuation-only query must reach vector search, not return empty"
+    );
+}
+
+#[test]
 fn test_vector_only_excerpt_uses_closest_chunk() {
     let (_dir, conn) = setup_test_db();
     let now_ms = 1_750_000_000_000_i64;
