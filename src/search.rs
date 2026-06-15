@@ -341,7 +341,7 @@ fn snippet_or_default(result: rusqlite::Result<String>, session_id: &str) -> Opt
 
 fn fetch_chunks(
     conn: &Connection,
-    fts_query: &str,
+    fts_query: Option<&str>,
     ranked: Vec<(String, f64)>,
     meta_map: &mut HashMap<String, SessionData>,
     vec_chunks: &HashMap<String, i64>,
@@ -385,23 +385,28 @@ fn fetch_chunks(
     let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
-        if let Some(content) = snippet_or_default(
-            rowid_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
-            sid,
-        ) {
-            return content;
-        }
-        if let Some(content) = snippet_or_default(
-            instr_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
-            sid,
-        ) {
-            return content;
-        }
-        if let Some(snippet) = snippet_or_default(
-            snippet_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
-            sid,
-        ) {
-            return snippet;
+        // No trigram-indexable FTS query (#164): a short-only query reaches here on
+        // the vector path. Skip the three MATCH-based snippet tiers (MATCH "" errors
+        // and logs a warning per session) and use the vec-chunk content directly.
+        if let Some(fts_query) = fts_query {
+            if let Some(content) = snippet_or_default(
+                rowid_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+                sid,
+            ) {
+                return content;
+            }
+            if let Some(content) = snippet_or_default(
+                instr_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+                sid,
+            ) {
+                return content;
+            }
+            if let Some(snippet) = snippet_or_default(
+                snippet_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+                sid,
+            ) {
+                return snippet;
+            }
         }
         if let Some(&chunk_id) = vec_chunks.get(sid)
             && let Some(content) = snippet_or_default(
@@ -532,10 +537,16 @@ pub fn search_with_embedder(
             return Err(e.into());
         }
     };
-    let Some(fts_query) = clean_for_trigram(&matched) else {
-        return Ok(Vec::new());
+    // A short query (e.g. "UI") whose terms are all <3 chars yields no trigram-
+    // indexable FTS query. That must not skip vector search when embeddings exist
+    // (#164): fall through with no FTS candidates and let the vec path answer by
+    // meaning. The empty/whitespace-only case already returned above (NoSearchableTerms).
+    let fts_query = clean_for_trigram(&matched);
+    let fts_query = fts_query.as_deref();
+    let fts_ranked = match fts_query {
+        Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
+        None => Vec::new(),
     };
-    let fts_ranked = find_candidate_sessions(conn, opts, &fts_query, now_ms)?;
 
     if let Some(embedder) = embedder
         && has_vec_data(conn)
@@ -587,7 +598,7 @@ pub fn search_with_embedder(
         );
         merged.truncate(opts.limit);
 
-        let candidates = fetch_chunks(conn, &fts_query, merged, &mut meta_map, &vec_chunks)?;
+        let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
         Ok(candidates.into_iter().map(|(_, r)| r).collect())
     } else {
         if fts_ranked.is_empty() {
@@ -596,8 +607,7 @@ pub fn search_with_embedder(
         let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
         // FTS-only path: every session matched FTS, so there is always a snippet;
         // pass an empty vec-chunk map (no vector-only fallback needed here).
-        let candidates =
-            fetch_chunks(conn, &fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
+        let candidates = fetch_chunks(conn, fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
         Ok(score_and_sort(candidates, now_ms, opts.limit))
     }
 }
