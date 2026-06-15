@@ -5,6 +5,7 @@ use amici::testing::hybrid::assert_filter_symmetric;
 use super::*;
 use crate::db::setup_test_db;
 use crate::embedder::MockEmbedder;
+use crate::indexer::index_chunks;
 
 fn make_result(sid: &str, ts: i64) -> SearchResult {
     SearchResult {
@@ -48,6 +49,47 @@ fn insert_chunk_with_embedding(conn: &Connection, chunk_id: i64, sid: &str, text
         rusqlite::params![chunk_id, embedding_bytes],
     )
     .unwrap();
+}
+
+/// Like `insert_chunk_with_embedding`, but stamps the chunk's source message
+/// rowid range (#192). The primary `fetch_chunks` SQL joins the FTS top-hit
+/// `m.rowid BETWEEN c.src_rowid_lo AND c.src_rowid_hi`, so the [lo, hi] literals
+/// must bracket the intended message's rowid. Messages are inserted by
+/// `insert_message` in order, taking rowids 1, 2, 3, … — assert with
+/// `message_rowid` when the alignment is load-bearing.
+fn insert_chunk_with_rowid_range(
+    conn: &Connection,
+    chunk_id: i64,
+    sid: &str,
+    text: &str,
+    ts: i64,
+    lo: i64,
+    hi: i64,
+) {
+    conn.execute(
+        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![chunk_id, sid, text, ts, lo, hi],
+    )
+    .unwrap();
+    let embedding = MockEmbedder::deterministic_vector(text);
+    let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
+    conn.execute(
+        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![chunk_id, embedding_bytes],
+    )
+    .unwrap();
+}
+
+/// The rowid FTS5 assigned to a message, so a test can pin lo/hi alignment to the
+/// actual stored rowid rather than trusting insertion order.
+fn message_rowid(conn: &Connection, sid: &str, text: &str) -> i64 {
+    conn.query_row(
+        "SELECT rowid FROM messages WHERE session_id = ?1 AND text = ?2",
+        rusqlite::params![sid, text],
+        |r| r.get(0),
+    )
+    .unwrap()
 }
 
 #[test]
@@ -240,6 +282,245 @@ fn test_fts_hit_returns_unique_chunk_among_multiple() {
     assert!(
         excerpt.contains("HOME_BODY") && !excerpt.contains("**"),
         "count=1 must return the full home chunk, not over-suppress to a snippet: {excerpt:?}"
+    );
+}
+
+// T-192a (#192): false ambiguity. A short message "yes" instr-collides with two
+// chunks, so the #118 instr guard saw COUNT(*) = 2 and degraded to a snippet.
+// The rowid-range JOIN resolves it: the "yes" message's rowid falls inside
+// exactly one group's [lo, hi], so the primary SQL's COUNT(*) = 1 holds and the
+// full owning chunk is returned. Perspective: Combination (instr collision ×
+// rowid scoping) + Hazard (short-token false ambiguity). RED on current code:
+// today's instr-only SQL has no src_rowid columns to JOIN, so this compiles
+// against the intended API only and, once Green, must return the full chunk.
+#[test]
+fn test_192a_short_hit_rowid_range_disambiguates_to_full_chunk() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    // rowid 1: the matched user message "yes" — it lives in the group below.
+    insert_message(&conn, "s1", "user", "yes");
+    // rowid 2: an unrelated later message whose chunk also contains "yes" as a
+    // substring (instr-collision), but whose rowid range excludes rowid 1.
+    insert_message(&conn, "s1", "user", "did it say yes or no");
+    let yes_rowid = message_rowid(&conn, "s1", "yes");
+    let other_rowid = message_rowid(&conn, "s1", "did it say yes or no");
+
+    // Precondition: the FTS top-hit for "yes" must be the "yes" message itself.
+    // The primary SQL JOINs the single top-ranked rowid, so if a rank inversion
+    // ever makes the longer message win, this fixture (not production) is wrong.
+    // Pinning it here makes a Green-time inversion fail loudly on the fixture.
+    let top_hit_rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1",
+            ("yes", "s1"),
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        top_hit_rowid, yes_rowid,
+        "fixture precondition: the FTS top-hit for 'yes' is the 'yes' message"
+    );
+
+    // Owning group: range covers rowid 1 only → the "yes" hit lands here.
+    insert_chunk_with_rowid_range(
+        &conn,
+        1,
+        "s1",
+        "yes — OWNER_BODY confirming the deploy",
+        1709251200000,
+        yes_rowid,
+        yes_rowid,
+    );
+    // Collider: substring "yes" matches via instr, but its range is the later
+    // message, which does not contain rowid 1.
+    insert_chunk_with_rowid_range(
+        &conn,
+        2,
+        "s1",
+        "did it say yes or no — COLLIDER_BODY",
+        1709251200000,
+        other_rowid,
+        other_rowid,
+    );
+
+    let results = search(&conn, "yes", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("OWNER_BODY") && !excerpt.contains("COLLIDER_BODY"),
+        "rowid range must scope the hit to its owning chunk and return it full, \
+         not degrade to a snippet under instr collision: {excerpt:?}"
+    );
+    assert!(
+        !excerpt.contains("**"),
+        "the disambiguated hit returns a full chunk, not the snippet fallback: {excerpt:?}"
+    );
+}
+
+// T-192b (#192): assistant-message coverage. The FTS top-hit is an assistant
+// message whose rowid is the group's `hi` (user rowid + 1). The range JOIN
+// (lo <= rowid <= hi) still matches the owning chunk, so the full chunk is
+// returned. This pins that the link is a RANGE, not a single user rowid: a
+// user-rowid-only design (lo == hi == user rowid) would exclude the assistant
+// rowid and return 0 rows → wrong snippet fallback. Perspective: Boundary (hit
+// at the upper bound of the range) + Hazard (assistant-rowid regression).
+#[test]
+fn test_192b_assistant_hit_at_range_hi_returns_full_chunk() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    // rowid 1 user, rowid 2 assistant. The query word "quasar" appears ONLY in
+    // the assistant message, so the assistant message is the unambiguous FTS hit.
+    insert_message(&conn, "s1", "user", "what is the brightest object");
+    insert_message(&conn, "s1", "assistant", "a quasar outshines its galaxy");
+    let user_rowid = message_rowid(&conn, "s1", "what is the brightest object");
+    let assistant_rowid = message_rowid(&conn, "s1", "a quasar outshines its galaxy");
+    assert_eq!(
+        assistant_rowid,
+        user_rowid + 1,
+        "fixture precondition: assistant rowid is the group's hi"
+    );
+
+    // The chunk spans [user_rowid, assistant_rowid]. The hit (assistant) sits at hi.
+    insert_chunk_with_rowid_range(
+        &conn,
+        1,
+        "s1",
+        "what is the brightest object\na quasar outshines its galaxy — QUASAR_BODY",
+        1709251200000,
+        user_rowid,
+        assistant_rowid,
+    );
+
+    let results = search(&conn, "quasar", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("QUASAR_BODY") && !excerpt.contains("**"),
+        "an assistant hit at the range hi must return the full owning chunk; a \
+         user-rowid-only link would miss it and fall to a snippet: {excerpt:?}"
+    );
+}
+
+// T-192c (#192): the uniqueness guard stays. One user message split into N
+// chunks shares the same [lo, hi] range, so a hit rowid in that range matches
+// all N chunks → COUNT(*) = N > 1 → HAVING COUNT(*) = 1 rejects → the
+// match-centered snippet is returned, never an arbitrary one of the N siblings.
+// Perspective: Combination (split group × range JOIN) + Boundary (COUNT just
+// above 1). This is the honest-ambiguity case the range link must NOT paper over.
+#[test]
+fn test_192c_split_group_shared_range_falls_back_to_snippet() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s1", "user", "explain consensus");
+    let user_rowid = message_rowid(&conn, "s1", "explain consensus");
+
+    // Two sibling chunks from the same split group: identical [lo, hi] covering
+    // the user rowid. Both contain "consensus" → both match the JOIN → COUNT = 2.
+    insert_chunk_with_rowid_range(
+        &conn,
+        1,
+        "s1",
+        "explain consensus — SPLIT_BODY_A part one",
+        1709251200000,
+        user_rowid,
+        user_rowid,
+    );
+    insert_chunk_with_rowid_range(
+        &conn,
+        2,
+        "s1",
+        "explain consensus — SPLIT_BODY_B part two",
+        1709251200000,
+        user_rowid,
+        user_rowid,
+    );
+
+    let results = search(&conn, "consensus", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("**")
+            && !excerpt.contains("SPLIT_BODY_A")
+            && !excerpt.contains("SPLIT_BODY_B"),
+        "a hit matching N sibling chunks must reject (COUNT>1) and return the \
+         match-centered snippet, not an arbitrary sibling: {excerpt:?}"
+    );
+}
+
+// T-192d (#192): backward compatibility. A legacy chunk with NULL src_rowid_lo
+// is excluded from the primary rowid SQL (WHERE c.src_rowid_lo IS NOT NULL), so
+// the hit falls through to the NULL-scoped instr guard and the chunk is still
+// returned in full — the pre-#192 behavior. Perspective: Branch (the IS NULL
+// fallback path) + Error (NULL input to the range JOIN). This must insert NULL
+// lo/hi chunks explicitly; the existing T-001/002/003 only incidentally cover it.
+#[test]
+fn test_192d_null_rowid_range_falls_back_to_instr_guard() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s1", "user", "legacy authentication question");
+    // Legacy chunk: src_rowid_lo / src_rowid_hi default to NULL (helper does not
+    // set them), so the primary rowid SQL skips it and the instr guard answers.
+    insert_chunk_with_embedding(
+        &conn,
+        1,
+        "s1",
+        "legacy authentication question — LEGACY_BODY answered before #192",
+        1709251200000,
+    );
+
+    let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("LEGACY_BODY") && !excerpt.contains("**"),
+        "a NULL-rowid legacy chunk must still resolve via the instr fallback and \
+         return the full chunk, preserving pre-#192 behavior: {excerpt:?}"
+    );
+}
+
+// T-192g (#192): round-trip wiring. The other T-192 tests stamp lo/hi by hand via
+// `insert_chunk_with_rowid_range`, so none exercise the real `index_chunks` INSERT
+// (indexer.rs) end-to-end into a search result. This drives that path: index two
+// messages, then search, and assert the full chunk (user + assistant) comes back
+// via the rowid JOIN, not a snippet. A param-order swap of ?4/?5 (lo/hi) in the
+// index_chunks INSERT would store an inverted range; with lo > hi the BETWEEN JOIN
+// matches nothing and the excerpt degrades to a snippet, which this test catches.
+// Perspective: Hazard (param-order swap) + integration seam (chunker→indexer→search).
+#[test]
+fn test_192g_indexed_chunk_resolves_full_chunk_via_rowid_join() {
+    let (_dir, mut conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    // "perihelion" appears only in the user message (the assistant body avoids the
+    // word so the trigram FTS hit is unambiguous) → the sole hit rowid sits at the
+    // group's lo. The assistant body must still come back with it, proving the full
+    // owning chunk was resolved across the [lo, hi] range rather than a match snippet.
+    insert_message(&conn, "s1", "user", "define perihelion precisely");
+    insert_message(
+        &conn,
+        "s1",
+        "assistant",
+        "the closest orbital point — APSIS_REPLY_BODY",
+    );
+
+    let stats = index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        stats.chunks_created, 1,
+        "one user+assistant pair → one chunk"
+    );
+
+    let results = search(&conn, "perihelion", &SearchOptions::default()).unwrap();
+
+    assert_eq!(results.len(), 1);
+    let excerpt = &results[0].excerpt;
+    assert!(
+        excerpt.contains("APSIS_REPLY_BODY") && !excerpt.contains("**"),
+        "an index_chunks-written chunk must resolve to the full user+assistant body \
+         via the rowid JOIN; an inverted lo/hi range would degrade to a snippet: \
+         {excerpt:?}"
     );
 }
 

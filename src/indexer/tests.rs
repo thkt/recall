@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use super::*;
 use crate::db::{seed_session, setup_test_db};
-use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks};
+use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use tempfile::TempDir;
 
 #[test]
@@ -1556,5 +1556,172 @@ fn test_embed_chunks_continues_past_failed_batch_and_counts_remainder() {
     assert_eq!(
         vec_count, EMBED_BATCH_SIZE as i64,
         "the committed first batch survives the later failures"
+    );
+}
+
+/// Seeds one message into the default test session `s1`. Returns its rowid so the
+/// backfill tests can pin which range a chunk should receive.
+fn seed_message(conn: &Connection, role: &str, text: &str) -> i64 {
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('s1', ?1, ?2)",
+        rusqlite::params![role, text],
+    )
+    .unwrap();
+    conn.query_row(
+        "SELECT rowid FROM messages WHERE session_id = 's1' AND text = ?1",
+        [text],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Seeds a legacy qa_chunk (NULL src_rowid_lo/hi) plus its vec_chunks embedding,
+/// mirroring a row written before #192. Backfill must populate lo/hi in place
+/// without disturbing id or the embedding.
+fn seed_legacy_chunk(conn: &Connection, id: i64, content: &str) {
+    conn.execute(
+        "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, 's1', ?2, 0)",
+        rusqlite::params![id, content],
+    )
+    .unwrap();
+    let embedding = MockEmbedder::deterministic_vector(content);
+    conn.execute(
+        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![id, f32_as_bytes(&embedding)],
+    )
+    .unwrap();
+}
+
+// T-192e (#192, FR-6): migration backfill on a count-matching session. A legacy
+// session whose stored qa_chunks count equals the re-derived chunk count gets
+// its NULL src_rowid_lo/hi populated by re-running the chunker and zipping by
+// qa_chunks.id ascending. The embedding rows (vec_chunks) and qa_chunks.id must
+// be untouched — no re-embed, no row churn (FR-5). Perspective: State (NULL →
+// populated) + Hazard (embedding loss / id reassignment on migration).
+#[test]
+fn test_192e_backfill_populates_rowid_range_count_match() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    // One user+assistant pair → the chunker re-derives exactly one chunk.
+    let user_rowid = seed_message(&conn, "user", "how to rotate tokens");
+    let assistant_rowid = seed_message(&conn, "assistant", "use a refresh grant");
+    // Legacy stored chunk: NULL lo/hi, one row → matches the re-derived count of 1.
+    seed_legacy_chunk(&conn, 1, "how to rotate tokens\nuse a refresh grant");
+
+    let vec_before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+
+    let updated = backfill_rowid_ranges(&mut conn).unwrap();
+    assert_eq!(updated, 1, "the count-matching session is backfilled");
+
+    let (lo, hi): (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT src_rowid_lo, src_rowid_hi FROM qa_chunks WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        lo,
+        Some(user_rowid),
+        "backfill sets lo to the user message rowid"
+    );
+    assert_eq!(
+        hi,
+        Some(assistant_rowid),
+        "backfill sets hi to the adjacent assistant message rowid"
+    );
+
+    let vec_after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        vec_after, vec_before,
+        "backfill must not delete or re-create embeddings"
+    );
+    let embedding_kept: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        embedding_kept, 1,
+        "the chunk's embedding stays linked by its unchanged id"
+    );
+}
+
+// T-192f (#192, FR-6): migration safety on a count mismatch. When the re-derived
+// chunk count does not equal the stored count, the id-order zip is unsafe (a
+// chunk would get the wrong message's rowid), so backfill leaves the rows' lo/hi
+// NULL and does not panic. Those rows then resolve via the instr fallback
+// (T-192d). Perspective: Error (mismatched cardinality) + Hazard (silent
+// mis-stamping). The stored count is 2; the seeded single user message re-derives
+// to 1 chunk → mismatch.
+#[test]
+fn test_192f_backfill_leaves_null_on_count_mismatch() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    // One user-only message → the chunker re-derives exactly one chunk.
+    seed_message(&conn, "user", "single turn");
+    // But two legacy chunks are stored → re-derived (1) != stored (2): mismatch.
+    seed_legacy_chunk(&conn, 1, "single turn");
+    seed_legacy_chunk(&conn, 2, "orphaned extra chunk");
+
+    let updated = backfill_rowid_ranges(&mut conn).unwrap();
+    assert_eq!(
+        updated, 0,
+        "a count-mismatched session is skipped, not backfilled"
+    );
+
+    let null_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 's1' AND src_rowid_lo IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        null_count, 2,
+        "both rows keep NULL lo/hi when the chunk count cannot be reconciled"
+    );
+}
+
+// T-192h (#192): read_session_messages skips rows whose role is neither user nor
+// assistant (Role::from_db returns None). recall only writes those two roles, so
+// this is defensive, but an unknown role must never leak into a chunk's content or
+// shift the rowid range. Perspective: Error (invalid role input) + Hazard (foreign
+// text contaminating an excerpt). Here a 'system' row sits between two real
+// messages; the re-derived chunk must contain only the user/assistant text.
+#[test]
+fn test_192h_unknown_role_message_is_skipped() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    seed_message(&conn, "user", "how do vaccines train immunity");
+    // 'system' is not a known role; read_session_messages must drop it.
+    seed_message(&conn, "system", "INTERNAL_SYSTEM_NOTE do not index");
+    seed_message(&conn, "assistant", "they present a harmless antigen");
+
+    let stats = index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        stats.chunks_created, 1,
+        "the user message pairs with the adjacent assistant; the system row is dropped"
+    );
+
+    let content: String = conn
+        .query_row(
+            "SELECT content FROM qa_chunks WHERE session_id = 's1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        !content.contains("INTERNAL_SYSTEM_NOTE")
+            && content.contains("how do vaccines train immunity")
+            && content.contains("they present a harmless antigen"),
+        "the chunk holds only the user and assistant text, never the skipped system \
+         row: {content:?}"
     );
 }

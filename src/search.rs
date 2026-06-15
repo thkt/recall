@@ -346,26 +346,36 @@ fn fetch_chunks(
     meta_map: &mut HashMap<String, SessionData>,
     vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<(f64, SearchResult)>> {
-    // Full chunk for an FTS hit (#8): find the message that matched, then the
-    // qa_chunk whose content contains that message text. `instr` runs on the
-    // already-matched message text (not the raw query), so FTS5 operators
-    // (AND/OR/quotes) are resolved by MATCH and never reach `instr`. Scoped to the
-    // session, so it scans only that session's handful of chunks (idx_qa_chunks_session).
-    // `ORDER BY rank` picks the most relevant matched message when several match,
-    // instead of an arbitrary rowid-ordered one.
-    // Uniqueness guard (#118): return the chunk only when exactly one chunk in the
-    // session contains the matched text. `HAVING COUNT(*) = 1` makes the empty/0
-    // and ambiguous/2+ cases yield no row (→ snippet fallback below); `MAX(content)`
-    // simply unwraps the single matching row. This drops the arbitrary `LIMIT 1`,
-    // so a short matched text (e.g. "yes") that instr-collides with another chunk
-    // no longer returns a chunk that is not the matched message's home; an honest
-    // multi-chunk echo collapses to the snippet the same way (correctness > full
-    // chunk, the snippet always contains the match).
-    let chunk_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
+    // Full chunk for an FTS hit (#8, #192): find the message that matched, then the
+    // qa_chunk it was generated from. The primary path links by the source message
+    // rowid range stored on the chunk (#192): the FTS top-hit's rowid is resolved to
+    // its owning chunk via `m.rowid BETWEEN c.src_rowid_lo AND c.src_rowid_hi`. Ranges
+    // are disjoint per group, so a short hit (e.g. "yes") that the old instr substring
+    // guess collided with now lands on its true home. `ORDER BY rank LIMIT 1` picks the
+    // most relevant matched message; scoped to the session (idx_qa_chunks_session).
+    // Uniqueness guard (#118): `HAVING COUNT(*) = 1` keeps split-siblings (which share
+    // one range → COUNT=N) collapsing to the snippet instead of an arbitrary sibling.
+    // Restricted to `src_rowid_lo IS NOT NULL` so only linked (current or backfilled)
+    // chunks take this path; legacy NULL rows fall through to the instr guess below.
+    let rowid_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
+        JOIN (SELECT rowid FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
+          ON m.rowid BETWEEN c.src_rowid_lo AND c.src_rowid_hi \
+        WHERE c.session_id = ?2 AND c.src_rowid_lo IS NOT NULL HAVING COUNT(*) = 1";
+    let mut rowid_match_stmt = conn.prepare(rowid_match_sql)?;
+    // Fallback for legacy chunks indexed before #192 (src_rowid_lo NULL) that a
+    // count-mismatched session left unbackfilled: the pre-#192 instr substring guess.
+    // `instr` runs on the already-matched message text (not the raw query), so FTS5
+    // operators (AND/OR/quotes) are resolved by MATCH and never reach `instr`.
+    // `HAVING COUNT(*) = 1` keeps the same uniqueness guard; the `IS NULL` scope means
+    // that in a fully-linked DB the `instr` join matches no chunk and returns no row.
+    // (The inner MATCH subquery still runs on a rowid-tier miss before the outer
+    // `IS NULL` prunes it; harmless on this single-user path, and the instr tier is
+    // skipped entirely whenever the rowid tier already resolved the hit.)
+    let instr_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
         JOIN (SELECT text FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
           ON instr(c.content, m.text) > 0 \
-        WHERE c.session_id = ?2 HAVING COUNT(*) = 1";
-    let mut chunk_match_stmt = conn.prepare(chunk_match_sql)?;
+        WHERE c.session_id = ?2 AND c.src_rowid_lo IS NULL HAVING COUNT(*) = 1";
+    let mut instr_match_stmt = conn.prepare(instr_match_sql)?;
     // Fallback when no single chunk contains the matched message (e.g. the message
     // was split across chunks, or the session has no qa_chunks): the 20-token snippet.
     let snippet_sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
@@ -376,7 +386,13 @@ fn fetch_chunks(
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
         if let Some(content) = snippet_or_default(
-            chunk_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+            rowid_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+            sid,
+        ) {
+            return content;
+        }
+        if let Some(content) = snippet_or_default(
+            instr_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
             sid,
         ) {
             return content;

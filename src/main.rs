@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::envelope::{CommandOutput, render_json_error, render_json_success};
 use crate::error::{RecallError, classify_exit_code, download_error, error_envelope};
@@ -412,6 +412,15 @@ where
         sp.set_message(&format!("Creating chunks... {done}/{total} sessions"));
     };
     let chunk_stats = indexer::index_chunks(&mut conn, Some(&on_progress))?;
+    // Link pre-#192 chunks to their source message rowid range; see
+    // `backfill_rowid_ranges` for the no-op-once-linked and count-mismatch behavior.
+    let backfilled = indexer::backfill_rowid_ranges(&mut conn)?;
+    if backfilled > 0 {
+        debug!(
+            sessions = backfilled,
+            "linked legacy chunks to rowid ranges"
+        );
+    }
     if chunk_stats.chunks_created > 0 {
         sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
@@ -1999,6 +2008,62 @@ mod tests {
             hits.len(),
             1,
             "rebuild must reconstruct FTS: the seeded term must return its session"
+        );
+    }
+
+    // T-192i (#192, FR-6): the backfill pass is wired into the `recall index`
+    // path, not only callable in isolation. A first index links every chunk's
+    // rowid range; nulling lo/hi simulates a pre-#192 row, and a second index
+    // (the same source, force=false) must repopulate it via backfill_rowid_ranges
+    // — index_chunks skips the session because its qa_chunks already exist
+    // (indexer.rs:645), so only backfill can restore the link. Perspective: state
+    // (legacy NULL → populated through the index command) + hazard (a backfill
+    // call dropped from index_and_report_with would leave old rows on the instr
+    // fallback forever, undetected by the isolated T-192e unit test).
+    #[test]
+    fn index_and_report_with_backfills_legacy_null_rowid_ranges() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        // Simulate a pre-#192 row: clear the rowid link the first index wrote.
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            let cleared = conn
+                .execute(
+                    "UPDATE qa_chunks SET src_rowid_lo = NULL, src_rowid_hi = NULL",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(cleared, 1, "precondition: one chunk to un-link");
+        }
+
+        // Second index over the unchanged source: index_chunks skips the already
+        // chunked session, so backfill is the only thing that can re-link it.
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        let (lo, hi): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT src_rowid_lo, src_rowid_hi FROM qa_chunks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            lo.is_some() && hi.is_some(),
+            "the index-path backfill must repopulate the legacy NULL rowid range, got lo={lo:?} hi={hi:?}"
         );
     }
 
