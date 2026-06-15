@@ -747,7 +747,14 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
 
     let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
-    let embedded: i64 = conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))?;
+    // Count distinct embedded chunks, not vec_chunks rows: one qa_chunk can hold
+    // several sub-embedding rows (embedder.rs:80 inserts one per sub-chunk), so
+    // COUNT(*) overstates coverage and can exceed qa_chunks. This mirrors the
+    // chunk-level coverage `pending_chunks` uses (DISTINCT chunk_id, embedder.rs:127).
+    let embedded: i64 =
+        conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
+            r.get(0)
+        })?;
 
     let model_ok = cached_artifacts(ModelId::DEFAULT)
         .map(|opt| opt.is_some())
@@ -1936,6 +1943,44 @@ mod tests {
             vec_chunk_count(&conn),
             2,
             "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
+        );
+    }
+
+    // #163: status reports embedded *chunks*, not vec_chunks rows. One qa_chunk
+    // whose embedder output split into 2 sub-embeddings owns 2 vec_chunks rows
+    // (sub_idx 0,1). COUNT(*) would report embedded=2 > qa_chunks=1; the
+    // chunk-level coverage (DISTINCT chunk_id) must report 1, matching the
+    // pending-embedding semantics agents rely on to decide if index is complete.
+    // Perspective: hazard (sub-embedding overcount) + boundary (embedded vs the
+    // qa_chunks denominator never exceeds it).
+    #[test]
+    fn run_status_counts_distinct_embedded_chunks_not_subembedding_rows() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        db::seed_session(&conn, "s1");
+        db::seed_chunk(&conn, 1, "one chunk, two sub-embeddings");
+        let emb = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
+        for sub_idx in 0..2 {
+            conn.execute(
+                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, ?2)",
+                rusqlite::params![embedder::f32_as_bytes(&emb), sub_idx],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let out = run_status(false, &Some(db_path)).unwrap();
+
+        assert_eq!(
+            out.data["embedded"], 1,
+            "one qa_chunk with two sub-embedding rows is one embedded chunk, not two"
+        );
+        assert_eq!(out.data["qa_chunks"], 1);
+        assert!(
+            out.markdown.contains("Embedded: 1/1"),
+            "human output must not overstate coverage past the qa_chunks total, got: {}",
+            out.markdown
         );
     }
 
