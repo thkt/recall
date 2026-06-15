@@ -456,12 +456,16 @@ fn rebuild_json_emits_structured_embed_summary() {
 }
 
 // T-CLI019: `status --json` against a never-created index reports zero counters
-// with model_ready:false as a success envelope, exit 0 — the no-database branch
-// of run_status. Pairs with T-CLI013, which runs `index` first (the live path).
+// as a success envelope, exit 0 — the no-database branch of run_status. With
+// HF_HOME pointed at an empty cache the model is not installed, so model_ready is
+// false here; T-CLI020 covers the same branch when the model IS cached. Pairs
+// with T-CLI013, which runs `index` first (the live path).
 #[test]
 fn status_json_without_index_reports_zero_counts() {
     let dir = TempDir::new().unwrap();
+    let hf_home = TempDir::new().unwrap();
     let out = recall(dir.path())
+        .env("HF_HOME", hf_home.path())
         .args(["status", "--json"])
         .output()
         .expect("spawn recall binary");
@@ -481,7 +485,121 @@ fn status_json_without_index_reports_zero_counts() {
     assert_eq!(
         v["data"]["model_ready"],
         serde_json::json!(false),
-        "the no-database branch reports model_ready:false, got: {stdout}"
+        "an empty HF cache means the model is not installed, got: {stdout}"
+    );
+}
+
+/// Populate an HF Hub cache under `hf_home` with valid DEFAULT-model artifacts so
+/// `cached_artifacts(ModelId::DEFAULT)` verifies as ready. Builds the
+/// `hub/models--{slug}/refs/{revision}` → `snapshots/{hash}/` layout
+/// `hf_hub::Cache::from_env` expects (root is `$HF_HOME/hub`). The fixtures mirror
+/// rurico's `test_support` (VALID_CONFIG_JSON / MINIMAL_TOKENIZER_JSON /
+/// FAKE_BACKBONE_KEY), which is `pub(crate)` and so unreachable from here.
+fn setup_cached_default_model(hf_home: &Path) {
+    // ruri-v3-310m is ModelId::DEFAULT; the revision keys the refs file name.
+    let repo_slug = "cl-nagoya--ruri-v3-310m";
+    let revision = "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3";
+    let commit = "abc123";
+    let repo_dir = hf_home.join("hub").join(format!("models--{repo_slug}"));
+    let refs_dir = repo_dir.join("refs");
+    fs::create_dir_all(&refs_dir).unwrap();
+    fs::write(refs_dir.join(revision), commit).unwrap();
+    let snapshot = repo_dir.join("snapshots").join(commit);
+    fs::create_dir_all(&snapshot).unwrap();
+
+    // config.json must parse as a valid ModernBERT Config (artifacts.rs verify_config).
+    let config = r#"{
+        "vocab_size": 1000,
+        "hidden_size": 768,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 12,
+        "intermediate_size": 3072,
+        "max_position_embeddings": 512,
+        "layer_norm_eps": 1e-5,
+        "pad_token_id": 0,
+        "global_attn_every_n_layers": 3,
+        "global_rope_theta": 160000.0,
+        "local_attention": 128,
+        "local_rope_theta": 10000.0
+    }"#;
+    fs::write(snapshot.join("config.json"), config).unwrap();
+
+    // Minimal BPE tokenizer accepted by tokenizers 0.22+ (verify_tokenizer).
+    let tokenizer = r#"{
+        "version": "1.0",
+        "model": {"type": "BPE", "vocab": {}, "merges": []},
+        "added_tokens": [],
+        "normalizer": null,
+        "pre_tokenizer": null,
+        "post_processor": null,
+        "decoder": null,
+        "truncation": null,
+        "padding": null
+    }"#;
+    fs::write(snapshot.join("tokenizer.json"), tokenizer).unwrap();
+
+    // safetensors carrying one `layers.` backbone key (verify_embed_kind) and no
+    // reranker key, with one f32 of weight data.
+    fs::write(
+        snapshot.join("model.safetensors"),
+        fake_safetensors(&["layers.0.attn.Wo.weight"]),
+    )
+    .unwrap();
+}
+
+/// Structurally valid safetensors with the given tensor keys, each one f32 of
+/// data. Mirrors rurico `test_support::write_fake_safetensors`.
+fn fake_safetensors(keys: &[&str]) -> Vec<u8> {
+    let mut header = serde_json::Map::new();
+    header.insert("__metadata__".to_owned(), serde_json::json!({}));
+    let mut offset = 0usize;
+    for &key in keys {
+        let end = offset + 4;
+        header.insert(
+            key.to_owned(),
+            serde_json::json!({"dtype": "F32", "shape": [1], "data_offsets": [offset, end]}),
+        );
+        offset = end;
+    }
+    let header_json = serde_json::to_vec(&header).unwrap();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+    out.extend_from_slice(&header_json);
+    for _ in keys {
+        out.extend_from_slice(&0f32.to_le_bytes());
+    }
+    out
+}
+
+// T-CLI020: `status --json` reports model_ready:true when the model artifacts are
+// cached but no index DB exists (#166). The no-database branch must reflect the
+// real HF cache state, not a hard-coded false — an agent can `recall model
+// download` before its first `recall index`. Counts stay zero (no DB). Pairs with
+// T-CLI019 (empty cache → false) and exercises the regression directly.
+// Perspective: hazard (model installed before index) + branch (no-DB true path).
+#[test]
+fn status_json_without_index_reports_model_ready_when_cached() {
+    let dir = TempDir::new().unwrap();
+    let hf_home = TempDir::new().unwrap();
+    setup_cached_default_model(hf_home.path());
+    let out = recall(dir.path())
+        .env("HF_HOME", hf_home.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "status --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    assert_eq!(
+        v["data"]["model_ready"],
+        serde_json::json!(true),
+        "no-database branch must report the cached model as ready, got: {stdout}"
+    );
+    assert_eq!(
+        v["data"]["sessions"],
+        serde_json::json!(0),
+        "status must not create the DB; counts stay zero, got: {stdout}"
     );
 }
 
