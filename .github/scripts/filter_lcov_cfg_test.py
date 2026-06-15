@@ -140,32 +140,38 @@ def cfg_test_ranges(path: Path) -> set[int]:
 # dropped line number leaves test code in; a defaulted hit count marks a covered
 # line uncovered). This differs from ENC-002/OPS-006, which guard against
 # gate-weakening specifically; here the contract itself is the invariant.
-def parse_line_number(record: str) -> int:
+def parse_line_number(record: str, context: str) -> int:
     try:
         return int(record.split(":", 1)[1].split(",", 1)[0])
     except (IndexError, ValueError) as e:
-        raise ValueError(f"malformed lcov record: {record!r}") from e
+        raise ValueError(f"malformed lcov record in {context}: {record[:80]!r}") from e
 
 
-def parse_fn(record: str) -> tuple[int, str]:
+def parse_fn(record: str, context: str) -> tuple[int, str]:
     try:
         payload = record.split(":", 1)[1]
         line, name = payload.split(",", 1)
         return int(line), name
     except (IndexError, ValueError) as e:
-        raise ValueError(f"malformed lcov FN record: {record!r}") from e
+        raise ValueError(f"malformed lcov FN record in {context}: {record[:80]!r}") from e
 
 
-def parse_fnda(record: str) -> tuple[int, str]:
+def parse_fnda(record: str, context: str) -> tuple[int, str]:
     try:
         payload = record.split(":", 1)[1]
         count, name = payload.split(",", 1)
         return int(count), name
     except (IndexError, ValueError) as e:
-        raise ValueError(f"malformed lcov FNDA record: {record!r}") from e
+        raise ValueError(f"malformed lcov FNDA record in {context}: {record[:80]!r}") from e
 
 
-def render_record(record: list[str], ignored: set[int]) -> list[str]:
+def render_record(record: list[str], ignored: set[int], input_path: Path) -> list[str]:
+    # `context` carries input_path + the enclosing SF (record[0]) into every
+    # parse/validation error so a malformed record in a multi-SF lcov is locatable
+    # without grepping. The malformed entry itself is bounded to 80 chars (log
+    # hygiene: the raw record may embed a path, and CI logs are public); the SF
+    # path stays full because it IS the locality signal being added.
+    context = f"{input_path} [{record[0]}]" if record else str(input_path)
     output: list[str] = []
     skipped_functions: set[str] = set()
     fn_count = fn_hit = line_count = line_hit = branch_count = branch_hit = 0
@@ -176,33 +182,45 @@ def render_record(record: list[str], ignored: set[int]) -> list[str]:
             continue
 
         if entry.startswith("DA:"):
-            line_no = parse_line_number(entry)
+            line_no = parse_line_number(entry, context)
             if line_no in ignored:
                 continue
             line_count += 1
             try:
                 hit_count = int(entry.split(",", 2)[1])
             except (IndexError, ValueError) as e:
-                raise ValueError(f"malformed lcov DA record: {entry!r}") from e
+                raise ValueError(
+                    f"malformed lcov DA record in {context}: {entry[:80]!r}"
+                ) from e
             if hit_count > 0:
                 line_hit += 1
             output.append(entry)
             continue
 
         if entry.startswith("BRDA:"):
-            line_no = parse_line_number(entry)
+            line_no = parse_line_number(entry, context)
             if line_no in ignored:
                 continue
             saw_branch = True
             branch_count += 1
+            # BRDA taken is "-" (branch not instrumented) or an execution count.
+            # Symmetric with the DA hit-count fail-loud above: a non-"-",
+            # non-integer taken violates the cargo llvm-cov format contract and
+            # would silently inflate BRH if treated as a hit, so raise instead.
             taken = entry.rsplit(",", 1)[-1]
-            if taken not in {"-", "0"}:
-                branch_hit += 1
+            if taken != "-":
+                try:
+                    if int(taken) > 0:
+                        branch_hit += 1
+                except ValueError as e:
+                    raise ValueError(
+                        f"malformed lcov BRDA record in {context}: {entry[:80]!r}"
+                    ) from e
             output.append(entry)
             continue
 
         if entry.startswith("FN:"):
-            line_no, name = parse_fn(entry)
+            line_no, name = parse_fn(entry, context)
             if line_no in ignored:
                 skipped_functions.add(name)
                 continue
@@ -212,7 +230,7 @@ def render_record(record: list[str], ignored: set[int]) -> list[str]:
             continue
 
         if entry.startswith("FNDA:"):
-            hit_count, name = parse_fnda(entry)
+            hit_count, name = parse_fnda(entry, context)
             if name in skipped_functions:
                 continue
             if hit_count > 0:
@@ -302,7 +320,7 @@ def filter_lcov(input_path: Path, output_path: Path, repo_root: Path) -> None:
             continue
 
         if line == "end_of_record":
-            filtered.extend(render_record(record, ignored))
+            filtered.extend(render_record(record, ignored, input_path))
             record = []
             ignored = set()
             continue
