@@ -29,7 +29,7 @@ use amici::storage::{collect_rows, filter::escape_like};
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Parser, Subcommand};
-use rurico::embed::{Embed, ModelId, cached_artifacts};
+use rurico::embed::{EMBEDDING_DIMS, Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
 use tracing::{debug, warn};
@@ -126,6 +126,9 @@ enum Command {
     },
     /// Show index and embedding status
     Status,
+    /// Diagnose a broken index: corruption, orphaned rows, and a live model
+    /// load probe. Reports only; remedies point at index/rebuild/model download.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -808,6 +811,256 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
     Ok(CommandOutput::ok(markdown, data))
 }
 
+/// One diagnostic check's result: a stable `name`, whether it passed, an optional
+/// human `detail` (e.g. the orphan count or corruption message), and the remedy
+/// command an agent should run when it failed. `ok` checks carry no remedy.
+struct DoctorCheck {
+    name: &'static str,
+    ok: bool,
+    detail: Option<String>,
+    remedy: Option<&'static str>,
+}
+
+impl DoctorCheck {
+    fn pass(name: &'static str) -> Self {
+        Self {
+            name,
+            ok: true,
+            detail: None,
+            remedy: None,
+        }
+    }
+
+    /// A non-fault note: the check passed (`ok`, no remedy) but carries context
+    /// worth surfacing. Used for a not-installed model — search runs FTS-only,
+    /// which is a supported mode, not breakage, so it must not flip `healthy`.
+    /// This keeps `doctor` and `status` agreeing on the no-model state.
+    fn info(name: &'static str, detail: String) -> Self {
+        Self {
+            name,
+            ok: true,
+            detail: Some(detail),
+            remedy: None,
+        }
+    }
+
+    fn fail(name: &'static str, detail: String, remedy: &'static str) -> Self {
+        Self {
+            name,
+            ok: false,
+            detail: Some(detail),
+            remedy: Some(remedy),
+        }
+    }
+}
+
+/// Remedy for a database that is corrupt, unopenable, or whose check query can't
+/// run: re-create the index from the JSONL sources (the data-loss tier).
+const CORRUPT_DB_REMEDY: &str = "remove the database file and run `recall index`";
+
+/// Run a DB-backed check, converting an error from the query itself into a
+/// degraded verdict instead of propagating. doctor exists to report on a broken
+/// index, so a DB corrupt enough that the check can't even execute must surface
+/// as a `fail` verdict, not abort the whole run.
+fn run_db_check(name: &'static str, check: impl FnOnce() -> Result<DoctorCheck>) -> DoctorCheck {
+    check().unwrap_or_else(|e| {
+        DoctorCheck::fail(name, format!("check could not run: {e}"), CORRUPT_DB_REMEDY)
+    })
+}
+
+/// `PRAGMA quick_check` (not `integrity_check`): the page-level scan returns a
+/// single `ok` row on a healthy DB and one error row per problem otherwise.
+/// quick_check skips the expensive cross-index verification integrity_check runs,
+/// which matters at the 27k+ chunk scale recall reaches. A corrupt DB is the
+/// data-loss tier, so the remedy re-creates the index from the JSONL sources.
+fn check_integrity(conn: &Connection) -> Result<DoctorCheck> {
+    let result: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    Ok(if result == "ok" {
+        DoctorCheck::pass("integrity")
+    } else {
+        DoctorCheck::fail(
+            "integrity",
+            format!("database corrupt: {result}"),
+            CORRUPT_DB_REMEDY,
+        )
+    })
+}
+
+/// Count `vec_chunks` embeddings whose `chunk_id` no longer resolves to a
+/// `qa_chunks` row. A vector hit on such a row fetches an empty or wrong excerpt,
+/// so the agent sees a phantom result (agent-misjudgment tier). `recall rebuild`
+/// re-embeds every present session, dropping the dangling rows.
+fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
+    let orphans: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if orphans == 0 {
+        DoctorCheck::pass("orphan_embeddings")
+    } else {
+        DoctorCheck::fail(
+            "orphan_embeddings",
+            format!("{orphans} embedding(s) reference a missing chunk"),
+            "recall rebuild",
+        )
+    })
+}
+
+/// Count `qa_chunks` whose `session_id` no longer resolves to a `sessions` row.
+/// Such a chunk can match but has no session metadata to render (date, project,
+/// slug), so the hit can't be shown coherently. `recall rebuild` re-stages every
+/// present session, restoring the link or dropping the chunk.
+fn check_orphan_chunks(conn: &Connection) -> Result<DoctorCheck> {
+    let orphans: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM qa_chunks WHERE session_id NOT IN (SELECT session_id FROM sessions)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if orphans == 0 {
+        DoctorCheck::pass("orphan_chunks")
+    } else {
+        DoctorCheck::fail(
+            "orphan_chunks",
+            format!("{orphans} chunk(s) reference a missing session"),
+            "recall rebuild",
+        )
+    })
+}
+
+/// Live model probe: load the cached embedder and embed a probe string, asserting
+/// the output width matches [`EMBEDDING_DIMS`]. This goes beyond `status`'s
+/// cache-presence check — it catches a cached-but-unloadable model and a dimension
+/// drift that would silently degrade `search` to FTS-only. A not-installed model
+/// is reported as info (FTS-only is supported, not broken); a load error, embed
+/// error, or wrong width is a fault whose remedy is to re-fetch the model.
+fn check_model<F>(load_embedder: F) -> DoctorCheck
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    const REMEDY: &str = "recall model download";
+    let embedder = match load_embedder() {
+        Ok(e) => e,
+        // A not-installed model is not a broken index: search runs FTS-only, a
+        // supported mode. Report it as info (ok, no remedy) so it never flips
+        // `healthy`, keeping `doctor` and `status` agreeing on the no-model state.
+        Err(reason @ DegradedReason::NotInstalled) => {
+            return DoctorCheck::info("model", format!("{reason}; search runs FTS-only"));
+        }
+        Err(reason) => {
+            return DoctorCheck::fail("model", format!("model not loadable: {reason}"), REMEDY);
+        }
+    };
+    match embedder.embed_query("recall doctor probe") {
+        Ok(v) if v.len() == EMBEDDING_DIMS => DoctorCheck::pass("model"),
+        Ok(v) => DoctorCheck::fail(
+            "model",
+            format!("embedding width {} != expected {EMBEDDING_DIMS}", v.len()),
+            REMEDY,
+        ),
+        Err(e) => DoctorCheck::fail("model", format!("model embed failed: {e}"), REMEDY),
+    }
+}
+
+fn run_doctor(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    run_doctor_with(verbose, db_path, try_load_embedder_cached)
+}
+
+/// Diagnose the index, reporting per-check verdicts plus an overall `healthy`
+/// flag; never repairs. `load_embedder` is injected so the model probe is
+/// testable without an MLX load. Mirrors `status`'s `!path.exists()` early return
+/// so diagnosing never auto-creates a DB. A failed check sets the envelope's
+/// `degraded` flag and adds its remedy to `notes`, so an agent reading `--json`
+/// gets both the verdict and the fix.
+fn run_doctor_with<F>(
+    verbose: bool,
+    db_path: &Option<PathBuf>,
+    load_embedder: F,
+) -> Result<CommandOutput>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    let path = resolve_db_path(db_path)?;
+
+    if !path.exists() {
+        cli_info(&format!("database not found at {}", path.display()));
+        cli_info("run `recall index` to create the index.");
+        return Ok(CommandOutput::with_notes(
+            String::new(),
+            serde_json::json!({ "healthy": false, "checks": [] }),
+            true,
+            vec!["no index: run `recall index`".to_owned()],
+        ));
+    }
+
+    // A DB corrupt at the header level fails to open (open_db runs WAL + schema
+    // migrations before any check). doctor must report that, not crash on it, so
+    // an open failure becomes the integrity verdict; the model probe is DB-free
+    // and still runs.
+    let checks = match open_or_create_db(&path) {
+        Ok(conn) => vec![
+            run_db_check("integrity", || check_integrity(&conn)),
+            run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
+            run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
+            check_model(load_embedder),
+        ],
+        Err(e) => vec![
+            DoctorCheck::fail(
+                "integrity",
+                format!("cannot open database: {e}"),
+                CORRUPT_DB_REMEDY,
+            ),
+            check_model(load_embedder),
+        ],
+    };
+
+    let healthy = checks.iter().all(|c| c.ok);
+    let notes: Vec<String> = checks
+        .iter()
+        .filter_map(|c| c.remedy.map(|r| format!("{}: {}", c.name, r)))
+        .collect();
+
+    let mut buf = Vec::new();
+    let _ = writeln!(
+        buf,
+        "Health: {}",
+        if healthy { "healthy" } else { "degraded" }
+    );
+    for c in &checks {
+        let status = if c.ok { "ok" } else { "FAIL" };
+        match (&c.detail, c.remedy) {
+            (Some(detail), Some(remedy)) => {
+                let _ = writeln!(buf, "  {} [{status}] {detail} -> {remedy}", c.name);
+            }
+            (Some(detail), None) => {
+                let _ = writeln!(buf, "  {} [{status}] {detail}", c.name);
+            }
+            (None, _) => {
+                let _ = writeln!(buf, "  {} [{status}]", c.name);
+            }
+        }
+    }
+    if verbose {
+        let _ = writeln!(buf, "DB: {}", path.display());
+    }
+    let markdown = String::from_utf8_lossy(&buf).into_owned();
+
+    let checks_json: Vec<serde_json::Value> = checks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "ok": c.ok,
+                "detail": c.detail,
+                "remedy": c.remedy,
+            })
+        })
+        .collect();
+    let data = serde_json::json!({ "healthy": healthy, "checks": checks_json });
+
+    Ok(CommandOutput::with_notes(markdown, data, !healthy, notes))
+}
+
 // -- Output formatting --
 
 /// Path structure: `{...}/{parent-session-uuid}/subagents/{agent-id}.jsonl`
@@ -1067,7 +1320,7 @@ fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<C
 // as a subcommand, anything else as a bare `search` query. Add every new
 // subcommand (and keep it matching the `Command` enum) or its shorthand breaks.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "index", "rebuild", "model", "search", "show", "status", "classify", "help",
+    "index", "rebuild", "model", "search", "show", "status", "classify", "doctor", "help",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
@@ -1119,6 +1372,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Classify { all, dry_run }) => run_classify(all, dry_run, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
+        Some(Command::Doctor) => run_doctor(cli.verbose, &cli.db_path),
         None => Err(RecallError::Usage(
             "A search query is required. Usage: recall search \"query\" or recall index".to_owned(),
         )
@@ -1164,6 +1418,8 @@ fn main() -> ExitCode {
 mod tests {
     use std::assert_matches;
     use std::fs;
+
+    use rurico::embed::{ChunkedEmbedding, EmbedError};
 
     use super::*;
 
@@ -1551,6 +1807,18 @@ mod tests {
         // rewritten to `search rebuild` by shorthand expansion.
         let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
         assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
+    }
+
+    // `doctor` must be in KNOWN_SUBCOMMANDS, else shorthand expansion rewrites
+    // `recall doctor` to `search doctor` (it did before the fix) and the diagnostic
+    // command becomes unreachable. Guards the enum/KNOWN_SUBCOMMANDS sync the
+    // comment above the list demands.
+    #[test]
+    fn doctor_recognized_by_shorthand_expansion() {
+        let args: Vec<OsString> = ["recall", "doctor"].iter().map(OsString::from).collect();
+        assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
+        let cli = Cli::try_parse_from(["recall", "doctor"]).unwrap();
+        assert_matches!(cli.command, Some(Command::Doctor));
     }
 
     // T-005 (FR-005): with `embed` dropped from KNOWN_SUBCOMMANDS, `recall embed`
@@ -2032,6 +2300,420 @@ mod tests {
         assert!(
             out.markdown.contains("Embedded: 1/1"),
             "human output must not overstate coverage past the qa_chunks total, got: {}",
+            out.markdown
+        );
+    }
+
+    /// A test-only embedder whose `embed_query` returns a vector of the given
+    /// width, so the doctor model probe's dimension-mismatch branch is reachable
+    /// without an MLX load. Only `embed_query` is exercised; the document methods
+    /// are unreachable in the probe path.
+    struct WidthEmbedder(usize);
+
+    impl Embed for WidthEmbedder {
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![0.0; self.0])
+        }
+        fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+            unreachable!("doctor probe only calls embed_query")
+        }
+        fn embed_documents_batch(
+            &self,
+            _texts: &[&str],
+        ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+            unreachable!("doctor probe only calls embed_query")
+        }
+        fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
+            unreachable!("doctor probe only calls embed_query")
+        }
+    }
+
+    /// A test-only embedder that loads fine but whose `embed_query` returns an
+    /// error, so the doctor model probe's embed-failure branch (distinct from a
+    /// load failure and from a wrong-width result) is reachable without MLX.
+    struct FailingEmbedder;
+
+    impl Embed for FailingEmbedder {
+        fn embed_query(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+            Err(EmbedError::EmptySequence)
+        }
+        fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+            unreachable!("doctor probe only calls embed_query")
+        }
+        fn embed_documents_batch(
+            &self,
+            _texts: &[&str],
+        ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+            unreachable!("doctor probe only calls embed_query")
+        }
+        fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
+            unreachable!("doctor probe only calls embed_query")
+        }
+    }
+
+    /// Seed a valid embedded index for `s1`: one session, one qa_chunk, one
+    /// vec_chunks row linked by chunk_id. The baseline every doctor check passes
+    /// against, so a single seeded fault is the only thing a failure test changes.
+    fn seed_healthy_index(conn: &Connection) {
+        db::seed_session(conn, "s1");
+        db::seed_chunk(conn, 1, "healthy chunk");
+        let emb = embedder::MockEmbedder::deterministic_vector("healthy chunk");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+            rusqlite::params![embedder::f32_as_bytes(&emb)],
+        )
+        .unwrap();
+    }
+
+    // doctor reports healthy when the DB passes quick_check, has no orphan rows,
+    // and the model loads and embeds at the expected width. Perspective: the
+    // all-pass baseline — degraded must be false and no remedy notes emitted, so a
+    // later single-fault test isolates exactly one failing check.
+    #[test]
+    fn doctor_reports_healthy_on_intact_index_and_loadable_model() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(out.data["healthy"], true);
+        assert!(!out.degraded, "an intact index must not be degraded");
+        assert!(
+            out.notes.is_empty(),
+            "no failing check means no remedy notes"
+        );
+        assert!(
+            out.markdown.contains("Health: healthy"),
+            "got: {}",
+            out.markdown
+        );
+    }
+
+    // doctor flags an embedding whose chunk_id no longer resolves to a qa_chunk.
+    // This also proves the `NOT IN` orphan scan runs against the vec0 virtual
+    // table (the aux chunk_id column is queryable outside a MATCH). Perspective:
+    // hazard (phantom vector hit) + the load-bearing SQL-form verification.
+    #[test]
+    fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        // A vec_chunks row whose chunk_id (999) has no qa_chunks row.
+        let emb = embedder::MockEmbedder::deterministic_vector("orphan");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
+            rusqlite::params![embedder::f32_as_bytes(&emb)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(out.data["healthy"], false);
+        assert!(out.degraded);
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "orphan_embeddings")
+            .unwrap();
+        assert_eq!(check["ok"], false);
+        assert!(
+            out.notes.iter().any(|n| n.contains("recall rebuild")),
+            "remedy note must point at rebuild, got: {:?}",
+            out.notes
+        );
+    }
+
+    // doctor flags a chunk whose session_id no longer resolves to a sessions row,
+    // because the hit cannot be rendered without session metadata. Perspective:
+    // hazard (unrenderable hit) — the chunk side of the orphan invariant.
+    #[test]
+    fn doctor_flags_orphan_chunk_referencing_missing_session() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        // A qa_chunk for a session that was never inserted.
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 'ghost', 'x', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "orphan_chunks")
+            .unwrap();
+        assert_eq!(check["ok"], false);
+        assert_eq!(out.data["healthy"], false);
+    }
+
+    // doctor flags a model that the cache reports present but that fails to load,
+    // catching the gap status's cache-presence check misses. Perspective: error
+    // (load failure path) — remedy must be the model re-fetch.
+    #[test]
+    fn doctor_flags_model_that_fails_to_load() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let failing_loader = || Err(DegradedReason::ProbeFailed);
+        let out = run_doctor_with(false, &Some(db_path), failing_loader).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "model")
+            .unwrap();
+        assert_eq!(check["ok"], false);
+        assert_eq!(out.data["healthy"], false);
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("recall model download")),
+            "got: {:?}",
+            out.notes
+        );
+    }
+
+    // doctor flags a model that loads but embeds at the wrong width, catching a
+    // dimension drift that would silently degrade search to FTS-only. Perspective:
+    // boundary (output width != EMBEDDING_DIMS) — the probe must embed, not just load.
+    #[test]
+    fn doctor_flags_model_dimension_mismatch() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let wrong_width = || Ok(Arc::new(WidthEmbedder(EMBEDDING_DIMS - 1)) as Arc<dyn Embed>);
+        let out = run_doctor_with(false, &Some(db_path), wrong_width).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "model")
+            .unwrap();
+        assert_eq!(
+            check["ok"], false,
+            "wrong embedding width must fail the probe"
+        );
+        assert_eq!(out.data["healthy"], false);
+    }
+
+    // doctor treats a not-installed model as info, not a fault: search runs
+    // FTS-only (a supported mode), so the model check stays ok, `healthy` stays
+    // true, and no `recall model download` remedy is emitted. This keeps doctor
+    // agreeing with status, which also reports no-model as a state, not breakage.
+    // Perspective: branch (NotInstalled vs other load errors) — only the latter fails.
+    #[test]
+    fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let not_installed = || Err(DegradedReason::NotInstalled);
+        let out = run_doctor_with(false, &Some(db_path), not_installed).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "model")
+            .unwrap();
+        assert_eq!(
+            check["ok"], true,
+            "a not-installed model is FTS-only, not a broken index"
+        );
+        assert_eq!(check["remedy"], serde_json::Value::Null);
+        assert_eq!(out.data["healthy"], true);
+        assert!(
+            !out.notes
+                .iter()
+                .any(|n| n.contains("recall model download")),
+            "info-level no-model must not emit the download remedy, got: {:?}",
+            out.notes
+        );
+    }
+
+    // doctor on a missing database reports unhealthy with the index remedy rather
+    // than auto-creating a DB (mirrors status's read-only no-DB path). Perspective:
+    // boundary (no index yet) — diagnosing must not have the side effect of creating one.
+    #[test]
+    fn doctor_reports_unhealthy_and_does_not_create_db_when_absent() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("missing.db");
+
+        let out = run_doctor_with(false, &Some(db_path.clone()), mock_loader).unwrap();
+
+        assert_eq!(out.data["healthy"], false);
+        assert!(out.degraded);
+        assert!(
+            out.notes.iter().any(|n| n.contains("recall index")),
+            "got: {:?}",
+            out.notes
+        );
+        assert!(
+            !db_path.exists(),
+            "doctor must not create the database while diagnosing"
+        );
+    }
+
+    // doctor reports rather than crashes when the DB file is corrupt enough that
+    // open fails: open_or_create_db runs WAL + schema migrations before any check,
+    // so a header-level corruption aborts at open, not at a check query. The open
+    // failure must become the integrity verdict (not propagate as an Err), keeping
+    // the model probe (DB-free) running. Perspective: error (unopenable DB) — the
+    // crash-vs-report boundary the RS1∪RS5 merge exists to hold.
+    #[test]
+    fn doctor_reports_unhealthy_on_unopenable_database() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        // Garbage bytes: not a valid SQLite header, so open_db fails before any check.
+        fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(out.data["healthy"], false);
+        assert!(out.degraded);
+        let integrity = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "integrity")
+            .unwrap();
+        assert_eq!(integrity["ok"], false);
+        assert!(
+            integrity["detail"]
+                .as_str()
+                .unwrap()
+                .contains("cannot open database"),
+            "got: {integrity}"
+        );
+        assert!(
+            out.notes.iter().any(|n| n.contains("recall index")),
+            "remedy must point at re-indexing a removed DB, got: {:?}",
+            out.notes
+        );
+    }
+
+    // doctor flags a model that loads but whose embed call fails, the third model
+    // failure mode distinct from a load failure and a wrong-width result. The probe
+    // must exercise embed_query, not stop at a successful load. Perspective: error
+    // (embed-time failure) — remedy is the model re-fetch.
+    #[test]
+    fn doctor_flags_model_that_fails_to_embed() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let failing_embed = || Ok(Arc::new(FailingEmbedder) as Arc<dyn Embed>);
+        let out = run_doctor_with(false, &Some(db_path), failing_embed).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "model")
+            .unwrap();
+        assert_eq!(check["ok"], false);
+        assert!(
+            check["detail"]
+                .as_str()
+                .unwrap()
+                .contains("model embed failed"),
+            "got: {check}"
+        );
+        assert_eq!(out.data["healthy"], false);
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("recall model download")),
+            "got: {:?}",
+            out.notes
+        );
+    }
+
+    // run_db_check turns an error from the check query itself (the DB opened but a
+    // scan failed, e.g. a corrupt b-tree page) into a fail verdict rather than
+    // propagating. This is the RS5 half of the open-vs-scan split: T1 covers the
+    // open failure, this covers the scan failure, and only both together make the
+    // check exhaustive. Perspective: error (check query Err) — the data-loss-tier
+    // branch must report, not abort.
+    #[test]
+    fn run_db_check_converts_query_error_into_fail_verdict() {
+        let check = run_db_check("integrity", || Err(anyhow::anyhow!("disk I/O error")));
+
+        assert!(!check.ok);
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("check could not run"),
+            "got: {:?}",
+            check.detail
+        );
+        assert_eq!(check.remedy, Some(CORRUPT_DB_REMEDY));
+    }
+
+    // check_orphan_embeddings propagates the scan error when the table it queries
+    // is absent, instead of silently reporting zero orphans. run_db_check is what
+    // turns this Err into a fail verdict; here we pin the Err itself so the wrapper
+    // has something to convert. Perspective: error (query against a schemaless DB).
+    #[test]
+    fn check_orphan_embeddings_errors_when_table_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(check_orphan_embeddings(&conn).is_err());
+    }
+
+    // check_orphan_chunks propagates the scan error when its table is absent,
+    // mirroring check_orphan_embeddings. Perspective: error (query against a
+    // schemaless DB).
+    #[test]
+    fn check_orphan_chunks_errors_when_table_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(check_orphan_chunks(&conn).is_err());
+    }
+
+    // run_doctor (the thin wrapper over run_doctor_with that binds the real cached
+    // loader) returns an Ok envelope on a seeded healthy DB, and verbose=true adds
+    // the DB-path line to the human output. The model verdict is left unasserted:
+    // try_load_embedder_cached loads the real model when present and reports
+    // not-installed (info, still healthy) when absent, so this test stays robust
+    // across environments. Perspective: dispatch wiring + verbose branch.
+    #[test]
+    fn run_doctor_wrapper_reports_on_healthy_db_with_verbose_output() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let out = run_doctor(true, &Some(db_path.clone())).unwrap();
+
+        assert!(out.data["healthy"].is_boolean(), "got: {}", out.data);
+        assert!(
+            out.markdown.contains(&db_path.display().to_string()),
+            "verbose output must show the DB path, got: {}",
             out.markdown
         );
     }
