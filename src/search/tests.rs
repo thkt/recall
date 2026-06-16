@@ -1691,3 +1691,169 @@ fn test_search_cjk_short_term_with_special_chars() {
         .expect("CJK short term + long term should not cause FTS5 error");
     assert_eq!(results.len(), 1);
 }
+
+#[test]
+fn segment_script_boundaries_splits_multi_script_run() {
+    // #167: a no-space natural-language query (助詞 dropped) is a single trigram
+    // phrase that only matches contiguously. Inserting a space at each script
+    // transition yields the implicit-AND of per-word phrases — the same form the
+    // user could have typed with spaces.
+    assert_eq!(
+        segment_script_boundaries("textlint日本語ドキュメント校正"),
+        "textlint 日本語 ドキュメント 校正"
+    );
+    // han↔hiragana and katakana↔hiragana transitions split too.
+    assert_eq!(segment_script_boundaries("校正する"), "校正 する");
+    assert_eq!(segment_script_boundaries("Reactのhooks"), "React の hooks");
+}
+
+#[test]
+fn segment_script_boundaries_keeps_ascii_alnum_whole() {
+    // ASCII letter↔digit is NOT a split boundary, so technical tokens survive.
+    for q in ["utf8", "v2", "sha256", "h264", "fix the bug"] {
+        assert_eq!(
+            segment_script_boundaries(q),
+            q,
+            "ASCII/space query must be byte-identical (precision guard, AC2)"
+        );
+    }
+}
+
+#[test]
+fn segment_script_boundaries_is_noop_on_single_script_and_quotes() {
+    // A pure-han kanji compound has no script transition; splitting it needs a
+    // dictionary (out of scope), so it is left intact.
+    assert_eq!(
+        segment_script_boundaries("機械学習日本語処理"),
+        "機械学習日本語処理"
+    );
+    // Already space-separated input is unchanged (spaces are not script chars).
+    assert_eq!(
+        segment_script_boundaries("日本語 ドキュメント"),
+        "日本語 ドキュメント"
+    );
+    // A double-quoted span is an explicit phrase-match intent: leave it verbatim.
+    assert_eq!(
+        segment_script_boundaries("\"日本語ドキュメント\""),
+        "\"日本語ドキュメント\""
+    );
+}
+
+#[test]
+fn degraded_no_space_cjk_query_reaches_session() {
+    // #167: in degraded mode (FTS-only, no embedder) a no-space multi-script
+    // query must reach the session whose message keeps the 助詞.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(
+        &conn,
+        "s1",
+        "user",
+        "textlintで日本語ドキュメントを校正する",
+    );
+    // An unrelated session that must not be returned (precision guard).
+    insert_session(&conn, "s2", "claude", "/proj", now_ms);
+    insert_message(&conn, "s2", "user", "completely unrelated gardening notes");
+
+    let opts = SearchOptions {
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+    let ids = |q: &str| -> Vec<String> {
+        search(&conn, q, &opts)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.session.session_id)
+            .collect()
+    };
+
+    let no_space = ids("textlint日本語ドキュメント校正");
+    assert!(
+        no_space.iter().any(|s| s == "s1"),
+        "degraded no-space query must reach s1, got: {no_space:?}"
+    );
+    assert!(
+        !no_space.iter().any(|s| s == "s2"),
+        "no-space query must not match the unrelated session, got: {no_space:?}"
+    );
+
+    // Parity: the no-space form reaches the same sessions as the space-separated
+    // form the user could have typed (segmentation produces that exact form).
+    let spaced = ids("textlint 日本語 ドキュメント 校正");
+    assert_eq!(
+        no_space, spaced,
+        "no-space query must reach parity with the space-separated form (AC1)"
+    );
+}
+#[test]
+fn segment_falls_back_to_raw_when_no_anchor_term() {
+    // #167 review Finding 1: segmenting an all-short query (no run ≥3 chars)
+    // into multiple vocab-expanded OR-groups can overflow amici's MAX_COMBOS
+    // (25×25 > 100) → `fixed_only()` with no fixed term → None → zero results,
+    // regressing the contiguous-phrase match the raw query had. The fix keeps
+    // the raw query when the split yields no ≥3-char anchor.
+    //
+    // Only reproduces at corpus scale: the OR-group product must exceed 100, so
+    // 校正* and する* each need >10 distinct following chars in the vocab. A
+    // small DB keeps the groups tiny and hides the overflow (observer effect).
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    // Target: an indexed message whose text contains contiguous "校正する".
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
+    // Inflate the 校正* and する* trigram vocab past the overflow threshold.
+    let following = "案版中後前用例集表記号点字形面"; // 14 distinct trailing chars
+    for (i, c) in following.chars().enumerate() {
+        insert_session(&conn, &format!("k{i}"), "claude", "/proj", now_ms);
+        insert_message(
+            &conn,
+            &format!("k{i}"),
+            "user",
+            &format!("校正{c}についてのメモ"),
+        );
+        insert_session(&conn, &format!("u{i}"), "claude", "/proj", now_ms);
+        insert_message(
+            &conn,
+            &format!("u{i}"),
+            "user",
+            &format!("する{c}に関する記録"),
+        );
+    }
+    let opts = SearchOptions {
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+    let r = search(&conn, "校正する", &opts).unwrap();
+    assert!(
+        r.iter().any(|x| x.session.session_id == "s1"),
+        "all-short query must keep raw-phrase recall (no MAX_COMBOS overflow), got: {:?}",
+        r.iter()
+            .map(|x| x.session.session_id.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn segment_prolonged_sound_mark_does_not_strand_hiragana() {
+    // #167 review Finding 2: ー (U+30FC) classifies as Katakana, so a hiragana
+    // word like うーん would split into three 1-char runs, all sub-trigram →
+    // None → zero results. The no-anchor fallback keeps the raw query.
+    assert_eq!(segment_script_boundaries("うーん"), "う ー ん");
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "それはうーんと悩ましい問題だ");
+    let opts = SearchOptions {
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+    let r = search(&conn, "うーん", &opts).unwrap();
+    assert!(
+        r.iter().any(|x| x.session.session_id == "s1"),
+        "hiragana word with ー must keep raw recall, got: {:?}",
+        r.iter()
+            .map(|x| x.session.session_id.as_str())
+            .collect::<Vec<_>>()
+    );
+}

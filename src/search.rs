@@ -500,6 +500,77 @@ fn vec_search(
     Ok(hits)
 }
 
+/// Script class of a character for trigram-boundary segmentation (#167).
+/// ASCII letters and digits share one class so technical tokens (`utf8`, `v2`,
+/// `sha256`) are never split at a letter↔digit transition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Han,
+    Hiragana,
+    Katakana,
+    Latin,
+    Other,
+}
+
+fn classify_script(c: char) -> Script {
+    match c {
+        'a'..='z' | 'A'..='Z' | '0'..='9' => Script::Latin,
+        '\u{3040}'..='\u{309F}' => Script::Hiragana,
+        '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}' => {
+            Script::Katakana
+        }
+        // CJK ideographs (incl. ext A / compatibility) and the 々 iteration mark.
+        '\u{3005}'
+        | '\u{3400}'..='\u{4DBF}'
+        | '\u{4E00}'..='\u{9FFF}'
+        | '\u{F900}'..='\u{FAFF}' => Script::Han,
+        _ => Script::Other,
+    }
+}
+
+/// Insert a space at every script-run transition so a no-space natural-language
+/// query reaches the same sessions a space-separated query would (#167).
+///
+/// In degraded (FTS-only) mode the trigram tokenizer matches a no-space query as
+/// a single phrase requiring a contiguous substring; a query whose 助詞 were
+/// dropped (`textlint日本語ドキュメント校正`) never matches indexed text that
+/// keeps them (`textlintで日本語ドキュメントを校正する`). Splitting at the
+/// latin↔han↔katakana↔hiragana transitions produces the implicit-AND of
+/// per-word phrases — byte-equivalent to the spaced query the user could have
+/// typed — so the no-space form inherits the spaced form's recall.
+///
+/// Only transitions among {Latin, Han, Hiragana, Katakana} split. A pure
+/// single-script run (e.g. a kanji compound with no transition) is left intact:
+/// splitting it requires a dictionary, which is out of scope. Text inside double
+/// quotes is preserved verbatim to keep an explicit phrase-match intent.
+fn segment_script_boundaries(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut in_quotes = false;
+    let mut prev: Option<Script> = None;
+    for c in query.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            out.push(c);
+            prev = None;
+            continue;
+        }
+        if in_quotes {
+            out.push(c);
+            continue;
+        }
+        let cur = classify_script(c);
+        if cur != Script::Other
+            && let Some(p) = prev
+            && p != cur
+        {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = (cur != Script::Other).then_some(cur);
+    }
+    out
+}
+
 #[cfg(test)]
 pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
     search_with_embedder(conn, query, opts, None)
@@ -520,9 +591,25 @@ pub fn search_with_embedder(
     // raw message text into FTS (no normalize_for_fts pass), so query-side NFKC /
     // lowercase / whitespace folding would silently miss full-width and CJK matches.
     // Adopting normalization means normalizing both sides and re-indexing (#51).
+    // Split a no-space CJK query at script boundaries so the trigram FTS path
+    // sees the same per-word tokens a spaced query would (#167). The raw `query`
+    // still feeds vec_search below — embedding wants the natural text.
+    //
+    // Only adopt the split when it yields an anchor term (≥3 chars). Without one,
+    // an all-short split (e.g. `校正する` → `校正 する`) vocab-expands into two
+    // OR-groups whose product can exceed amici's MAX_COMBOS, dropping to
+    // `fixed_only()` with no fixed term → no results — a regression over the raw
+    // contiguous-phrase match. An anchor term survives as a `fixed` phrase, so
+    // segmenting is then a strict recall superset of the raw query.
+    let segmented = segment_script_boundaries(query);
+    let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
+        segmented
+    } else {
+        query.to_owned()
+    };
     let matched = match prepare_match_query(
         conn,
-        query,
+        &fts_input,
         "messages_vocab",
         &QueryNormalizationConfig::disabled(),
     ) {
