@@ -34,6 +34,28 @@ pub struct SearchResult {
     pub excerpt: String,
 }
 
+/// The ranked hits plus whether the vector (semantic) leg silently fell back to
+/// FTS-only at runtime. A loaded embedder can still fail at query time (e.g.
+/// `embed_query` under memory pressure); `vec_search` swallows that into a
+/// text-only result, so `vec_degraded` carries the signal to the caller, which
+/// marks the `--json` envelope `degraded:true` (#204). It is the runtime
+/// counterpart to the load-time degradation derived in `search_degraded_state`.
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    pub vec_degraded: bool,
+}
+
+impl SearchOutcome {
+    /// A search that never touched a degraded vector path: the empty-query,
+    /// limit-zero, and FTS-only branches that cannot lose semantic coverage.
+    fn nominal(results: Vec<SearchResult>) -> Self {
+        Self {
+            results,
+            vec_degraded: false,
+        }
+    }
+}
+
 /// How `recall search` treats the session that invoked it.
 ///
 /// Resolved by the CLI layer from `CLAUDE_CODE_SESSION_ID` and the
@@ -573,7 +595,9 @@ fn segment_script_boundaries(query: &str) -> String {
 
 #[cfg(test)]
 pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
-    search_with_embedder(conn, query, opts, None)
+    // The FTS-only path (no embedder) can never be vector-degraded, so the
+    // signal is discarded here; only the CLI envelope path needs it.
+    Ok(search_with_embedder(conn, query, opts, None)?.results)
 }
 
 pub fn search_with_embedder(
@@ -581,9 +605,9 @@ pub fn search_with_embedder(
     query: &str,
     opts: &SearchOptions,
     embedder: Option<&dyn Embed>,
-) -> Result<Vec<SearchResult>> {
+) -> Result<SearchOutcome> {
     if opts.limit == 0 {
-        return Ok(Vec::new());
+        return Ok(SearchOutcome::nominal(Vec::new()));
     }
 
     let now_ms = resolve_now_ms(opts)?;
@@ -616,7 +640,7 @@ pub fn search_with_embedder(
         Ok(m) => m,
         Err(SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms) => {
             debug!(%query, "query produced no searchable terms");
-            return Ok(Vec::new());
+            return Ok(SearchOutcome::nominal(Vec::new()));
         }
         // A bad vocab-table name or a failed SQLite vocab lookup is a real
         // fault, not an empty query — surface it instead of returning no hits.
@@ -645,13 +669,18 @@ pub fn search_with_embedder(
             .map(|(sid, _)| (sid.clone(), 0.0))
             .collect();
 
-        let vec_hits = match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
-            Ok(hits) => hits,
-            Err(e) => {
-                warn!(error = %e, "vector search failed, using text search only");
-                Vec::new()
-            }
-        };
+        // A runtime `vec_search` failure (e.g. `embed_query` under memory
+        // pressure) silently drops semantic coverage. Record it so the caller can
+        // mark the envelope `degraded:true` instead of returning a thinned or
+        // empty result as if it were complete (#204).
+        let (vec_hits, vec_degraded) =
+            match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
+                Ok(hits) => (hits, false),
+                Err(e) => {
+                    warn!(error = %e, "vector search failed, using text search only");
+                    (Vec::new(), true)
+                }
+            };
 
         // Map each vector-hit session to its closest chunk so fetch_chunks can use
         // that chunk's content as the excerpt when there is no FTS snippet (#36).
@@ -662,7 +691,10 @@ pub fn search_with_embedder(
         let mut merged = rrf_merge_strings(&fts_hits, &vec_for_rrf);
 
         if merged.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome {
+                results: Vec::new(),
+                vec_degraded,
+            });
         }
 
         let mut meta_map = fetch_session_metadata(conn, &merged)?;
@@ -674,7 +706,10 @@ pub fn search_with_embedder(
         merged.retain(|(sid, _)| meta_map.contains_key(sid));
 
         if merged.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome {
+                results: Vec::new(),
+                vec_degraded,
+            });
         }
 
         hybrid::apply_recency_boost(
@@ -686,16 +721,23 @@ pub fn search_with_embedder(
         merged.truncate(opts.limit);
 
         let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
-        Ok(candidates.into_iter().map(|(_, r)| r).collect())
+        Ok(SearchOutcome {
+            results: candidates.into_iter().map(|(_, r)| r).collect(),
+            vec_degraded,
+        })
     } else {
+        // No embedder or no vector data: this is the FTS-only path by design, not
+        // a runtime degradation, so `vec_degraded` stays false.
         if fts_ranked.is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchOutcome::nominal(Vec::new()));
         }
         let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
         // FTS-only path: every session matched FTS, so there is always a snippet;
         // pass an empty vec-chunk map (no vector-only fallback needed here).
         let candidates = fetch_chunks(conn, fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
-        Ok(score_and_sort(candidates, now_ms, opts.limit))
+        Ok(SearchOutcome::nominal(score_and_sort(
+            candidates, now_ms, opts.limit,
+        )))
     }
 }
 

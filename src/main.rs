@@ -593,10 +593,10 @@ where
     let embedder = load_embedder();
     // A failed embedder load degrades search to FTS-only with a reason-aware note
     // for the `--json` channel; see search_degraded_state.
-    let (degraded, mut notes) = search_degraded_state(&embedder);
+    let (mut degraded, mut notes) = search_degraded_state(&embedder);
     let embedder = embedder.ok();
 
-    let results = search::search_with_embedder(
+    let outcome = search::search_with_embedder(
         &conn,
         &query,
         &search::SearchOptions {
@@ -610,6 +610,19 @@ where
         },
         embedder.as_deref(),
     )?;
+    let results = outcome.results;
+
+    // A loaded embedder that failed at query time (vector search dropped to
+    // FTS-only mid-run) degrades the result just as a failed load does. Merge the
+    // runtime signal into the load-time one so the envelope never reports
+    // `degraded:false` over a thinned or empty text-only result set (#204).
+    if outcome.vec_degraded {
+        degraded = true;
+        notes.push(
+            "semantic search unavailable: vector query failed at runtime; results are text-only"
+                .to_owned(),
+        );
+    }
 
     // Surface the default automated-session exclusion so an agent consumer can
     // discover --include-automated; skipped when the agent already opted in.
@@ -2713,6 +2726,54 @@ mod tests {
             vec_chunk_count(&conn),
             0,
             "search must not embed: vec_chunks stays empty even with an embedder present"
+        );
+    }
+
+    /// A loader that hands `run_search_with` an embedder which loads cleanly but
+    /// errors at query time. This reproduces the #204 runtime degradation: the
+    /// load-time degraded state is false, yet `vec_search` fails mid-run.
+    fn runtime_failing_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
+        Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
+    }
+
+    // #204: a loaded embedder whose query-time embedding fails degrades the search
+    // to FTS-only mid-run. The `--json` envelope must report degraded:true with a
+    // runtime note instead of presenting the text-only result as complete. Driven
+    // through run_search_with so the load-time/runtime degraded merge in run_search
+    // is the code under test, not just the search-layer signal.
+    // Perspective: hazard (a silent runtime fallback misread as a complete result)
+    // + branch (the vec_degraded=true merge arm).
+    #[test]
+    fn run_search_reports_degraded_when_vector_search_fails_at_runtime() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let mut conn = open_or_create_db(&db_path).unwrap();
+            db::seed_session(&conn, "s1");
+            db::seed_chunk(&conn, 1, "authentication flow");
+            // Embed the chunk so vec_chunks is non-empty: has_vec_data() is then
+            // true and search takes the hybrid (vector) branch where the runtime
+            // failure occurs. The embed itself uses a healthy mock.
+            embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        }
+
+        let out = run_search_with(
+            search_command("authentication"),
+            &Some(db_path),
+            runtime_failing_loader,
+        )
+        .unwrap();
+
+        assert!(
+            out.degraded,
+            "a runtime vector-search failure must mark the envelope degraded"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("vector query failed at runtime")),
+            "the runtime degradation note must surface for the agent channel, got: {:?}",
+            out.notes
         );
     }
 
