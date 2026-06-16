@@ -1350,6 +1350,47 @@ fn test_runtime_vector_failure_with_no_fts_match_flags_degraded_on_empty() {
     );
 }
 
+#[test]
+fn test_runtime_vector_failure_with_unknown_source_hits_flags_degraded_on_empty() {
+    // The second empty early-return (#204): the vector leg fails AND every FTS
+    // candidate is dropped by fetch_session_metadata because its `sessions.source`
+    // is unknown (not claude/codex). `find_candidate_sessions` still returns it
+    // (no source filter), so `merged` is non-empty at the first check, then
+    // `retain` empties it. This pruned-to-empty path must still carry vec_degraded,
+    // else an envelope over a result that silently pruned to zero reports
+    // degraded:false.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // Source "gemini" is not claude/codex, so Source::from_db returns None and
+    // fetch_session_metadata skips the row.
+    insert_session(&conn, "weird", "gemini", "/proj", now_ms);
+    insert_message(&conn, "weird", "user", "authentication flow design");
+    // has_vec_data() must be true for the hybrid path to run, so seed one vec_chunk.
+    insert_chunk_with_embedding(&conn, 1, "weird", "authentication flow", now_ms);
+
+    let embedder = MockEmbedder::failing_after(0);
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        Some(&embedder),
+    )
+    .unwrap();
+
+    assert!(
+        outcome.results.is_empty(),
+        "the only FTS hit had an unknown source and was pruned, so the result is empty"
+    );
+    assert!(
+        outcome.vec_degraded,
+        "the pruned-to-empty early-return must still flag the runtime vector failure (#204)"
+    );
+}
+
 fn hybrid_search_ids(
     conn: &Connection,
     embedder: &MockEmbedder,
