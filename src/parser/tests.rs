@@ -124,3 +124,26 @@ fn test_role_from_db_unknown_returns_none() {
     assert_eq!(Role::from_db(""), None);
     assert_eq!(Role::from_db("USER"), None);
 }
+
+// ADR-0002 Confirmation: every `Source` variant round-trips through its DB token,
+// so `from_db(x.as_str()) == Some(x)`. Driven off `ValueEnum::value_variants()`
+// so a newly added variant is covered without editing this test.
+#[test]
+fn test_source_from_db_roundtrips_every_variant() {
+    use clap::ValueEnum;
+    for &variant in Source::value_variants() {
+        assert_eq!(
+            Source::from_db(variant.as_str()),
+            Some(variant),
+            "Source::from_db({:?}) must round-trip back to {variant:?}",
+            variant.as_str(),
+        );
+    }
+}
+
+#[test]
+fn test_source_from_db_unknown_returns_none() {
+    assert_eq!(Source::from_db("gemini"), None);
+    assert_eq!(Source::from_db(""), None);
+    assert_eq!(Source::from_db("Claude"), None);
+}

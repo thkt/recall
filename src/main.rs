@@ -1144,6 +1144,28 @@ mod tests {
 
     use super::*;
 
+    // ADR-0003 Confirmation: `create_db_file` creates the index DB with owner-only
+    // 0o600 permission. 0o600 sets only owner bits, so no umask (including the common
+    // 022 / 077) strips them and the assertion is stable across environments.
+    #[cfg(unix)]
+    #[test]
+    fn create_db_file_sets_owner_only_0600_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("index.db");
+
+        create_db_file(&db_path).unwrap();
+
+        let mode = fs::metadata(&db_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "created DB must be owner-only 0o600, got {:o}",
+            mode & 0o777,
+        );
+    }
+
     // T-CS001: resolve_current_session is the single place the env-exclude policy
     // lives, so this (flags x env) truth table is the contract.
     #[test]
@@ -2681,6 +2703,173 @@ mod tests {
             vec_chunk_count(&conn),
             0,
             "search must not embed: vec_chunks stays empty even with an embedder present"
+        );
+    }
+
+    // -- ADR-0001 Confirmation: the `--json` data payload is a frozen contract -----
+    //
+    // These golden tests pin the EXACT top-level key set (not mere presence) of each
+    // command's `data` payload, so a key added or removed fails loudly. Both the
+    // empty and populated branches of search/status are pinned, locking the invariant
+    // that the key set is branch-independent.
+
+    /// Sorted top-level object keys of a `--json` payload. Panics if `v` is not a
+    /// JSON object, which itself guards the envelope's object-at-root shape.
+    fn payload_keys(v: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = v
+            .as_object()
+            .expect("payload must be a JSON object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn freeze_index_payload_key_set() {
+        let outcome = IndexOutcome {
+            degraded_note: None,
+            embedded: 4,
+            failed_count: 0,
+            first_error: None,
+            skipped_roots: vec![indexer::SkippedRoot {
+                source: parser::Source::Codex,
+                preserved_sessions: 2,
+                reason: indexer::SkippedReason::IncompleteEnumeration,
+            }],
+        };
+
+        let out = index_command_output(&outcome);
+
+        assert_eq!(
+            payload_keys(&out.data),
+            ["embedded", "failed_count", "skipped_roots"],
+            "index --json top-level keys are frozen"
+        );
+        assert_eq!(
+            payload_keys(&out.data["skipped_roots"][0]),
+            ["preserved_sessions", "reason", "source"],
+            "index --json skipped_roots element keys are frozen"
+        );
+    }
+
+    #[test]
+    fn freeze_status_payload_key_set_both_branches() {
+        let frozen = ["embedded", "model_ready", "qa_chunks", "sessions"];
+
+        // No-database branch: the path does not exist.
+        let missing = tempfile::TempDir::new().unwrap();
+        let no_db = run_status(false, &Some(missing.path().join("absent.db"))).unwrap();
+        assert_eq!(
+            payload_keys(&no_db.data),
+            frozen,
+            "status --json keys are frozen on the no-database branch"
+        );
+
+        // With-database branch.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            db::seed_session(&conn, "s1");
+        }
+        let with_db = run_status(false, &Some(db_path)).unwrap();
+        assert_eq!(
+            payload_keys(&with_db.data),
+            frozen,
+            "status --json keys are frozen on the with-database branch"
+        );
+    }
+
+    #[test]
+    fn freeze_search_payload_key_set_both_branches() {
+        // Empty branch: no sessions, so search short-circuits to {results: []}.
+        let empty_dir = tempfile::TempDir::new().unwrap();
+        let empty_path = empty_dir.path().join("empty.db");
+        open_or_create_db(&empty_path).unwrap();
+        let empty = run_search(search_command("anything"), &Some(empty_path)).unwrap();
+        assert_eq!(
+            payload_keys(&empty.data),
+            ["results"],
+            "search --json top-level keys are frozen on the empty branch"
+        );
+        assert_eq!(
+            empty.data["results"].as_array().unwrap().len(),
+            0,
+            "the empty branch emits an empty results array"
+        );
+
+        // Populated branch: one session with a matching message yields a hit, so the
+        // result element shape (result_to_json) is exercised on the live path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            db::seed_session(&conn, "s1");
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) \
+                 VALUES ('s1', 'user', 'frozen envelope contract')",
+                [],
+            )
+            .unwrap();
+        }
+        let populated = run_search(search_command("frozen"), &Some(db_path)).unwrap();
+        assert_eq!(
+            payload_keys(&populated.data),
+            ["results"],
+            "search --json top-level keys are frozen on the populated branch"
+        );
+        let results = populated.data["results"].as_array().unwrap();
+        assert!(
+            !results.is_empty(),
+            "the populated branch must return at least one hit, got: {}",
+            populated.data
+        );
+        assert_eq!(
+            payload_keys(&results[0]),
+            [
+                "excerpt",
+                "project",
+                "session_id",
+                "slug",
+                "source",
+                "timestamp"
+            ],
+            "search --json result element keys are frozen"
+        );
+    }
+
+    // ADR-0001 Confirmation: SearchResult and SessionData stay non-Serialize so the
+    // public `--json` schema is built explicitly (result_to_json / json! payloads)
+    // and never coupled to these internal structs. Per the ADR's literal "grep
+    // check", this guards against either gaining `derive(Serialize)`. It scans the
+    // whole leading attribute/doc block — from the previous item's `}`/`;` up to the
+    // declaration — so a rustfmt-wrapped multi-line `derive(...)` or a comment placed
+    // between the derive and the struct cannot create a silent pass. It asserts the
+    // declaration is present first, so a rename surfaces as a panic. The scan can only
+    // over-match (a doc comment above the struct literally writing "Serialize" → a
+    // safe-side false failure), never under-match.
+    #[test]
+    fn search_result_and_session_data_stay_non_serialize() {
+        fn leading_block_mentions_serialize(src: &str, decl: &str) -> bool {
+            let pos = src.find(decl).unwrap_or_else(|| {
+                panic!("{decl} not found — the Serialize guard is reading the wrong source")
+            });
+            let block_start = src[..pos].rfind(['}', ';']).map(|i| i + 1).unwrap_or(0);
+            src[block_start..pos].contains("Serialize")
+        }
+
+        assert!(
+            !leading_block_mentions_serialize(include_str!("search.rs"), "pub struct SearchResult"),
+            "SearchResult must not derive Serialize (ADR-0001): the --json schema is built explicitly"
+        );
+        assert!(
+            !leading_block_mentions_serialize(
+                include_str!("parser/mod.rs"),
+                "pub struct SessionData"
+            ),
+            "SessionData must not derive Serialize (ADR-0001): the --json schema is built explicitly"
         );
     }
 }
