@@ -114,6 +114,14 @@ recall show abc-123     # show full conversation of a session (prefix match)
 recall status           # sessions, chunks, embedding coverage, model status
 ```
 
+### Doctor
+
+```sh
+recall doctor           # diagnose a broken index; reports only, never repairs
+```
+
+Runs four checks: SQLite `quick_check`, orphaned embeddings, orphaned chunks, and a live model load-and-embed probe. Each failing check prints the remedy command (`recall rebuild`, `recall model download`, or re-`recall index` after removing a corrupt DB). A not-installed model is reported as info, not a failure — search runs FTS-only without it, so the index stays healthy. Under `--json`, a failure sets `degraded: true` and lists each remedy in `notes`.
+
 ### Hook
 
 `recall index` is the primary way to refresh — run it whenever you want search up to date. Optionally register it as a Claude Code SessionEnd hook to re-index the moment a session ends. Each fire re-scans the whole session tree (incremental — only changed files are re-parsed) and embeds new chunks.
