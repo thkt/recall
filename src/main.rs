@@ -798,6 +798,13 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
 // -- Output formatting --
 
 /// Path structure: `{...}/{parent-session-uuid}/subagents/{agent-id}.jsonl`
+///
+/// Assumption/risk: this layout is owned by the upstream session writer (Claude
+/// Code / Codex), not by recall -- we only read it. If the writer changes where
+/// it nests subagent transcripts, the `/subagents/` segment or the parent-UUID
+/// position shifts and this silently returns `None` (subagent rows lose their
+/// parent link). recall cannot enforce the contract, so treat a `None` here as a
+/// "writer layout drifted" signal rather than a malformed-path error.
 fn extract_parent_session(file_path: &str) -> Option<&str> {
     let idx = file_path.find("/subagents/")?;
     let prefix = &file_path[..idx];
@@ -1043,6 +1050,9 @@ fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<C
 
 // -- Entry point --
 
+// Drives shorthand expansion in `try_expand_shorthand`: a token here is treated
+// as a subcommand, anything else as a bare `search` query. Add every new
+// subcommand (and keep it matching the `Command` enum) or its shorthand breaks.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "index", "rebuild", "model", "search", "show", "status", "classify", "help",
 ];
