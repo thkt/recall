@@ -998,8 +998,9 @@ fn test_012_search_without_embedder_fts5_only() {
     insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
     insert_message(&conn, "s1", "user", "authentication flow discussion");
 
-    let results =
-        search_with_embedder(&conn, "authentication", &SearchOptions::default(), None).unwrap();
+    let results = search_with_embedder(&conn, "authentication", &SearchOptions::default(), None)
+        .unwrap()
+        .results;
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].session.session_id, "s1");
@@ -1023,7 +1024,7 @@ fn test_hybrid_search_merges_fts_and_vector() {
     assert!(has_vec_data(&conn));
 
     let embedder = MockEmbedder::new();
-    let results = search_with_embedder(
+    let outcome = search_with_embedder(
         &conn,
         "authentication",
         &SearchOptions {
@@ -1033,6 +1034,13 @@ fn test_hybrid_search_merges_fts_and_vector() {
         Some(&embedder),
     )
     .unwrap();
+    // A vector leg that succeeds (the embedder never errors here) must leave the
+    // outcome non-degraded, so a healthy hybrid search reports `degraded:false`.
+    assert!(
+        !outcome.vec_degraded,
+        "a successful vector search must not flag degradation"
+    );
+    let results = outcome.results;
 
     let ids: Vec<&str> = results
         .iter()
@@ -1110,7 +1118,9 @@ fn test_short_query_runs_vector_search_when_fts_has_no_trigram_term() {
 
     // With an embedder, vector search now runs and finds s2 by meaning.
     let embedder = MockEmbedder::new();
-    let results = search_with_embedder(&conn, "ui", &opts, Some(&embedder)).unwrap();
+    let results = search_with_embedder(&conn, "ui", &opts, Some(&embedder))
+        .unwrap()
+        .results;
     let ids: Vec<&str> = results
         .iter()
         .map(|r| r.session.session_id.as_str())
@@ -1154,7 +1164,9 @@ fn test_empty_and_whitespace_queries_return_empty_even_with_embedder_and_vec_dat
     let embedder = MockEmbedder::new();
 
     for query in ["", "   "] {
-        let results = search_with_embedder(&conn, query, &opts, Some(&embedder)).unwrap();
+        let results = search_with_embedder(&conn, query, &opts, Some(&embedder))
+            .unwrap()
+            .results;
         assert!(
             results.is_empty(),
             "query {query:?} must return no results, got: {:?}",
@@ -1170,7 +1182,9 @@ fn test_empty_and_whitespace_queries_return_empty_even_with_embedder_and_vec_dat
     // fix as "let vector search run for non-empty queries"; the pre-fix empty result
     // for "..." was an incidental effect of the removed early return, not a promise.
     // Pinned so a future "re-fix" that re-adds an empty-on-punctuation gate is caught.
-    let punct = search_with_embedder(&conn, "...", &opts, Some(&embedder)).unwrap();
+    let punct = search_with_embedder(&conn, "...", &opts, Some(&embedder))
+        .unwrap()
+        .results;
     assert!(
         !punct.is_empty(),
         "non-empty punctuation-only query must reach vector search, not return empty"
@@ -1203,7 +1217,8 @@ fn test_vector_only_excerpt_uses_closest_chunk() {
         },
         Some(&embedder),
     )
-    .unwrap();
+    .unwrap()
+    .results;
 
     let s2 = results
         .iter()
@@ -1253,7 +1268,8 @@ fn test_hybrid_recency_boost_favors_newer() {
         },
         Some(&embedder),
     )
-    .unwrap();
+    .unwrap()
+    .results;
 
     assert_eq!(results.len(), 2);
     assert_eq!(
@@ -1274,7 +1290,7 @@ fn test_hybrid_search_falls_back_on_vector_error() {
     insert_chunk_with_embedding(&conn, 1, "s1", "content", now_ms);
 
     let embedder = MockEmbedder::failing_after(0);
-    let results = search_with_embedder(
+    let outcome = search_with_embedder(
         &conn,
         "authentication",
         &SearchOptions {
@@ -1285,8 +1301,94 @@ fn test_hybrid_search_falls_back_on_vector_error() {
     )
     .unwrap();
 
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].session.session_id, "s1");
+    assert_eq!(outcome.results.len(), 1);
+    assert_eq!(outcome.results[0].session.session_id, "s1");
+    // The FTS leg still answered (s1 matched), so the result is non-empty — but
+    // the vector leg failed, so the outcome must flag degradation for the
+    // envelope rather than presenting a text-only result as complete (#204).
+    assert!(
+        outcome.vec_degraded,
+        "a runtime vector-search failure must set vec_degraded even when FTS yields hits"
+    );
+}
+
+#[test]
+fn test_runtime_vector_failure_with_no_fts_match_flags_degraded_on_empty() {
+    // The dangerous case (#204): the vector leg fails AND FTS finds nothing, so
+    // the result is empty. Without the runtime signal the envelope would report
+    // `degraded:false` over a `→0` result — exactly the silent failure that once
+    // misled a benchmark into a false "total miss" conclusion. The empty-result
+    // early-returns must still carry vec_degraded.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // A session whose text shares no term with the query, so FTS yields no hit,
+    // but it has a vec_chunk so has_vec_data() is true and the hybrid path runs.
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "totally unrelated weather forecast");
+    insert_chunk_with_embedding(&conn, 1, "s1", "weather forecast", now_ms);
+
+    let embedder = MockEmbedder::failing_after(0);
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        Some(&embedder),
+    )
+    .unwrap();
+
+    assert!(
+        outcome.results.is_empty(),
+        "FTS finds nothing and the vector leg failed, so the result is empty"
+    );
+    assert!(
+        outcome.vec_degraded,
+        "an empty result from a runtime vector failure must still flag degradation (#204)"
+    );
+}
+
+#[test]
+fn test_runtime_vector_failure_with_unknown_source_hits_flags_degraded_on_empty() {
+    // The second empty early-return (#204): the vector leg fails AND every FTS
+    // candidate is dropped by fetch_session_metadata because its `sessions.source`
+    // is unknown (not claude/codex). `find_candidate_sessions` still returns it
+    // (no source filter), so `merged` is non-empty at the first check, then
+    // `retain` empties it. This pruned-to-empty path must still carry vec_degraded,
+    // else an envelope over a result that silently pruned to zero reports
+    // degraded:false.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // Source "gemini" is not claude/codex, so Source::from_db returns None and
+    // fetch_session_metadata skips the row.
+    insert_session(&conn, "weird", "gemini", "/proj", now_ms);
+    insert_message(&conn, "weird", "user", "authentication flow design");
+    // has_vec_data() must be true for the hybrid path to run, so seed one vec_chunk.
+    insert_chunk_with_embedding(&conn, 1, "weird", "authentication flow", now_ms);
+
+    let embedder = MockEmbedder::failing_after(0);
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        Some(&embedder),
+    )
+    .unwrap();
+
+    assert!(
+        outcome.results.is_empty(),
+        "the only FTS hit had an unknown source and was pruned, so the result is empty"
+    );
+    assert!(
+        outcome.vec_degraded,
+        "the pruned-to-empty early-return must still flag the runtime vector failure (#204)"
+    );
 }
 
 fn hybrid_search_ids(
@@ -1296,6 +1398,7 @@ fn hybrid_search_ids(
 ) -> Vec<String> {
     search_with_embedder(conn, "authentication", opts, Some(embedder))
         .unwrap()
+        .results
         .into_iter()
         .map(|r| r.session.session_id)
         .collect()
@@ -1663,7 +1766,8 @@ fn test_hybrid_unknown_source_does_not_crowd_out_valid_hit() {
         },
         Some(&embedder),
     )
-    .unwrap();
+    .unwrap()
+    .results;
 
     assert_eq!(
         results.len(),
