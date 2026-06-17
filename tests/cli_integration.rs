@@ -455,6 +455,69 @@ fn rebuild_json_emits_structured_embed_summary() {
     );
 }
 
+// T-CLI028 (ADR-0001, #211): `doctor --json` against a built index freezes the
+// diagnostic envelope an agent consumes. The `data` payload pins the top keys
+// `healthy` / `checks`, each check object's `name` / `ok` / `detail` / `remedy`,
+// and the four check `name` tokens (`integrity` / `orphan_embeddings` /
+// `orphan_chunks` / `model`) an agent pattern-matches. A valid seeded DB always
+// takes the four-check arm (open succeeds), so the name set is deterministic; the
+// model check's verdict still varies by host, so this asserts the envelope
+// invariant `degraded == !healthy` rather than a fixed `healthy` value, keeping
+// the test portable. Exit is 0 because a successful command maps to SUCCESS
+// regardless of the degraded flag (exit_code_for_write). Perspective: contract
+// freeze (key set) + invariant (degraded co-varies with healthy).
+#[test]
+fn doctor_json_freezes_diagnostic_envelope_key_set() {
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let out = recall(dir.path())
+        .args(["doctor", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "doctor --json should exit 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    let healthy = v["data"]["healthy"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("data.healthy should be a bool, got: {stdout}"));
+    let degraded = v["degraded"]
+        .as_bool()
+        .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));
+    assert_eq!(
+        degraded, !healthy,
+        "envelope degraded must be the negation of data.healthy, got: {stdout}"
+    );
+    let checks = v["data"]["checks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("data.checks should be an array, got: {stdout}"));
+    for c in checks {
+        let obj = c
+            .as_object()
+            .unwrap_or_else(|| panic!("each check should be an object, got: {stdout}"));
+        for key in ["name", "ok", "detail", "remedy"] {
+            assert!(
+                obj.contains_key(key),
+                "each check must carry the `{key}` key, got: {stdout}"
+            );
+        }
+    }
+    let mut names: Vec<&str> = checks
+        .iter()
+        .map(|c| {
+            c["name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("check name should be a string, got: {stdout}"))
+        })
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        ["integrity", "model", "orphan_chunks", "orphan_embeddings"],
+        "a built index freezes exactly these four check tokens, got: {stdout}"
+    );
+}
+
 // T-CLI019: `status --json` against a never-created index reports zero counters
 // as a success envelope, exit 0 — the no-database branch of run_status. With
 // HF_HOME pointed at an empty cache the model is not installed, so model_ready is

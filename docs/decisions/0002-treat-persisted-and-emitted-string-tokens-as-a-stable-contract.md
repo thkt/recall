@@ -8,12 +8,13 @@ decision-makers: thkt
 
 ## Context and Problem Statement
 
-recall stores and emits hand-written string tokens that double as contracts. `Source` and `Role` round-trip through the DB via `as_str` / `from_db` (parser/mod.rs:22-65), `session_type` is persisted as `"interactive"` / `"automated"` with NULL coalesced to interactive in the search filter (db.rs:143, search.rs:140), and skip-reason tokens `"missing_root"` / `"incomplete_enumeration"` flow into the `--json` envelope (indexer.rs:88, main.rs:360). These strings are matched, not type-checked across the boundary, so a rename silently breaks existing DB rows or agent consumers. No document records that they are frozen.
+recall stores and emits hand-written string tokens that double as contracts. `Source` and `Role` round-trip through the DB via `as_str` / `from_db` (parser/mod.rs:22-65), `session_type` is produced as `"interactive"` / `"automated"` by `SessionType::as_str` (classify.rs:20-25), persisted (column at db.rs:36, migration at db.rs:171-178), and matched against the literal default `'interactive'` in the search filter's `COALESCE` (search.rs:175) where NULL coalesces to interactive, and skip-reason tokens `"missing_root"` / `"incomplete_enumeration"` flow into the `--json` envelope (indexer.rs:88, main.rs:360). These strings are matched, not type-checked across the boundary, so a rename silently breaks existing DB rows or agent consumers. No document records that they are frozen.
 
 ## Decision Drivers
 
 - `from_db` matches stored strings exactly; a rename strands every pre-existing row
 - Skip-reason tokens reach `--json` consumers as machine values
+- `session_type` has two literal binding sites the compiler cannot keep in sync: the producer `SessionType::as_str` (classify.rs:20-25) and the `COALESCE` default `'interactive'` in the search filter (search.rs:175). Renaming one without the other silently desyncs the default from the stored value
 - The compiler cannot enforce string-equality contracts across the persistence boundary
 
 ## Considered Options
@@ -34,7 +35,7 @@ Chosen option: "Treat the token strings as a frozen contract", because the value
 
 ### Confirmation
 
-A round-trip test asserts `from_db(x.as_str()) == Some(x)` for every `Source` / `Role` variant. A test asserts the NULL-`session_type` row is treated as interactive by the search filter. A test asserts the skip-reason `--json` tokens match the documented set. Renames are caught in review against this ADR.
+A round-trip test asserts `from_db(x.as_str()) == Some(x)` for every `Source` / `Role` variant. A test asserts the NULL-`session_type` row is treated as interactive by the search filter, which exercises the `COALESCE` default; the producer literal `SessionType::as_str` (classify.rs:20-25) and that default (search.rs:175) must use the identical token, since no test couples them directly. A test asserts the skip-reason `--json` tokens match the documented set. Renames are caught in review against this ADR.
 
 ## More Information
 
