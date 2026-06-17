@@ -8,7 +8,7 @@ decision-makers: thkt
 
 ## Context and Problem Statement
 
-Under `--json`, recall emits `SuccessEnvelope` (`data` / `degraded` / `notes`) to stdout and `ErrorEnvelope` (`error.code` / `message` / `next_step` / `candidates` / `retryable`) to stderr (envelope.rs). Agents parse these keys. The code decouples the wire schema from internal types via a `serde_json::json!` seam and keeps `SearchResult` / `SessionData` non-`Serialize`, but no document states that the envelope keys are a frozen public contract, nor that every string field reaching stdout must be control-char sanitized (main.rs:800-821). A future contributor could break agent consumers by renaming a key or surfacing a raw field.
+Under `--json`, recall emits `SuccessEnvelope` (`data` / `degraded` / `notes`) to stdout and `ErrorEnvelope` (`error.code` / `message` / `next_step` / `candidates` / `retryable`) to stderr (envelope.rs). Agents parse these keys. The code decouples the wire schema from internal types via a `serde_json::json!` seam and keeps `SearchResult` / `SessionData` non-`Serialize`, but no document states that the envelope keys are a frozen public contract, nor that every string field reaching stdout must be control-char sanitized (`format_result` strips each field at main.rs:1096-1117, the error-note path at main.rs:339). A future contributor could break agent consumers by renaming a key or surfacing a raw field.
 
 ## Decision Drivers
 
@@ -33,7 +33,7 @@ Chosen option: "Freeze the envelope shape", because the envelope is the only sta
 
 ### Confirmation
 
-A golden/snapshot test asserts the `--json` key set for `search` / `index` / `status` (extend envelope.rs tests). A grep check confirms `SearchResult` and `SessionData` carry no `derive(Serialize)`. Code review verifies every new string field in `format_result` and the `json!` payloads passes `ansi::strip_control_chars`.
+A golden/snapshot test asserts the `--json` key set for `search` / `index` / `status` / `doctor` (search/index/status assertions live in tests/cli_integration.rs; `doctor`'s `data` payload freezes the top keys `healthy` / `checks` and each check object's `name` / `ok` / `detail` / `remedy`, main.rs:1059). A grep check confirms `SearchResult` and `SessionData` carry no `derive(Serialize)`. Code review verifies every new string field in `format_result` and the `json!` payloads passes `ansi::strip_control_chars`.
 
 ## More Information
 
