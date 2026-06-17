@@ -41,6 +41,22 @@ A golden/snapshot test asserts the `--json` key set for `search` / `index` / `st
 
 ADR-0060 governs the shared envelope pattern across the tool family; this ADR records the recall-specific freeze + strip-every-field commitment that ADR-0060 does not cover.
 
+### Degraded Trigger Semantics (amendment 2026-06-17)
+
+This freeze fixed the envelope KEY `degraded`, not the conditions that set it. The trigger is recorded here so a future contributor does not "reconcile" an intentional cross-command divergence into a bug.
+
+For `search`, `degraded:true` means semantic (vector) coverage was lost relative to a fully-loaded run; the search still returns its FTS-only results rather than failing. Two sources feed it, and they co-vary with the same boolean so the bool and the notes never disagree:
+
+- Load-time: the embedder could not load (model-less or a probe/backend failure), derived by `search_degraded_state` (main.rs:251-258). A caller-disabled model is intentional and stays non-degraded.
+- Runtime: a loaded embedder's `embed_query` / `vec_search` fails at query time (e.g. memory pressure) and is swallowed to FTS-only, carried by `SearchOutcome::vec_degraded` (search.rs:39-57, 676-683). It is the runtime counterpart to the load-time path.
+
+The no-model state is reported on two different axes by design, and this asymmetry is intentional, not a contract violation:
+
+- `search` reports it on a coverage axis: no model means semantic search is unavailable, so results are FTS-only and may be thinner, hence `degraded:true`.
+- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (main.rs:834-845). `doctor` and `status` agree with each other on this axis (#166).
+
+A contributor who tries to make all three commands agree on `degraded` for the no-model case would either wrongly mark `doctor`/`status` unhealthy or wrongly hide search's lost-coverage signal. The divergence is the contract.
+
 ### Reassessment Triggers
 
 - A v2 JSON schema is introduced (then version the envelope explicitly)

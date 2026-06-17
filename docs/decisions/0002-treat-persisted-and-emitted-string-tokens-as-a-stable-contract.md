@@ -35,7 +35,7 @@ Chosen option: "Treat the token strings as a frozen contract", because the value
 
 ### Confirmation
 
-A round-trip test asserts `from_db(x.as_str()) == Some(x)` for every `Source` / `Role` variant. A test asserts the NULL-`session_type` row is treated as interactive by the search filter, which exercises the `COALESCE` default; the producer literal `SessionType::as_str` (classify.rs:20-25) and that default (search.rs:175) must use the identical token, since no test couples them directly. A test asserts the skip-reason `--json` tokens match the documented set. Renames are caught in review against this ADR.
+A round-trip test asserts `from_db(x.as_str()) == Some(x)` for every `Source` / `Role` variant. A test asserts the NULL-`session_type` row is treated as interactive by the search filter, which exercises the `COALESCE` default; the producer literal `SessionType::as_str` (classify.rs:20-25) and that default (search.rs:175) must use the identical token, since no test couples them directly. A test asserts the skip-reason `--json` tokens match the documented set. The policy of which reasons surface (the `MissingRoot`-at-0 suppression versus the always-on `IncompleteEnumeration`) is type-enforced separately from the token strings: the exhaustive `match reason` (indexer.rs:479-482) will not compile until a new variant's emit choice is made, and tests pin the current asymmetry (`IncompleteEnumeration` surfaces at zero preserved, `MissingRoot` stays silent). Renames are caught in review against this ADR.
 
 ## More Information
 
