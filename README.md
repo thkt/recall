@@ -77,13 +77,17 @@ recall search "auth AND middleware"                               # boolean oper
 
 Backward compatible: `recall "query"` works as shorthand for `recall search "query"`.
 
-| Flag        | Description                           |
-| ----------- | ------------------------------------- |
-| `--project` | Filter by project path (prefix match) |
-| `--days`    | Only sessions from the last N days    |
-| `--source`  | `claude` or `codex`                   |
-| `--limit`   | Max results, 1-100 (default: 10)      |
-| `-v`        | Verbose output                        |
+| Flag                  | Description                                                         |
+| --------------------- | ------------------------------------------------------------------- |
+| `--project`           | Filter by project path (prefix match)                               |
+| `--days`              | Only sessions from the last N days                                  |
+| `--source`            | `claude` or `codex`                                                 |
+| `--limit`             | Max results, 1-100 (default: 10)                                    |
+| `--exclude-current`   | Exclude the invoking session (default inside a Claude Code session) |
+| `--include-current`   | Include the invoking session even inside a session                  |
+| `--only-current`      | Return only the invoking session                                    |
+| `--include-automated` | Include automated (hook/script/agent) sessions; excluded by default |
+| `-v`                  | Verbose output                                                      |
 
 Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
 
@@ -91,7 +95,7 @@ Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_sy
 
 ```sh
 recall index            # parse, chunk, and embed new session logs (incremental)
-recall rebuild          # drop, rebuild, and re-embed the full index from scratch
+recall rebuild          # re-parse and re-embed every present session; missing roots keep their rows
 ```
 
 Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
@@ -113,6 +117,16 @@ recall show abc-123     # show full conversation of a session (prefix match)
 ```sh
 recall status           # sessions, chunks, embedding coverage, model status
 ```
+
+### Classify
+
+```sh
+recall classify             # classify unclassified sessions interactive/automated
+recall classify --all       # re-classify every session
+recall classify --dry-run   # report what would change without writing
+```
+
+Each session is classified interactive or automated from its first user turn. Automated sessions (hook/script/agent-generated) are excluded from search by default; pass `--include-automated` to include them.
 
 ### Doctor
 
