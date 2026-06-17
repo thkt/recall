@@ -752,6 +752,13 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
     // same state (#166). `cached_artifacts` only reads the HF cache, so hoisting
     // it above the existence check keeps `status` read-only and the no-DB counts
     // at zero.
+    //
+    // A not-installed model is reported here as a plain `model_ready:false` fact,
+    // never as `degraded`. `status` and `doctor` share this health axis: FTS-only
+    // is a supported mode, not a broken index (DoctorCheck::info, ~L834). `search`
+    // deliberately diverges, marking the no-model case `degraded:true` on its
+    // coverage axis; that asymmetry is the contract, not a bug to reconcile (the
+    // degraded-trigger amendment in ADR-0001).
     let model_ok = cached_artifacts(ModelId::DEFAULT)
         .map(|opt| opt.is_some())
         .unwrap_or(false);
@@ -1830,6 +1837,26 @@ mod tests {
         assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_some());
     }
 
+    // KNOWN_SUBCOMMANDS must cover every real subcommand clap parses, else
+    // shorthand expansion rewrites the uncovered one to a `search <name>` query
+    // and the command is unreachable. The list was kept in sync by a comment
+    // alone, yet `recall doctor` shipped as `search doctor` regardless; this test
+    // is the enforcement the comment could not be. Adding a `Command` variant
+    // without listing its name here fails the assertion. clap auto-generates the
+    // `help` subcommand, which is already in the list.
+    #[test]
+    fn known_subcommands_covers_every_clap_subcommand() {
+        use clap::CommandFactory;
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                KNOWN_SUBCOMMANDS.contains(&name),
+                "clap subcommand `{name}` is missing from KNOWN_SUBCOMMANDS; \
+                 shorthand expansion will rewrite `recall {name}` to a search query"
+            );
+        }
+    }
+
     // T-007 (FR-008): the user-facing READMEs must describe index-time embedding,
     // not the retired post-search/progressive model. OUTCOME.md carries the same
     // revision but is git-ignored, so this committed test targets the committed
@@ -2572,6 +2599,27 @@ mod tests {
         assert!(
             !db_path.exists(),
             "doctor must not create the database while diagnosing"
+        );
+    }
+
+    // status on a missing database reports zero counts without creating the DB,
+    // the read-only guarantee doctor's no-DB path mirrors. It rests on run_status
+    // computing model readiness before the `!path.exists()` early return, so the
+    // no-DB branch never calls open_or_create_db. Perspective: boundary (no index
+    // yet) — reporting status must not have the side effect of creating one.
+    #[test]
+    fn run_status_does_not_create_db_when_absent() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("missing.db");
+
+        let out = run_status(false, &Some(db_path.clone())).unwrap();
+
+        assert_eq!(out.data["sessions"], 0);
+        assert_eq!(out.data["qa_chunks"], 0);
+        assert_eq!(out.data["embedded"], 0);
+        assert!(
+            !db_path.exists(),
+            "status must not create the database while reporting"
         );
     }
 
