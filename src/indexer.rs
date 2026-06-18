@@ -36,6 +36,13 @@ pub struct IndexStats {
     /// root can't prove their files were deleted (#165). Surfaced so a silent
     /// preservation — a root outage masking real deletions — stays visible.
     pub skipped_roots: Vec<SkippedRoot>,
+    /// Embedded sessions left untouched because the model was absent at index
+    /// time (#215). Re-indexing them would delete their chunks/embeddings before
+    /// the embed gate could rebuild them, dropping semantic search to degraded;
+    /// preserving them keeps search intact and lets a later model-present run
+    /// re-embed any content that changed meanwhile. Surfaced so the skip is
+    /// visible, not silent.
+    pub preserved_embedded: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +109,9 @@ impl IndexStats {
 enum IndexOutcome {
     Indexed,
     Unchanged,
+    /// A re-index was due, but the session already has embeddings and the model
+    /// is absent this run, so its rows were left untouched to protect them (#215).
+    Preserved,
     ParseError(String),
 }
 
@@ -111,6 +121,12 @@ struct IndexContext<'a> {
     /// Force re-index: `check_freshness` must not skip an mtime-unchanged file,
     /// so every present file is re-parsed and its chunks/embeddings rebuilt.
     force: bool,
+    /// Session ids that already hold embeddings, populated only when the model is
+    /// absent this run (#215). `Some` activates preserve-in-place: a re-index of
+    /// a session in this set is skipped so its chunks/embeddings survive instead
+    /// of being deleted before an embed gate that cannot rebuild them. `None`
+    /// (model present) leaves the normal delete-and-reindex path unchanged.
+    embedded_sessions: Option<HashSet<String>>,
 }
 
 pub(crate) struct IndexOptions<'a> {
@@ -273,6 +289,21 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         return Ok(IndexOutcome::Unchanged);
     };
 
+    // Preserve-in-place (#215): when the model is absent, a re-index of a session
+    // that already holds embeddings must not run — `upsert_session` would delete
+    // its chunks/embeddings before the embed gate, which cannot rebuild them this
+    // run, leaving search degraded. Skip before parsing so its rows (and mtime)
+    // stay untouched; a later model-present run re-indexes it (mtime drives the
+    // self-heal for changed files, the embed gate for unchanged ones). A cached
+    // session without embeddings, or a new session, is not in the set and falls
+    // through to the normal FTS-only index.
+    if let Some(embedded) = &ctx.embedded_sessions
+        && let Some(entry) = ctx.existing.get(&fpath_str)
+        && embedded.contains(&entry.session_id)
+    {
+        return Ok(IndexOutcome::Preserved);
+    }
+
     let result = match source {
         Source::Claude => parse_claude_session(fpath),
         Source::Codex => parse_codex_session(fpath),
@@ -359,18 +390,24 @@ fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {
     }
 }
 
-fn index_all(
-    ctx: &IndexContext,
-    sources: &[(PathBuf, Source)],
-) -> Result<(usize, usize, Option<String>)> {
+struct IndexTotals {
+    indexed: usize,
+    parse_errors: usize,
+    first_error: Option<String>,
+    preserved_embedded: usize,
+}
+
+fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexTotals> {
     let mut indexed = 0;
     let mut parse_errors = 0;
     let mut first_error = None;
+    let mut preserved_embedded = 0;
 
     for (fpath, source) in sources {
         match index_file(ctx, fpath, source)? {
             IndexOutcome::Indexed => indexed += 1,
             IndexOutcome::Unchanged => {}
+            IndexOutcome::Preserved => preserved_embedded += 1,
             IndexOutcome::ParseError(msg) => {
                 parse_errors += 1;
                 if first_error.is_none() {
@@ -380,7 +417,12 @@ fn index_all(
         }
     }
 
-    Ok((indexed, parse_errors, first_error))
+    Ok(IndexTotals {
+        indexed,
+        parse_errors,
+        first_error,
+        preserved_embedded,
+    })
 }
 
 fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()> {
@@ -394,7 +436,16 @@ fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()
     Ok(())
 }
 
-pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Result<IndexStats> {
+/// `embed_capable` is whether the embedder loaded this run. When false (model
+/// absent), sessions that already hold embeddings are preserved in place rather
+/// than re-indexed (#215), since the embed gate downstream cannot rebuild what a
+/// re-index would delete. The caller loads the embedder once and passes the
+/// result here so the model is not probed twice.
+pub(crate) fn index_from_dirs(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+    embed_capable: bool,
+) -> Result<IndexStats> {
     let start = Instant::now();
 
     // Always full-scan: file-level mtime checks in check_freshness keep indexing
@@ -408,6 +459,14 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     // instead re-indexes every present file (mtime skip bypassed via `ctx.force`)
     // while cleanup removes only rows whose scanned root confirms their absence.
     let existing = load_existing_sessions(conn)?;
+    // Compute the embedded-session set before the transaction borrows conn, only
+    // when the model is absent — when present the normal re-index path applies and
+    // the (potentially large) set is never built (#215).
+    let embedded_sessions = if embed_capable {
+        None
+    } else {
+        Some(embedded_session_ids(conn)?)
+    };
     let scan = collect_sources(opts);
     let sources = &scan.sources;
 
@@ -423,12 +482,13 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
         tx: &tx,
         existing: &existing,
         force: opts.force,
+        embedded_sessions,
     };
-    let (indexed, parse_errors, first_error) = index_all(&ctx, sources)?;
-    cleanup_orphans(&tx, &existing, sources, &scan.scanned, indexed)?;
+    let totals = index_all(&ctx, sources)?;
+    cleanup_orphans(&tx, &existing, sources, &scan.scanned, totals.indexed)?;
     tx.commit().context("Failed to commit transaction")?;
 
-    finalize_fts(conn, indexed, opts.force)?;
+    finalize_fts(conn, totals.indexed, opts.force)?;
 
     let total_sessions = {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
@@ -436,13 +496,42 @@ pub(crate) fn index_from_dirs(conn: &mut Connection, opts: &IndexOptions) -> Res
     };
 
     Ok(IndexStats {
-        indexed,
-        parse_errors,
-        first_error,
+        indexed: totals.indexed,
+        parse_errors: totals.parse_errors,
+        first_error: totals.first_error,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
         skipped_roots: summarize_skipped_roots(&existing, sources, &scan.skipped),
+        preserved_embedded: totals.preserved_embedded,
     })
+}
+
+/// Session ids that already hold at least one embedding. One pass over each table
+/// (#138): load the embedded chunk ids into a set, then scan `qa_chunks` once,
+/// collecting the session of every chunk in that set. A correlated subquery
+/// against `vec_chunks.chunk_id` would re-scan it per row — that column is an
+/// unindexed auxiliary column (see `embedder::pending_chunks`), so the one-pass
+/// form keeps this O(N+M), not O(N*M).
+fn embedded_session_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let embedded: HashSet<i64> = {
+        let mut stmt = conn.prepare("SELECT DISTINCT chunk_id FROM vec_chunks")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<StdResult<_, _>>()?
+    };
+
+    let mut stmt = conn.prepare("SELECT id, session_id FROM qa_chunks")?;
+    let rows = stmt.query_map([], |row| {
+        let id: i64 = row.get(0)?;
+        if embedded.contains(&id) {
+            // Decode session_id only on a hit; sqlite materializes only the
+            // columns a row actually reads (mirrors `pending_chunks`, #138).
+            return Ok(Some(row.get::<_, String>(1)?));
+        }
+        Ok(None)
+    })?;
+    rows.filter_map(StdResult::transpose)
+        .collect::<StdResult<_, _>>()
+        .map_err(Into::into)
 }
 
 /// Counts, per source whose root was not scanned this run, how many existing
