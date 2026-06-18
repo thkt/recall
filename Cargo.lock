@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "recall"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "amici",
  "anyhow",
