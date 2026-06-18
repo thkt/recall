@@ -481,6 +481,12 @@ fn doctor_json_freezes_diagnostic_envelope_key_set() {
     let healthy = v["data"]["healthy"]
         .as_bool()
         .unwrap_or_else(|| panic!("data.healthy should be a bool, got: {stdout}"));
+    assert!(
+        v["data"]
+            .get("repaired")
+            .is_some_and(serde_json::Value::is_null),
+        "a read-only doctor (no --fix) freezes repaired=null, got: {stdout}"
+    );
     let degraded = v["degraded"]
         .as_bool()
         .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));

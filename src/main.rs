@@ -127,8 +127,15 @@ enum Command {
     /// Show index and embedding status
     Status,
     /// Diagnose a broken index: corruption, orphaned rows, and a live model
-    /// load probe. Reports only; remedies point at index/rebuild/model download.
-    Doctor,
+    /// load probe. Read-only by default; `--fix` repairs orphan embeddings and
+    /// re-runs the checks. Other remedies point at index/rebuild/model download.
+    Doctor {
+        /// Delete dangling `vec_chunks` rows whose `chunk_id` no longer resolves
+        /// to a `qa_chunks` row (the orphan_embeddings fault), then re-run the
+        /// checks so the verdict reflects the repaired state.
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -936,7 +943,9 @@ fn check_integrity(conn: &Connection) -> Result<DoctorCheck> {
 /// Count `vec_chunks` embeddings whose `chunk_id` no longer resolves to a
 /// `qa_chunks` row. A vector hit on such a row fetches an empty or wrong excerpt,
 /// so the agent sees a phantom result (agent-misjudgment tier). `recall rebuild`
-/// re-embeds every present session, dropping the dangling rows.
+/// does not reach these rows (its deletes are keyed on present `qa_chunks` ids /
+/// `session_id`, never the dangling set), so the remedy is `recall doctor --fix`,
+/// which deletes exactly the rows this check counts.
 fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
     let orphans: i64 = conn.query_row(
         "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
@@ -949,9 +958,27 @@ fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
         DoctorCheck::fail(
             "orphan_embeddings",
             format!("{orphans} embedding(s) reference a missing chunk"),
-            "recall rebuild",
+            "recall doctor --fix",
         )
     })
+}
+
+/// Delete the dangling `vec_chunks` rows `check_orphan_embeddings` counts: those
+/// whose `chunk_id` no longer resolves to a `qa_chunks` row. The DELETE predicate
+/// is identical to that check's COUNT predicate, so it removes exactly the
+/// counted rows (no more, no less). Returns the number deleted.
+///
+/// Run once on demand (`doctor --fix`), never on the index path: `chunk_id` is an
+/// unindexed vec0 auxiliary column, so the `NOT IN` predicate is an O(N)
+/// `SCAN vec_chunks` (see the DELETE note in `embedder::embed_chunks`). A
+/// one-shot repair pays that scan once; folding it into every index would add a
+/// full scan to the hot path.
+fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
+        [],
+    )?;
+    Ok(deleted)
 }
 
 /// Count `qa_chunks` whose `session_id` no longer resolves to a `sessions` row.
@@ -1009,18 +1036,21 @@ where
     }
 }
 
-fn run_doctor(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    run_doctor_with(verbose, db_path, try_load_embedder_cached)
+fn run_doctor(verbose: bool, fix: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    run_doctor_with(verbose, fix, db_path, try_load_embedder_cached)
 }
 
 /// Diagnose the index, reporting per-check verdicts plus an overall `healthy`
-/// flag; never repairs. `load_embedder` is injected so the model probe is
-/// testable without an MLX load. Mirrors `status`'s `!path.exists()` early return
-/// so diagnosing never auto-creates a DB. A failed check sets the envelope's
-/// `degraded` flag and adds its remedy to `notes`, so an agent reading `--json`
-/// gets both the verdict and the fix.
+/// flag. Read-only unless `fix` is set, which first deletes orphan embeddings
+/// (the only repairable fault) and then runs the checks, so every verdict
+/// reflects the post-repair state. `load_embedder` is injected so the model probe
+/// is testable without an MLX load. Mirrors `status`'s `!path.exists()` early
+/// return so diagnosing never auto-creates a DB. A failed check sets the
+/// envelope's `degraded` flag and adds its remedy to `notes`, so an agent reading
+/// `--json` gets both the verdict and the fix.
 fn run_doctor_with<F>(
     verbose: bool,
+    fix: bool,
     db_path: &Option<PathBuf>,
     load_embedder: F,
 ) -> Result<CommandOutput>
@@ -1032,9 +1062,12 @@ where
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
         cli_info("run `recall index` to create the index.");
+        // Carry the `repaired` key render_doctor_report always emits, so the
+        // --json envelope key set stays identical on every doctor path. null
+        // here: with no DB there is nothing to repair.
         return Ok(CommandOutput::with_notes(
             String::new(),
-            serde_json::json!({ "healthy": false, "checks": [] }),
+            serde_json::json!({ "healthy": false, "checks": [], "repaired": null }),
             true,
             vec!["no index: run `recall index`".to_owned()],
         ));
@@ -1044,13 +1077,24 @@ where
     // migrations before any check). doctor must report that, not crash on it, so
     // an open failure becomes the integrity verdict; the model probe is DB-free
     // and still runs.
+    //
+    // `--fix` runs before the checks (only when the DB opened) so orphan_embeddings
+    // re-counts the post-delete state — without that ordering the user would repair
+    // and still see the pre-fix FAIL. A corrupt DB that fails to open can't be
+    // repaired here; its remedy is the data-loss tier (re-index), not orphan cleanup.
+    let mut repair: Option<Result<usize>> = None;
     let checks = match open_or_create_db(&path) {
-        Ok(conn) => vec![
-            run_db_check("integrity", || check_integrity(&conn)),
-            run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
-            run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
-            check_model(load_embedder),
-        ],
+        Ok(conn) => {
+            if fix {
+                repair = Some(fix_orphan_embeddings(&conn));
+            }
+            vec![
+                run_db_check("integrity", || check_integrity(&conn)),
+                run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
+                run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
+                check_model(load_embedder),
+            ]
+        }
         Err(e) => vec![
             DoctorCheck::fail(
                 "integrity",
@@ -1061,11 +1105,32 @@ where
         ],
     };
 
+    Ok(render_doctor_report(verbose, &path, &checks, &repair))
+}
+
+/// Assemble the doctor envelope from the per-check verdicts and the optional
+/// `--fix` outcome. Split out as a pure function so the repair-outcome rendering
+/// (`Ok` count, `Err` cause) is unit-testable without staging a real delete
+/// failure on an open DB. `repair` is `None` when `--fix` was not passed,
+/// `Some(Ok(n))` for `n` rows deleted, and `Some(Err)` when the delete itself
+/// failed (a rare I/O fault); a repair error stays visible in both the human
+/// output and `notes`, since the orphan check re-emits only the symptom.
+fn render_doctor_report(
+    verbose: bool,
+    path: &Path,
+    checks: &[DoctorCheck],
+    repair: &Option<Result<usize>>,
+) -> CommandOutput {
     let healthy = checks.iter().all(|c| c.ok);
-    let notes: Vec<String> = checks
+    let mut notes: Vec<String> = checks
         .iter()
         .filter_map(|c| c.remedy.map(|r| format!("{}: {}", c.name, r)))
         .collect();
+    // A repair error must not vanish (the orphan check still FAILs and re-emits
+    // its remedy, but the failed-delete cause stays invisible without this note).
+    if let Some(Err(e)) = repair {
+        notes.push(format!("fix: repair failed: {e}"));
+    }
 
     let mut buf = Vec::new();
     let _ = writeln!(
@@ -1073,7 +1138,16 @@ where
         "Health: {}",
         if healthy { "healthy" } else { "degraded" }
     );
-    for c in &checks {
+    match repair {
+        Some(Ok(n)) => {
+            let _ = writeln!(buf, "Repaired: deleted {n} orphan embedding(s)");
+        }
+        Some(Err(e)) => {
+            let _ = writeln!(buf, "Repair failed: {e}");
+        }
+        None => {}
+    }
+    for c in checks {
         let status = if c.ok { "ok" } else { "FAIL" };
         match (&c.detail, c.remedy) {
             (Some(detail), Some(remedy)) => {
@@ -1103,9 +1177,16 @@ where
             })
         })
         .collect();
-    let data = serde_json::json!({ "healthy": healthy, "checks": checks_json });
+    // `repaired`: rows deleted by --fix (null when --fix absent or the delete
+    // errored). Lets a --json consumer confirm the repair ran and its magnitude.
+    let repaired = match repair {
+        Some(Ok(n)) => serde_json::json!(n),
+        _ => serde_json::Value::Null,
+    };
+    let data =
+        serde_json::json!({ "healthy": healthy, "checks": checks_json, "repaired": repaired });
 
-    Ok(CommandOutput::with_notes(markdown, data, !healthy, notes))
+    CommandOutput::with_notes(markdown, data, !healthy, notes)
 }
 
 // -- Output formatting --
@@ -1419,7 +1500,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
         Some(Command::Classify { all, dry_run }) => run_classify(all, dry_run, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
-        Some(Command::Doctor) => run_doctor(cli.verbose, &cli.db_path),
+        Some(Command::Doctor { fix }) => run_doctor(cli.verbose, fix, &cli.db_path),
         None => Err(RecallError::Usage(
             "A search query is required. Usage: recall search \"query\" or recall index".to_owned(),
         )
@@ -1865,7 +1946,16 @@ mod tests {
         let args: Vec<OsString> = ["recall", "doctor"].iter().map(OsString::from).collect();
         assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
         let cli = Cli::try_parse_from(["recall", "doctor"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Doctor));
+        assert_matches!(cli.command, Some(Command::Doctor { fix: false }));
+    }
+
+    // `recall doctor --fix` parses the repair flag; the bare form leaves it false
+    // (asserted above). Guards the read-only default — fix must be opt-in so a
+    // plain diagnostic never mutates the index.
+    #[test]
+    fn doctor_fix_flag_parses() {
+        let cli = Cli::try_parse_from(["recall", "doctor", "--fix"]).unwrap();
+        assert_matches!(cli.command, Some(Command::Doctor { fix: true }));
     }
 
     // T-005 (FR-005): with `embed` dropped from KNOWN_SUBCOMMANDS, `recall embed`
@@ -2444,7 +2534,7 @@ mod tests {
         seed_healthy_index(&conn);
         drop(conn);
 
-        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
 
         assert_eq!(out.data["healthy"], true);
         assert!(!out.degraded, "an intact index must not be degraded");
@@ -2478,7 +2568,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
 
         assert_eq!(out.data["healthy"], false);
         assert!(out.degraded);
@@ -2490,9 +2580,139 @@ mod tests {
             .unwrap();
         assert_eq!(check["ok"], false);
         assert!(
-            out.notes.iter().any(|n| n.contains("recall rebuild")),
-            "remedy note must point at rebuild, got: {:?}",
+            out.notes.iter().any(|n| n.contains("recall doctor --fix")),
+            "remedy note must point at the --fix repair, got: {:?}",
             out.notes
+        );
+    }
+
+    // T-216a: fix_orphan_embeddings deletes exactly the dangling rows and leaves
+    // the linked ones. Seed one healthy vec row (chunk_id 1, present) plus one
+    // orphan (chunk_id 999, absent); the delete must return 1 and leave the
+    // healthy row, so vec_chunks holds 1 row. Perspective: the load-bearing
+    // delete predicate matches the COUNT predicate — no over-deletion of live rows.
+    #[test]
+    fn fix_orphan_embeddings_deletes_only_dangling_rows() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
+        seed_healthy_index(&conn);
+        let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
+            rusqlite::params![embedder::f32_as_bytes(&orphan)],
+        )
+        .unwrap();
+
+        let deleted = fix_orphan_embeddings(&conn).unwrap();
+
+        assert_eq!(deleted, 1, "only the dangling chunk_id=999 row is deleted");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "the linked chunk_id=1 row must survive");
+    }
+
+    // T-216b: fix_orphan_embeddings is a no-op on a clean index. No orphan rows
+    // means the NOT IN predicate matches nothing, so it returns 0 and touches
+    // nothing. Perspective: boundary (zero orphans) — repair must be safe to run
+    // on a healthy DB.
+    #[test]
+    fn fix_orphan_embeddings_is_noop_when_clean() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
+        seed_healthy_index(&conn);
+
+        let deleted = fix_orphan_embeddings(&conn).unwrap();
+
+        assert_eq!(deleted, 0, "a clean index has nothing to repair");
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "the linked row must be untouched");
+    }
+
+    // T-216c: fix_orphan_embeddings propagates the delete error when vec_chunks is
+    // absent, mirroring check_orphan_embeddings_errors_when_table_missing. Covers
+    // the `?` Err region the delete sits behind. Perspective: error (query against
+    // a missing table).
+    #[test]
+    fn fix_orphan_embeddings_errors_when_table_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(fix_orphan_embeddings(&conn).is_err());
+    }
+
+    // T-216d: doctor --fix repairs the orphan_embeddings fault and re-runs the
+    // checks, so the verdict reflects the post-repair state. Given a DB that fails
+    // orphan_embeddings, a --fix run must report healthy, mark that check ok, and
+    // expose repaired=1 in --json. Perspective: hazard (fix-then-recheck ordering)
+    // — without re-running checks after the delete the user repairs yet still sees
+    // the pre-fix FAIL.
+    #[test]
+    fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
+            rusqlite::params![embedder::f32_as_bytes(&orphan)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = run_doctor_with(false, true, &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(out.data["healthy"], true, "got: {}", out.data);
+        assert!(!out.degraded, "repaired index must not be degraded");
+        assert_eq!(out.data["repaired"], 1, "got: {}", out.data);
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "orphan_embeddings")
+            .unwrap();
+        assert_eq!(check["ok"], true, "orphan check must pass post-repair");
+        assert!(
+            out.markdown.contains("deleted 1 orphan embedding"),
+            "got: {}",
+            out.markdown
+        );
+    }
+
+    // T-216e: render_doctor_report keeps a repair *error* visible. A failed delete
+    // (rare I/O fault) is the one case the orphan check can't fully explain — it
+    // re-emits the symptom (orphans remain) but not the cause. The report must
+    // print the cause and add it to notes so a --json consumer sees why --fix did
+    // not take. Perspective: silent-failure (a swallowed repair error) on the
+    // I/O-fault path that can't be staged on an open DB.
+    #[test]
+    fn render_doctor_report_surfaces_repair_error() {
+        let path = PathBuf::from("/tmp/recall-test.db");
+        let checks = vec![DoctorCheck::fail(
+            "orphan_embeddings",
+            "1 embedding(s) reference a missing chunk".to_owned(),
+            "recall doctor --fix",
+        )];
+        let repair = Some(Err(anyhow::anyhow!("disk I/O error")));
+
+        let out = render_doctor_report(false, &path, &checks, &repair);
+
+        assert!(
+            out.markdown.contains("Repair failed: disk I/O error"),
+            "the repair cause must appear in human output, got: {}",
+            out.markdown
+        );
+        assert!(
+            out.notes.iter().any(|n| n.contains("repair failed")),
+            "the repair cause must appear in notes, got: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            out.data["repaired"],
+            serde_json::Value::Null,
+            "a failed repair reports repaired=null, got: {}",
+            out.data
         );
     }
 
@@ -2512,7 +2732,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -2536,7 +2756,7 @@ mod tests {
         drop(conn);
 
         let failing_loader = || Err(DegradedReason::ProbeFailed);
-        let out = run_doctor_with(false, &Some(db_path), failing_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), failing_loader).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -2567,7 +2787,7 @@ mod tests {
         drop(conn);
 
         let wrong_width = || Ok(Arc::new(WidthEmbedder(EMBEDDING_DIMS - 1)) as Arc<dyn Embed>);
-        let out = run_doctor_with(false, &Some(db_path), wrong_width).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), wrong_width).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -2596,7 +2816,7 @@ mod tests {
         drop(conn);
 
         let not_installed = || Err(DegradedReason::NotInstalled);
-        let out = run_doctor_with(false, &Some(db_path), not_installed).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), not_installed).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -2627,10 +2847,20 @@ mod tests {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("missing.db");
 
-        let out = run_doctor_with(false, &Some(db_path.clone()), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path.clone()), mock_loader).unwrap();
 
         assert_eq!(out.data["healthy"], false);
         assert!(out.degraded);
+        // The no-index path emits the same `repaired` key every other doctor path
+        // does (null here — no DB to repair), so the --json envelope key set the
+        // freeze test pins stays identical across paths.
+        assert!(
+            out.data
+                .get("repaired")
+                .is_some_and(serde_json::Value::is_null),
+            "got: {:?}",
+            out.data
+        );
         assert!(
             out.notes.iter().any(|n| n.contains("recall index")),
             "got: {:?}",
@@ -2676,7 +2906,7 @@ mod tests {
         // Garbage bytes: not a valid SQLite header, so open_db fails before any check.
         fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
-        let out = run_doctor_with(false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
 
         assert_eq!(out.data["healthy"], false);
         assert!(out.degraded);
@@ -2714,7 +2944,7 @@ mod tests {
         drop(conn);
 
         let failing_embed = || Ok(Arc::new(FailingEmbedder) as Arc<dyn Embed>);
-        let out = run_doctor_with(false, &Some(db_path), failing_embed).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), failing_embed).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -2796,7 +3026,7 @@ mod tests {
         seed_healthy_index(&conn);
         drop(conn);
 
-        let out = run_doctor(true, &Some(db_path.clone())).unwrap();
+        let out = run_doctor(true, false, &Some(db_path.clone())).unwrap();
 
         assert!(out.data["healthy"].is_boolean(), "got: {}", out.data);
         assert!(
