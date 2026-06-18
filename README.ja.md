@@ -98,6 +98,12 @@ recall rebuild          # 存在する全セッションを再解析・再embedd
 
 embedding にはモデルが必要です。`recall model download`（約1.2GB）で一度取得してください。モデルがない場合 `recall index` はFTS5のみ構築し、ダウンロードを促す note を出します。モデル導入後の次回 index が backlog を embedding します。
 
+インデックスはデフォルトで `~/.local/share/recall/recall.db` に置かれます（`--db-path` または環境変数 `RECALL_DB` で上書き可能。親ディレクトリは初回実行時に作成します）。`~/.recall.db` に保存する旧ビルドからの移行時は、再 index の前に旧ファイルを移動してください。移動しないと recall は新パスに空のインデックスを作り直し、過去セッションが検索から不可視になります。
+
+```sh
+mkdir -p ~/.local/share/recall && mv ~/.recall.db ~/.local/share/recall/recall.db
+```
+
 ### モデル
 
 ```sh

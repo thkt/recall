@@ -100,6 +100,12 @@ recall rebuild          # re-parse and re-embed every present session; missing r
 
 Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
 
+The index lives at `~/.local/share/recall/recall.db` by default (override with `--db-path` or the `RECALL_DB` env var; recall creates the parent directory on first run). Upgrading from a build that stored it at `~/.recall.db`? Move the old file before re-indexing, otherwise recall starts a fresh empty index at the new path and your past sessions stay invisible to search:
+
+```sh
+mkdir -p ~/.local/share/recall && mv ~/.recall.db ~/.local/share/recall/recall.db
+```
+
 ### Model
 
 ```sh
