@@ -1011,6 +1011,52 @@ fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
     Ok(deleted)
 }
 
+/// A repairable fault: the check `name` it clears and the `action` that fixes it,
+/// returning the number of rows repaired. Only faults `doctor` can fix safely and
+/// idempotently — without scanning the source JSONL or any external action — earn
+/// a `Repair`. The remaining checks stay remedy-only because their fix needs more
+/// than a local DELETE: `integrity` (a corrupt DB → re-index), `model` (re-download),
+/// and `orphan_chunks` (a `rebuild` re-stages the source JSONL and can *restore* the
+/// missing session link, whereas a blind DELETE here only destroys the chunk — the
+/// data-loss tier, #222).
+struct Repair {
+    name: &'static str,
+    action: fn(&Connection) -> Result<usize>,
+}
+
+/// One repair's outcome: the check `name` it targeted and the delete `result`
+/// (rows repaired, or the I/O error that stopped it). Carried per-repair so the
+/// report can render a name-keyed breakdown and keep each repair's error visible.
+struct RepairOutcome {
+    name: &'static str,
+    result: Result<usize>,
+}
+
+/// The single dispatch point for `doctor --fix`: every safely-repairable fault and
+/// its action, run in listed order. Sequence matters when one repair's deletes
+/// would create rows another repair counts (e.g. deleting chunks orphans their
+/// embeddings); with the one entry today order is moot, but `run_repairs` honors
+/// it so a future entry only needs the right position here. Adding a repair is a
+/// one-line append — its check already runs, so the verdict reflects the fix.
+const REPAIRS: &[Repair] = &[Repair {
+    name: "orphan_embeddings",
+    action: fix_orphan_embeddings,
+}];
+
+/// Run every [`REPAIRS`] action against `conn` in order, collecting each outcome.
+/// A repair error does not stop the rest: each is independent, and a stopped run
+/// would hide later repairs an agent could still apply. The orphan checks re-run
+/// after this, so a failed repair still surfaces as its check's FAIL.
+fn run_repairs(conn: &Connection) -> Vec<RepairOutcome> {
+    REPAIRS
+        .iter()
+        .map(|r| RepairOutcome {
+            name: r.name,
+            result: (r.action)(conn),
+        })
+        .collect()
+}
+
 /// Count `qa_chunks` whose `session_id` no longer resolves to a `sessions` row.
 /// Such a chunk can match but has no session metadata to render (date, project,
 /// slug), so the hit can't be shown coherently. `recall rebuild` re-stages every
@@ -1112,11 +1158,11 @@ where
     // re-counts the post-delete state — without that ordering the user would repair
     // and still see the pre-fix FAIL. A corrupt DB that fails to open can't be
     // repaired here; its remedy is the data-loss tier (re-index), not orphan cleanup.
-    let mut repair: Option<Result<usize>> = None;
+    let mut repairs: Option<Vec<RepairOutcome>> = None;
     let checks = match open_or_create_db(&path) {
         Ok(conn) => {
             if fix {
-                repair = Some(fix_orphan_embeddings(&conn));
+                repairs = Some(run_repairs(&conn));
             }
             vec![
                 run_db_check("integrity", || check_integrity(&conn)),
@@ -1135,31 +1181,35 @@ where
         ],
     };
 
-    Ok(render_doctor_report(verbose, &path, &checks, &repair))
+    Ok(render_doctor_report(verbose, &path, &checks, &repairs))
 }
 
 /// Assemble the doctor envelope from the per-check verdicts and the optional
-/// `--fix` outcome. Split out as a pure function so the repair-outcome rendering
-/// (`Ok` count, `Err` cause) is unit-testable without staging a real delete
-/// failure on an open DB. `repair` is `None` when `--fix` was not passed,
-/// `Some(Ok(n))` for `n` rows deleted, and `Some(Err)` when the delete itself
-/// failed (a rare I/O fault); a repair error stays visible in both the human
-/// output and `notes`, since the orphan check re-emits only the symptom.
+/// `--fix` outcomes. Split out as a pure function so the repair-outcome rendering
+/// (per-repair count, `Err` cause) is unit-testable without staging a real delete
+/// failure on an open DB. `repairs` is `None` when `--fix` was not passed, else one
+/// [`RepairOutcome`] per [`REPAIRS`] entry: `Ok(n)` for `n` rows deleted, `Err` when
+/// that delete failed (a rare I/O fault). A repair error stays visible in both the
+/// human output and `notes`, since the matching check re-emits only the symptom.
 fn render_doctor_report(
     verbose: bool,
     path: &Path,
     checks: &[DoctorCheck],
-    repair: &Option<Result<usize>>,
+    repairs: &Option<Vec<RepairOutcome>>,
 ) -> CommandOutput {
     let healthy = checks.iter().all(|c| c.ok);
     let mut notes: Vec<String> = checks
         .iter()
         .filter_map(|c| c.remedy.map(|r| format!("{}: {}", c.name, r)))
         .collect();
-    // A repair error must not vanish (the orphan check still FAILs and re-emits
+    // A repair error must not vanish (the matching check still FAILs and re-emits
     // its remedy, but the failed-delete cause stays invisible without this note).
-    if let Some(Err(e)) = repair {
-        notes.push(format!("fix: repair failed: {e}"));
+    if let Some(outcomes) = repairs {
+        for o in outcomes {
+            if let Err(e) = &o.result {
+                notes.push(format!("fix: {}: repair failed: {e}", o.name));
+            }
+        }
     }
 
     let mut buf = Vec::new();
@@ -1168,14 +1218,17 @@ fn render_doctor_report(
         "Health: {}",
         if healthy { "healthy" } else { "degraded" }
     );
-    match repair {
-        Some(Ok(n)) => {
-            let _ = writeln!(buf, "Repaired: deleted {n} orphan embedding(s)");
+    if let Some(outcomes) = repairs {
+        for o in outcomes {
+            match &o.result {
+                Ok(n) => {
+                    let _ = writeln!(buf, "Repaired {}: {n} row(s)", o.name);
+                }
+                Err(e) => {
+                    let _ = writeln!(buf, "Repair failed {}: {e}", o.name);
+                }
+            }
         }
-        Some(Err(e)) => {
-            let _ = writeln!(buf, "Repair failed: {e}");
-        }
-        None => {}
     }
     for c in checks {
         let status = if c.ok { "ok" } else { "FAIL" };
@@ -1207,11 +1260,25 @@ fn render_doctor_report(
             })
         })
         .collect();
-    // `repaired`: rows deleted by --fix (null when --fix absent or the delete
-    // errored). Lets a --json consumer confirm the repair ran and its magnitude.
-    let repaired = match repair {
-        Some(Ok(n)) => serde_json::json!(n),
-        _ => serde_json::Value::Null,
+    // `repaired`: null when `--fix` was absent, else a name-keyed breakdown — one
+    // entry per [`REPAIRS`] action, value = rows deleted (`Ok`) or null (the delete
+    // errored). The null-vs-object split lets a --json consumer tell "no repair ran"
+    // from "repair ran"; a null value pinpoints which repair failed.
+    let repaired = match repairs {
+        Some(outcomes) => {
+            let map: serde_json::Map<String, serde_json::Value> = outcomes
+                .iter()
+                .map(|o| {
+                    let v = match &o.result {
+                        Ok(n) => serde_json::json!(n),
+                        Err(_) => serde_json::Value::Null,
+                    };
+                    (o.name.to_owned(), v)
+                })
+                .collect();
+            serde_json::Value::Object(map)
+        }
+        None => serde_json::Value::Null,
     };
     let data =
         serde_json::json!({ "healthy": healthy, "checks": checks_json, "repaired": repaired });
@@ -2783,7 +2850,11 @@ mod tests {
 
         assert_eq!(out.data["healthy"], true, "got: {}", out.data);
         assert!(!out.degraded, "repaired index must not be degraded");
-        assert_eq!(out.data["repaired"], 1, "got: {}", out.data);
+        assert_eq!(
+            out.data["repaired"]["orphan_embeddings"], 1,
+            "the name-keyed breakdown must report 1 row repaired, got: {}",
+            out.data
+        );
         let check = out.data["checks"]
             .as_array()
             .unwrap()
@@ -2792,7 +2863,8 @@ mod tests {
             .unwrap();
         assert_eq!(check["ok"], true, "orphan check must pass post-repair");
         assert!(
-            out.markdown.contains("deleted 1 orphan embedding"),
+            out.markdown
+                .contains("Repaired orphan_embeddings: 1 row(s)"),
             "got: {}",
             out.markdown
         );
@@ -2812,12 +2884,16 @@ mod tests {
             "1 embedding(s) reference a missing chunk".to_owned(),
             "recall doctor --fix",
         )];
-        let repair = Some(Err(anyhow::anyhow!("disk I/O error")));
+        let repairs = Some(vec![RepairOutcome {
+            name: "orphan_embeddings",
+            result: Err(anyhow::anyhow!("disk I/O error")),
+        }]);
 
-        let out = render_doctor_report(false, &path, &checks, &repair);
+        let out = render_doctor_report(false, &path, &checks, &repairs);
 
         assert!(
-            out.markdown.contains("Repair failed: disk I/O error"),
+            out.markdown
+                .contains("Repair failed orphan_embeddings: disk I/O error"),
             "the repair cause must appear in human output, got: {}",
             out.markdown
         );
@@ -2827,9 +2903,9 @@ mod tests {
             out.notes
         );
         assert_eq!(
-            out.data["repaired"],
+            out.data["repaired"]["orphan_embeddings"],
             serde_json::Value::Null,
-            "a failed repair reports repaired=null, got: {}",
+            "a failed repair reports a null value under its name, got: {}",
             out.data
         );
     }
@@ -2860,6 +2936,95 @@ mod tests {
             .unwrap();
         assert_eq!(check["ok"], false);
         assert_eq!(out.data["healthy"], false);
+    }
+
+    // #222: a fault outside REPAIRS is left in place by --fix. orphan_chunks is
+    // remedy-only (a blind DELETE here is the data-loss tier — `rebuild` re-stages
+    // the source JSONL and can restore the link doctor cannot). So a --fix run
+    // against an orphan_chunks fault must still FAIL that check, re-emit its
+    // `recall rebuild` remedy, and omit it from the repaired breakdown. Perspective:
+    // hazard (a fixable dispatch must not silently destroy un-repairable data).
+    #[test]
+    fn doctor_fix_leaves_unrepairable_orphan_chunk_in_place() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        // A qa_chunk for a session that was never inserted — orphan_chunks fault.
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 'ghost', 'x', 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = run_doctor_with(false, true, &Some(db_path.clone()), mock_loader).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "orphan_chunks")
+            .unwrap();
+        assert_eq!(
+            check["ok"], false,
+            "--fix must not repair orphan_chunks, got: {}",
+            out.data
+        );
+        assert_eq!(
+            out.data["healthy"], false,
+            "unrepaired fault stays degraded"
+        );
+        assert!(
+            out.notes.iter().any(|n| n.contains("recall rebuild")),
+            "the orphan_chunks remedy must still surface, got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.data["repaired"].get("orphan_chunks").is_none(),
+            "orphan_chunks is not a repair, so the breakdown must omit it, got: {}",
+            out.data
+        );
+        // The chunk row must survive: --fix only deletes what REPAIRS covers.
+        let conn = open_or_create_db(&db_path).unwrap();
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining, 1,
+            "the orphan chunk must not be deleted by --fix"
+        );
+    }
+
+    // #222: with `--fix` the repaired breakdown carries one entry per REPAIRS action
+    // even when nothing needed repair. A clean DB run reports orphan_embeddings=0
+    // (ran, deleted nothing), pinning the name-keyed envelope shape a --json consumer
+    // reads. Perspective: contract freeze (the --fix `repaired` object key set) +
+    // boundary (zero rows repaired).
+    #[test]
+    fn doctor_fix_breakdown_lists_every_repair_even_when_clean() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let out = run_doctor_with(false, true, &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(out.data["healthy"], true, "got: {}", out.data);
+        let repaired = out.data["repaired"]
+            .as_object()
+            .unwrap_or_else(|| panic!("--fix must report an object breakdown, got: {}", out.data));
+        assert_eq!(
+            repaired.keys().collect::<Vec<_>>(),
+            vec!["orphan_embeddings"],
+            "the breakdown freezes exactly the REPAIRS names, got: {}",
+            out.data
+        );
+        assert_eq!(
+            repaired["orphan_embeddings"], 0,
+            "a clean DB repairs zero rows, got: {}",
+            out.data
+        );
     }
 
     // doctor flags a model that the cache reports present but that fails to load,
