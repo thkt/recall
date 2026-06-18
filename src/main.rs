@@ -491,6 +491,16 @@ where
         sp.finish("Chunks up to date");
     }
 
+    // #221: a force rebuild is the full, destructive repair path, so self-heal any
+    // true orphan vec row here — one whose chunk_id resolves to no qa_chunks row,
+    // which the id/session_id-scoped index deletes never reach. Embed-independent,
+    // so it runs on both model arms; gated on force to keep the incremental hot
+    // path free of the O(N) vec_chunks scan. Single statement so diff-cover marks
+    // the call covered (the `?` Err region is an unreachable early return; #49/#121).
+    if opts.force {
+        fix_orphan_embeddings(&conn)?;
+    }
+
     // Model present: embed all pending with the handle loaded up front. Model
     // absent (degraded): skip embed but keep the completed FTS index and carry a
     // note naming `recall model download` so the wrapper can guide the user
@@ -987,11 +997,12 @@ fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
 /// is identical to that check's COUNT predicate, so it removes exactly the
 /// counted rows (no more, no less). Returns the number deleted.
 ///
-/// Run once on demand (`doctor --fix`), never on the index path: `chunk_id` is an
-/// unindexed vec0 auxiliary column, so the `NOT IN` predicate is an O(N)
-/// `SCAN vec_chunks` (see the DELETE note in `embedder::embed_chunks`). A
-/// one-shot repair pays that scan once; folding it into every index would add a
-/// full scan to the hot path.
+/// Run on the repair paths only: `doctor --fix` on demand, and once per
+/// `recall rebuild` (force index, #221). Never on the incremental index hot path:
+/// `chunk_id` is an unindexed vec0 auxiliary column, so the `NOT IN` predicate is
+/// an O(N) `SCAN vec_chunks` (see the DELETE note in `embedder::embed_chunks`). A
+/// one-shot repair or a full rebuild pays that scan once; folding it into every
+/// incremental index would add a full scan to the hot path.
 fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
     let deleted = conn.execute(
         "DELETE FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
@@ -3536,6 +3547,134 @@ mod tests {
             vec_chunk_count(&conn),
             before,
             "a model-absent rebuild must preserve existing embeddings, not destroy them"
+        );
+    }
+
+    // T-221a (#221, hazard + state): a model-present rebuild self-heals a true
+    // orphan vec row — one whose chunk_id resolves to no qa_chunks row, which the
+    // id/session_id-scoped index deletes never reach. Seed an embedded index,
+    // inject a dangling vec row at a sentinel id above any regenerated qa id, force
+    // a rebuild, then assert that exact row is gone (not merely count==0, so the
+    // assertion can't pass trivially). Perspective: hazard (orphan accumulation) +
+    // state (force rebuild transition).
+    #[test]
+    fn model_present_rebuild_heals_orphan_vec_rows() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        const ORPHAN_ID: i64 = 9_999_999;
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
+            conn.execute(
+                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, 0)",
+                rusqlite::params![embedder::f32_as_bytes(&orphan), ORPHAN_ID],
+            )
+            .unwrap();
+        }
+
+        let rebuild = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &rebuild, mock_loader).unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        let orphan_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id = ?1",
+                [ORPHAN_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_remaining, 0,
+            "a model-present rebuild must delete the pre-existing orphan vec row"
+        );
+    }
+
+    // T-221b (#221, AC#2, hazard + state): the self-heal also runs on the
+    // model-absent rebuild arm, and it deletes only the true orphan. The preserved
+    // embeddings keep their stable qa_chunks ids, so the NOT IN predicate can't
+    // reach them. Seed an embedded index, inject one orphan vec row, run a
+    // model-absent force rebuild: the orphan is gone and the preserved rows survive
+    // (final count returns to the pre-orphan baseline). This fixes that the #215
+    // preserve and the #221 cleanup coexist without the cleanup eating live rows.
+    #[test]
+    fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let before = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            vec_chunk_count(&conn)
+        };
+        assert!(
+            before > 0,
+            "precondition: the initial index embedded chunks"
+        );
+
+        const ORPHAN_ID: i64 = 9_999_999;
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
+            conn.execute(
+                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, 0)",
+                rusqlite::params![embedder::f32_as_bytes(&orphan), ORPHAN_ID],
+            )
+            .unwrap();
+        }
+
+        let rebuild = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &rebuild, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        let orphan_remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id = ?1",
+                [ORPHAN_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_remaining, 0,
+            "the orphan vec row must be deleted on the model-absent rebuild arm"
+        );
+        assert_eq!(
+            vec_chunk_count(&conn),
+            before,
+            "preserved embeddings (stable qa ids) survive; only the orphan is removed"
         );
     }
 
