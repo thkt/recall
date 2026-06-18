@@ -13,8 +13,8 @@ mod parser;
 mod search;
 
 use std::env;
-use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::ffi::{OsStr, OsString};
+use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -52,7 +52,7 @@ struct Cli {
     #[arg(long, short, global = true)]
     verbose: bool,
 
-    /// Database file path (default: ~/.recall.db, env: RECALL_DB)
+    /// Database file path (default: ~/.local/share/recall/recall.db, env: RECALL_DB)
     #[arg(long, env = "RECALL_DB", global = true)]
     db_path: Option<PathBuf>,
 
@@ -138,6 +138,9 @@ enum ModelCommand {
 }
 
 fn create_db_file(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent)?;
+    }
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -170,10 +173,27 @@ fn open_or_create_db(path: &Path) -> Result<Connection> {
 fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
     match db_path {
         Some(p) => Ok(p.clone()),
-        None => Ok(dirs::home_dir()
-            .context("Could not determine home directory")?
-            .join(".recall.db")),
+        None => resolve_default_db_path(
+            env::var_os("XDG_DATA_HOME").as_deref(),
+            dirs::home_dir().as_deref(),
+        ),
     }
+}
+
+/// Resolve the default DB location under the XDG data dir as `recall/recall.db`.
+/// `XDG_DATA_HOME` wins only when it is absolute (per the XDG spec a relative
+/// value is ignored); otherwise fall back to `~/.local/share`. `dirs::data_local_dir`
+/// is deliberately avoided: on macOS it returns `~/Library/Application Support`,
+/// not the `~/.local/share` recall expects.
+fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -> Result<PathBuf> {
+    let data_home = match xdg_data_home.map(Path::new) {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        _ => home
+            .context("Could not determine home directory")?
+            .join(".local")
+            .join("share"),
+    };
+    Ok(data_home.join("recall").join("recall.db"))
 }
 
 fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
@@ -1489,6 +1509,76 @@ mod tests {
             0o600,
             "created DB must be owner-only 0o600, got {:o}",
             mode & 0o777,
+        );
+    }
+
+    // create_db_file makes any missing parent dirs before creating the file, so
+    // the XDG subdirectory (~/.local/share/recall) is created on first run.
+    #[test]
+    fn create_db_file_creates_missing_parent_dirs() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("recall").join("recall.db");
+
+        create_db_file(&db_path).unwrap();
+
+        assert!(
+            db_path.exists(),
+            "DB file must be created under a fresh parent dir"
+        );
+    }
+
+    // Default DB path lives under the XDG data dir as recall/recall.db, falling
+    // back to ~/.local/share when XDG_DATA_HOME is unset.
+    #[test]
+    fn resolve_default_db_path_uses_local_share_when_xdg_unset() {
+        let home = Path::new("/home/u");
+
+        let path = resolve_default_db_path(None, Some(home)).unwrap();
+
+        assert_eq!(path, Path::new("/home/u/.local/share/recall/recall.db"));
+    }
+
+    // An absolute XDG_DATA_HOME wins over the ~/.local/share fallback.
+    #[test]
+    fn resolve_default_db_path_prefers_absolute_xdg_data_home() {
+        let path =
+            resolve_default_db_path(Some(OsStr::new("/xdg/data")), Some(Path::new("/home/u")))
+                .unwrap();
+
+        assert_eq!(path, Path::new("/xdg/data/recall/recall.db"));
+    }
+
+    // A relative XDG_DATA_HOME is ignored per the XDG spec; fall back to home.
+    #[test]
+    fn resolve_default_db_path_ignores_relative_xdg_data_home() {
+        let path = resolve_default_db_path(
+            Some(OsStr::new("relative/data")),
+            Some(Path::new("/home/u")),
+        )
+        .unwrap();
+
+        assert_eq!(path, Path::new("/home/u/.local/share/recall/recall.db"));
+    }
+
+    // An explicit --db-path / RECALL_DB value passes through untouched.
+    #[test]
+    fn resolve_db_path_passes_through_explicit_path() {
+        let explicit = PathBuf::from("/tmp/custom/recall.db");
+
+        let path = resolve_db_path(&Some(explicit.clone())).unwrap();
+
+        assert_eq!(path, explicit);
+    }
+
+    // With no explicit path, resolve_db_path wires the live env/home into the
+    // default resolver and yields a recall/recall.db under the data dir.
+    #[test]
+    fn resolve_db_path_defaults_to_recall_db_under_data_dir() {
+        let path = resolve_db_path(&None).unwrap();
+
+        assert!(
+            path.ends_with("recall/recall.db"),
+            "default path must end with recall/recall.db, got {path:?}"
         );
     }
 
