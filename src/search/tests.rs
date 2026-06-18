@@ -920,6 +920,7 @@ fn test_index_then_search_roundtrip() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats.indexed, 2);
@@ -970,6 +971,7 @@ fn test_index_then_search_roundtrip() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats2.indexed, 0);

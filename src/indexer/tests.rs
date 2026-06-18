@@ -27,6 +27,7 @@ fn test_index_from_dirs_indexes_and_skips() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats.indexed, 1);
@@ -39,6 +40,7 @@ fn test_index_from_dirs_indexes_and_skips() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats2.indexed, 0);
@@ -71,7 +73,7 @@ fn test_index_from_dirs_steady_state_keeps_db_stable() {
         codex_dir: &codex_dir,
     };
 
-    index_from_dirs(&mut conn, &opts).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
     let counts = |conn: &Connection| -> (i64, i64, i64, i64) {
         let m = conn
@@ -90,7 +92,7 @@ fn test_index_from_dirs_steady_state_keeps_db_stable() {
     };
     let before = counts(&conn);
 
-    let stats = index_from_dirs(&mut conn, &opts).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
 
     assert_eq!(stats.indexed, 0, "an unchanged tree re-parses nothing");
@@ -126,7 +128,7 @@ fn test_index_from_dirs_reindexes_appended_file() {
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
     };
-    index_from_dirs(&mut conn, &opts).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
 
     // Append a turn and push mtime clearly past the 0.001s freshness epsilon.
     let mut all = fs::read_to_string(&file).unwrap();
@@ -139,7 +141,7 @@ fn test_index_from_dirs_reindexes_appended_file() {
         .unwrap();
     drop(f);
 
-    let stats = index_from_dirs(&mut conn, &opts).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
 
     assert_eq!(stats.indexed, 1, "the appended file must be re-parsed");
     let sessions: i64 = conn
@@ -187,6 +189,7 @@ fn index_one_claude_session(content: &str) -> Option<String> {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     conn.query_row("SELECT session_type FROM sessions", [], |r| r.get(0))
@@ -230,6 +233,7 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats1.indexed, 1);
@@ -248,6 +252,7 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(
@@ -278,6 +283,7 @@ fn test_index_from_dirs_force_reindexes() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats.indexed, 1);
@@ -305,6 +311,7 @@ fn test_index_from_dirs_force_reindexes() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats2.indexed, 1);
@@ -340,6 +347,7 @@ fn test_orphan_cleanup_removes_deleted_files() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats.indexed, 2);
@@ -375,6 +383,7 @@ fn test_orphan_cleanup_removes_deleted_files() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats2.total_sessions, 1);
@@ -427,6 +436,7 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats.total_sessions, 2, "seed should index both sessions");
@@ -449,6 +459,7 @@ fn test_missing_source_roots_preserve_existing_index() {
             claude_dir: &gone_claude,
             codex_dir: &gone_codex,
         },
+        true,
     )
     .unwrap();
 
@@ -481,6 +492,7 @@ fn test_partial_missing_root_preserves_unscanned_source_only() {
             claude_dir: &claude_dir,
             codex_dir: &gone_codex,
         },
+        true,
     )
     .unwrap();
 
@@ -521,6 +533,7 @@ fn test_unreadable_source_root_preserves_index() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     );
 
     // Restore permissions before asserting so TempDir cleanup always works.
@@ -559,6 +572,7 @@ fn test_unreadable_child_subdir_preserves_source() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     );
 
     fs::set_permissions(&locked_subdir, orig).unwrap();
@@ -606,6 +620,7 @@ fn test_deleted_file_under_scanned_root_cascades_cleanup() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
 
@@ -661,6 +676,7 @@ fn test_skipped_root_reports_preserved_count() {
             claude_dir: &claude_dir,
             codex_dir: &gone_codex,
         },
+        true,
     )
     .unwrap();
 
@@ -707,6 +723,7 @@ fn test_skipped_root_counts_only_file_absent_rows() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
 
@@ -726,6 +743,7 @@ fn test_skipped_root_counts_only_file_absent_rows() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     );
 
     fs::set_permissions(&locked_subdir, orig).unwrap();
@@ -782,6 +800,7 @@ fn test_incomplete_enumeration_surfaces_with_empty_db() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     );
 
     fs::set_permissions(&locked_subdir, orig).unwrap();
@@ -816,6 +835,7 @@ fn test_missing_root_with_no_preserved_rows_is_silent() {
             claude_dir: &gone_claude,
             codex_dir: &gone_codex,
         },
+        true,
     )
     .unwrap();
 
@@ -961,6 +981,7 @@ fn test_cleanup_deletes_real_orphan_when_new_file_added() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
 
@@ -1025,6 +1046,7 @@ fn test_force_rebuild_preserves_missing_source_root() {
             claude_dir: &claude_dir,
             codex_dir: &gone_codex,
         },
+        true,
     )
     .unwrap();
 
@@ -1090,6 +1112,7 @@ fn test_force_rebuild_all_roots_missing_preserves_index() {
             claude_dir: &gone_claude,
             codex_dir: &gone_codex,
         },
+        true,
     )
     .unwrap();
 
@@ -1150,6 +1173,7 @@ fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
 
@@ -1217,6 +1241,7 @@ fn test_session_id_collision_cleans_old_messages() {
             claude_dir: &dir_a,
             codex_dir: &empty_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats.indexed, 1);
@@ -1228,6 +1253,7 @@ fn test_session_id_collision_cleans_old_messages() {
             claude_dir: &dir_b,
             codex_dir: &empty_dir,
         },
+        true,
     )
     .unwrap();
     assert_eq!(stats2.indexed, 1);
@@ -1340,6 +1366,7 @@ fn test_011_index_chunks_incremental() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
 
@@ -1470,6 +1497,7 @@ fn test_embed_recent_chunks_populates_vec_chunks() {
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
         },
+        true,
     )
     .unwrap();
     index_chunks(&mut conn, None).unwrap();

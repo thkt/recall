@@ -229,6 +229,21 @@ fn search_degraded_note(reason: DegradedReason) -> Option<String> {
         .map(|note| format!("note: {note}."))
 }
 
+/// Note for embedded sessions preserved because the model was absent at index
+/// time (#215). `None` when nothing was preserved so the surface stays quiet on
+/// the common path. The single source for both the human note and the `--json`
+/// `notes[]` entry, mirroring `SkippedReason::note` so the two channels never
+/// disagree. The download hint already rides the degraded note; this one names
+/// the magnitude and what preservation means (search stayed intact, a re-index
+/// after `recall model download` refreshes any content that changed).
+fn preserved_embedded_note(count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        format!(
+            "preserved embeddings for {count} session(s) the model was absent to rebuild — semantic search for them stays intact; run `recall model download`, then `recall index` to refresh any that changed"
+        )
+    })
+}
+
 /// The `--json` `notes[]` entry for a search that fell back to FTS-only, derived
 /// from the same per-reason source as [`search_degraded_note`] so the agent and
 /// human channels never disagree. `NotInstalled` keeps the actionable download
@@ -288,6 +303,9 @@ fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<IndexOutco
     if let Some(note) = &outcome.degraded_note {
         cli_info(note);
     }
+    if let Some(note) = preserved_embedded_note(outcome.preserved_embedded) {
+        cli_info(&note);
+    }
     Ok(outcome)
 }
 
@@ -309,6 +327,11 @@ struct IndexOutcome {
     /// an agent reading the machine path — not just the human stderr warning —
     /// learns a root outage may be masking real deletions.
     skipped_roots: Vec<indexer::SkippedRoot>,
+    /// Embedded sessions left untouched because the model was absent this run
+    /// (#215). Carried so both the human note and the `--json` envelope can report
+    /// that semantic search for those sessions stayed intact instead of being
+    /// silently rebuilt-then-degraded.
+    preserved_embedded: usize,
 }
 
 /// Build the `--json` envelope for an index run from its [`IndexOutcome`],
@@ -352,6 +375,9 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
                 .note(skipped.source.as_str(), skipped.preserved_sessions),
         );
     }
+    if let Some(note) = preserved_embedded_note(outcome.preserved_embedded) {
+        notes.push(note);
+    }
     let degraded = !notes.is_empty();
     let skipped_roots: Vec<_> = outcome
         .skipped_roots
@@ -368,6 +394,7 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         "embedded": outcome.embedded,
         "failed_count": outcome.failed_count,
         "skipped_roots": skipped_roots,
+        "preserved_embedded": outcome.preserved_embedded,
     });
     CommandOutput::with_notes(String::new(), data, degraded, notes)
 }
@@ -390,8 +417,16 @@ where
     let path = resolve_db_path(db_path)?;
     let mut conn = open_or_create_db(&path)?;
 
+    // Load the embedder once, up front: its presence gates whether indexing
+    // preserves embedded sessions (model absent) or re-indexes them (model
+    // present), and the same handle is reused for the embed step below so the
+    // model loads at most once (#215). The seam's `FnOnce` bound makes the single
+    // call structural.
+    let load_result = load_embedder();
+    let embed_capable = load_result.is_ok();
+
     let sp = Spinner::new("Indexing sessions...");
-    let stats = indexer::index_from_dirs(&mut conn, opts)?;
+    let stats = indexer::index_from_dirs(&mut conn, opts, embed_capable)?;
     let main_msg = if stats.indexed > 0 {
         format!(
             "Indexed {} sessions in {:.1}s",
@@ -430,10 +465,13 @@ where
         sp.finish("Chunks up to date");
     }
 
-    // Model present: embed all pending. Model absent (degraded): skip embed but
-    // keep the completed FTS index and carry a note naming `recall model download`
-    // so the wrapper can guide the user (FR-004a/004b).
-    match load_embedder() {
+    // Model present: embed all pending with the handle loaded up front. Model
+    // absent (degraded): skip embed but keep the completed FTS index and carry a
+    // note naming `recall model download` so the wrapper can guide the user
+    // (FR-004a/004b). The model-absent run also preserved any embedded sessions it
+    // would otherwise have re-indexed (#215); that count rides along either arm.
+    let preserved_embedded = stats.preserved_embedded;
+    match load_result {
         Ok(embedder) => {
             let result = embed_all_pending(&mut conn, embedder.as_ref())?;
             Ok(IndexOutcome {
@@ -442,11 +480,13 @@ where
                 failed_count: result.failed_count,
                 first_error: result.first_error,
                 skipped_roots,
+                preserved_embedded,
             })
         }
         Err(reason) => Ok(IndexOutcome {
             degraded_note: search_degraded_note(reason),
             skipped_roots,
+            preserved_embedded,
             ..IndexOutcome::default()
         }),
     }
@@ -3109,6 +3149,347 @@ mod tests {
         );
     }
 
+    // T-1 (#215, FR-1, hazard): a model-absent rebuild must preserve the
+    // embeddings of sessions it re-indexes, not destroy them. Given an embedded
+    // index, a force=true rebuild whose loader returns Err(NotInstalled) must
+    // leave vec_chunks intact — the destructive pre-#215 path deleted them before
+    // the embed gate ran, dropping semantic search to degraded with no recovery
+    // until a manual re-download + re-index. Perspective: hazard (data-loss path)
+    // + state (rebuild transition under the model-absent precondition).
+    #[test]
+    fn model_absent_rebuild_preserves_existing_embeddings() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        // Precondition: an embedded index (model present).
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let before = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            vec_chunk_count(&conn)
+        };
+        assert!(
+            before > 0,
+            "precondition: the initial index must embed at least one chunk"
+        );
+
+        // Model-absent rebuild: force=true re-indexes the seeded session, but the
+        // loader is Err so the embeddings cannot be rebuilt this run.
+        let rebuild = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &rebuild, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            before,
+            "a model-absent rebuild must preserve existing embeddings, not destroy them"
+        );
+    }
+
+    // T-2 (#215, FR-5, state): a model-absent rebuild that preserves embeddings
+    // must report the count, not silently skip. The IndexOutcome carries
+    // preserved_embedded > 0, and the --json envelope's note names both the count
+    // and `recall model download` so an agent and a human both learn what happened
+    // and how to refresh. Perspective: state (the preserve transition's visible
+    // output) + error (the actionable remedy reaches both channels).
+    #[test]
+    fn model_absent_rebuild_surfaces_preserved_count_and_note() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let rebuild = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+
+        assert!(
+            outcome.preserved_embedded > 0,
+            "the outcome must report the preserved session count, got {}",
+            outcome.preserved_embedded
+        );
+
+        let out = index_command_output(&outcome);
+        assert!(
+            out.degraded,
+            "a model-absent run with preservation degrades"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains(&outcome.preserved_embedded.to_string())
+                    && n.contains("recall model download")),
+            "a note must name the preserved count and the download command, got: {:?}",
+            out.notes
+        );
+        assert_eq!(
+            out.data["preserved_embedded"], outcome.preserved_embedded,
+            "the --json payload carries the preserved magnitude for an agent"
+        );
+    }
+
+    // T-3 (#215, FR-3, branch): with the model absent, a new session must still
+    // be indexed FTS-only while the existing embedded session is preserved. Given
+    // an embedded index, adding a second source file and indexing with an Err
+    // loader leaves the new session's term FTS-searchable and the original
+    // embeddings intact. Perspective: branch (new vs preserved session split
+    // under one model-absent run) + hazard (a coarse model-absent abort would
+    // have skipped the new session entirely).
+    #[test]
+    fn model_absent_index_adds_new_session_and_preserves_embeddings() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let before = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            vec_chunk_count(&conn)
+        };
+        assert!(before > 0, "precondition: the first session was embedded");
+
+        // A new, never-embedded session arrives while the model is absent. Force a
+        // rebuild so s1's re-index is actually due (the preserve guard only fires
+        // for sessions check_freshness decides to re-index; an unchanged-mtime
+        // incremental skips s1 as Unchanged, which protects embeddings without
+        // counting as Preserved).
+        fs::write(
+            claude_dir.join("s2.jsonl"),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"platypus newcomer"},"timestamp":"2026-03-02T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let rebuild_opts = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            before,
+            "the original session's embeddings must be preserved, not destroyed"
+        );
+        assert_eq!(
+            outcome.preserved_embedded, 1,
+            "only the one embedded session is preserved; the new one is indexed"
+        );
+        let search_opts = search::SearchOptions::default();
+        let hits = search::search(&conn, "platypus", &search_opts).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the new session must be FTS-indexed even with the model absent"
+        );
+    }
+
+    // T-5 (#215, FR-1, hazard/regression lock): preserve fires only for sessions
+    // that actually hold embeddings. A cached session indexed while the model was
+    // absent has FTS rows but no embeddings; a later model-absent rebuild must
+    // re-index it (its content changed), NOT preserve it — preserving an
+    // unembedded session would freeze stale FTS content forever. Without this
+    // test, an implementation that preserved every cached session would pass T-1
+    // through T-3. Perspective: hazard (the over-preserve failure mode) + state
+    // (cached-unembedded is a distinct precondition from cached-embedded).
+    #[test]
+    fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        fs::create_dir_all(&claude_dir).unwrap();
+        let session = claude_dir.join("s1.jsonl");
+        fs::write(
+            &session,
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"alphaword original"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        // Index with the model absent from the start: FTS rows exist, no embeddings.
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            assert_eq!(
+                vec_chunk_count(&conn),
+                0,
+                "precondition: a model-absent index embeds nothing"
+            );
+        }
+
+        // The session's content changes; a model-absent rebuild must re-index it
+        // because it has no embeddings to protect.
+        fs::write(
+            &session,
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"betaword replaced"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let rebuild = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+
+        assert_eq!(
+            outcome.preserved_embedded, 0,
+            "a cached session without embeddings must not be preserved"
+        );
+        let conn = open_or_create_db(&db_path).unwrap();
+        let search_opts = search::SearchOptions::default();
+        assert_eq!(
+            search::search(&conn, "betaword", &search_opts)
+                .unwrap()
+                .len(),
+            1,
+            "the rebuild must re-index the new content, not freeze the old"
+        );
+        assert_eq!(
+            search::search(&conn, "alphaword", &search_opts)
+                .unwrap()
+                .len(),
+            0,
+            "the stale content must be gone, proving a real re-index occurred"
+        );
+    }
+
+    // T-6 (#215, FR-1/FR-3, branch/hazard): the incremental `recall index` path.
+    // #215 names both `recall index` and `rebuild`; T-1..T-5 reach the preserve
+    // guard via force=true, but the incremental dispatch reaches it differently —
+    // force=false + a changed mtime makes check_freshness return Some, so an
+    // embedded session whose file was edited while the model is absent is
+    // preserved (delete + re-parse skipped), not destroyed. The appended turn
+    // stays invisible to FTS until the model returns (parse is skipped); that is
+    // the FR-2 stale-FTS trade-off, asserted here so it reads as intended, not a
+    // regression. mtime is pushed forward explicitly: a same-second rewrite leaves
+    // mtime unchanged → Unchanged path → preserved_embedded==0 (the trap that
+    // first broke T-3).
+    #[test]
+    fn model_absent_incremental_index_preserves_edited_embedded_session() {
+        use std::time::{Duration, SystemTime};
+
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let before = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            vec_chunk_count(&conn)
+        };
+        assert!(before > 0, "precondition: the session was embedded");
+
+        // The embedded session's file is edited while the model is absent. Append a
+        // turn and push mtime clearly past the freshness epsilon so check_freshness
+        // marks it for re-index (the incremental dispatch into the preserve guard).
+        let session = claude_dir.join("s1.jsonl");
+        let mut all = fs::read_to_string(&session).unwrap();
+        all.push('\n');
+        all.push_str(
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"echidna appended"},"timestamp":"2026-03-01T00:00:01Z"}"#,
+        );
+        fs::write(&session, all).unwrap();
+        let f = fs::OpenOptions::new().append(true).open(&session).unwrap();
+        f.set_modified(SystemTime::now() + Duration::from_secs(10))
+            .unwrap();
+        drop(f);
+
+        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
+            Err(DegradedReason::NotInstalled)
+        })
+        .unwrap();
+
+        assert_eq!(
+            outcome.preserved_embedded, 1,
+            "the edited embedded session is preserved, not destroyed, on `recall index`"
+        );
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            before,
+            "the embeddings survive the incremental re-index"
+        );
+        let search_opts = search::SearchOptions::default();
+        assert_eq!(
+            search::search(&conn, "quokka", &search_opts).unwrap().len(),
+            1,
+            "the preserved session's original FTS rows remain searchable"
+        );
+        assert_eq!(
+            search::search(&conn, "echidna", &search_opts)
+                .unwrap()
+                .len(),
+            0,
+            "the appended turn stays out of FTS until the model returns (FR-2 trade-off)"
+        );
+    }
+
     // -- Phase 2 (D2, AC-4..7): index_command_output builds the --json envelope --
     //
     // index_command_output(&IndexOutcome) -> CommandOutput is the pure seam the Spec
@@ -3128,6 +3509,7 @@ mod tests {
             failed_count: 3,
             first_error: Some("batch: mock failure".to_owned()),
             skipped_roots: Vec::new(),
+            preserved_embedded: 0,
         }
     }
 
@@ -3140,6 +3522,7 @@ mod tests {
             failed_count: 0,
             first_error: None,
             skipped_roots: Vec::new(),
+            preserved_embedded: 0,
         }
     }
 
@@ -3152,6 +3535,7 @@ mod tests {
             failed_count: 0,
             first_error: None,
             skipped_roots: Vec::new(),
+            preserved_embedded: 0,
         }
     }
 
@@ -3281,6 +3665,7 @@ mod tests {
             failed_count: 2,
             first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
             skipped_roots: Vec::new(),
+            preserved_embedded: 0,
         };
 
         let out = index_command_output(&outcome);
@@ -3321,6 +3706,7 @@ mod tests {
                 preserved_sessions: 2,
                 reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
+            preserved_embedded: 0,
         };
 
         let out = index_command_output(&outcome);
@@ -3372,6 +3758,7 @@ mod tests {
                 preserved_sessions: 0,
                 reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
+            preserved_embedded: 0,
         };
 
         let out = index_command_output(&outcome);
@@ -3539,13 +3926,19 @@ mod tests {
                 preserved_sessions: 2,
                 reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
+            preserved_embedded: 0,
         };
 
         let out = index_command_output(&outcome);
 
         assert_eq!(
             payload_keys(&out.data),
-            ["embedded", "failed_count", "skipped_roots"],
+            [
+                "embedded",
+                "failed_count",
+                "preserved_embedded",
+                "skipped_roots"
+            ],
             "index --json top-level keys are frozen"
         );
         assert_eq!(
