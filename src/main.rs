@@ -138,9 +138,8 @@ enum ModelCommand {
 }
 
 fn create_db_file(path: &Path) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent)?;
-    }
+    // create_dir_all("") is a no-op, so a parentless path needs no special case.
+    create_dir_all(path.parent().unwrap_or(Path::new("")))?;
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1524,6 +1523,24 @@ mod tests {
         assert!(
             db_path.exists(),
             "DB file must be created under a fresh parent dir"
+        );
+    }
+
+    // When a parent component is a regular file, create_dir_all fails and
+    // create_db_file propagates the error instead of silently succeeding.
+    #[test]
+    fn create_db_file_errors_when_parent_cannot_be_created() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocker = dir.path().join("not_a_dir");
+        create_db_file(&blocker).unwrap(); // create `not_a_dir` as a regular file
+        let db_path = blocker.join("sub").join("recall.db");
+
+        let err = create_db_file(&db_path).unwrap_err();
+
+        assert_ne!(
+            err.kind(),
+            ErrorKind::AlreadyExists,
+            "expected a parent-creation failure, got {err:?}"
         );
     }
 
