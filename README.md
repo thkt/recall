@@ -131,10 +131,11 @@ Each session is classified interactive or automated from its first user turn. Au
 ### Doctor
 
 ```sh
-recall doctor           # diagnose a broken index; reports only, never repairs
+recall doctor           # diagnose a broken index; read-only by default
+recall doctor --fix      # also delete orphan embeddings, then re-run the checks
 ```
 
-Runs four checks: SQLite `quick_check`, orphaned embeddings, orphaned chunks, and a live model load-and-embed probe. Each failing check prints the remedy command (`recall rebuild`, `recall model download`, or re-`recall index` after removing a corrupt DB). A not-installed model is reported as info, not a failure — search runs FTS-only without it, so the index stays healthy. Under `--json`, a failure sets `degraded: true` and lists each remedy in `notes`.
+Runs four checks: SQLite `quick_check`, orphaned embeddings, orphaned chunks, and a live model load-and-embed probe. Each failing check prints the remedy command (`recall doctor --fix` for orphan embeddings, `recall rebuild`, `recall model download`, or re-`recall index` after removing a corrupt DB). `--fix` deletes the dangling `vec_chunks` rows the orphan-embeddings check counts and re-runs every check, so the reported verdict reflects the repaired state (the count of deleted rows appears as `repaired` under `--json`); without it `doctor` only reports. A not-installed model is reported as info, not a failure — search runs FTS-only without it, so the index stays healthy. Under `--json`, a failure sets `degraded: true` and lists each remedy in `notes`.
 
 ### Hook
 
