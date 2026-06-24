@@ -1,4 +1,4 @@
-//! CLI exit-code contract (ADR-0066 Group 2, #82). Spawns the real binary and
+//! CLI exit-code contract (recall ADR-0006, extending scout ADR-0066 Group 2; #82). Spawns the real binary and
 //! pins the sysexits codes agents branch on, exercising the parse / dispatch /
 //! error-classification glue that unit tests cannot reach in-process.
 

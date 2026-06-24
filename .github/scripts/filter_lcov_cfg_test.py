@@ -138,8 +138,9 @@ def cfg_test_ranges(path: Path) -> set[int]:
 # so the filter's output can no longer be trusted. Fail loud rather than default
 # silently: a None/0 default would skew the gate in an unverifiable direction (a
 # dropped line number leaves test code in; a defaulted hit count marks a covered
-# line uncovered). This differs from ENC-002/OPS-006, which guard against
-# gate-weakening specifically; here the contract itself is the invariant.
+# line uncovered). The empty-tracefile and path-resolution guards below fail
+# loud against gate-weakening specifically; here the format contract itself is
+# the invariant.
 def parse_line_number(record: str, context: str) -> int:
     try:
         return int(record.split(":", 1)[1].split(",", 1)[0])
@@ -264,8 +265,8 @@ def _check_source_resolvable(source: Path, repo_root: Path) -> bool:
     #                       changed lines), and skipping avoids reading an
     #                       out-of-tree path even when it exists (a traversed SF).
     #   .rs under root,
-    #     missing        -> OPS-006: SF path resolution is broken and test code
-    #                       would leak into the gate. Fail loud.
+    #     missing        -> fail loud: SF path resolution is broken and test
+    #                       code would leak into the gate.
     if source.suffix != ".rs":
         return True
     if not _is_under(source, repo_root):
@@ -280,7 +281,7 @@ def _check_source_resolvable(source: Path, repo_root: Path) -> bool:
 
 
 def _validate_filtered(filtered: list[str], sf_count: int, input_path: Path) -> None:
-    # ENC-002: diff-cover treats an empty / record-less tracefile as 100%
+    # diff-cover treats an empty / record-less tracefile as 100%
     # covered, so an over-aggressive filter that drops every record would
     # silently disable the gate. Require at least one SF and one end_of_record
     # per SF. The mismatch branch is defense-in-depth: it backstops the invariant
