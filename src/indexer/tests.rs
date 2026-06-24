@@ -1717,6 +1717,50 @@ fn test_192f_backfill_leaves_null_on_count_mismatch() {
     );
 }
 
+// T-229b (#229): backfill must not widen a legacy chunk's range over stale
+// content. A pre-#192 DB indexed before the consecutive-assistant merge stored
+// [Q, A1, A2] as one chunk "Q\nA1" (the trailing A2 was orphaned). The merged
+// chunker now re-derives a single chunk "Q\nA1\nA2" spanning [Q..A2] — the count
+// still matches (1 == 1), so the old count-only guard would stamp the widened
+// range onto the stale "Q\nA1" content, making an FTS hit on A2 resolve to a
+// chunk that never held it. The content-equality guard must catch the drift and
+// keep NULL so the row stays on the safe instr fallback until `rebuild`.
+// Perspective: Hazard (count-preserving re-grouping) + Boundary (content differs
+// while count matches).
+#[test]
+fn test_229b_backfill_skips_count_match_with_content_drift() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    // Three messages: the merge collapses A1+A2 into the Q chunk → 1 re-derived.
+    seed_message(&conn, "user", "how do i tune the cache");
+    seed_message(&conn, "assistant", "raise the ttl first");
+    seed_message(&conn, "assistant", "then widen the shard count");
+    // Legacy stored chunk: NULL range, content stops at A1 (pre-merge grouping).
+    // Re-derived count is 1 == stored 1, but content "...ttl first" differs from
+    // the re-derived "...ttl first\nthen widen the shard count".
+    seed_legacy_chunk(&conn, 1, "how do i tune the cache\nraise the ttl first");
+
+    let updated = backfill_rowid_ranges(&mut conn).unwrap();
+    assert_eq!(
+        updated, 0,
+        "a count-matching but content-drifted session is skipped, not backfilled"
+    );
+
+    let (lo, hi): (Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT src_rowid_lo, src_rowid_hi FROM qa_chunks WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (lo, hi),
+        (None, None),
+        "the drifted chunk keeps NULL lo/hi so it resolves via the instr fallback, \
+         never inheriting the widened [Q..A2] range over its stale content"
+    );
+}
+
 // T-192h (#192): read_session_messages skips rows whose role is neither user nor
 // assistant (Role::from_db returns None). recall only writes those two roles, so
 // this is defensive, but an unknown role must never leak into a chunk's content or
