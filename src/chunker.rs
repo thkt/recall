@@ -5,8 +5,8 @@ pub(crate) struct QAChunk {
     /// Embedding content: user_text [+ "\n" + assistant_text]. Prefix added by embedder.
     pub content: String,
     pub timestamp: Option<i64>,
-    /// Source message rowid range (#192): lo = user message rowid, hi = adjacent
-    /// assistant message rowid (or lo when user-only). fetch_chunks resolves an
+    /// Source message rowid range (#192): lo = user message rowid, hi = last
+    /// consecutive assistant rowid (or lo when user-only). fetch_chunks resolves an
     /// FTS hit to its owning chunk via `m.rowid BETWEEN lo AND hi`; this replaces
     /// the instr substring guess for linked chunks, while legacy NULL-range rows
     /// still fall back to instr. Split-siblings of one message share one range.
@@ -84,7 +84,7 @@ fn find_split_boundary(text: &str, max_bytes: usize) -> usize {
 /// Build Q&A chunks from a session's messages.
 ///
 /// Rules:
-/// - user + adjacent assistant → one chunk with both texts
+/// - user + following assistant run → one chunk; consecutive assistants merge
 /// - user followed by user (no assistant) → user-only chunk
 /// - assistant without preceding user → skipped
 /// - empty messages → empty list
@@ -110,20 +110,24 @@ pub(crate) fn chunk_messages(
             continue;
         }
 
-        // hi defaults to the user rowid (user-only group), extended to the
-        // adjacent assistant rowid when one is consumed below.
+        // hi defaults to the user rowid (user-only group), extended to the last
+        // consumed assistant rowid below. Consecutive assistants arise when the
+        // parser drops tool_result-only user turns between them (#229); merge
+        // them all into this Q&A so the trailing answer is not orphaned out of
+        // the embedding path.
         let mut hi = lo;
-        let assistant_text = if i + 1 < messages.len() && messages[i + 1].1.role == Role::Assistant
-        {
+        let mut assistant_parts = Vec::new();
+        while i + 1 < messages.len() && messages[i + 1].1.role == Role::Assistant {
             i += 1;
             hi = messages[i].0;
             let text = messages[i].1.text.as_str();
-            if text.is_empty() { None } else { Some(text) }
-        } else {
-            None
-        };
+            if !text.is_empty() {
+                assistant_parts.push(text);
+            }
+        }
+        let merged_assistant = (!assistant_parts.is_empty()).then(|| assistant_parts.join("\n"));
 
-        let contents = build_content(&msg.text, assistant_text);
+        let contents = build_content(&msg.text, merged_assistant.as_deref());
         for content in contents {
             chunks.push(QAChunk {
                 session_id: session_id.to_owned(),

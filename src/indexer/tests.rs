@@ -1753,3 +1753,45 @@ fn test_192h_unknown_role_message_is_skipped() {
          row: {content:?}"
     );
 }
+
+// T-229 (#229): in a multi-assistant tool-use turn the parser drops the
+// tool_result-only user turns between assistant messages, leaving consecutive
+// assistant rows in the DB. The trailing assistant's text reaches FTS (every
+// message is inserted) but the embedding path only sees chunked content, so if
+// chunking orphans the trailing assistant it becomes invisible to semantic /
+// vector search. Reproduce the bug surface (embed path): seed user, assistant,
+// assistant, then assert the trailing assistant's unique term lands in a
+// qa_chunk that actually has a vec_chunks embedding row.
+// Red before the chunker merge fix (orphaned → no chunk → no embedding).
+#[test]
+fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    seed_message(&conn, "user", "how do i configure the retry backoff");
+    seed_message(&conn, "assistant", "first set the base interval");
+    // A tool_result-only user turn sat here in the source session; the parser
+    // dropped it, so this second assistant is stored adjacent to the first.
+    seed_message(
+        &conn,
+        "assistant",
+        "then cap it with zylophonemax jitter ceiling",
+    );
+
+    index_chunks(&mut conn, None).unwrap();
+    let embedder = MockEmbedder::new();
+    embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
+
+    let embedded: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM qa_chunks c JOIN vec_chunks v ON v.chunk_id = c.id \
+             WHERE c.content LIKE '%zylophonemax%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        embedded > 0,
+        "the trailing assistant's text must reach an embedded qa_chunk so semantic \
+         search can find it; orphaning it leaves it FTS-only and vector-invisible"
+    );
+}

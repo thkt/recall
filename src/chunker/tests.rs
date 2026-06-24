@@ -71,7 +71,7 @@ fn test_mixed_sequence() {
     let messages = rowed(vec![
         msg(Role::User, "Q1"),
         msg(Role::Assistant, "A1"),
-        msg(Role::Assistant, "extra A"), // skipped (no preceding user)
+        msg(Role::Assistant, "extra A"), // merges into the Q1/A1 chunk (#229)
         msg(Role::User, "Q2"),           // user-only (next is user)
         msg(Role::User, "Q3"),
         msg(Role::Assistant, "A3"),
@@ -81,9 +81,175 @@ fn test_mixed_sequence() {
     assert_eq!(chunks.len(), 3);
     assert!(chunks[0].content.contains("Q1"));
     assert!(chunks[0].content.contains("A1"));
+    assert!(
+        chunks[0].content.contains("extra A"),
+        "the consecutive assistant merges into the same chunk instead of being skipped"
+    );
     assert_eq!(chunks[1].content, "Q2");
     assert!(chunks[2].content.contains("Q3"));
     assert!(chunks[2].content.contains("A3"));
+}
+
+// T-229 (#229): when the parser drops tool_result-only user turns, the source
+// session leaves consecutive assistant messages. They must all merge into the
+// preceding user's chunk so the trailing answer reaches the embedding path, and
+// the chunk's rowid range must extend to the last assistant so fetch_chunks can
+// resolve an FTS hit on any of them. Perspective: Equivalence (multi-part answer)
+// + Boundary (hi spans to the last consecutive assistant rowid).
+#[test]
+fn test_229_consecutive_assistants_merge_into_one_chunk() {
+    // rowid 1 user, rowid 2/3 consecutive assistants.
+    let messages = rowed(vec![
+        msg(Role::User, "how do I configure retries"),
+        msg(Role::Assistant, "first set the base interval"),
+        msg(Role::Assistant, "then cap it with a jitter ceiling"),
+    ]);
+    let chunks = chunk_messages("s1", &messages, None);
+
+    assert_eq!(
+        chunks.len(),
+        1,
+        "all consecutive assistants fold into one chunk"
+    );
+    assert!(chunks[0].content.contains("first set the base interval"));
+    assert!(
+        chunks[0]
+            .content
+            .contains("then cap it with a jitter ceiling"),
+        "the trailing assistant must be present so it is not embed-invisible"
+    );
+    assert_eq!(chunks[0].src_rowid_lo, 1, "lo is the user rowid");
+    assert_eq!(
+        chunks[0].src_rowid_hi, 3,
+        "hi extends to the last consecutive assistant rowid, not the first"
+    );
+}
+
+// T-229b (#229): an empty-text assistant interleaved in the run is dropped from
+// the content (the `if !text.is_empty()` filter) but its rowid is still consumed,
+// so `hi` advances past it. This pins the invariant that `hi` tracks consumed
+// rowids independently of empty-filtering — a regression that moved the `hi`
+// assignment inside the filter would silently pass every other test. Perspective:
+// Combination (empty hole × rowid stamping) + Hazard (a leading empty must not
+// inject a stray newline into the join).
+#[test]
+fn test_229_empty_assistant_in_run_drops_text_but_advances_hi() {
+    // Trailing empty: real answer then an empty assistant turn.
+    let trailing = rowed(vec![
+        msg(Role::User, "Q"),
+        msg(Role::Assistant, "real answer"),
+        msg(Role::Assistant, ""),
+    ]);
+    let chunks = chunk_messages("s1", &trailing, None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].content, "Q\nreal answer",
+        "the empty trailing assistant adds no content or stray newline"
+    );
+    assert_eq!(
+        chunks[0].src_rowid_hi, 3,
+        "hi advances to the consumed empty assistant's rowid, not the last non-empty one"
+    );
+
+    // Leading empty: empty assistant turn before the real answer.
+    let leading = rowed(vec![
+        msg(Role::User, "Q"),
+        msg(Role::Assistant, ""),
+        msg(Role::Assistant, "real answer"),
+    ]);
+    let chunks = chunk_messages("s1", &leading, None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].content, "Q\nreal answer",
+        "the empty leading assistant does not prepend a newline to the join"
+    );
+    assert_eq!(chunks[0].src_rowid_hi, 3);
+}
+
+// T-229c (#229): three consecutive assistants is the boundary that distinguishes
+// the merge `while` loop from the old single-`if`. The join order across all
+// three and `hi` reaching the third rowid are the loop's third-iteration
+// behavior. Perspective: Boundary (run length 3 > the old max of 1 consumed).
+#[test]
+fn test_229_three_consecutive_assistants_merge_in_order() {
+    let messages = rowed(vec![
+        msg(Role::User, "Q"),
+        msg(Role::Assistant, "p1"),
+        msg(Role::Assistant, "p2"),
+        msg(Role::Assistant, "p3"),
+    ]);
+    let chunks = chunk_messages("s1", &messages, None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].content, "Q\np1\np2\np3",
+        "all three assistants merge in source order"
+    );
+    assert_eq!(
+        chunks[0].src_rowid_hi, 4,
+        "hi reaches the third assistant rowid"
+    );
+}
+
+// T-229d (#229): an all-empty assistant run yields a user-only chunk (content has
+// no assistant text), yet `hi` has advanced past `lo`. This "user-only content
+// but hi != lo" state is unreachable by test_005 (which keeps hi == lo) and
+// guards the `merged_assistant` None branch when every part was filtered out.
+// Perspective: Combination (all-empty filter × rowid advance).
+#[test]
+fn test_229_all_empty_assistant_run_is_user_only_with_advanced_hi() {
+    let messages = rowed(vec![
+        msg(Role::User, "Q"),
+        msg(Role::Assistant, ""),
+        msg(Role::Assistant, ""),
+    ]);
+    let chunks = chunk_messages("s1", &messages, None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].content, "Q",
+        "no non-empty assistant text means a user-only chunk with no trailing newline"
+    );
+    assert_eq!(chunks[0].src_rowid_lo, 1);
+    assert_eq!(
+        chunks[0].src_rowid_hi, 3,
+        "hi still advances over the consumed empty assistants"
+    );
+}
+
+// T-229e (#229): merging two assistants that each fit under MAX_CHUNK_BYTES but
+// whose `\n`-join exceeds it forces the split path on the *merged* string. Every
+// sub-chunk must carry the user prefix and share one [lo, hi] range that now
+// spans the merged run. Perspective: Combination (merge × split) + Hazard (a
+// per-sub-chunk rowid would mis-scope the search JOIN across the merged range).
+#[test]
+fn test_229_merged_run_over_limit_splits_sharing_one_range() {
+    let half = "line\n".repeat(2000); // ~10,000 bytes each; joined > MAX_CHUNK_BYTES
+    let messages = rowed(vec![
+        msg(Role::User, "質問"),
+        msg(Role::Assistant, &half),
+        msg(Role::Assistant, &half),
+    ]);
+    let chunks = chunk_messages("s1", &messages, None);
+
+    assert!(
+        chunks.len() > 1,
+        "the merged run exceeds the limit and must split, got {}",
+        chunks.len()
+    );
+    for (i, chunk) in chunks.iter().enumerate() {
+        assert!(
+            chunk.content.len() <= MAX_CHUNK_BYTES,
+            "sub-chunk[{i}] is {} bytes, exceeds limit {MAX_CHUNK_BYTES}",
+            chunk.content.len()
+        );
+        assert_eq!(
+            chunk.src_rowid_lo, 1,
+            "sub-chunk[{i}] shares the user rowid"
+        );
+        assert_eq!(
+            chunk.src_rowid_hi, 3,
+            "sub-chunk[{i}] shares the merged run's last assistant rowid"
+        );
+    }
 }
 
 #[test]
