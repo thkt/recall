@@ -10,6 +10,9 @@ fn test_strip_control_chars() {
         ("before\x1b]0;title\x1b\\after", "beforeafter"),
         ("before\x1b]0;title", "before"), // unterminated OSC
         ("before\x1b[31", "before"),      // unterminated CSI
+        ("foo\tbar", "foo bar"),          // #239: inter-word tab normalizes to space, not fused
+        ("a\t\tb", "a  b"),               // each tab maps to one space
+        ("foo\rbar", "foobar"),           // CR stays dropped (CRLF -> LF), per #239
     ] {
         assert_eq!(strip_control_chars(input), expected, "input: {input:?}");
     }
@@ -36,7 +39,10 @@ fn test_fast_path_and_char_loop_agree_on_control_chars() {
         let isolated = strip_control_chars(&clean);
         let forced = strip_control_chars(&forcing);
         assert_eq!(isolated, forced, "paths diverge on {cp:#04x}");
-        if c.is_control() && c != '\n' {
+        if c == '\t' {
+            // #239: tab normalizes to a space (not dropped), in both paths.
+            assert_eq!(isolated, "a b", "tab must normalize to a space");
+        } else if c.is_control() && c != '\n' {
             assert_eq!(isolated, "ab", "control char {cp:#04x} must be stripped");
         } else if c == '\n' {
             assert_eq!(isolated, "a\nb", "newline must be preserved");
