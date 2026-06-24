@@ -160,6 +160,12 @@ fn create_db_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// UTC civil date with no local-timezone offset, by design (issue #232). recall
+// labels are consumed by AI agents (human calendar browsing is an OUTCOME
+// non-goal), and `--days N` filters a rolling 24h window rather than calendar
+// boundaries, so a fixed UTC label keeps the shown date independent of the
+// viewer's timezone. A late-night JST session can therefore display the prior
+// UTC day; that is accepted, not a bug.
 fn format_timestamp(ts_ms: Option<i64>) -> String {
     let Some(ts) = ts_ms else {
         return "unknown".to_owned();
