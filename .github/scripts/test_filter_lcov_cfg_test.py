@@ -147,7 +147,7 @@ def test_cfg_test_ranges_unbalanced_brace_in_multiline_raw_string(tmp_path):
 
 
 def test_filter_lcov_raises_on_unresolved_repo_source(tmp_path):
-    # OPS-006: a `.rs` SF path under repo_root that does not exist is a path
+    # A `.rs` SF path under repo_root that does not exist is a path
     # resolution bug; fail loud rather than silently under-filtering.
     lcov = tmp_path / "in.info"
     lcov.write_text("SF:src/ghost.rs\nDA:1,1\nend_of_record\n", encoding="utf-8")
@@ -156,7 +156,7 @@ def test_filter_lcov_raises_on_unresolved_repo_source(tmp_path):
 
 
 def test_filter_lcov_warns_and_skips_external_source(tmp_path, capsys):
-    # OPS-006 / SEC: an absolute `.rs` outside repo_root (external dep) cannot
+    # An absolute `.rs` outside repo_root (external dep) cannot
     # affect the gate (diff-cover scores only this repo's changed lines); it is
     # skipped without reading and the record is passed through unfiltered.
     repo = tmp_path / "repo"
@@ -175,7 +175,7 @@ def test_filter_lcov_warns_and_skips_external_source(tmp_path, capsys):
 
 
 def test_filter_lcov_raises_on_empty_input(tmp_path):
-    # ENC-002: an input with no SF records would yield a trivially-passing
+    # An input with no SF records would yield a trivially-passing
     # filtered file; fail loud.
     lcov = tmp_path / "in.info"
     lcov.write_text("TN:\n", encoding="utf-8")
@@ -184,7 +184,7 @@ def test_filter_lcov_raises_on_empty_input(tmp_path):
 
 
 def test_filter_lcov_emits_one_end_of_record_per_sf(tmp_path):
-    # ENC-002 well-formedness: one end_of_record per SF, production lines kept.
+    # Well-formedness: one end_of_record per SF, production lines kept.
     (tmp_path / "real.rs").write_text(
         "pub fn f() -> i32 {\n    1\n}\n", encoding="utf-8"
     )

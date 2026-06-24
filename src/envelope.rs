@@ -1,4 +1,4 @@
-//! Output envelopes for `--json` mode (ADR-0060, #67 Phase 2).
+//! Output envelopes for `--json` mode (ADR-0001 freeze; scout ADR-0060 family pattern; #67 Phase 2).
 //!
 //! Mirrors `sae/src/envelope.rs`. [`CommandOutput`] is the canonical runner
 //! return type, pairing the human-facing `markdown` with the machine `data`

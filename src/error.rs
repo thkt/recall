@@ -1,4 +1,4 @@
-//! Exit-code classification per ADR-0066 Group 2 baseline.
+//! Exit-code classification per recall ADR-0006 (extending scout ADR-0066 Group 2).
 //!
 //! recall stays anyhow-based internally. `RecallError` types only the explicit
 //! failures recall raises, so a classification survives to the CLI boundary
@@ -7,7 +7,7 @@
 //! `USER_ERROR_MARKERS` stderr-string match, which silently broke whenever a
 //! `bail!` message was reworded (#26 / #82 / #83).
 //!
-//! The ADR-0066 Group 2 baseline also defines `CANT_CREAT` (73); recall has no
+//! The scout ADR-0066 Group 2 baseline also defines `CANT_CREAT` (73); recall has no
 //! distinct "cannot create output" path (DB/IO failures map to `IoError`), so
 //! that class is intentionally absent until a path needs it.
 
@@ -21,7 +21,7 @@ use serde::Serialize;
 
 use crate::envelope::{ErrorEnvelope, ErrorPayload};
 
-/// sysexits-derived exit-code classes recall distinguishes (ADR-0066 Group 2).
+/// sysexits-derived exit-code classes recall distinguishes (ADR-0006).
 ///
 /// Serializes to its SCREAMING_SNAKE_CASE name for the `--json` error envelope
 /// (#67 Phase 2), so agents branch on the concept name (`"USAGE_ERROR"`), not

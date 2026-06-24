@@ -1,11 +1,11 @@
-//! Stdout result writing with a single SIGPIPE policy (ADR-0060, #67 Phase 1).
+//! Stdout result writing with a single SIGPIPE policy (scout ADR-0060, external; #67 Phase 1).
 //!
 //! `recall` renders a command's result into a string, then writes it through
 //! [`write_result`]. A consumer that closes the pipe early (`recall search foo
 //! | head`) surfaces as [`WriteOutcome::PipeClosed`] instead of the panic a
 //! bare `println!` raises, so the caller stops cleanly with exit 0. The
-//! search/status result paths share this one policy; `recall show` keeps its
-//! own (to be unified in Phase 2).
+//! search/status/show result paths all share this one policy, routed through
+//! this `write_result` boundary (show unified in #67 Phase 2).
 
 use std::io::{self, ErrorKind, Write};
 
