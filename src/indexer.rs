@@ -808,16 +808,19 @@ fn read_session_messages(tx: &Transaction, session_id: &str) -> Result<Vec<(i64,
 /// Link pre-#192 chunks (NULL src_rowid_lo/hi) to their source message rowid range
 /// without a re-embed. For each session holding an unlinked chunk, re-run the
 /// deterministic chunker over its messages and zip the re-derived ranges onto the
-/// stored chunks by qa_chunks.id ascending (= original insertion order). Only
-/// sessions whose re-derived chunk count equals the stored count are updated; a
-/// mismatch (chunker logic changed since the session was indexed) leaves the rows
-/// NULL so they keep resolving via the instr fallback rather than risk a
-/// mis-aligned range. The count check guards only against count drift, not against
-/// a count-preserving re-grouping; the chunker is a deterministic single pass
-/// (user + one adjacent assistant), so no such variant exists today, and `rebuild`
-/// is the escape hatch if one is ever introduced. Returns the number of sessions
-/// backfilled. A no-op once every row is linked, since the NULL-row scan then
-/// finds no session.
+/// stored chunks by qa_chunks.id ascending (= original insertion order). A session
+/// is updated only when the re-derived chunks match the stored ones both in count
+/// and in content, position by position. A count or content mismatch means the
+/// chunker re-grouped differently than the stored chunks were built (chunker logic
+/// drift since the session was indexed), so the rows stay NULL and keep resolving
+/// via the instr fallback rather than inherit a mis-aligned range over stale
+/// content. Content equality is the load-bearing guard: a count-preserving
+/// re-grouping (e.g. #229 merging consecutive assistants into one chunk) keeps the
+/// count but rewrites the content, so stamping the widened range onto the old
+/// content would make an FTS hit on the newly covered text resolve to a chunk that
+/// never held it. `rebuild` re-chunks and re-embeds those drifted sessions.
+/// Returns the number of sessions backfilled. A no-op once every row is linked,
+/// since the NULL-row scan then finds no session.
 pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     let sessions: Vec<(String, Option<i64>)> = {
         let null_row_sessions_sql = "SELECT DISTINCT s.session_id, s.timestamp FROM sessions s \
@@ -840,25 +843,40 @@ pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
         let messages = read_session_messages(&tx, session_id)?;
         let chunks = chunker::chunk_messages(session_id, &messages, *timestamp);
 
-        let ids: Vec<i64> = {
-            let mut stmt =
-                tx.prepare_cached("SELECT id FROM qa_chunks WHERE session_id = ? ORDER BY id")?;
-            let rows = stmt.query_map([session_id], |row| row.get::<_, i64>(0))?;
+        let stored_chunks: Vec<(i64, String)> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT id, content FROM qa_chunks WHERE session_id = ? ORDER BY id",
+            )?;
+            let rows = stmt.query_map([session_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
             rows.collect::<StdResult<Vec<_>, _>>()?
         };
 
-        // Count mismatch makes the id-order zip unsafe (a chunk would inherit
-        // another group's rowid range), so skip the session and keep NULL. It
-        // means the chunker re-derived a different grouping than the one stored
-        // (chunker logic drift since the session was indexed); log it so the
-        // permanent instr-fallback degradation is observable rather than silent.
-        let (stored, rederived) = (ids.len(), chunks.len());
+        // The id-order zip is only safe when the re-derived chunks correspond to
+        // the stored ones position by position. A count mismatch breaks that
+        // outright; a content mismatch means the chunker re-grouped the same
+        // number of chunks differently (e.g. #229 merging consecutive assistants
+        // widens a range while rewriting its content), so stamping the new range
+        // onto stale content would misroute an FTS hit on the newly covered text.
+        // Either way the grouping drifted since the session was indexed, so skip
+        // it and keep NULL; log it so the permanent instr-fallback degradation is
+        // observable rather than silent. `rebuild` re-chunks and re-embeds.
+        let (stored, rederived) = (stored_chunks.len(), chunks.len());
         if stored != rederived {
             debug!(%session_id, stored, rederived, "rowid backfill skipped: count mismatch");
             continue;
         }
+        if stored_chunks
+            .iter()
+            .zip(chunks.iter())
+            .any(|((_, stored_content), chunk)| *stored_content != chunk.content)
+        {
+            debug!(%session_id, "rowid backfill skipped: content mismatch");
+            continue;
+        }
 
-        for (id, chunk) in ids.iter().zip(chunks.iter()) {
+        for ((id, _), chunk) in stored_chunks.iter().zip(chunks.iter()) {
             tx.execute(
                 "UPDATE qa_chunks SET src_rowid_lo = ?1, src_rowid_hi = ?2 WHERE id = ?3",
                 rusqlite::params![chunk.src_rowid_lo, chunk.src_rowid_hi, id],
