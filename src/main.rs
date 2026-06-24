@@ -24,7 +24,9 @@ use amici::cli::exit_code::codes;
 use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand, warning};
 use amici::logging::init_subscriber;
 use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
-use amici::model::{EmbedderDegraded, download_and_verify_model, record_degraded};
+use amici::model::{
+    EmbedderDegraded, degrade_with_warn, download_and_verify_model, record_degraded,
+};
 use amici::storage::{collect_rows, filter::escape_like};
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
@@ -255,17 +257,22 @@ fn search_degraded_note(reason: DegradedReason) -> Option<String> {
         .map(|note| format!("note: {note}."))
 }
 
-/// Note for embedded sessions preserved because the model was absent at index
-/// time (#215). `None` when nothing was preserved so the surface stays quiet on
-/// the common path. The single source for both the human note and the `--json`
-/// `notes[]` entry, mirroring `SkippedReason::note` so the two channels never
-/// disagree. The download hint already rides the degraded note; this one names
-/// the magnitude and what preservation means (search stayed intact, a re-index
-/// after `recall model download` refreshes any content that changed).
+/// Note for embedded sessions preserved because the model could not rebuild them
+/// this run (#215). Reason-neutral wording so it reads true on both preserve
+/// triggers: the model is absent (#215, `NotInstalled`) or it loaded but failed
+/// the inference probe (#230, a present but corrupt model). `None` when nothing
+/// was preserved so the surface stays quiet on the common path. The single source
+/// for both the human note and the `--json` `notes[]` entry, mirroring
+/// `SkippedReason::note` so the two channels never disagree. The remedy command is
+/// deferred to the degraded note, which carries `recall model download` only for
+/// `NotInstalled`: re-downloading cannot repair the corrupt cache behind a
+/// `ProbeFailed`, so naming it here would misdirect the #230 path. This note names
+/// only the magnitude, that search stayed intact, and a reason-neutral refresh
+/// step once the model can embed again.
 fn preserved_embedded_note(count: usize) -> Option<String> {
     (count > 0).then(|| {
         format!(
-            "preserved embeddings for {count} session(s) the model was absent to rebuild — semantic search for them stays intact; run `recall model download`, then `recall index` to refresh any that changed"
+            "preserved embeddings for {count} session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed"
         )
     })
 }
@@ -448,7 +455,26 @@ where
     // present), and the same handle is reused for the embed step below so the
     // model loads at most once (#215). The seam's `FnOnce` bound makes the single
     // call structural.
-    let load_result = load_embedder();
+    // A loaded model can still fail the forward pass: the production load probe
+    // only constructs the model (rurico dispatch.rs `Embedder::new().map(|_| ())`)
+    // and runs no inference, so corrupt weights that error during real embedding
+    // pass load yet return load-Ok. Run one minimal `embed_document` probe so
+    // `embed_capable` reflects inference capability, not just load. On failure,
+    // demote to `ProbeFailed` so the preserve path runs instead of a destructive
+    // re-index the failing embed step cannot rebuild (#230, guarding #215's
+    // preserve). `degrade_with_warn` keeps the typed error in the structured warn
+    // before collapsing to the coarse reason (amici ADR-0009 house rule). The probe
+    // input is a non-degenerate string; an empty one would make pooling reject a
+    // healthy model's all-zero mask.
+    let load_result = load_embedder().and_then(|embedder| {
+        embedder
+            .embed_document("probe")
+            .map(|_| embedder)
+            .map_err(degrade_with_warn(
+                "embedder inference probe: embed_document",
+                DegradedReason::ProbeFailed,
+            ))
+    });
     let embed_capable = load_result.is_ok();
 
     let sp = Spinner::new("Indexing sessions...");
@@ -3715,6 +3741,70 @@ mod tests {
         );
     }
 
+    // T-230 (#230, hazard + state): a model that loads OK but fails inference must
+    // not enter the destructive rebuild path. The production load probe only
+    // constructs the model (rurico dispatch.rs: `Embedder::new().map(|_| ())`); it
+    // runs no forward pass, so a corrupt-weights model that errors during real
+    // embedding still returns load-Ok. Pre-fix, `embed_capable = is_ok()` was true,
+    // so a force rebuild deleted the existing embeddings before the embed step
+    // failed — destroying what #215 preserves. The fix runs a minimal inference
+    // probe up front and demotes inference failure to degraded, so the preserve
+    // path runs. Perspective: hazard (data-loss path) + state (rebuild under a
+    // load-OK-but-inference-fails precondition).
+    #[test]
+    fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        seed_claude_source(&claude_dir);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+
+        // Precondition: an embedded index (model present, inference healthy).
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let before = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            vec_chunk_count(&conn)
+        };
+        assert!(
+            before > 0,
+            "precondition: the initial index must embed at least one chunk"
+        );
+
+        // Load-OK-but-inference-fails rebuild: the loader returns Ok, but every
+        // embed call errors (a corrupt model that passes the construction probe).
+        let rebuild = indexer::IndexOptions {
+            force: true,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
+            Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
+        })
+        .unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            before,
+            "a load-OK-but-inference-fails rebuild must preserve existing embeddings, not destroy them"
+        );
+        assert!(
+            outcome.preserved_embedded > 0,
+            "the preserved-embedding count must ride the degraded arm"
+        );
+        assert!(
+            outcome.degraded_note.is_some(),
+            "an inference-incapable model must report a degraded note"
+        );
+    }
+
     // T-221a (#221, hazard + state): a model-present rebuild self-heals a true
     // orphan vec row — one whose chunk_id resolves to no qa_chunks row, which the
     // id/session_id-scoped index deletes never reach. Seed an embedded index,
@@ -3845,10 +3935,13 @@ mod tests {
 
     // T-2 (#215, FR-5, state): a model-absent rebuild that preserves embeddings
     // must report the count, not silently skip. The IndexOutcome carries
-    // preserved_embedded > 0, and the --json envelope's note names both the count
-    // and `recall model download` so an agent and a human both learn what happened
-    // and how to refresh. Perspective: state (the preserve transition's visible
-    // output) + error (the actionable remedy reaches both channels).
+    // preserved_embedded > 0; the --json envelope splits the two facts across two
+    // notes — the preserve note names the count, and the degraded note carries
+    // `recall model download` (the remedy lives there because it applies only to a
+    // not-installed model, not a corrupt one; #230). An agent and a human learn
+    // both what happened and how to refresh. Perspective: state (the preserve
+    // transition's visible output) + error (the actionable remedy reaches both
+    // channels).
     #[test]
     fn model_absent_rebuild_surfaces_preserved_count_and_note() {
         let src = tempfile::TempDir::new().unwrap();
@@ -3890,9 +3983,15 @@ mod tests {
         assert!(
             out.notes
                 .iter()
-                .any(|n| n.contains(&outcome.preserved_embedded.to_string())
-                    && n.contains("recall model download")),
-            "a note must name the preserved count and the download command, got: {:?}",
+                .any(|n| n.contains(&outcome.preserved_embedded.to_string())),
+            "the preserve note must name the preserved count, got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("recall model download")),
+            "the degraded note must carry the download remedy for a not-installed model, got: {:?}",
             out.notes
         );
         assert_eq!(
