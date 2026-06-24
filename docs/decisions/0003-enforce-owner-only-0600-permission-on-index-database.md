@@ -8,7 +8,7 @@ decision-makers: thkt
 
 ## Context and Problem Statement
 
-recall indexes Claude Code and Codex session transcripts, which contain private conversation content, into a local SQLite DB. `create_db_file` opens the DB with mode `0o600` on Unix so only the owner can read it (main.rs:137-147). The mode is set at the single creation point, but no rule states that this owner-only invariant must hold for every future path that creates or recreates the DB. A later contributor adding a second DB-write path (export, backup, alternate store) could drop the mode and silently widen access to private data.
+recall indexes Claude Code and Codex session transcripts, which contain private conversation content, into a local SQLite DB. `create_db_file` opens the DB with mode `0o600` on Unix so only the owner can read it (`create_db_file` at main.rs:149, `opts.mode(0o600)` at main.rs:157). The mode is set at the single creation point, but no rule states that this owner-only invariant must hold for every future path that creates or recreates the DB. A later contributor adding a second DB-write path (export, backup, alternate store) could drop the mode and silently widen access to private data.
 
 ## Decision Drivers
 

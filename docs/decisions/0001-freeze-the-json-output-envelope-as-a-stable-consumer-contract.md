@@ -8,7 +8,7 @@ decision-makers: thkt
 
 ## Context and Problem Statement
 
-Under `--json`, recall emits `SuccessEnvelope` (`data` / `degraded` / `notes`) to stdout and `ErrorEnvelope` (`error.code` / `message` / `next_step` / `candidates` / `retryable`) to stderr (envelope.rs). Agents parse these keys. The code decouples the wire schema from internal types via a `serde_json::json!` seam and keeps `SearchResult` / `SessionData` non-`Serialize`, but no document states that the envelope keys are a frozen public contract, nor that every string field reaching stdout must be control-char sanitized (`format_result` strips each field at main.rs:1096-1117, the error-note path at main.rs:339). A future contributor could break agent consumers by renaming a key or surfacing a raw field.
+Under `--json`, recall emits `SuccessEnvelope` (`data` / `degraded` / `notes`) to stdout and `ErrorEnvelope` (`error.code` / `message` / `next_step` / `candidates` / `retryable`) to stderr (envelope.rs). Agents parse these keys. The code decouples the wire schema from internal types via a `serde_json::json!` seam and keeps `SearchResult` / `SessionData` non-`Serialize`, but no document states that the envelope keys are a frozen public contract, nor that every string field reaching stdout must be control-char sanitized (`format_result` strips each field at main.rs:1342-1374, the error-note path at main.rs:401). A future contributor could break agent consumers by renaming a key or surfacing a raw field.
 
 ## Decision Drivers
 
@@ -33,7 +33,7 @@ Chosen option: "Freeze the envelope shape", because the envelope is the only sta
 
 ### Confirmation
 
-A golden/snapshot test asserts the `--json` key set for `search` / `index` / `status` / `doctor` (search/index/status assertions live in tests/cli_integration.rs; `doctor`'s `data` payload freezes the top keys `healthy` / `checks` and each check object's `name` / `ok` / `detail` / `remedy`, main.rs:1059). A grep check confirms `SearchResult` and `SessionData` carry no `derive(Serialize)`. Code review verifies every new string field in `format_result` and the `json!` payloads passes `ansi::strip_control_chars`.
+A golden/snapshot test asserts the `--json` key set for `search` / `index` / `status` / `doctor` (search/index/status assertions live in tests/cli_integration.rs; `doctor`'s `data` payload freezes the top keys `healthy` / `checks` and each check object's `name` / `ok` / `detail` / `remedy`, main.rs:1316). A grep check confirms `SearchResult` and `SessionData` carry no `derive(Serialize)`. Code review verifies every new string field in `format_result` and the `json!` payloads passes `ansi::strip_control_chars`.
 
 ## More Information
 
@@ -47,13 +47,13 @@ This freeze fixed the envelope KEY `degraded`, not the conditions that set it. T
 
 For `search`, `degraded:true` means semantic (vector) coverage was lost relative to a fully-loaded run; the search still returns its FTS-only results rather than failing. Two sources feed it, and they co-vary with the same boolean so the bool and the notes never disagree:
 
-- Load-time: the embedder could not load (model-less or a probe/backend failure), derived by `search_degraded_state` (main.rs:251-258). A caller-disabled model is intentional and stays non-degraded.
+- Load-time: the embedder could not load (model-less or a probe/backend failure), derived by `search_degraded_state` (main.rs:305). A caller-disabled model is intentional and stays non-degraded.
 - Runtime: a loaded embedder's `embed_query` / `vec_search` fails at query time (e.g. memory pressure) and is swallowed to FTS-only, carried by `SearchOutcome::vec_degraded` (search.rs:39-57, 676-683). It is the runtime counterpart to the load-time path.
 
 The no-model state is reported on two different axes by design, and this asymmetry is intentional, not a contract violation:
 
 - `search` reports it on a coverage axis: no model means semantic search is unavailable, so results are FTS-only and may be thinner, hence `degraded:true`.
-- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (main.rs:834-845). `doctor` and `status` agree with each other on this axis (#166).
+- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (main.rs:864-866, with the FTS-only fallback at the `check_model` info path main.rs:1119-1130). `doctor` and `status` agree with each other on this axis (#166).
 
 A contributor who tries to make all three commands agree on `degraded` for the no-model case would either wrongly mark `doctor`/`status` unhealthy or wrongly hide search's lost-coverage signal. The divergence is the contract.
 
