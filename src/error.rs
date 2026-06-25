@@ -86,6 +86,14 @@ impl RecallError {
         }
     }
 
+    /// Whether retrying the same call may succeed. True only for
+    /// [`Self::TempFailure`]: a usage, data, or internal/permanent fault cannot
+    /// clear on retry. The single source for this distinction, reused by both the
+    /// error envelope and `doctor --fix`'s recovery report.
+    pub(crate) fn retryable(&self) -> bool {
+        matches!(self, Self::TempFailure(_))
+    }
+
     /// Build the `--json` error envelope for this failure (#67 Phase 2).
     ///
     /// `retryable` is true only for [`Self::TempFailure`]: retrying the same
@@ -114,7 +122,7 @@ impl RecallError {
                 message: self.to_string(),
                 next_step,
                 candidates: Vec::new(),
-                retryable: matches!(self, Self::TempFailure(_)),
+                retryable: self.retryable(),
             },
         }
     }

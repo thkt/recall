@@ -967,6 +967,14 @@ impl DoctorCheck {
             remedy: Some(remedy),
         }
     }
+
+    /// True only for a clean [`pass`](Self::pass): `ok` with no detail. The
+    /// not-installed [`info`](Self::info) note is `ok` but carries a detail, and a
+    /// [`fail`](Self::fail) is not `ok`, so both fall through. Centralizes the
+    /// "no recovery needed" invariant so callers don't re-encode `detail.is_none()`.
+    fn is_fully_usable(&self) -> bool {
+        self.ok && self.detail.is_none()
+    }
 }
 
 /// Remedy for a database that is corrupt, unopenable, or whose check query can't
@@ -1144,9 +1152,25 @@ where
     }
 }
 
+/// The outcome of the optional model re-fetch under `doctor --fix`.
+///
+/// `Skipped` covers both "no `--fix`" and "model already fully usable" — no
+/// re-fetch ran. `Succeeded` means the re-fetch ran *and* the re-probe came back
+/// fully usable. `Failed` covers both a re-fetch that errored and a re-fetch that
+/// returned `Ok` but whose re-probe still faults (the model is still unusable, so
+/// it is not a recovery). It keeps the typed [`RecallError`] (not a bare string)
+/// so the report can tell a transient download fault (retryable) from a permanent
+/// backend mismatch; collapsing to `String` here would discard that distinction
+/// before it reaches the `--json` consumer.
+enum ModelRecovery {
+    Skipped,
+    Succeeded,
+    Failed(RecallError),
+}
+
 /// The model column under `--fix`. Without `--fix`, or when the model already
-/// probes healthy, this is just [`check_model`] and no recovery runs. With
-/// `--fix` on a degraded model (a load/probe fault or the not-installed note),
+/// probes healthy, this is just [`check_model`] and recovery is [`ModelRecovery::Skipped`].
+/// With `--fix` on a degraded model (a load/probe fault or the not-installed note),
 /// it runs `recover_model` — re-fetching the cached model — and re-probes, so
 /// the returned column reflects the post-recovery state. The recovery outcome is
 /// returned alongside so the report can surface that a re-fetch happened, or that
@@ -1156,29 +1180,44 @@ fn check_model_with_optional_recovery<F, R>(
     fix: bool,
     load_embedder: F,
     recover_model: R,
-) -> (DoctorCheck, Option<Result<(), String>>)
+) -> (DoctorCheck, ModelRecovery)
 where
     F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
-    R: FnOnce() -> Result<(), String>,
+    R: FnOnce() -> Result<(), RecallError>,
 {
     let initial = check_model(&load_embedder);
-    // A clean probe carries no detail; the not-installed info note is `ok` but
-    // carries one. So "fully usable" is `ok && detail.is_none()` — both the
-    // not-installed note and a fail (ok=false) fall through to recovery.
-    let fully_usable = initial.ok && initial.detail.is_none();
-    if !fix || fully_usable {
-        return (initial, None);
+    // The not-installed info note and any fault both fall through to recovery;
+    // only a clean pass is fully usable. The invariant lives on DoctorCheck.
+    if !fix || initial.is_fully_usable() {
+        return (initial, ModelRecovery::Skipped);
     }
-    let outcome = recover_model();
-    match &outcome {
-        Ok(()) => (check_model(&load_embedder), Some(outcome)),
-        Err(_) => (initial, Some(outcome)),
+    match recover_model() {
+        Ok(()) => {
+            let rechecked = check_model(&load_embedder);
+            if rechecked.is_fully_usable() {
+                (rechecked, ModelRecovery::Succeeded)
+            } else {
+                // The re-fetch's own verify passed, yet the re-probe still faults:
+                // the model is still unusable, so reporting "recovered" would
+                // contradict the FAIL verdict. A re-fetch that verified clean but
+                // still fails the probe is deterministic — retrying re-runs the
+                // same download to the same fault — so this is a permanent
+                // Internal fault, not a retryable transient.
+                (
+                    rechecked,
+                    ModelRecovery::Failed(RecallError::Internal(
+                        "re-fetched model still fails its probe".to_owned(),
+                    )),
+                )
+            }
+        }
+        Err(e) => (initial, ModelRecovery::Failed(e)),
     }
 }
 
 fn run_doctor(verbose: bool, fix: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     run_doctor_with(verbose, fix, db_path, try_load_embedder_cached, || {
-        download_and_verify_model().map_err(|e| download_error(&e).to_string())
+        download_and_verify_model().map_err(|e| download_error(&e))
     })
 }
 
@@ -1199,19 +1238,26 @@ fn run_doctor_with<F, R>(
 ) -> Result<CommandOutput>
 where
     F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
-    R: FnOnce() -> Result<(), String>,
+    R: FnOnce() -> Result<(), RecallError>,
 {
     let path = resolve_db_path(db_path)?;
 
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
         cli_info("run `recall index` to create the index.");
-        // Carry the `repaired` key render_doctor_report always emits, so the
-        // --json envelope key set stays identical on every doctor path. null
-        // here: with no DB there is nothing to repair.
+        // Carry the `repaired` / `model_recovered` / `model_recovery_retryable`
+        // keys render_doctor_report always emits, so the --json envelope key set
+        // stays identical on every doctor path. All null here: with no DB there is
+        // nothing to repair, and the model probe + recovery run only past this point.
         return Ok(CommandOutput::with_notes(
             String::new(),
-            serde_json::json!({ "healthy": false, "checks": [], "repaired": null, "model_recovered": null }),
+            serde_json::json!({
+                "healthy": false,
+                "checks": [],
+                "repaired": null,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+            }),
             true,
             vec!["no index: run `recall index`".to_owned()],
         ));
@@ -1272,7 +1318,7 @@ fn render_doctor_report(
     path: &Path,
     checks: &[DoctorCheck],
     repairs: &Option<Vec<RepairOutcome>>,
-    model_recovery: &Option<Result<(), String>>,
+    model_recovery: &ModelRecovery,
 ) -> CommandOutput {
     let healthy = checks.iter().all(|c| c.ok);
     let mut notes: Vec<String> = checks
@@ -1288,10 +1334,11 @@ fn render_doctor_report(
             }
         }
     }
-    // A failed model re-fetch: the `model` column re-emits only its symptom (or,
+    // A failed model re-fetch — whether the re-fetch errored or it returned Ok but
+    // the re-probe still faults: the `model` column re-emits only its symptom (or,
     // for a still-not-installed model, stays the `ok` info note), so the recovery
     // cause stays invisible without this note.
-    if let Some(Err(e)) = model_recovery {
+    if let ModelRecovery::Failed(e) = model_recovery {
         notes.push(format!("fix: model: recovery failed: {e}"));
     }
 
@@ -1313,15 +1360,14 @@ fn render_doctor_report(
             }
         }
     }
-    if let Some(outcome) = model_recovery {
-        match outcome {
-            Ok(()) => {
-                let _ = writeln!(buf, "Recovered model");
-            }
-            Err(e) => {
-                let _ = writeln!(buf, "Model recovery failed: {e}");
-            }
+    match model_recovery {
+        ModelRecovery::Succeeded => {
+            let _ = writeln!(buf, "Recovered model");
         }
+        ModelRecovery::Failed(e) => {
+            let _ = writeln!(buf, "Model recovery failed: {e}");
+        }
+        ModelRecovery::Skipped => {}
     }
     for c in checks {
         let status = if c.ok { "ok" } else { "FAIL" };
@@ -1374,19 +1420,29 @@ fn render_doctor_report(
         None => serde_json::Value::Null,
     };
     // `model_recovered`: null when no re-fetch ran (no --fix, or model already
-    // usable), `true` on a successful re-fetch, `false` when the re-fetch failed.
-    // Kept beside `repaired` (not inside it) because that map counts deleted rows,
-    // a count the model re-fetch has no analogue for.
-    let model_recovered = match model_recovery {
-        Some(Ok(())) => serde_json::Value::Bool(true),
-        Some(Err(_)) => serde_json::Value::Bool(false),
-        None => serde_json::Value::Null,
+    // usable), `true` only when the re-fetch ran and the re-probe came back fully
+    // usable, `false` when the re-fetch failed — either it errored or it returned
+    // Ok but the re-probe still faults (the model is still unusable).
+    // `model_recovery_retryable` pairs with the `false` case: `true` if retrying
+    // `--fix` may succeed (a transient download fault), `false` for a permanent
+    // backend mismatch — so an agent reading `model_recovered: false` can decide
+    // whether to retry instead of guessing from the note text. Both are null when
+    // no re-fetch ran or it succeeded. Kept beside `repaired` (not inside it)
+    // because that map counts deleted rows, which the model re-fetch has no analogue for.
+    let (model_recovered, model_recovery_retryable) = match model_recovery {
+        ModelRecovery::Skipped => (serde_json::Value::Null, serde_json::Value::Null),
+        ModelRecovery::Succeeded => (serde_json::Value::Bool(true), serde_json::Value::Null),
+        ModelRecovery::Failed(e) => (
+            serde_json::Value::Bool(false),
+            serde_json::Value::Bool(e.retryable()),
+        ),
     };
     let data = serde_json::json!({
         "healthy": healthy,
         "checks": checks_json,
         "repaired": repaired,
         "model_recovered": model_recovered,
+        "model_recovery_retryable": model_recovery_retryable,
     });
 
     CommandOutput::with_notes(markdown, data, !healthy, notes)
@@ -2603,7 +2659,7 @@ mod tests {
     /// Recovery seam asserting it never runs: passed to `run_doctor_with` in every
     /// test where the model is healthy or `--fix` is absent, so a stray re-fetch
     /// (which would re-download the real model) panics instead of passing silently.
-    fn no_recover() -> Result<(), String> {
+    fn no_recover() -> Result<(), RecallError> {
         panic!("model recovery must not run")
     }
 
@@ -3003,7 +3059,7 @@ mod tests {
             result: Err(anyhow::anyhow!("disk I/O error")),
         }]);
 
-        let out = render_doctor_report(false, &path, &checks, &repairs, &None);
+        let out = render_doctor_report(false, &path, &checks, &repairs, &ModelRecovery::Skipped);
 
         assert!(
             out.markdown
@@ -3339,10 +3395,13 @@ mod tests {
         drop(conn);
 
         let not_installed = || Err(DegradedReason::NotInstalled);
-        let recover = || Err("MLX backend unavailable".to_owned());
+        let recover = || Err(RecallError::Internal("MLX backend unavailable".to_owned()));
         let out = run_doctor_with(false, true, &Some(db_path), not_installed, recover).unwrap();
 
         assert_eq!(out.data["model_recovered"], false);
+        // `Internal` is a permanent fault, so retrying `--fix` cannot help: the
+        // JSON must say so, not leave the agent to parse the note text.
+        assert_eq!(out.data["model_recovery_retryable"], false);
         assert!(
             out.markdown
                 .contains("Model recovery failed: MLX backend unavailable"),
@@ -3354,6 +3413,93 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("fix: model: recovery failed: MLX backend unavailable")),
             "recovery failure must reach notes, got: {:?}",
+            out.notes
+        );
+    }
+
+    // doctor --fix on a hard fault whose re-fetch fails transiently: the model
+    // stays unloadable (a re-probe still faults), so `healthy` stays false, and
+    // because the recovery error is a `TempFailure`, `model_recovery_retryable`
+    // is true — an agent reading `model_recovered: false` learns retrying `--fix`
+    // may yet succeed. Pairs with the `Internal` case above to cover both
+    // retryability branches. Perspective: condition (retryable true vs false).
+    #[test]
+    fn doctor_fix_failure_marks_transient_recovery_retryable() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let failing = || Err(DegradedReason::ProbeFailed);
+        let recover = || Err(RecallError::TempFailure("download interrupted".to_owned()));
+        let out = run_doctor_with(false, true, &Some(db_path), failing, recover).unwrap();
+
+        assert_eq!(out.data["model_recovered"], false);
+        assert_eq!(out.data["model_recovery_retryable"], true);
+        assert_eq!(
+            out.data["healthy"], false,
+            "a model that stays unloadable keeps the degraded flag"
+        );
+        assert!(
+            out.markdown
+                .contains("Model recovery failed: download interrupted"),
+            "human output must name the recovery failure, got: {}",
+            out.markdown
+        );
+    }
+
+    // doctor --fix whose re-fetch returns Ok but the re-probe still faults: the
+    // download "succeeded" yet the model is still unusable, so reporting
+    // `model_recovered: true` beside `healthy: false` would tell an agent the
+    // model is usable when it is not. Recovery must register as failed instead:
+    // `model_recovered` false, and because a verify-passing re-fetch that still
+    // fails the probe is deterministic (a retry re-runs the same download → same
+    // fault), `model_recovery_retryable` is false. Perspective: hazard
+    // (success+failure contradiction in the same envelope).
+    #[test]
+    fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let calls = Cell::new(0u32);
+        let loader = || {
+            calls.set(calls.get() + 1);
+            Err(DegradedReason::ProbeFailed)
+        };
+        let recover = || Ok(());
+        let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
+
+        assert_eq!(
+            out.data["model_recovered"], false,
+            "a re-fetch that leaves the probe failing did not recover the model"
+        );
+        assert_eq!(
+            out.data["model_recovery_retryable"], false,
+            "a deterministic post-verify probe failure will not clear on retry"
+        );
+        assert_eq!(
+            out.data["healthy"], false,
+            "the model is still unloadable, so the index stays degraded"
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "recovery must trigger a second, re-probe load even when it still faults"
+        );
+        assert!(
+            out.markdown
+                .contains("Model recovery failed: re-fetched model still fails its probe"),
+            "human output must name the still-faulting re-probe as a failure, got: {}",
+            out.markdown
+        );
+        assert!(
+            out.notes.iter().any(|n| n
+                .contains("fix: model: recovery failed: re-fetched model still fails its probe")),
+            "the still-faulting re-probe must reach notes, got: {:?}",
             out.notes
         );
     }
