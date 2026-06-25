@@ -1116,9 +1116,9 @@ fn check_orphan_chunks(conn: &Connection) -> Result<DoctorCheck> {
 /// drift that would silently degrade `search` to FTS-only. A not-installed model
 /// is reported as info (FTS-only is supported, not broken); a load error, embed
 /// error, or wrong width is a fault whose remedy is to re-fetch the model.
-fn check_model<F>(load_embedder: F) -> DoctorCheck
+fn check_model<F>(load_embedder: &F) -> DoctorCheck
 where
-    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+    F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
     const REMEDY: &str = "recall model download";
     let embedder = match load_embedder() {
@@ -1144,8 +1144,42 @@ where
     }
 }
 
+/// The model column under `--fix`. Without `--fix`, or when the model already
+/// probes healthy, this is just [`check_model`] and no recovery runs. With
+/// `--fix` on a degraded model (a load/probe fault or the not-installed note),
+/// it runs `recover_model` — re-fetching the cached model — and re-probes, so
+/// the returned column reflects the post-recovery state. The recovery outcome is
+/// returned alongside so the report can surface that a re-fetch happened, or that
+/// it failed. `load_embedder` is `Fn` because a successful recovery re-loads to
+/// re-probe; `recover_model` is `FnOnce` (one re-fetch per run).
+fn check_model_with_optional_recovery<F, R>(
+    fix: bool,
+    load_embedder: F,
+    recover_model: R,
+) -> (DoctorCheck, Option<Result<(), String>>)
+where
+    F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
+    R: FnOnce() -> Result<(), String>,
+{
+    let initial = check_model(&load_embedder);
+    // A clean probe carries no detail; the not-installed info note is `ok` but
+    // carries one. So "fully usable" is `ok && detail.is_none()` — both the
+    // not-installed note and a fail (ok=false) fall through to recovery.
+    let fully_usable = initial.ok && initial.detail.is_none();
+    if !fix || fully_usable {
+        return (initial, None);
+    }
+    let outcome = recover_model();
+    match &outcome {
+        Ok(()) => (check_model(&load_embedder), Some(outcome)),
+        Err(_) => (initial, Some(outcome)),
+    }
+}
+
 fn run_doctor(verbose: bool, fix: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    run_doctor_with(verbose, fix, db_path, try_load_embedder_cached)
+    run_doctor_with(verbose, fix, db_path, try_load_embedder_cached, || {
+        download_and_verify_model().map_err(|e| download_error(&e).to_string())
+    })
 }
 
 /// Diagnose the index, reporting per-check verdicts plus an overall `healthy`
@@ -1156,14 +1190,16 @@ fn run_doctor(verbose: bool, fix: bool, db_path: &Option<PathBuf>) -> Result<Com
 /// return so diagnosing never auto-creates a DB. A failed check sets the
 /// envelope's `degraded` flag and adds its remedy to `notes`, so an agent reading
 /// `--json` gets both the verdict and the fix.
-fn run_doctor_with<F>(
+fn run_doctor_with<F, R>(
     verbose: bool,
     fix: bool,
     db_path: &Option<PathBuf>,
     load_embedder: F,
+    recover_model: R,
 ) -> Result<CommandOutput>
 where
-    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+    F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
+    R: FnOnce() -> Result<(), String>,
 {
     let path = resolve_db_path(db_path)?;
 
@@ -1175,7 +1211,7 @@ where
         // here: with no DB there is nothing to repair.
         return Ok(CommandOutput::with_notes(
             String::new(),
-            serde_json::json!({ "healthy": false, "checks": [], "repaired": null }),
+            serde_json::json!({ "healthy": false, "checks": [], "repaired": null, "model_recovered": null }),
             true,
             vec!["no index: run `recall index`".to_owned()],
         ));
@@ -1191,7 +1227,7 @@ where
     // and still see the pre-fix FAIL. A corrupt DB that fails to open can't be
     // repaired here; its remedy is the data-loss tier (re-index), not orphan cleanup.
     let mut repairs: Option<Vec<RepairOutcome>> = None;
-    let checks = match open_or_create_db(&path) {
+    let mut checks = match open_or_create_db(&path) {
         Ok(conn) => {
             if fix {
                 repairs = Some(run_repairs(&conn));
@@ -1200,20 +1236,28 @@ where
                 run_db_check("integrity", || check_integrity(&conn)),
                 run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
                 run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
-                check_model(load_embedder),
             ]
         }
-        Err(e) => vec![
-            DoctorCheck::fail(
-                "integrity",
-                format!("cannot open database: {e}"),
-                CORRUPT_DB_REMEDY,
-            ),
-            check_model(load_embedder),
-        ],
+        Err(e) => vec![DoctorCheck::fail(
+            "integrity",
+            format!("cannot open database: {e}"),
+            CORRUPT_DB_REMEDY,
+        )],
     };
+    // The model column comes last on every path (DB-free probe), so it runs even
+    // when the DB failed to open. Under --fix it may re-fetch a degraded model
+    // and re-probe; the recovery outcome rides alongside for the report.
+    let (model_check, model_recovery) =
+        check_model_with_optional_recovery(fix, load_embedder, recover_model);
+    checks.push(model_check);
 
-    Ok(render_doctor_report(verbose, &path, &checks, &repairs))
+    Ok(render_doctor_report(
+        verbose,
+        &path,
+        &checks,
+        &repairs,
+        &model_recovery,
+    ))
 }
 
 /// Assemble the doctor envelope from the per-check verdicts and the optional
@@ -1228,6 +1272,7 @@ fn render_doctor_report(
     path: &Path,
     checks: &[DoctorCheck],
     repairs: &Option<Vec<RepairOutcome>>,
+    model_recovery: &Option<Result<(), String>>,
 ) -> CommandOutput {
     let healthy = checks.iter().all(|c| c.ok);
     let mut notes: Vec<String> = checks
@@ -1242,6 +1287,12 @@ fn render_doctor_report(
                 notes.push(format!("fix: {}: repair failed: {e}", o.name));
             }
         }
+    }
+    // A failed model re-fetch: the `model` column re-emits only its symptom (or,
+    // for a still-not-installed model, stays the `ok` info note), so the recovery
+    // cause stays invisible without this note.
+    if let Some(Err(e)) = model_recovery {
+        notes.push(format!("fix: model: recovery failed: {e}"));
     }
 
     let mut buf = Vec::new();
@@ -1259,6 +1310,16 @@ fn render_doctor_report(
                 Err(e) => {
                     let _ = writeln!(buf, "Repair failed {}: {e}", o.name);
                 }
+            }
+        }
+    }
+    if let Some(outcome) = model_recovery {
+        match outcome {
+            Ok(()) => {
+                let _ = writeln!(buf, "Recovered model");
+            }
+            Err(e) => {
+                let _ = writeln!(buf, "Model recovery failed: {e}");
             }
         }
     }
@@ -1312,8 +1373,21 @@ fn render_doctor_report(
         }
         None => serde_json::Value::Null,
     };
-    let data =
-        serde_json::json!({ "healthy": healthy, "checks": checks_json, "repaired": repaired });
+    // `model_recovered`: null when no re-fetch ran (no --fix, or model already
+    // usable), `true` on a successful re-fetch, `false` when the re-fetch failed.
+    // Kept beside `repaired` (not inside it) because that map counts deleted rows,
+    // a count the model re-fetch has no analogue for.
+    let model_recovered = match model_recovery {
+        Some(Ok(())) => serde_json::Value::Bool(true),
+        Some(Err(_)) => serde_json::Value::Bool(false),
+        None => serde_json::Value::Null,
+    };
+    let data = serde_json::json!({
+        "healthy": healthy,
+        "checks": checks_json,
+        "repaired": repaired,
+        "model_recovered": model_recovered,
+    });
 
     CommandOutput::with_notes(markdown, data, !healthy, notes)
 }
@@ -1679,6 +1753,7 @@ mod tests {
     use rurico::embed::{ChunkedEmbedding, EmbedError};
 
     use super::*;
+    use std::cell::Cell;
 
     // ADR-0003 Confirmation: `create_db_file` creates the index DB with owner-only
     // 0o600 permission. 0o600 sets only owner bits, so no umask (including the common
@@ -2525,6 +2600,13 @@ mod tests {
         Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
     }
 
+    /// Recovery seam asserting it never runs: passed to `run_doctor_with` in every
+    /// test where the model is healthy or `--fix` is absent, so a stray re-fetch
+    /// (which would re-download the real model) panics instead of passing silently.
+    fn no_recover() -> Result<(), String> {
+        panic!("model recovery must not run")
+    }
+
     /// Two temp dirs that do not exist on disk. `collect_sources` gates session
     /// scanning on `is_dir()` (indexer.rs:269), so `index_from_dirs` scans no
     /// files — but its orphan cleanup still deletes any hand-seeded session
@@ -2751,7 +2833,7 @@ mod tests {
         seed_healthy_index(&conn);
         drop(conn);
 
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
 
         assert_eq!(out.data["healthy"], true);
         assert!(!out.degraded, "an intact index must not be degraded");
@@ -2785,7 +2867,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
 
         assert_eq!(out.data["healthy"], false);
         assert!(out.degraded);
@@ -2878,7 +2960,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let out = run_doctor_with(false, true, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
 
         assert_eq!(out.data["healthy"], true, "got: {}", out.data);
         assert!(!out.degraded, "repaired index must not be degraded");
@@ -2921,7 +3003,7 @@ mod tests {
             result: Err(anyhow::anyhow!("disk I/O error")),
         }]);
 
-        let out = render_doctor_report(false, &path, &checks, &repairs);
+        let out = render_doctor_report(false, &path, &checks, &repairs, &None);
 
         assert!(
             out.markdown
@@ -2958,7 +3040,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -2989,7 +3071,8 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let out = run_doctor_with(false, true, &Some(db_path.clone()), mock_loader).unwrap();
+        let out =
+            run_doctor_with(false, true, &Some(db_path.clone()), mock_loader, no_recover).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -3040,7 +3123,7 @@ mod tests {
         seed_healthy_index(&conn);
         drop(conn);
 
-        let out = run_doctor_with(false, true, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
 
         assert_eq!(out.data["healthy"], true, "got: {}", out.data);
         let repaired = out.data["repaired"]
@@ -3071,7 +3154,8 @@ mod tests {
         drop(conn);
 
         let failing_loader = || Err(DegradedReason::ProbeFailed);
-        let out = run_doctor_with(false, false, &Some(db_path), failing_loader).unwrap();
+        let out =
+            run_doctor_with(false, false, &Some(db_path), failing_loader, no_recover).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -3102,7 +3186,7 @@ mod tests {
         drop(conn);
 
         let wrong_width = || Ok(Arc::new(WidthEmbedder(EMBEDDING_DIMS - 1)) as Arc<dyn Embed>);
-        let out = run_doctor_with(false, false, &Some(db_path), wrong_width).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), wrong_width, no_recover).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -3131,7 +3215,7 @@ mod tests {
         drop(conn);
 
         let not_installed = || Err(DegradedReason::NotInstalled);
-        let out = run_doctor_with(false, false, &Some(db_path), not_installed).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), not_installed, no_recover).unwrap();
 
         let check = out.data["checks"]
             .as_array()
@@ -3154,6 +3238,144 @@ mod tests {
         );
     }
 
+    // doctor --fix re-fetches a not-installed model and re-probes: the model
+    // column flips from the not-installed info note to a clean pass, `healthy`
+    // stays true, `model_recovered` is true, and the human output names the
+    // re-fetch. The loader is stateful (not-installed first, loadable after) to
+    // mirror a real recovery, and is asserted to be called twice — the second call
+    // is the post-recovery re-probe. Perspective: state (degraded -> recovered).
+    #[test]
+    fn doctor_fix_recovers_not_installed_model_to_healthy() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let calls = Cell::new(0u32);
+        let loader = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                Err(DegradedReason::NotInstalled)
+            } else {
+                Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
+            }
+        };
+        let recover = || Ok(());
+        let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
+
+        let check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "model")
+            .unwrap();
+        assert_eq!(check["ok"], true, "post-recovery probe must pass");
+        assert_eq!(
+            check["detail"],
+            serde_json::Value::Null,
+            "a recovered model is a clean pass, not the not-installed note"
+        );
+        assert_eq!(out.data["model_recovered"], true);
+        assert_eq!(out.data["healthy"], true);
+        assert!(
+            out.markdown.contains("Recovered model"),
+            "human output must report the re-fetch, got: {}",
+            out.markdown
+        );
+        assert_eq!(
+            calls.get(),
+            2,
+            "recovery must trigger a second, re-probe load"
+        );
+    }
+
+    // doctor --fix on an unloadable model (a fault, ok=false) that recovers: the
+    // model column flips from FAIL to pass, so `healthy` flips false -> true and
+    // `model_recovered` is true. Distinct from the not-installed case because here
+    // the pre-recovery state is a hard fault, proving recovery is gated on
+    // "not fully usable", not specifically on the not-installed note. Perspective:
+    // branch (fault path vs not-installed path both reaching recovery).
+    #[test]
+    fn doctor_fix_recovers_unloadable_model_flipping_healthy() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let calls = Cell::new(0u32);
+        let loader = || {
+            let n = calls.get();
+            calls.set(n + 1);
+            if n == 0 {
+                Err(DegradedReason::ProbeFailed)
+            } else {
+                Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
+            }
+        };
+        let recover = || Ok(());
+        let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
+
+        assert_eq!(out.data["model_recovered"], true);
+        assert_eq!(
+            out.data["healthy"], true,
+            "a recovered fault must clear the degraded flag"
+        );
+    }
+
+    // doctor --fix whose model re-fetch fails: a not-installed model that can't be
+    // re-fetched stays FTS-only (the info note, so `healthy` stays true), but the
+    // failure cause must not vanish — `model_recovered` is false, the cause is in
+    // both the human output and notes so a --json consumer sees why --fix did not
+    // take. Perspective: silent-failure (a swallowed recovery error).
+    #[test]
+    fn doctor_fix_surfaces_model_recovery_failure() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let not_installed = || Err(DegradedReason::NotInstalled);
+        let recover = || Err("MLX backend unavailable".to_owned());
+        let out = run_doctor_with(false, true, &Some(db_path), not_installed, recover).unwrap();
+
+        assert_eq!(out.data["model_recovered"], false);
+        assert!(
+            out.markdown
+                .contains("Model recovery failed: MLX backend unavailable"),
+            "human output must name the recovery failure, got: {}",
+            out.markdown
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("fix: model: recovery failed: MLX backend unavailable")),
+            "recovery failure must reach notes, got: {:?}",
+            out.notes
+        );
+    }
+
+    // Without --fix, a degraded model is never re-fetched: `model_recovered` is
+    // null (no re-fetch ran) and `no_recover` would panic if it were called.
+    // Perspective: boundary (--fix off) — diagnosing stays read-only of the model.
+    #[test]
+    fn doctor_without_fix_leaves_model_recovered_null() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        drop(conn);
+
+        let failing = || Err(DegradedReason::ProbeFailed);
+        let out = run_doctor_with(false, false, &Some(db_path), failing, no_recover).unwrap();
+
+        assert_eq!(out.data["model_recovered"], serde_json::Value::Null);
+        assert_eq!(out.data["healthy"], false, "an unloadable model is a fault");
+    }
+
     // doctor on a missing database reports unhealthy with the index remedy rather
     // than auto-creating a DB (mirrors status's read-only no-DB path). Perspective:
     // boundary (no index yet) — diagnosing must not have the side effect of creating one.
@@ -3162,7 +3384,14 @@ mod tests {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("missing.db");
 
-        let out = run_doctor_with(false, false, &Some(db_path.clone()), mock_loader).unwrap();
+        let out = run_doctor_with(
+            false,
+            false,
+            &Some(db_path.clone()),
+            mock_loader,
+            no_recover,
+        )
+        .unwrap();
 
         assert_eq!(out.data["healthy"], false);
         assert!(out.degraded);
@@ -3221,7 +3450,7 @@ mod tests {
         // Garbage bytes: not a valid SQLite header, so open_db fails before any check.
         fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
 
         assert_eq!(out.data["healthy"], false);
         assert!(out.degraded);
@@ -3259,7 +3488,7 @@ mod tests {
         drop(conn);
 
         let failing_embed = || Ok(Arc::new(FailingEmbedder) as Arc<dyn Embed>);
-        let out = run_doctor_with(false, false, &Some(db_path), failing_embed).unwrap();
+        let out = run_doctor_with(false, false, &Some(db_path), failing_embed, no_recover).unwrap();
 
         let check = out.data["checks"]
             .as_array()
