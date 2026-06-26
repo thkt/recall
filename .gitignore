@@ -7,3 +7,4 @@ workspace/
 # Coverage artifacts (cargo llvm-cov)
 *.profraw
 /lcov.info
+/lcov.filtered.info
