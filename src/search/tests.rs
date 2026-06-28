@@ -1553,15 +1553,91 @@ fn test_fts_only_metadata_prune_flags_results_incomplete() {
     assert_eq!(outcome.results.len(), 1);
 }
 
+/// Inserts a message whose UNINDEXED `session_id` is NULL, so the candidate query's
+/// `row.get::<String>(0)` fails to deserialize that row (#249 RC-002). The automated
+/// filter's `session_id IN (...)` subquery would exclude a NULL id, so callers must
+/// set `include_automated: true` for the row to reach deserialization.
+fn insert_null_session_id_message(conn: &Connection, text: &str) {
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES (NULL, 'user', ?1)",
+        rusqlite::params![text],
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_undeserializable_candidate_row_reports_skip() {
+    // #249 RC-002: a candidate row that fails to deserialize (NULL session_id) is
+    // skipped, and `find_candidate_sessions` reports skipped>0 so the caller can flag
+    // the ranking as a strict subset of the true matches. One valid row survives, so
+    // the all-rows-failed hard-error path is not taken.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow");
+    insert_null_session_id_message(&conn, "authentication token");
+
+    let (ranked, skipped) = find_candidate_sessions(
+        &conn,
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            include_automated: true,
+            ..Default::default()
+        },
+        "authentication",
+        now_ms,
+    )
+    .unwrap();
+
+    assert_eq!(
+        skipped, 1,
+        "the NULL-session_id row must be counted as skipped"
+    );
+    assert_eq!(ranked.len(), 1, "the one valid candidate survives");
+    assert_eq!(ranked[0].0, "s1");
+}
+
+#[test]
+fn test_skipped_candidate_row_flags_results_incomplete() {
+    // #249 RC-002 wiring: a skipped candidate row must surface on the envelope via
+    // `results_incomplete`, distinct from the metadata-prune path. FTS-only (no
+    // embedder), so the flag can only originate from `fts_skipped > 0`.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow");
+    insert_null_session_id_message(&conn, "authentication token");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            include_automated: true,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        outcome.results_incomplete,
+        "a skipped FTS candidate row must flag results_incomplete (#249 RC-002)"
+    );
+    assert!(
+        !outcome.vec_degraded,
+        "no embedder, no vector leg to degrade"
+    );
+    assert_eq!(outcome.results.len(), 1);
+}
+
 #[test]
 fn test_find_candidate_sessions_reports_no_skips_on_clean_rows() {
     // #249 RC-002 guard: a clean FTS query skips no rows, so the search is complete
-    // (skipped=0). The skipped>0 -> results_incomplete branch fires only on a candidate
-    // row that fails to deserialize, which needs a corrupt DB not reproducible in-process
-    // (the session_id/rank columns always deserialize), so that true-branch stays
-    // uncovered. It is a distinct assignment from the metadata-prune branch
-    // (meta_map.len() < requested) the prune tests exercise; they converge on the same
-    // results_incomplete field but do not cover this path.
+    // (skipped=0). The skipped>0 -> results_incomplete branch is covered by
+    // `test_undeserializable_candidate_row_reports_skip` (a NULL session_id forces the
+    // deserialize failure) and its envelope wiring by
+    // `test_skipped_candidate_row_flags_results_incomplete`.
     let (_dir, conn) = setup_test_db();
     let now_ms = 1_750_000_000_000_i64;
     insert_session(&conn, "s1", "claude", "/proj", now_ms);
