@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use rurico::embed::Embed;
 use rurico::storage::{QueryNormalizationConfig, SanitizeError, prepare_match_query};
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
@@ -34,24 +35,37 @@ pub struct SearchResult {
     pub excerpt: String,
 }
 
-/// The ranked hits plus whether the vector (semantic) leg silently fell back to
-/// FTS-only at runtime. A loaded embedder can still fail at query time (e.g.
-/// `embed_query` under memory pressure); `vec_search` swallows that into a
-/// text-only result, so `vec_degraded` carries the signal to the caller, which
-/// marks the `--json` envelope `degraded:true` (#204). It is the runtime
-/// counterpart to the load-time degradation derived in `search_degraded_state`.
+/// The ranked hits plus two independent degradation signals the caller forwards
+/// to the `--json` envelope so a `degraded:false` is never reported over an
+/// internally-truncated result (#204, #249).
+///
+/// `vec_degraded` covers the semantic (vector) leg silently falling back to
+/// FTS-only: a loaded embedder can still fail at query time (e.g. `embed_query`
+/// under memory pressure) or the `vec_chunks` probe can error, and `vec_search`
+/// swallows the former into a text-only result. It is the runtime counterpart to
+/// the load-time degradation derived in `search_degraded_state`.
+///
+/// `results_incomplete` covers the FTS leg silently dropping matched sessions:
+/// a candidate row that fails to deserialize (`find_candidate_sessions`) or a
+/// matched session pruned because its `sessions` metadata is missing or has an
+/// unknown source (`fetch_session_metadata` retain / `build_candidates`). Either
+/// thins the result below the true match set, so the envelope must flag it rather
+/// than present the partial set as complete (#249 RC-002/RC-003).
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
     pub vec_degraded: bool,
+    pub results_incomplete: bool,
 }
 
 impl SearchOutcome {
-    /// A search that never touched a degraded vector path: the empty-query,
-    /// limit-zero, and FTS-only branches that cannot lose semantic coverage.
+    /// A search that never touched a degraded vector path nor dropped a matched
+    /// session: the empty-query, limit-zero, and FTS-only branches with complete
+    /// coverage.
     fn nominal(results: Vec<SearchResult>) -> Self {
         Self {
             results,
             vec_degraded: false,
+            results_incomplete: false,
         }
     }
 }
@@ -193,12 +207,18 @@ fn build_fts_candidate_query(
     (sql, params)
 }
 
+/// FTS candidate sessions paired with the count of candidate rows that failed to
+/// deserialize. A non-zero `skipped` means the returned ranking is a strict subset
+/// of the true FTS matches, which the caller threads into
+/// `SearchOutcome::results_incomplete` so the envelope never reports a thinned
+/// result as complete (#249 RC-002). `skipped` is only non-zero on a corrupt row;
+/// the all-rows-failed case still hard-errors below.
 fn find_candidate_sessions(
     conn: &Connection,
     opts: &SearchOptions,
     fts_query: &str,
     now_ms: i64,
-) -> Result<Vec<(String, f64)>> {
+) -> Result<(Vec<(String, f64)>, usize)> {
     let (sql, params) = build_fts_candidate_query(fts_query, opts, now_ms);
     debug_assert_eq!(
         params.len(),
@@ -237,7 +257,7 @@ fn find_candidate_sessions(
         }
         warn!(skipped, %err_msg, "rows skipped during search");
     }
-    Ok(ranked)
+    Ok((ranked, skipped))
 }
 
 fn fetch_session_metadata(
@@ -455,9 +475,20 @@ fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
     }
 }
 
-fn has_vec_data(conn: &Connection) -> bool {
-    conn.query_row("SELECT 1 FROM vec_chunks LIMIT 1", [], |_| Ok(true))
-        .unwrap_or(false)
+/// Whether the `vec_chunks` table holds at least one embedding.
+///
+/// Three outcomes the caller must tell apart (#249 RC-001): `Ok(true)` has data
+/// (run the vector leg), `Ok(false)` is an empty table — the normal indexed-but-
+/// not-yet-embedded state, never a degradation — and `Err` is a real probe fault
+/// (e.g. a corrupt or missing virtual table) that silently bypasses the vector
+/// leg. `.optional()` maps `QueryReturnedNoRows` (empty table) to `None`, so only
+/// a genuine SQLite error reaches `Err` and flips `vec_degraded`.
+fn has_vec_data(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM vec_chunks LIMIT 1", [], |_| Ok(()))
+        .optional()
+        .context("Failed to probe vec_chunks for embeddings")?
+        .is_some())
 }
 
 fn vec_search(
@@ -654,91 +685,144 @@ pub fn search_with_embedder(
     // meaning. The empty/whitespace-only case already returned above (NoSearchableTerms).
     let fts_query = clean_for_trigram(&matched);
     let fts_query = fts_query.as_deref();
-    let fts_ranked = match fts_query {
+    let (fts_ranked, fts_skipped) = match fts_query {
         Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
-        None => Vec::new(),
+        None => (Vec::new(), 0),
+    };
+    // A skipped FTS candidate row thins the match set; carry it so a partial
+    // result is never reported as complete (#249 RC-002).
+    let incomplete = fts_skipped > 0;
+
+    // Decide whether the vector leg runs. The probe has three outcomes (#249
+    // RC-001): has data -> hybrid; empty table -> FTS-only by design (not a
+    // degradation); probe error -> FTS-only but flag `vec_degraded`, since the
+    // semantic leg is silently unavailable.
+    let run_hybrid = match embedder {
+        Some(_) => match has_vec_data(conn) {
+            Ok(has_data) => has_data,
+            Err(e) => {
+                warn!(error = %e, "vec_chunks probe failed, using text search only");
+                return fts_only_outcome(
+                    conn, fts_query, fts_ranked, opts, now_ms, true, incomplete,
+                );
+            }
+        },
+        None => false,
     };
 
-    if let Some(embedder) = embedder
-        && has_vec_data(conn)
-    {
-        let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
+    let Some(embedder) = embedder.filter(|_| run_hybrid) else {
+        // No embedder or an empty vector table: the FTS-only path by design, not a
+        // runtime degradation, so `vec_degraded` stays false.
+        return fts_only_outcome(conn, fts_query, fts_ranked, opts, now_ms, false, incomplete);
+    };
 
-        let fts_hits: Vec<(String, f64)> = fts_ranked
-            .iter()
-            .map(|(sid, _)| (sid.clone(), 0.0))
-            .collect();
+    let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
 
-        // A runtime `vec_search` failure (e.g. `embed_query` under memory
-        // pressure) silently drops semantic coverage. Record it so the caller can
-        // mark the envelope `degraded:true` instead of returning a thinned or
-        // empty result as if it were complete (#204).
-        let (vec_hits, vec_degraded) =
-            match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
-                Ok(hits) => (hits, false),
-                Err(e) => {
-                    warn!(error = %e, "vector search failed, using text search only");
-                    (Vec::new(), true)
-                }
-            };
+    let fts_hits: Vec<(String, f64)> = fts_ranked
+        .iter()
+        .map(|(sid, _)| (sid.clone(), 0.0))
+        .collect();
 
-        // Map each vector-hit session to its closest chunk so fetch_chunks can use
-        // that chunk's content as the excerpt when there is no FTS snippet (#36).
-        let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
-        let vec_for_rrf: Vec<(String, f64)> =
-            vec_hits.iter().map(|(sid, _)| (sid.clone(), 0.0)).collect();
+    // A runtime `vec_search` failure (e.g. `embed_query` under memory
+    // pressure) silently drops semantic coverage. Record it so the caller can
+    // mark the envelope `degraded:true` instead of returning a thinned or
+    // empty result as if it were complete (#204).
+    let (vec_hits, vec_degraded) =
+        match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
+            Ok(hits) => (hits, false),
+            Err(e) => {
+                warn!(error = %e, "vector search failed, using text search only");
+                (Vec::new(), true)
+            }
+        };
 
-        let mut merged = rrf_merge_strings(&fts_hits, &vec_for_rrf);
+    // Map each vector-hit session to its closest chunk so fetch_chunks can use
+    // that chunk's content as the excerpt when there is no FTS snippet (#36).
+    let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
+    let vec_for_rrf: Vec<(String, f64)> =
+        vec_hits.iter().map(|(sid, _)| (sid.clone(), 0.0)).collect();
 
-        if merged.is_empty() {
-            return Ok(SearchOutcome {
-                results: Vec::new(),
-                vec_degraded,
-            });
-        }
+    let mut merged = rrf_merge_strings(&fts_hits, &vec_for_rrf);
 
-        let mut meta_map = fetch_session_metadata(conn, &merged)?;
-
-        // Drop hits whose `sessions` row is missing or has an unknown source;
-        // `fetch_session_metadata` skips those, and without pruning here they
-        // would consume `limit` slots during truncate and cause `fetch_chunks`
-        // to under-fill the result set.
-        merged.retain(|(sid, _)| meta_map.contains_key(sid));
-
-        if merged.is_empty() {
-            return Ok(SearchOutcome {
-                results: Vec::new(),
-                vec_degraded,
-            });
-        }
-
-        hybrid::apply_recency_boost(
-            &mut merged,
-            |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
-            now_ms,
-            RECENCY_BOOST_WEIGHT,
-        );
-        merged.truncate(opts.limit);
-
-        let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
-        Ok(SearchOutcome {
-            results: candidates.into_iter().map(|(_, r)| r).collect(),
+    if merged.is_empty() {
+        return Ok(SearchOutcome {
+            results: Vec::new(),
             vec_degraded,
-        })
-    } else {
-        // No embedder or no vector data: this is the FTS-only path by design, not
-        // a runtime degradation, so `vec_degraded` stays false.
-        if fts_ranked.is_empty() {
-            return Ok(SearchOutcome::nominal(Vec::new()));
-        }
-        let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
-        // FTS-only path: every session matched FTS, so there is always a snippet;
-        // pass an empty vec-chunk map (no vector-only fallback needed here).
-        let candidates = fetch_chunks(conn, fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
-        Ok(SearchOutcome::nominal(score_and_sort(
-            candidates, now_ms, opts.limit,
-        )))
+            results_incomplete: incomplete,
+        });
     }
+
+    let mut meta_map = fetch_session_metadata(conn, &merged)?;
+
+    // Drop hits whose `sessions` row is missing or has an unknown source;
+    // `fetch_session_metadata` skips those, and without pruning here they
+    // would consume `limit` slots during truncate and cause `fetch_chunks`
+    // to under-fill the result set. A prune thins the match set, so flag it (#249
+    // RC-003).
+    let before_prune = merged.len();
+    merged.retain(|(sid, _)| meta_map.contains_key(sid));
+    let incomplete = incomplete || merged.len() < before_prune;
+
+    if merged.is_empty() {
+        return Ok(SearchOutcome {
+            results: Vec::new(),
+            vec_degraded,
+            results_incomplete: incomplete,
+        });
+    }
+
+    hybrid::apply_recency_boost(
+        &mut merged,
+        |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
+        now_ms,
+        RECENCY_BOOST_WEIGHT,
+    );
+    merged.truncate(opts.limit);
+
+    let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
+    Ok(SearchOutcome {
+        results: candidates.into_iter().map(|(_, r)| r).collect(),
+        vec_degraded,
+        results_incomplete: incomplete,
+    })
+}
+
+/// The FTS-only outcome shared by the no-embedder / empty-vector path and the
+/// probe-error fallback (#249 RC-001). `vec_degraded` is set by the probe-error
+/// caller (the semantic leg was silently unavailable) and stays false on the
+/// by-design path. A matched session pruned by `fetch_session_metadata` (missing
+/// row or unknown source) thins the set, so it folds into `results_incomplete`
+/// alongside any FTS skip the caller already counted (#249 RC-003).
+fn fts_only_outcome(
+    conn: &Connection,
+    fts_query: Option<&str>,
+    fts_ranked: Vec<(String, f64)>,
+    opts: &SearchOptions,
+    now_ms: i64,
+    vec_degraded: bool,
+    incomplete: bool,
+) -> Result<SearchOutcome> {
+    if fts_ranked.is_empty() {
+        return Ok(SearchOutcome {
+            results: Vec::new(),
+            vec_degraded,
+            results_incomplete: incomplete,
+        });
+    }
+    let requested = fts_ranked.len();
+    let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
+    // `fts_ranked` is GROUP BY session_id (unique ids), and `meta_map` keys are a
+    // subset, so a smaller map means `build_candidates` will silently drop the
+    // missing sessions.
+    let incomplete = incomplete || meta_map.len() < requested;
+    // FTS-only path: every session matched FTS, so there is always a snippet;
+    // pass an empty vec-chunk map (no vector-only fallback needed here).
+    let candidates = fetch_chunks(conn, fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
+    Ok(SearchOutcome {
+        results: score_and_sort(candidates, now_ms, opts.limit),
+        vec_degraded,
+        results_incomplete: incomplete,
+    })
 }
 
 #[cfg(test)]
