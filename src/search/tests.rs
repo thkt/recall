@@ -1023,7 +1023,7 @@ fn test_hybrid_search_merges_fts_and_vector() {
 
     insert_chunk_with_embedding(&conn, 1, "s2", "authentication", now_ms);
 
-    assert!(has_vec_data(&conn));
+    assert!(has_vec_data(&conn).unwrap());
 
     let embedder = MockEmbedder::new();
     let outcome = search_with_embedder(
@@ -1391,6 +1391,195 @@ fn test_runtime_vector_failure_with_unknown_source_hits_flags_degraded_on_empty(
         outcome.vec_degraded,
         "the pruned-to-empty early-return must still flag the runtime vector failure (#204)"
     );
+}
+
+#[test]
+fn test_vec_probe_error_flags_vec_degraded_falls_back_to_fts() {
+    // #249 RC-001: the `vec_chunks` probe itself errors (the virtual table is gone —
+    // a corrupt or externally-wiped index), distinct from an empty table. The old
+    // `unwrap_or(false)` collapsed this into "no vec data" and returned the FTS-only
+    // result as complete; it must instead flag `vec_degraded` so the envelope reports
+    // the silent loss of the semantic leg. Perspective: error (probe fault) + branch
+    // (the third has_vec_data state).
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow discussion");
+    // Drop the table so the probe errors ("no such table") rather than returning an
+    // empty Ok(false). FTS reads from `messages`, so it still answers.
+    conn.execute_batch("DROP TABLE vec_chunks;").unwrap();
+
+    let embedder = MockEmbedder::new();
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        Some(&embedder),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.results.len(),
+        1,
+        "FTS still answers from the messages table"
+    );
+    assert!(
+        outcome.vec_degraded,
+        "a vec_chunks probe error must flag the semantic leg as degraded (#249 RC-001)"
+    );
+}
+
+#[test]
+fn test_empty_vec_table_with_embedder_is_not_degraded() {
+    // #249 RC-001 guard against a false positive: an embedder is loaded but
+    // vec_chunks is empty — the normal indexed-but-not-yet-embedded state. The probe
+    // returns Ok(false) (an empty table is QueryReturnedNoRows, not an error), so this
+    // must stay degraded:false; flagging it would mark every unembedded index degraded.
+    // Perspective: boundary (empty table vs probe error).
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow discussion");
+    // No insert_chunk_with_embedding: vec_chunks stays empty.
+
+    let embedder = MockEmbedder::new();
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        Some(&embedder),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.results.len(), 1);
+    assert!(
+        !outcome.vec_degraded,
+        "an empty vec table is the normal not-embedded state, never degraded"
+    );
+    assert!(!outcome.results_incomplete);
+}
+
+#[test]
+fn test_metadata_prune_flags_results_incomplete_without_vec_degraded() {
+    // #249 RC-003: a matched session is pruned because its source is unknown (not
+    // claude/codex), so fetch_session_metadata drops it and `retain` shrinks the set.
+    // The vector leg SUCCEEDS here (healthy embedder), so vec_degraded stays false —
+    // isolating the new results_incomplete signal: the result silently lost a match
+    // and must not be reported as complete. Perspective: hazard (a silent prune
+    // misread as a complete result) + independence (results_incomplete fires without
+    // vec_degraded).
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // s1 survives, so the result is non-empty.
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow design");
+    insert_chunk_with_embedding(&conn, 1, "s1", "authentication flow", now_ms);
+    // `weird` has an unknown source, so fetch_session_metadata prunes it.
+    insert_session(&conn, "weird", "gemini", "/proj", now_ms);
+    insert_message(&conn, "weird", "user", "authentication retry logic");
+    insert_chunk_with_embedding(&conn, 2, "weird", "authentication retry", now_ms);
+
+    let embedder = MockEmbedder::new();
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        Some(&embedder),
+    )
+    .unwrap();
+
+    assert!(
+        !outcome.vec_degraded,
+        "the vector leg succeeded, so vec_degraded must stay false"
+    );
+    assert!(
+        outcome.results_incomplete,
+        "a pruned unknown-source match must flag results_incomplete (#249 RC-003)"
+    );
+    assert!(
+        outcome
+            .results
+            .iter()
+            .all(|r| r.session.session_id != "weird"),
+        "the unknown-source session must not appear in results"
+    );
+}
+
+#[test]
+fn test_fts_only_metadata_prune_flags_results_incomplete() {
+    // #249 RC-003 on the FTS-only path (no embedder): build_candidates silently drops
+    // a matched session whose source is unknown. fts_only_outcome detects the shrunk
+    // metadata map and flags results_incomplete. Perspective: branch (the FTS-only
+    // prune site, separate from the hybrid `retain`).
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow design");
+    insert_session(&conn, "weird", "gemini", "/proj", now_ms);
+    insert_message(&conn, "weird", "user", "authentication retry logic");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        outcome.results_incomplete,
+        "the FTS-only path must also flag a pruned unknown-source match (#249 RC-003)"
+    );
+    assert!(
+        !outcome.vec_degraded,
+        "no embedder, so no vector leg to degrade"
+    );
+    assert_eq!(outcome.results.len(), 1);
+}
+
+#[test]
+fn test_find_candidate_sessions_reports_no_skips_on_clean_rows() {
+    // #249 RC-002 guard: a clean FTS query skips no rows, so the search is complete
+    // (skipped=0). The skipped>0 -> results_incomplete branch fires only on a candidate
+    // row that fails to deserialize, which needs a corrupt DB not reproducible in-process
+    // (the session_id/rank columns always deserialize), so that true-branch stays
+    // uncovered. It is a distinct assignment from the metadata-prune branch
+    // (meta_map.len() < requested) the prune tests exercise; they converge on the same
+    // results_incomplete field but do not cover this path.
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    insert_session(&conn, "s1", "claude", "/proj", now_ms);
+    insert_message(&conn, "s1", "user", "authentication flow design");
+
+    let (ranked, skipped) = find_candidate_sessions(
+        &conn,
+        &SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        "authentication",
+        now_ms,
+    )
+    .unwrap();
+
+    assert_eq!(skipped, 0, "clean rows skip nothing");
+    assert_eq!(ranked.len(), 1);
 }
 
 fn hybrid_search_ids(

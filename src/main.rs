@@ -735,6 +735,18 @@ where
         );
     }
 
+    // The FTS leg silently dropped matched sessions (a candidate row failed to
+    // deserialize, or a matched session was pruned for missing/unknown-source
+    // metadata). The returned set is a subset of the true matches, so the envelope
+    // must not report it as complete (#249 RC-002/RC-003).
+    if outcome.results_incomplete {
+        degraded = true;
+        notes.push(
+            "results may be incomplete: some matched sessions were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
+                .to_owned(),
+        );
+    }
+
     // Surface the default automated-session exclusion so an agent consumer can
     // discover --include-automated; skipped when the agent already opted in.
     if !include_automated {
@@ -1445,7 +1457,13 @@ fn render_doctor_report(
         "model_recovery_retryable": model_recovery_retryable,
     });
 
-    CommandOutput::with_notes(markdown, data, !healthy, notes)
+    // A failed `--fix` recovery must flip `degraded` even when every check is `ok`.
+    // A not-installed model reports `ok` (FTS-only is supported), so `!healthy`
+    // alone stays false and a failed re-fetch would surface only in `notes` and
+    // `data.model_recovered` — a `degraded:false` envelope over a recovery that did
+    // not take (#249 RC-004).
+    let degraded = !healthy || matches!(model_recovery, ModelRecovery::Failed(_));
+    CommandOutput::with_notes(markdown, data, degraded, notes)
 }
 
 // -- Output formatting --
@@ -3415,6 +3433,14 @@ mod tests {
             "recovery failure must reach notes, got: {:?}",
             out.notes
         );
+        // #249 RC-004: a not-installed model reports `ok` (FTS-only is supported), so
+        // every check is `ok` and `healthy` is true. Without folding the recovery
+        // verdict into the degraded flag, the envelope would say `degraded:false` over
+        // a `--fix` that did not take. The failed recovery must flip it.
+        assert!(
+            out.degraded,
+            "a failed --fix recovery must mark the envelope degraded even when every check is ok (#249 RC-004)"
+        );
     }
 
     // doctor --fix on a hard fault whose re-fetch fails transiently: the model
@@ -5011,6 +5037,63 @@ mod tests {
                 .iter()
                 .any(|n| n.contains("vector query failed at runtime")),
             "the runtime degradation note must surface for the agent channel, got: {:?}",
+            out.notes
+        );
+    }
+
+    // #249 RC-002/RC-003: the FTS leg silently dropped a matched session (here an
+    // unknown-source row pruned by fetch_session_metadata), so the result is a subset
+    // of the true matches. run_search must forward search's `results_incomplete` to a
+    // degraded envelope with an agent-facing note, not present the thinned set as
+    // complete. Driven through run_search_with so the envelope wiring is the code
+    // under test. Perspective: hazard (a silent prune misread as complete) + branch
+    // (the results_incomplete merge arm).
+    #[test]
+    fn run_search_reports_degraded_when_results_incomplete() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let mut conn = open_or_create_db(&db_path).unwrap();
+            // A surviving claude session keeps the result non-empty.
+            db::seed_session(&conn, "s1");
+            db::seed_chunk(&conn, 1, "authentication flow");
+            // An unknown-source session that matches but gets pruned for its source.
+            conn.execute(
+                "INSERT INTO sessions VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0, NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES ('weird', 'user', 'authentication retry')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (2, 'weird', 'authentication retry', 0)",
+                [],
+            )
+            .unwrap();
+            // Embed both chunks so has_vec_data() is true and the hybrid path (with the
+            // metadata prune) runs.
+            embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        }
+
+        let out = run_search_with(
+            search_command("authentication"),
+            &Some(db_path),
+            mock_loader,
+        )
+        .unwrap();
+
+        assert!(
+            out.degraded,
+            "a silently pruned match must mark the envelope degraded"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("results may be incomplete")),
+            "the incompleteness note must surface for the agent channel, got: {:?}",
             out.notes
         );
     }
