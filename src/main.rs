@@ -14,6 +14,7 @@ mod search;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Display;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -598,6 +599,30 @@ fn search_idle_message(session_count: i64) -> Option<&'static str> {
     (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
 }
 
+/// The empty-index search result: prints the idle guidance and returns an empty,
+/// non-degraded envelope at exit 0. Shared by the missing-file, never-indexed
+/// (`Empty` schema), and zero-session branches so all three behave identically.
+fn search_idle_output() -> CommandOutput {
+    if let Some(msg) = search_idle_message(0) {
+        done(msg);
+    }
+    CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
+}
+
+/// Gate the non-doctor read commands (`search`, `status`, `show`) on schema
+/// currency. A read-only open cannot migrate, so a stale on-disk schema surfaces
+/// as an explicit `DataError` naming `recall rebuild` rather than a silent stale
+/// result (SOW assumption 1). `Empty` is handled by each command's own empty path
+/// before this is called, so it maps to `Ok` here (never reached in practice).
+fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
+    match state {
+        db::SchemaState::Current | db::SchemaState::Empty => Ok(()),
+        db::SchemaState::Stale => Err(RecallError::DataError(
+            "database schema is out of date; run `recall rebuild` to migrate it".to_owned(),
+        )),
+    }
+}
+
 /// The three mutually exclusive `--*-current` flags, grouped so
 /// `resolve_current_session` takes one argument instead of three booleans.
 #[derive(Clone, Copy, Debug)]
@@ -688,17 +713,30 @@ where
     )?;
 
     let path = resolve_db_path(db_path)?;
-    let conn = open_or_create_db(&path)?;
+
+    // A missing DB file is the pre-index state, not an error: emit the same idle
+    // guidance search shows for a zero-session index, at exit 0 (never a stale or
+    // not-found failure). Read commands open read-only, so an absent file is not
+    // created here as a side effect (unlike the former open_or_create_db path).
+    if !path.exists() {
+        return Ok(search_idle_output());
+    }
+
+    let (conn, tier) = db::open_db_readonly(&path)?;
+    match db::schema_state(&conn)? {
+        // A file exists but recall never indexed it: idle, not stale.
+        db::SchemaState::Empty => return Ok(search_idle_output()),
+        // A read-only open cannot migrate an old shape; fail explicitly.
+        state => require_current_schema(state)?,
+    }
+    // Only the immutable (tier-2) branch can miss un-checkpointed `-wal` changes.
+    let wal_note = db::stale_wal_note(&path, tier);
 
     // Search reads the pre-built index; indexing happens via `recall index`,
     // not on every search, so search latency no longer depends on scan cost.
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-    if let Some(msg) = search_idle_message(session_count) {
-        done(msg);
-        return Ok(CommandOutput::ok(
-            String::new(),
-            serde_json::json!({ "results": [] }),
-        ));
+    if search_idle_message(session_count).is_some() {
+        return Ok(search_idle_output());
     }
 
     let embedder = load_embedder();
@@ -770,6 +808,13 @@ where
     let data = serde_json::json!({
         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
     });
+
+    // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; surface
+    // that as a note + degraded so an agent knows the result may lag the writer.
+    if let Some(note) = wal_note {
+        degraded = true;
+        notes.push(note);
+    }
 
     // Search is read-only: embedding happens at `recall index` time, never on the
     // search path, so search latency does not depend on embedding cost.
@@ -859,8 +904,18 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
         );
     }
 
-    let conn = open_or_create_db(&path)?;
-    show_session(&conn, session_id, verbose)
+    let (conn, _tier) = db::open_db_readonly(&path)?;
+    match db::schema_state(&conn)? {
+        // A file exists but recall never indexed it: same as not-found.
+        db::SchemaState::Empty => Err(RecallError::Usage(
+            "Database not found. Run `recall index` first.".to_owned(),
+        )
+        .into()),
+        state => {
+            require_current_schema(state)?;
+            show_session(&conn, session_id, verbose)
+        }
+    }
 }
 
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
@@ -897,18 +952,29 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
         ));
     }
 
-    let conn = open_or_create_db(&path)?;
+    let (conn, tier) = db::open_db_readonly(&path)?;
 
-    let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-    let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
-    // Count distinct embedded chunks, not vec_chunks rows: one qa_chunk can hold
-    // several sub-embedding rows (embedder.rs:80 inserts one per sub-chunk), so
-    // COUNT(*) overstates coverage and can exceed qa_chunks. This mirrors the
-    // chunk-level coverage `pending_chunks` uses (DISTINCT chunk_id, embedder.rs:127).
-    let embedded: i64 =
-        conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
-            r.get(0)
-        })?;
+    // A never-indexed DB (no `sessions` table) reports zero counts, same as a
+    // missing file; a stale on-disk schema cannot be migrated read-only, so it
+    // fails explicitly. Only `Current` runs the count queries.
+    let (sessions, chunks, embedded) = match db::schema_state(&conn)? {
+        db::SchemaState::Empty => (0, 0, 0),
+        state => {
+            require_current_schema(state)?;
+            let sessions: i64 =
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+            let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
+            // Count distinct embedded chunks, not vec_chunks rows: one qa_chunk can hold
+            // several sub-embedding rows (embedder.rs:80 inserts one per sub-chunk), so
+            // COUNT(*) overstates coverage and can exceed qa_chunks. This mirrors the
+            // chunk-level coverage `pending_chunks` uses (DISTINCT chunk_id, embedder.rs:127).
+            let embedded: i64 =
+                conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
+                    r.get(0)
+                })?;
+            (sessions, chunks, embedded)
+        }
+    };
 
     // Writes to an in-memory Vec are infallible, so the io::Result is discarded.
     let mut buf = Vec::new();
@@ -935,7 +1001,12 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
         "model_ready": model_ok,
     });
 
-    Ok(CommandOutput::ok(markdown, data))
+    // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; the
+    // reported counts may lag the writer, so mark the envelope degraded.
+    match db::stale_wal_note(&path, tier) {
+        Some(note) => Ok(CommandOutput::with_notes(markdown, data, true, vec![note])),
+        None => Ok(CommandOutput::ok(markdown, data)),
+    }
 }
 
 /// One diagnostic check's result: a stable `name`, whether it passed, an optional
@@ -1001,6 +1072,17 @@ fn run_db_check(name: &'static str, check: impl FnOnce() -> Result<DoctorCheck>)
     check().unwrap_or_else(|e| {
         DoctorCheck::fail(name, format!("check could not run: {e}"), CORRUPT_DB_REMEDY)
     })
+}
+
+/// The doctor verdict for a DB that could not be opened or read at the schema
+/// level: a single `integrity` FAIL naming the data-loss remedy. Shared by the
+/// open-failure and schema-read-error branches so their message stays identical.
+fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
+    vec![DoctorCheck::fail(
+        "integrity",
+        format!("cannot open database: {e}"),
+        CORRUPT_DB_REMEDY,
+    )]
 }
 
 /// `PRAGMA quick_check` (not `integrity_check`): the page-level scan returns a
@@ -1275,32 +1357,63 @@ where
         ));
     }
 
-    // A DB corrupt at the header level fails to open (open_db runs WAL + schema
-    // migrations before any check). doctor must report that, not crash on it, so
-    // an open failure becomes the integrity verdict; the model probe is DB-free
-    // and still runs.
+    // A DB corrupt at the header level fails to open. doctor must report that, not
+    // crash on it, so an open failure becomes the integrity verdict; the model
+    // probe is DB-free and still runs.
     //
-    // `--fix` runs before the checks (only when the DB opened) so orphan_embeddings
-    // re-counts the post-delete state — without that ordering the user would repair
-    // and still see the pre-fix FAIL. A corrupt DB that fails to open can't be
-    // repaired here; its remedy is the data-loss tier (re-index), not orphan cleanup.
+    // `--fix` deletes orphan rows, so it needs the writing `open_or_create_db` path
+    // (which also migrates a stale schema before repairing). Plain `doctor` is a
+    // read-only diagnostic (the issue's `inspect`): it opens read-only so it works
+    // in a read-only directory, and reads `schema_state` as a *verdict* rather than
+    // migrating. Under `--fix`, checks run after the repair so orphan_embeddings
+    // re-counts the post-delete state.
     let mut repairs: Option<Vec<RepairOutcome>> = None;
-    let mut checks = match open_or_create_db(&path) {
-        Ok(conn) => {
-            if fix {
+    let mut wal_note: Option<String> = None;
+    let mut checks = if fix {
+        match open_or_create_db(&path) {
+            Ok(conn) => {
                 repairs = Some(run_repairs(&conn));
+                vec![
+                    run_db_check("integrity", || check_integrity(&conn)),
+                    run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
+                    run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
+                ]
             }
-            vec![
-                run_db_check("integrity", || check_integrity(&conn)),
-                run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
-                run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
-            ]
+            Err(e) => open_failure_checks(e),
         }
-        Err(e) => vec![DoctorCheck::fail(
-            "integrity",
-            format!("cannot open database: {e}"),
-            CORRUPT_DB_REMEDY,
-        )],
+    } else {
+        match db::open_db_readonly(&path) {
+            Ok((conn, tier)) => {
+                wal_note = db::stale_wal_note(&path, tier);
+                match db::schema_state(&conn) {
+                    Ok(db::SchemaState::Current) => vec![
+                        run_db_check("integrity", || check_integrity(&conn)),
+                        run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
+                        run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
+                    ],
+                    // A stale (migratable) schema is not corruption: emit a dedicated
+                    // non-destructive verdict and skip the data/integrity checks that
+                    // would misreport the destructive CORRUPT_DB_REMEDY on an old shape.
+                    Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
+                        "schema",
+                        "database schema is out of date".to_owned(),
+                        "run `recall rebuild`",
+                    )],
+                    // A never-indexed DB has no tables to check; skip the DB checks
+                    // (they would query absent tables and misreport CORRUPT_DB_REMEDY)
+                    // but still emit an explicit unhealthy verdict, matching the
+                    // missing-DB path above (empty checks would otherwise render
+                    // `healthy: true` for an unusable index).
+                    Ok(db::SchemaState::Empty) => vec![DoctorCheck::fail(
+                        "index",
+                        "no index: database has never been indexed".to_owned(),
+                        "run `recall index`",
+                    )],
+                    Err(e) => open_failure_checks(e),
+                }
+            }
+            Err(e) => open_failure_checks(e),
+        }
     };
     // The model column comes last on every path (DB-free probe), so it runs even
     // when the DB failed to open. Under --fix it may re-fetch a degraded model
@@ -1309,13 +1422,14 @@ where
         check_model_with_optional_recovery(fix, load_embedder, recover_model);
     checks.push(model_check);
 
-    Ok(render_doctor_report(
-        verbose,
-        &path,
-        &checks,
-        &repairs,
-        &model_recovery,
-    ))
+    let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
+    // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; surface
+    // it in the same envelope notes[] the other read commands use, and mark degraded.
+    if let Some(note) = wal_note {
+        output.degraded = true;
+        output.notes.push(note);
+    }
+    Ok(output)
 }
 
 /// Assemble the doctor envelope from the per-check verdicts and the optional
@@ -3752,6 +3866,152 @@ mod tests {
         );
     }
 
+    // A DB file that exists but was never indexed (no `sessions` table) is unusable,
+    // so doctor must report `healthy: false` with an actionable `index` verdict —
+    // matching the missing-DB path. The pre-fix Empty branch emitted no checks, which
+    // rendered `healthy: true` for an index that cannot answer a single query.
+    #[test]
+    fn run_doctor_reports_unhealthy_on_never_indexed_db() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        // A bare connection creates a valid but empty SQLite file (no schema).
+        drop(rusqlite::Connection::open(&db_path).unwrap());
+
+        let out = run_doctor(false, false, &Some(db_path.clone())).unwrap();
+
+        assert_eq!(
+            out.data["healthy"], false,
+            "never-indexed DB must be unhealthy, got: {}",
+            out.data
+        );
+        let index_check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "index");
+        assert!(
+            index_check.is_some_and(|c| c["ok"] == false),
+            "expected a failing `index` check, got: {}",
+            out.data
+        );
+    }
+
+    /// A DB file that exists but was never indexed: a bare SQLite file with no
+    /// `sessions` table (`SchemaState::Empty`). The read commands treat this as the
+    /// idle pre-index state, distinct from a missing file (guarded earlier by
+    /// `path.exists()`). Perspective: boundary (existing-but-empty DB).
+    fn bare_empty_db(dir: &Path) -> PathBuf {
+        let db_path = dir.join("recall.db");
+        drop(rusqlite::Connection::open(&db_path).unwrap());
+        db_path
+    }
+
+    // search against an existing-but-never-indexed DB returns the idle envelope
+    // (empty results, exit-0 semantics), not a stale or not-found error: the
+    // `SchemaState::Empty` arm of run_search.
+    #[test]
+    fn run_search_on_existing_empty_db_returns_idle() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let out = run_search_with(search_command("anything"), &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(
+            out.data["results"].as_array().unwrap().len(),
+            0,
+            "an empty DB search must return zero results, got: {}",
+            out.data
+        );
+    }
+
+    // show against an existing-but-never-indexed DB is a Usage error identical to
+    // the missing-file path: the `SchemaState::Empty` arm of run_show.
+    #[test]
+    fn run_show_on_existing_empty_db_is_not_found_usage_error() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let err = run_show("deadbeef", false, &Some(db_path)).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Database not found"),
+            "empty DB show must report not-found, got: {err}"
+        );
+    }
+
+    // status against an existing-but-never-indexed DB reports zero counts, same as
+    // a missing file: the `SchemaState::Empty` arm of run_status.
+    #[test]
+    fn run_status_on_existing_empty_db_reports_zero_counts() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let out = run_status(false, &Some(db_path)).unwrap();
+
+        assert_eq!(out.data["sessions"], 0);
+        assert_eq!(out.data["qa_chunks"], 0);
+        assert_eq!(out.data["embedded"], 0);
+    }
+
+    // doctor (read-only, no --fix) on a stale on-disk schema emits a dedicated
+    // non-destructive `schema` verdict pointing at `recall rebuild`, not the
+    // data-loss CORRUPT_DB_REMEDY: the `SchemaState::Stale` arm of run_doctor.
+    // A lone `sessions` table (no `messages`) is the minimal stale shape.
+    #[test]
+    fn run_doctor_reports_schema_out_of_date_on_stale_db() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, session_type TEXT);",
+            )
+            .unwrap();
+        }
+
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
+
+        let schema = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "schema")
+            .unwrap_or_else(|| panic!("expected a `schema` check, got: {}", out.data));
+        assert_eq!(schema["ok"], false);
+        assert!(
+            schema["detail"].as_str().unwrap().contains("out of date"),
+            "got: {schema}"
+        );
+        assert_eq!(out.data["healthy"], false);
+    }
+
+    // doctor --fix on an unopenable (corrupt-header) DB: the writing
+    // open_or_create_db path fails, and the failure becomes the integrity verdict
+    // rather than propagating — the `--fix` open-failure arm of run_doctor.
+    #[test]
+    fn run_doctor_fix_reports_open_failure_on_unopenable_db() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
+
+        let integrity = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "integrity")
+            .unwrap();
+        assert_eq!(integrity["ok"], false);
+        assert!(
+            integrity["detail"]
+                .as_str()
+                .unwrap()
+                .contains("cannot open database"),
+            "got: {integrity}"
+        );
+    }
+
     /// Seed a one-session Claude JSONL under `claude_dir` so a rebuild that
     /// re-scans the source re-stages the session and its FTS terms. Mirrors the
     /// integration `seed_indexed_session` fixture (cli_integration.rs:186); the
@@ -5269,5 +5529,34 @@ mod tests {
             ),
             "SessionData must not derive Serialize (ADR-0001): the --json schema is built explicitly"
         );
+    }
+
+    // T-002 (FR-003): a stale on-disk schema hard-fails the non-doctor read
+    // commands with an actionable DataError, since a read-only open cannot migrate.
+    #[test]
+    fn require_current_schema_stale_is_data_error_naming_rebuild() {
+        let err = require_current_schema(db::SchemaState::Stale).unwrap_err();
+        assert!(
+            matches!(err, RecallError::DataError(_)),
+            "stale schema must be a DataError, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("recall rebuild"),
+            "message must name the fix: {err}"
+        );
+        // DataError maps to sysexits DATA_ERROR (65) at the CLI boundary.
+        assert_eq!(err.error_code().code(), 65);
+    }
+
+    #[test]
+    fn require_current_schema_current_is_ok() {
+        assert!(require_current_schema(db::SchemaState::Current).is_ok());
+    }
+
+    // T-004 (Empty branch): an existing-but-never-indexed DB (no `sessions` table)
+    // is readable-as-idle, not a hard-fail; read commands return empty output.
+    #[test]
+    fn require_current_schema_empty_is_ok() {
+        assert!(require_current_schema(db::SchemaState::Empty).is_ok());
     }
 }

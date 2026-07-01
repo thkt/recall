@@ -301,3 +301,316 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
         .unwrap();
     assert_eq!(vec_count2, 1, "re-open must keep vec row linked");
 }
+
+// ---- T-002: schema_state classification (FR-002) ----
+
+const SESSIONS_FULL: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
+     project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT";
+const SESSIONS_NO_TYPE: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
+     project TEXT, slug TEXT, timestamp INTEGER, mtime REAL";
+const QA_FULL: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
+     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER";
+const QA_NO_ROWID: &str =
+    "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER";
+const QA_CHUNK_HASH: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
+     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, chunk_hash TEXT";
+const VEC_FULL: &str = "+chunk_id INTEGER, +sub_idx INTEGER";
+const VEC_NO_SUB: &str = "+chunk_id INTEGER";
+
+/// Build a DB with the four core tables from explicit column/tokenizer knobs, so
+/// each `schema_state` variant is expressed as a single differing fragment.
+fn build_schema(path: &Path, sessions_cols: &str, tokenizer: &str, qa_cols: &str, vec_cols: &str) {
+    ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e)).unwrap();
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TABLE sessions ({sessions_cols});
+         CREATE VIRTUAL TABLE messages USING fts5(
+             session_id UNINDEXED, role, text, tokenize='{tokenizer}'
+         );
+         CREATE TABLE qa_chunks ({qa_cols});
+         CREATE VIRTUAL TABLE vec_chunks USING vec0(
+             embedding FLOAT[{EMBEDDING_DIMS}], {vec_cols}
+         );
+         CREATE VIRTUAL TABLE messages_vocab USING fts5vocab(messages, row);"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn test_schema_state_current_on_freshly_opened_db() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
+}
+
+#[test]
+fn test_schema_state_empty_when_no_sessions_table() {
+    // A bare file SQLite opens as an empty database: no `sessions` table.
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Empty);
+}
+
+#[test]
+fn test_schema_state_stale_when_sessions_only() {
+    // sessions present but every core table absent: crash-artifact guard.
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
+    conn.execute_batch(&format!("CREATE TABLE sessions ({SESSIONS_FULL});"))
+        .unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+#[test]
+fn test_schema_state_stale_missing_messages_vocab() {
+    // `messages_vocab` is the fts5vocab table `search` hard-requires; a DB missing
+    // only it (otherwise current) is a crash artifact, not a migration target.
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(tmp.path(), SESSIONS_FULL, FTS_TOKENIZER, QA_FULL, VEC_FULL);
+    let conn = Connection::open(tmp.path()).unwrap();
+    conn.execute_batch("DROP TABLE messages_vocab;").unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+#[test]
+fn test_schema_state_stale_missing_session_type() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(
+        tmp.path(),
+        SESSIONS_NO_TYPE,
+        FTS_TOKENIZER,
+        QA_FULL,
+        VEC_FULL,
+    );
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+#[test]
+fn test_schema_state_stale_missing_sub_idx() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(
+        tmp.path(),
+        SESSIONS_FULL,
+        FTS_TOKENIZER,
+        QA_FULL,
+        VEC_NO_SUB,
+    );
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+#[test]
+fn test_schema_state_stale_missing_src_rowid() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(
+        tmp.path(),
+        SESSIONS_FULL,
+        FTS_TOKENIZER,
+        QA_NO_ROWID,
+        VEC_FULL,
+    );
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+#[test]
+fn test_schema_state_stale_with_chunk_hash() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(
+        tmp.path(),
+        SESSIONS_FULL,
+        FTS_TOKENIZER,
+        QA_CHUNK_HASH,
+        VEC_FULL,
+    );
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+#[test]
+fn test_schema_state_stale_non_trigram_tokenizer() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(tmp.path(), SESSIONS_FULL, "unicode61", QA_FULL, VEC_FULL);
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+}
+
+// ---- T-003: stale_wal_note gating (FR-006) ----
+
+#[test]
+fn test_stale_wal_note_immutable_nonempty_wal_is_some() {
+    let tmp = NamedTempFile::new().unwrap();
+    let wal = wal_path(tmp.path());
+    fs::write(&wal, b"uncommitted").unwrap();
+    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
+    fs::remove_file(&wal).ok();
+    assert!(note.is_some(), "immutable tier + non-empty -wal must warn");
+}
+
+#[test]
+fn test_stale_wal_note_direct_is_none() {
+    let tmp = NamedTempFile::new().unwrap();
+    let wal = wal_path(tmp.path());
+    fs::write(&wal, b"uncommitted").unwrap();
+    let note = stale_wal_note(tmp.path(), OpenTier::Direct);
+    fs::remove_file(&wal).ok();
+    assert!(
+        note.is_none(),
+        "direct tier reads -wal fresh; no false positive"
+    );
+}
+
+#[test]
+fn test_stale_wal_note_absent_or_empty_wal_is_none() {
+    let tmp = NamedTempFile::new().unwrap();
+    // Absent -wal.
+    assert!(stale_wal_note(tmp.path(), OpenTier::Immutable).is_none());
+    // Zero-length -wal.
+    let wal = wal_path(tmp.path());
+    fs::write(&wal, b"").unwrap();
+    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
+    fs::remove_file(&wal).ok();
+    assert!(note.is_none(), "empty -wal carries no uncommitted changes");
+}
+
+// ---- T-001: open_db_readonly read-only flag + Direct tier (FR-001, AC-4) ----
+
+#[test]
+fn test_open_db_readonly_writable_dir_is_direct_and_read_only() {
+    // A DB created in a writable temp dir keeps its `-shm` sidecar, so the tier-1
+    // `SQLITE_OPEN_READ_ONLY` probe succeeds and selects Direct (no immutable fallback).
+    let tmp = NamedTempFile::new().unwrap();
+    {
+        let conn = open_db(tmp.path()).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
+    }
+
+    let (conn, tier) = open_db_readonly(tmp.path()).unwrap();
+    assert_eq!(
+        tier,
+        OpenTier::Direct,
+        "writable dir must select Direct tier"
+    );
+
+    // Proves the connection carries SQLITE_OPEN_READ_ONLY: any write is rejected.
+    // Returning OpenTier::Direct alone would not prove the flag; a broken impl
+    // could open read-write and still report Direct.
+    let err = conn
+        .execute("CREATE TABLE probe_write (x INTEGER)", [])
+        .expect_err("read-only connection must reject a write");
+    let rusqlite::Error::SqliteFailure(inner, _) = &err else {
+        panic!("expected a SqliteFailure, got {err:?}");
+    };
+    assert_eq!(
+        inner.code,
+        rusqlite::ErrorCode::ReadOnly,
+        "write must fail with SQLITE_READONLY, got {err:?}"
+    );
+}
+
+// ---- T-002: is_readonly_dir_error gates the immutable fallback on dir writability ----
+//
+// Regression for the SOW HIGH residual: the tier-2 `immutable=1` fallback disables change
+// detection, so it must fire ONLY on read-only media, never in a WRITABLE directory where a
+// missing `-shm` (restored single-file backup, EMFILE, TOCTOU delete) surfaces as the same
+// SQLITE_CANTOPEN. Without the `dir_is_unwritable` guard the predicate freezes a still-mutating
+// DB and races a concurrent `recall index` close-checkpoint (UB). Testing the predicate directly
+// avoids reproducing the version-fragile missing-`-shm`-in-writable SQLite state.
+
+#[cfg(unix)]
+#[test]
+fn test_is_readonly_dir_error_writable_dir_rejects_immutable_fallback() {
+    use rusqlite::ffi::Error as FfiError;
+
+    // SQLITE_CANTOPEN (14): the exact code a missing `-shm` surfaces on a WAL-mode read.
+    let cantopen = rusqlite::Error::SqliteFailure(FfiError::new(14), None);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+
+    assert!(
+        !is_readonly_dir_error(&db, &cantopen),
+        "CannotOpen in a writable dir is not read-only media; the immutable fallback must not fire"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
+    use rusqlite::ffi::Error as FfiError;
+    use std::os::unix::fs::PermissionsExt;
+
+    let cantopen = rusqlite::Error::SqliteFailure(FfiError::new(14), None);
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root ignores dir permission bits, so the read-only condition can't be reproduced.
+    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
+    if is_root {
+        let _ = fs::remove_file(dir.path().join(".root_probe"));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let got = is_readonly_dir_error(&db, &cantopen);
+    // Restore write bits before the assert so TempDir's drop can clean up.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        got,
+        "CannotOpen in a read-only (0o555) dir is read-only media; the immutable fallback must fire"
+    );
+}
+
+// A read-only open of a file that does not exist errors at open (READ_ONLY cannot
+// create the DB). In a WRITABLE dir that is not read-only media, so the initial-open
+// Err arm must propagate the error rather than reach for the immutable fallback.
+#[test]
+fn test_open_db_readonly_missing_file_in_writable_dir_errors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("nope.db");
+    assert!(
+        open_db_readonly(&missing).is_err(),
+        "a missing DB in a writable dir must error, not silently open"
+    );
+}
+
+// A missing file in a READ-ONLY dir sends the initial-open Err through the
+// immutable (tier-2) fallback branch; the fallback itself still fails (no file to
+// open immutably), so the call errors — but the tier-2 arm is exercised.
+#[cfg(unix)]
+#[test]
+fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("nope.db");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root ignores dir permission bits, so the read-only condition can't be reproduced.
+    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
+    if is_root {
+        let _ = fs::remove_file(dir.path().join(".root_probe"));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let result = open_db_readonly(&missing);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        result.is_err(),
+        "a missing DB in a read-only dir errors even after the immutable fallback"
+    );
+}
+
+// encode_uri_path percent-escapes every byte outside the RFC 3986 unreserved set,
+// keeping `/` as the separator; a space and a `?` (URI query delimiter) must be
+// escaped so the `file:` URI is not truncated at the DB path.
+#[test]
+fn test_encode_uri_path_escapes_reserved_bytes() {
+    let encoded = encode_uri_path(Path::new("/a b/c?d.db"));
+    assert_eq!(encoded, "/a%20b/c%3Fd.db");
+}
