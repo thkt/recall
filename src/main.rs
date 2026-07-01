@@ -3896,6 +3896,122 @@ mod tests {
         );
     }
 
+    /// A DB file that exists but was never indexed: a bare SQLite file with no
+    /// `sessions` table (`SchemaState::Empty`). The read commands treat this as the
+    /// idle pre-index state, distinct from a missing file (guarded earlier by
+    /// `path.exists()`). Perspective: boundary (existing-but-empty DB).
+    fn bare_empty_db(dir: &Path) -> PathBuf {
+        let db_path = dir.join("recall.db");
+        drop(rusqlite::Connection::open(&db_path).unwrap());
+        db_path
+    }
+
+    // search against an existing-but-never-indexed DB returns the idle envelope
+    // (empty results, exit-0 semantics), not a stale or not-found error: the
+    // `SchemaState::Empty` arm of run_search.
+    #[test]
+    fn run_search_on_existing_empty_db_returns_idle() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let out = run_search_with(search_command("anything"), &Some(db_path), mock_loader).unwrap();
+
+        assert_eq!(
+            out.data["results"].as_array().unwrap().len(),
+            0,
+            "an empty DB search must return zero results, got: {}",
+            out.data
+        );
+    }
+
+    // show against an existing-but-never-indexed DB is a Usage error identical to
+    // the missing-file path: the `SchemaState::Empty` arm of run_show.
+    #[test]
+    fn run_show_on_existing_empty_db_is_not_found_usage_error() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let err = run_show("deadbeef", false, &Some(db_path)).unwrap_err();
+
+        assert!(
+            err.to_string().contains("Database not found"),
+            "empty DB show must report not-found, got: {err}"
+        );
+    }
+
+    // status against an existing-but-never-indexed DB reports zero counts, same as
+    // a missing file: the `SchemaState::Empty` arm of run_status.
+    #[test]
+    fn run_status_on_existing_empty_db_reports_zero_counts() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let out = run_status(false, &Some(db_path)).unwrap();
+
+        assert_eq!(out.data["sessions"], 0);
+        assert_eq!(out.data["qa_chunks"], 0);
+        assert_eq!(out.data["embedded"], 0);
+    }
+
+    // doctor (read-only, no --fix) on a stale on-disk schema emits a dedicated
+    // non-destructive `schema` verdict pointing at `recall rebuild`, not the
+    // data-loss CORRUPT_DB_REMEDY: the `SchemaState::Stale` arm of run_doctor.
+    // A lone `sessions` table (no `messages`) is the minimal stale shape.
+    #[test]
+    fn run_doctor_reports_schema_out_of_date_on_stale_db() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, session_type TEXT);",
+            )
+            .unwrap();
+        }
+
+        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
+
+        let schema = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "schema")
+            .unwrap_or_else(|| panic!("expected a `schema` check, got: {}", out.data));
+        assert_eq!(schema["ok"], false);
+        assert!(
+            schema["detail"].as_str().unwrap().contains("out of date"),
+            "got: {schema}"
+        );
+        assert_eq!(out.data["healthy"], false);
+    }
+
+    // doctor --fix on an unopenable (corrupt-header) DB: the writing
+    // open_or_create_db path fails, and the failure becomes the integrity verdict
+    // rather than propagating — the `--fix` open-failure arm of run_doctor.
+    #[test]
+    fn run_doctor_fix_reports_open_failure_on_unopenable_db() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        fs::write(&db_path, b"this is not a sqlite database").unwrap();
+
+        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
+
+        let integrity = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "integrity")
+            .unwrap();
+        assert_eq!(integrity["ok"], false);
+        assert!(
+            integrity["detail"]
+                .as_str()
+                .unwrap()
+                .contains("cannot open database"),
+            "got: {integrity}"
+        );
+    }
+
     /// Seed a one-session Claude JSONL under `claude_dir` so a rebuild that
     /// re-scans the source re-stages the session and its FTS terms. Mirrors the
     /// integration `seed_indexed_session` fixture (cli_integration.rs:186); the

@@ -564,3 +564,53 @@ fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
         "CannotOpen in a read-only (0o555) dir is read-only media; the immutable fallback must fire"
     );
 }
+
+// A read-only open of a file that does not exist errors at open (READ_ONLY cannot
+// create the DB). In a WRITABLE dir that is not read-only media, so the initial-open
+// Err arm must propagate the error rather than reach for the immutable fallback.
+#[test]
+fn test_open_db_readonly_missing_file_in_writable_dir_errors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("nope.db");
+    assert!(
+        open_db_readonly(&missing).is_err(),
+        "a missing DB in a writable dir must error, not silently open"
+    );
+}
+
+// A missing file in a READ-ONLY dir sends the initial-open Err through the
+// immutable (tier-2) fallback branch; the fallback itself still fails (no file to
+// open immutably), so the call errors — but the tier-2 arm is exercised.
+#[cfg(unix)]
+#[test]
+fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("nope.db");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root ignores dir permission bits, so the read-only condition can't be reproduced.
+    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
+    if is_root {
+        let _ = fs::remove_file(dir.path().join(".root_probe"));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let result = open_db_readonly(&missing);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        result.is_err(),
+        "a missing DB in a read-only dir errors even after the immutable fallback"
+    );
+}
+
+// encode_uri_path percent-escapes every byte outside the RFC 3986 unreserved set,
+// keeping `/` as the separator; a space and a `?` (URI query delimiter) must be
+// escaped so the `file:` URI is not truncated at the DB path.
+#[test]
+fn test_encode_uri_path_escapes_reserved_bytes() {
+    let encoded = encode_uri_path(Path::new("/a b/c?d.db"));
+    assert_eq!(encoded, "/a%20b/c%3Fd.db");
+}
