@@ -4,7 +4,7 @@
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
@@ -61,14 +61,20 @@ fn show_without_database_exits_usage() {
     assert_eq!(exit_code(recall(dir.path()).args(["show", "deadbeef"])), 64);
 }
 
-// T-CLI005: searching an empty (but created) index is a success that prints the
-// "no sessions indexed" guidance, exit 0 — not an error.
+// T-CLI005 / T-006 (missing-DB, FR-003): searching before any index exists is a
+// success that prints the "no sessions indexed" guidance (exit 0) AND must not
+// create the DB file — search guards on `path.exists()` and returns idle output,
+// modeling the pre-index state without writing.
 #[test]
 fn search_empty_index_exits_success() {
     let dir = TempDir::new().unwrap();
     assert_eq!(
         exit_code(recall(dir.path()).args(["search", "anything"])),
         0
+    );
+    assert!(
+        !dir.path().join("recall.db").exists(),
+        "missing-DB search must not create the index file"
     );
 }
 
@@ -933,4 +939,153 @@ fn search_no_embed_flag_is_retired_exits_usage() {
         exit_code(recall(dir.path()).args(["search", "anything", "--no-embed"])),
         64
     );
+}
+
+// T-001 (AC-1): the read commands open an already-indexed DB in a directory the
+// process cannot write to, without emitting SQLite "Error code 14" and without
+// creating any `-wal` / `-shm` sidecar. A read-only directory forces the two-tier
+// open's immutable (tier-2) fallback, so this exercises it end to end.
+#[cfg(unix)]
+#[test]
+fn read_commands_work_in_readonly_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+
+    let db = dir.path().join("recall.db");
+    // Make the sidecar state deterministic: drop `-wal` / `-shm` so tier 2
+    // (immutable) is exercised rather than an accidental tier-1 success via a
+    // surviving readable `-shm`.
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(db.with_file_name(format!("recall.db{suffix}")));
+    }
+
+    let set_mode = |mode: u32| {
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+
+    // Root bypasses directory permission bits, so the read-only condition cannot
+    // be reproduced; probe by trying to write, and skip the body if it succeeds.
+    let probe = dir.path().join(".root_probe");
+    if fs::File::create(&probe).is_ok() {
+        let _ = fs::remove_file(&probe);
+        set_mode(0o755);
+        return;
+    }
+
+    let search_out = recall(dir.path())
+        .args(["search", "hello"])
+        .output()
+        .expect("spawn recall binary");
+    let status_out = recall(dir.path())
+        .arg("status")
+        .output()
+        .expect("spawn recall binary");
+
+    // Restore before any assertion can panic: a read-only dir breaks TempDir drop.
+    set_mode(0o755);
+
+    for (name, out) in [("search", &search_out), ("status", &status_out)] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !stderr.contains("Error code 14"),
+            "{name} must not emit SQLite code 14 in a read-only dir; stderr: {stderr}"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{name} should exit 0 in a read-only dir; stderr: {stderr}"
+        );
+    }
+
+    // The read-only opens must not have created a sidecar in the directory.
+    for suffix in ["-wal", "-shm"] {
+        let side = db.with_file_name(format!("recall.db{suffix}"));
+        assert!(
+            !side.exists(),
+            "read-only open must not create recall.db{suffix}"
+        );
+    }
+}
+
+// T-008 (FR-007, AC-5): on the immutable (tier-2) open with a non-empty `-wal`,
+// `search`, `status`, and `doctor` must carry `degraded: true` plus the stale-WAL
+// note in-band. A read-only directory (no `-shm`) forces tier 2, and a non-empty
+// `-wal` triggers `stale_wal_note`; immutable=1 tells SQLite to ignore the `-wal`
+// entirely, so a synthetic (never-parsed) `-wal` is a valid stand-in for
+// un-checkpointed changes the read cannot see.
+#[cfg(unix)]
+#[test]
+fn immutable_open_with_stale_wal_surfaces_degraded_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+
+    let db = dir.path().join("recall.db");
+    // Deterministic tier-2: drop `-shm` (its absence forces the immutable fallback
+    // in a read-only dir) and replace `-wal` with non-empty bytes so `stale_wal_note`
+    // fires. immutable=1 never reads the `-wal`, so the content need not be valid.
+    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
+    fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+
+    let set_mode = |mode: u32| {
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
+    };
+    set_mode(0o555);
+
+    // Root bypasses directory permission bits, so tier 2 cannot be forced; skip.
+    let probe = dir.path().join(".root_probe");
+    if fs::File::create(&probe).is_ok() {
+        let _ = fs::remove_file(&probe);
+        set_mode(0o755);
+        return;
+    }
+
+    let outputs = [
+        (
+            "search",
+            recall(dir.path())
+                .args(["search", "hello", "--json"])
+                .output(),
+        ),
+        (
+            "status",
+            recall(dir.path()).args(["status", "--json"]).output(),
+        ),
+        (
+            "doctor",
+            recall(dir.path()).args(["doctor", "--json"]).output(),
+        ),
+    ];
+    let outputs: Vec<(&str, Output)> = outputs
+        .into_iter()
+        .map(|(name, out)| (name, out.expect("spawn recall binary")))
+        .collect();
+
+    // Restore before any assertion can panic: a read-only dir breaks TempDir drop.
+    set_mode(0o755);
+
+    for (name, out) in &outputs {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+            panic!("{name} stdout should be one JSON envelope, got {stdout:?}: {e}")
+        });
+        assert_eq!(
+            v["degraded"].as_bool(),
+            Some(true),
+            "{name} must mark degraded on an immutable open with a stale -wal, got: {stdout}"
+        );
+        let notes = v["notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} notes should be an array, got: {stdout}"));
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().is_some_and(|s| s.contains("write-ahead log"))),
+            "{name} notes must carry the stale write-ahead-log warning, got: {stdout}"
+        );
+    }
 }

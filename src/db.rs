@@ -1,13 +1,201 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use amici::migration::notify_schema_change;
 use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage::ensure_sqlite_vec;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 const FTS_TOKENIZER: &str = "trigram";
+
+/// Which open strategy `open_db_readonly` succeeded with. `Direct` reads a live
+/// `-wal` fresh via the existing `-shm`; `Immutable` was forced by a read-only
+/// directory and cannot see un-checkpointed `-wal` changes (see `stale_wal_note`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenTier {
+    Direct,
+    Immutable,
+}
+
+/// On-disk schema currency, derived by reading `sqlite_master` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaState {
+    /// No `sessions` table: recall never indexed this DB.
+    Empty,
+    /// Current shape: usable by the read commands as-is.
+    Current,
+    /// Present but an old shape a `migrate_*` pass would rewrite; a read-only
+    /// open cannot migrate it, so the read commands hard-fail (see main.rs).
+    Stale,
+}
+
+/// Open the index read-only, never writing (no WAL/`-shm` sidecars, no schema
+/// creation). This is the read-command counterpart to [`open_db`]; the write
+/// path is left untouched (SOW NFR-001).
+///
+/// Tier 1 opens with `SQLITE_OPEN_READ_ONLY`, which in a writable directory reads
+/// a live `-wal` fresh via the existing `-shm`. `open_with_flags` is lazy (it does
+/// not touch the DB file until the first query), so a read-only directory does not
+/// fail at open: a WAL-mode DB needs to create the `-shm`/`-wal` sidecars on the
+/// first read and fails there with `SQLITE_READONLY_DIRECTORY`. We therefore probe
+/// with a `sqlite_master` read and, only on that read-only-directory error, fall back
+/// to tier 2: an `immutable=1` URI that tells SQLite the DB and its `-wal` will not
+/// change, so it reads without any sidecar. Any other error (missing/unreadable file,
+/// EMFILE, TOCTOU deletion, corruption) propagates unchanged rather than being masked
+/// by a doomed second open.
+pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {
+    ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+
+    match Connection::open_with_flags(path, flags) {
+        Ok(conn) => {
+            conn.busy_timeout(Duration::from_secs(30))?;
+            match probe_readable(&conn) {
+                Ok(()) => Ok((conn, OpenTier::Direct)),
+                Err(e) if is_readonly_dir_error(path, &e) => {
+                    drop(conn);
+                    open_immutable(path, flags)
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+        Err(e) if is_readonly_dir_error(path, &e) => open_immutable(path, flags),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Force the pager to touch the DB file: reading `sqlite_master` opens page 1,
+/// which for a WAL-mode DB requires the `-shm`/`-wal` sidecars and thus surfaces a
+/// read-only-directory failure that lazy `open_with_flags` hid.
+fn probe_readable(conn: &Connection) -> rusqlite::Result<()> {
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+}
+
+/// True only when a WAL-mode read failed *because its directory is read-only*, the sole
+/// cause that justifies the tier-2 `immutable=1` fallback (which disables change
+/// detection). A read-only directory blocks sidecar creation, surfacing as either
+/// `CannotOpen` (a missing `-shm` cannot be created; extended code 14) or `ReadOnly`
+/// (a needed rollback journal / `-wal` cannot be created; includes
+/// `SQLITE_READONLY_DIRECTORY` 1544). Those primary codes are ambiguous on their own,
+/// so we additionally require the directory to be genuinely unwritable: a missing or
+/// unreadable DB file, an fd exhaustion (EMFILE), or a TOCTOU deletion also surface as
+/// `CannotOpen`/`ReadOnly` but occur in a *writable* directory, where `immutable=1`
+/// cannot help and would either mask a real error or read a still-mutating DB as frozen.
+/// Corruption (`SQLITE_CORRUPT` -> `DatabaseCorrupt`) is a different primary code and
+/// never matches, so it always propagates.
+///
+/// Directory writability is judged from the parent's permission mode bits, which covers
+/// the `chmod 0o555` case this feature targets. A read-only mount whose mode bits still
+/// show writable is not detected; such a read then propagates its original error rather
+/// than being wrongly frozen (a safe miss, not a regression).
+fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
+    let sidecar_failure = matches!(
+        e.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::CannotOpen | rusqlite::ErrorCode::ReadOnly)
+    );
+    sidecar_failure && dir_is_unwritable(db_path)
+}
+
+/// True when the DB file's parent directory has its write mode bits cleared (e.g.
+/// `chmod 0o555`). Reads mode bits only, so it never touches the filesystem's write
+/// path and is independent of the effective uid (a root process still sees `0o555` as
+/// read-only). A missing parent or unreadable metadata is treated as writable, so an
+/// ambiguous error propagates instead of being masked by the `immutable=1` fallback.
+fn dir_is_unwritable(db_path: &Path) -> bool {
+    db_path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .and_then(|dir| fs::metadata(dir).ok())
+        .is_some_and(|meta| meta.permissions().readonly())
+}
+
+/// Tier 2: reopen via an `immutable=1` URI, which reads without any sidecar.
+fn open_immutable(path: &Path, flags: OpenFlags) -> Result<(Connection, OpenTier)> {
+    let uri = format!("file:{}?immutable=1", encode_uri_path(path));
+    let conn = Connection::open_with_flags(uri, flags)?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    Ok((conn, OpenTier::Immutable))
+}
+
+/// Percent-encode a filesystem path for use in a `file:` URI. Every byte outside
+/// the RFC 3986 unreserved set is escaped; `/` is kept as the path separator.
+/// Hand-rolled (no new dependency) since the only caller is the immutable-open
+/// fallback and the input is an absolute local path.
+fn encode_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for &b in path.as_os_str().as_encoded_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The `-wal` sidecar path for a DB file (`<path>-wal`).
+fn wal_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push("-wal");
+    PathBuf::from(s)
+}
+
+/// Classify the on-disk schema by reading `sqlite_master` only (never writes),
+/// reusing [`table_def`] so "current shape" is defined next to the `migrate_*`
+/// sniffs it mirrors. Each `Stale` condition is a `migrate_*` check inverted to
+/// "a migration would run".
+pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
+    let Some(sessions_sql) = table_def(conn, "sessions")? else {
+        return Ok(SchemaState::Empty);
+    };
+
+    // A core table missing while `sessions` exists is a crash artifact: it would
+    // pass every "nothing to migrate" sniff yet leak a raw `no such table` error
+    // to the caller, so treat it as stale (needs a rebuild).
+    let (Some(messages_sql), Some(qa_sql), Some(vec_sql), Some(_)) = (
+        table_def(conn, "messages")?,
+        table_def(conn, "qa_chunks")?,
+        table_def(conn, "vec_chunks")?,
+        // Presence-only: `search` hard-requires this fts5vocab table but its DDL
+        // has no versioned shape to sniff, so a missing one is a crash artifact.
+        table_def(conn, "messages_vocab")?,
+    ) else {
+        return Ok(SchemaState::Stale);
+    };
+
+    let stale = !sessions_sql.contains("session_type")
+        || !messages_sql.contains(FTS_TOKENIZER)
+        || !vec_sql.contains("sub_idx")
+        || qa_sql.contains("chunk_hash")
+        || !qa_sql.contains("src_rowid_lo");
+
+    Ok(if stale {
+        SchemaState::Stale
+    } else {
+        SchemaState::Current
+    })
+}
+
+/// A warning when the immutable (tier-2) open cannot see un-checkpointed `-wal`
+/// changes. Returns `None` on the `Direct` tier (SQLite reads the `-wal` fresh
+/// there, so a note would be a false positive) and when `<path>-wal` is absent or
+/// empty. No checkpoint is performed (byte-for-byte constraint, SOW assumption 3).
+pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
+    if tier != OpenTier::Immutable {
+        return None;
+    }
+    match fs::metadata(wal_path(path)) {
+        Ok(m) if m.len() > 0 => Some(
+            "read-only open cannot see uncommitted changes in the write-ahead log; \
+             run `recall index` to checkpoint them."
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
 
 pub fn open_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
