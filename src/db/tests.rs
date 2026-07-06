@@ -474,6 +474,71 @@ fn test_stale_wal_note_absent_or_empty_wal_is_none() {
     assert!(note.is_none(), "empty -wal carries no uncommitted changes");
 }
 
+// ---- stale_wal_note remedy branches on dir writability ----
+
+#[cfg(unix)]
+#[test]
+fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_index_実行案内を含まずコピーベース手順を含む()
+ {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    let wal = wal_path(&db);
+    fs::write(&wal, b"uncommitted").unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    // Root bypasses directory permission bits, so the read-only condition can't
+    // be reproduced.
+    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
+    if is_root {
+        let _ = fs::remove_file(dir.path().join(".root_probe"));
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let note = stale_wal_note(&db, OpenTier::Immutable);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let note = note.expect("non-empty -wal on Immutable tier must warn");
+    assert!(
+        note.contains("write-ahead log"),
+        "note must still carry the write-ahead-log wording, got: {note}"
+    );
+    assert!(
+        !note.contains("run `recall index`"),
+        "a read-only dir cannot run a bare `recall index`; got: {note}"
+    );
+    assert!(
+        note.contains("recall index --db-path <copy>"),
+        "note must guide a copy-based `recall index --db-path` remedy, got: {note}"
+    );
+    assert!(
+        note.contains("-wal") && note.contains("-shm"),
+        "note must tell the user to copy the -wal (and -shm) sidecar files, got: {note}"
+    );
+}
+
+#[test]
+fn writable_dir_immutable_tier_非空_wal_で_stale_wal_note_は従来文言を含む() {
+    let tmp = NamedTempFile::new().unwrap();
+    let wal = wal_path(tmp.path());
+    fs::write(&wal, b"uncommitted").unwrap();
+
+    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
+    fs::remove_file(&wal).ok();
+
+    let note = note.expect("non-empty -wal on Immutable tier must warn");
+    assert!(
+        note.contains("write-ahead log"),
+        "note must carry the write-ahead-log wording, got: {note}"
+    );
+    assert!(
+        note.contains("run `recall index`"),
+        "writable dir must keep the legacy bare `recall index` wording, got: {note}"
+    );
+}
+
 // ---- T-001: open_db_readonly read-only flag + Direct tier (FR-001, AC-4) ----
 
 #[test]
