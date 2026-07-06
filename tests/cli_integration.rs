@@ -1087,5 +1087,26 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
                 .any(|n| n.as_str().is_some_and(|s| s.contains("write-ahead log"))),
             "{name} notes must carry the stale write-ahead-log warning, got: {stdout}"
         );
+
+        // T-003: on a read-only dir the remedy must steer toward copying the DB
+        // together with its -wal/-shm sidecars elsewhere
+        // (`recall index --db-path <copy>`), never a bare `recall index` that
+        // cannot write into the read-only directory.
+        let remedy = notes
+            .iter()
+            .find_map(|n| n.as_str().filter(|s| s.contains("write-ahead log")))
+            .unwrap_or_else(|| {
+                panic!("{name} should carry the stale write-ahead-log note, got: {stdout}")
+            });
+        assert!(
+            remedy.contains("-wal")
+                && remedy.contains("-shm")
+                && remedy.contains("recall index --db-path <copy>"),
+            "{name} remedy must guide a read-only dir to copy the DB and its sidecars elsewhere, got: {remedy}"
+        );
+        assert!(
+            !remedy.contains("run `recall index`."),
+            "{name} remedy must not suggest a bare `recall index` run in a read-only dir, got: {remedy}"
+        );
     }
 }

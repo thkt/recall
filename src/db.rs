@@ -187,12 +187,17 @@ pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
     if tier != OpenTier::Immutable {
         return None;
     }
+    const PREFIX: &str = "read-only open cannot see uncommitted changes in the write-ahead log; ";
     match fs::metadata(wal_path(path)) {
-        Ok(m) if m.len() > 0 => Some(
-            "read-only open cannot see uncommitted changes in the write-ahead log; \
-             run `recall index` to checkpoint them."
-                .to_owned(),
-        ),
+        Ok(m) if m.len() > 0 => Some(if dir_is_unwritable(path) {
+            format!(
+                "{PREFIX}the directory is read-only, so copy the DB together with its \
+                 `-wal` (and `-shm`, if present) sidecar files elsewhere and run \
+                 `recall index --db-path <copy>` to checkpoint them there."
+            )
+        } else {
+            format!("{PREFIX}run `recall index` to checkpoint them.")
+        }),
         _ => None,
     }
 }
