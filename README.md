@@ -100,6 +100,16 @@ recall rebuild          # re-parse and re-embed every present session; missing r
 
 Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
 
+`recall index` and `recall rebuild` accept two flags (also settable via env, useful for the [Hook](#hook)) that tune the embed pass:
+
+```sh
+recall index --token-budget 32000 --forward-pause-ms 200
+# or
+RECALL_TOKEN_BUDGET=32000 RECALL_FORWARD_PAUSE_MS=200 recall index
+```
+
+`--token-budget` (`RECALL_TOKEN_BUDGET`) is reserved for a future embedder revision to consume as a forward-pass token budget override; values above 256000 clamp down to 256000 (never up) so an over-large value cannot exceed the embedder's own ceiling once that revision lands. The current embedder ignores this value, so setting it today has no effect on OOM/swap during a large embed run. `--forward-pause-ms` (`RECALL_FORWARD_PAUSE_MS`) is the flag with a real effect today: it inserts a pause before each embed batch, trading embed throughput for host responsiveness during large runs, for example when indexing runs in the background while you keep working. Start from 0 (unset, no pause) and raise it in small steps (for example 100-200ms) only if you notice the machine sluggish during a big backlog embed; each added millisecond directly extends the total embed time. Leaving both flags unset preserves the current default behavior.
+
 The index lives at `~/.local/share/recall/recall.db` by default (override with `--db-path` or the `RECALL_DB` env var; recall creates the parent directory on first run). Upgrading from a build that stored it at `~/.recall.db`? Move the old file before re-indexing, otherwise recall starts a fresh empty index at the new path and your past sessions stay invisible to search:
 
 ```sh
