@@ -4,103 +4,30 @@ use std::result::Result as StdResult;
 use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::thread;
-use std::time::Duration;
 
 use amici::storage::anon_placeholders;
 use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
-#[cfg(not(test))]
-use rurico::embed::{ChunkedEmbedding, EmbedError};
 use rusqlite::Connection;
 use tracing::warn;
+
+/// Per-call knobs for the index/rebuild embed pass, threaded from the
+/// `--token-budget` / `--forward-pause-ms` CLI flags down to rurico's
+/// `Embed::embed_documents_batch_with_options`. `None`/`None` (`Default`)
+/// preserves the pre-flag behavior. rurico's `Embedder` applies `token_budget`
+/// to forward-pass sub-batch sizing and sleeps `forward_pause` after each
+/// forward pass (per-forward, not per-batch), so a small budget plus a pause
+/// yields the GPU to interactive processes during large runs.
+pub(crate) use rurico::embed::EmbedOptions;
 
 /// Ceiling for `--token-budget` (index/rebuild CLI flag), matching rurico's
 /// `TOKEN_BUDGET` forward-pass ceiling (`docs/decisions/0009-...`). Values above
 /// this clamp down (never up) at clap parse time so an over-large flag cannot
-/// push a forward pass past the Metal OOM ceiling the const was chosen to avoid.
+/// push a forward pass past the Metal OOM ceiling the const was chosen to avoid
+/// (rurico does not clamp; the caller owns this bound).
 pub(crate) const TOKEN_BUDGET_CEILING: usize = 256_000;
-
-/// Per-call knobs for the index/rebuild embed pass, threaded from the
-/// `--token-budget` / `--forward-pause-ms` CLI flags down to
-/// `embed_documents_batch_with_options`. `None`/`None` (`Default`) preserves the
-/// pre-flag behavior: no forward-pass budget override, no inter-batch pause.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub(crate) struct EmbedOptions {
-    /// Forward-pass token budget override (clamped to [`TOKEN_BUDGET_CEILING`]
-    /// at clap parse time). Reserved for a future rurico revision to consume;
-    /// `rurico::embed::Embed` has no method that accepts a budget override
-    /// today, so this field is not read anywhere in the embed path and has no
-    /// effect on the embedder's actual forward-pass token budget or on
-    /// OOM/swap behavior. `--forward-pause-ms` / `forward_pause` is the only
-    /// currently-effective knob for host responsiveness during large runs.
-    pub token_budget: Option<usize>,
-    /// Pause applied before each `embed_documents_batch` call, trading
-    /// throughput for host responsiveness during large embed runs.
-    pub forward_pause: Option<Duration>,
-}
-
-/// Extends [`Embed`] with an options-aware batch entry point. Default body
-/// applies `forward_pause` (real effect, needs no embedder cooperation) and
-/// otherwise delegates to [`Embed::embed_documents_batch`], so any existing
-/// `Embed` implementor is usable through this trait with unchanged behavior
-/// under `EmbedOptions::default()`. Implemented for the trait-object type `dyn
-/// Embed` itself (not via a blanket `impl<T: Embed>`, which would conflict with
-/// `MockEmbedder`'s capturing override below); production reaches this impl via
-/// the [`AsEmbedWithOptions`] adapter, since `&dyn Embed` cannot itself coerce
-/// to `&dyn EmbedWithOptions` (see that type's doc comment).
-///
-/// `options.token_budget` is intentionally not read here: [`Embed`] has no
-/// method to carry a forward-pass token budget override into the embedder, so
-/// there is nothing for this default body to apply it to (see
-/// [`EmbedOptions::token_budget`]).
-pub(crate) trait EmbedWithOptions: Embed {
-    fn embed_documents_batch_with_options(
-        &self,
-        texts: &[&str],
-        options: &EmbedOptions,
-    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        if let Some(pause) = options.forward_pause {
-            thread::sleep(pause);
-        }
-        self.embed_documents_batch(texts)
-    }
-}
-
-impl EmbedWithOptions for dyn Embed + '_ {}
-
-/// Adapts a `&dyn Embed` into `&dyn EmbedWithOptions` for the production embed
-/// path, where the loaded embedder is only known as `Arc<dyn Embed>`. Rust's
-/// dyn-upcasting coercion covers only supertrait relationships, and `dyn Embed`
-/// itself is unsized so it cannot use the standard `T: Sized + Trait -> &dyn
-/// Trait` unsizing rule either — so `&dyn Embed` cannot coerce directly to
-/// `&dyn EmbedWithOptions` even though `impl EmbedWithOptions for dyn Embed`
-/// exists above. This newtype is `Sized` (it just wraps the fat pointer), so it
-/// picks up the standard coercion, delegating `Embed` verbatim and taking
-/// `EmbedWithOptions`'s default (pause-then-delegate) body.
-pub(crate) struct AsEmbedWithOptions<'a>(pub &'a dyn Embed);
-
-impl Embed for AsEmbedWithOptions<'_> {
-    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        self.0.embed_query(text)
-    }
-
-    fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-        self.0.embed_document(text)
-    }
-
-    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        self.0.embed_documents_batch(texts)
-    }
-
-    fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
-        self.0.embed_text(text, prefix)
-    }
-}
-
-impl EmbedWithOptions for AsEmbedWithOptions<'_> {}
 
 #[derive(Default)]
 pub(crate) struct EmbedResult {
@@ -133,7 +60,7 @@ pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
 
 pub(crate) fn embed_chunks(
     conn: &mut Connection,
-    embedder: &dyn EmbedWithOptions,
+    embedder: &dyn Embed,
     chunks: &[(i64, String)],
     on_progress: Option<&dyn Fn(usize, usize)>,
     options: &EmbedOptions,
@@ -247,7 +174,7 @@ pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<(i6
 #[cfg(test)]
 pub(crate) fn embed_recent_chunks(
     conn: &mut Connection,
-    embedder: &dyn EmbedWithOptions,
+    embedder: &dyn Embed,
     budget: usize,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
@@ -384,22 +311,17 @@ impl Embed for MockEmbedder {
     fn embed_text(&self, text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
         Ok(Self::deterministic_vector(text))
     }
-}
 
-/// Records `options` into `captured_options` before delegating (T-005/T-006),
-/// distinct from the trait-object `dyn Embed` default so a `MockEmbedder`
-/// passed directly (not behind `&dyn Embed`) observes what was forwarded.
-#[cfg(test)]
-impl EmbedWithOptions for MockEmbedder {
+    /// Records `options` into `captured_options` before delegating
+    /// (T-005/T-006), overriding rurico's ignore-and-delegate default so tests
+    /// can assert the CLI flags → `EmbedOptions` forwarding path. Does not
+    /// sleep: pause application is rurico `Embedder`'s responsibility.
     fn embed_documents_batch_with_options(
         &self,
         texts: &[&str],
         options: &EmbedOptions,
     ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
         *self.captured_options.lock().unwrap() = Some(*options);
-        if let Some(pause) = options.forward_pause {
-            thread::sleep(pause);
-        }
         self.embed_documents_batch(texts)
     }
 }

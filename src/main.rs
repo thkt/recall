@@ -160,16 +160,16 @@ enum ModelCommand {
 /// cannot drift apart.
 #[derive(Debug, Args)]
 struct EmbedFlags {
-    /// Reserved: accepted and clamped (down to 256_000, never up) for a
-    /// future rurico revision to consume as a forward-pass token budget
-    /// override. The current embedder ignores this value, so it has no
-    /// effect on OOM/swap during a large embed run; use
-    /// `--forward-pause-ms` for that today.
+    /// Forward-pass token budget override; smaller values shorten each GPU
+    /// forward so the host stays responsive during large embed runs. Clamped
+    /// down to 256_000 (never up) so it cannot exceed the embedder's own
+    /// OOM ceiling.
     #[arg(long, env = "RECALL_TOKEN_BUDGET", value_parser = parse_token_budget)]
     token_budget: Option<usize>,
 
-    /// Pause (in milliseconds) before each embed batch, trading
-    /// throughput for host responsiveness during large embed runs.
+    /// Pause (in milliseconds) after each GPU forward pass, yielding the GPU
+    /// to interactive processes; trades throughput for host responsiveness
+    /// during large embed runs.
     #[arg(long, env = "RECALL_FORWARD_PAUSE_MS")]
     forward_pause_ms: Option<u64>,
 }
@@ -638,11 +638,7 @@ where
     let preserved_embedded = stats.preserved_embedded;
     match load_result {
         Ok(embedder) => {
-            let result = embed_all_pending(
-                &mut conn,
-                &embedder::AsEmbedWithOptions(embedder.as_ref()),
-                &embed_options,
-            )?;
+            let result = embed_all_pending(&mut conn, embedder.as_ref(), &embed_options)?;
             Ok(IndexOutcome {
                 degraded_note: None,
                 embedded: result.embedded,
@@ -669,7 +665,7 @@ where
 /// `embed_chunks` — a separate COUNT would re-scan vec_chunks (#138).
 fn embed_all_pending(
     conn: &mut Connection,
-    embedder: &dyn embedder::EmbedWithOptions,
+    embedder: &dyn Embed,
     options: &embedder::EmbedOptions,
 ) -> Result<embedder::EmbedResult> {
     let pending = embedder::pending_chunks(conn, usize::MAX)?;
