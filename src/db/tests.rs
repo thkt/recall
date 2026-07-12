@@ -731,6 +731,25 @@ fn write_probe_reports_a_directory_with_cleared_write_bits_as_unwritable() {
 }
 
 #[test]
+fn a_leftover_probe_file_reads_as_ambiguous_so_the_directory_stays_classified_writable() {
+    // AlreadyExists from create_new is not a write-permission signal; the
+    // deliberate policy (db.rs dir_write_probe_fails doc) treats ambiguous
+    // failures as writable so the caller propagates the original error
+    // instead of wrongly selecting the immutable fallback.
+    let dir = tempfile::TempDir::new().unwrap();
+    let leftover = dir
+        .path()
+        .join(format!(".recall-write-probe-{}", std::process::id()));
+    fs::write(&leftover, b"stale").unwrap();
+
+    assert!(
+        !dir_write_probe_fails(dir.path()),
+        "a pre-existing probe file (AlreadyExists) must classify the directory \
+         as writable, not read-only"
+    );
+}
+
+#[test]
 fn probe_cleanup_failure_warns_instead_of_failing_the_read() {
     // A probe path whose directory does not exist makes remove_file fail
     // (NotFound); the cleanup must swallow it into a warn, not a panic/Err.
