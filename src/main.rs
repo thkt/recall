@@ -1186,6 +1186,26 @@ fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
     )]
 }
 
+/// The doctor verdict for an existing-but-never-indexed DB (`SchemaState::Empty`):
+/// there are no tables to check, so skip the data/integrity checks and emit an
+/// explicit unhealthy verdict. `schema_state` proves only the absence of a
+/// `sessions` table, never that recall created the file, so the detail names the
+/// resolved `path` the reader should verify — carried in the check detail (which
+/// renders in both the default human output and the `--json` `checks[].detail`),
+/// so the "verify the path" instruction is followable in both surfaces. Shared by
+/// the read-only and `--fix` branches so the mutating path stays no less
+/// forthcoming than the read-only one before it would graft recall's tables in.
+fn empty_index_check(path: &Path) -> DoctorCheck {
+    DoctorCheck::fail(
+        "index",
+        format!(
+            "no index: database has never been indexed; recall cannot confirm this file ({}) was created by recall — verify the path if this is unexpected",
+            path.display()
+        ),
+        "run `recall index`",
+    )
+}
+
 /// `PRAGMA quick_check` (not `integrity_check`): the page-level scan returns a
 /// single `ok` row on a healthy DB and one error row per problem otherwise.
 /// quick_check skips the expensive cross-index verification integrity_check runs,
@@ -1471,16 +1491,33 @@ where
     let mut repairs: Option<Vec<RepairOutcome>> = None;
     let mut wal_note: Option<String> = None;
     let mut checks = if fix {
-        match open_or_create_db(&path) {
-            Ok(conn) => {
-                repairs = Some(run_repairs(&conn));
-                vec![
-                    run_db_check("integrity", || check_integrity(&conn)),
-                    run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
-                    run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
-                ]
+        // Before the writing open, refuse to graft recall's tables into a DB that
+        // isn't recall's: an existing-but-empty file (`SchemaState::Empty`, no
+        // `sessions` table) would otherwise have recall's schema silently added by
+        // `open_or_create_db` -> `create_schema`. Emit the same unconfirmed-origin
+        // caveat the read-only path gives and skip the graft, so `--fix` is no less
+        // forthcoming than plain `doctor`. The read-only probe connection is dropped
+        // before the writing open. Any read-only open failure or non-`Empty` state
+        // falls through to `open_or_create_db`, preserving `--fix`'s stale-schema
+        // migration, orphan repair, and open-failure reporting.
+        let empty_foreign_db = matches!(
+            db::open_db_readonly(&path).map(|(conn, _)| db::schema_state(&conn)),
+            Ok(Ok(db::SchemaState::Empty))
+        );
+        if empty_foreign_db {
+            vec![empty_index_check(&path)]
+        } else {
+            match open_or_create_db(&path) {
+                Ok(conn) => {
+                    repairs = Some(run_repairs(&conn));
+                    vec![
+                        run_db_check("integrity", || check_integrity(&conn)),
+                        run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
+                        run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
+                    ]
+                }
+                Err(e) => open_failure_checks(e),
             }
-            Err(e) => open_failure_checks(e),
         }
     } else {
         match db::open_db_readonly(&path) {
@@ -1505,11 +1542,7 @@ where
                     // but still emit an explicit unhealthy verdict, matching the
                     // missing-DB path above (empty checks would otherwise render
                     // `healthy: true` for an unusable index).
-                    Ok(db::SchemaState::Empty) => vec![DoctorCheck::fail(
-                        "index",
-                        "no index: database has never been indexed".to_owned(),
-                        "run `recall index`",
-                    )],
+                    Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                     Err(e) => open_failure_checks(e),
                 }
             }
@@ -4189,6 +4222,84 @@ mod tests {
             "got: {schema}"
         );
         assert_eq!(out.data["healthy"], false);
+    }
+
+    // doctor on an existing bare SQLite DB (never indexed, `SchemaState::Empty`)
+    // emits an `index` FAIL whose detail carries a caveat that recall cannot
+    // confirm the file was created by recall, names the resolved path so the
+    // "verify the path" instruction is followable in both the default human
+    // output and `--json` (both render the same check detail), and keeps the
+    // existing `recall index` remedy — src/main.rs:1508.
+    #[test]
+    fn doctor_on_an_existing_bare_sqlite_db_emits_an_index_fail_with_the_unconfirmed_origin_caveat()
+    {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let out = run_doctor_with(
+            false,
+            false,
+            &Some(db_path.clone()),
+            mock_loader,
+            no_recover,
+        )
+        .unwrap();
+
+        assert_eq!(out.data["healthy"], false);
+        let index_check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "index")
+            .unwrap_or_else(|| panic!("expected an `index` check, got: {}", out.data));
+        assert_eq!(index_check["ok"], false);
+        let detail = index_check["detail"].as_str().unwrap();
+        assert!(detail.contains("cannot confirm"), "got: {detail}");
+        assert!(
+            detail.contains(&db_path.display().to_string()),
+            "caveat detail must name the resolved DB path to verify; got: {detail}"
+        );
+        assert_eq!(index_check["remedy"], "run `recall index`");
+    }
+
+    // F10: `doctor --fix` on an existing-but-empty foreign SQLite file must NOT
+    // silently graft recall's tables (via open_or_create_db -> create_schema). It
+    // must emit the same unconfirmed-origin caveat the read-only path gives and
+    // leave the file untouched (still `SchemaState::Empty`), so the mutating path
+    // is no less protected than the read-only one. Perspective: hazard (silent
+    // schema graft into a DB recall cannot confirm it owns).
+    #[test]
+    fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = bare_empty_db(db_dir.path());
+
+        let out =
+            run_doctor_with(false, true, &Some(db_path.clone()), mock_loader, no_recover).unwrap();
+
+        // Same unconfirmed-origin caveat as the read-only path, not a healthy graft.
+        assert_eq!(out.data["healthy"], false);
+        let index_check = out.data["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "index")
+            .unwrap_or_else(|| panic!("expected an `index` check, got: {}", out.data));
+        assert_eq!(index_check["ok"], false);
+        assert!(
+            index_check["detail"]
+                .as_str()
+                .unwrap()
+                .contains("cannot confirm"),
+            "got: {index_check}"
+        );
+        // No repair ran (nothing to repair; the graft was refused).
+        assert_eq!(out.data["repaired"], serde_json::Value::Null);
+        // The foreign file still has no recall `sessions` table: no graft happened.
+        let (conn, _) = db::open_db_readonly(&db_path).unwrap();
+        assert!(
+            matches!(db::schema_state(&conn), Ok(db::SchemaState::Empty)),
+            "expected the foreign DB to stay Empty (ungrafted)"
+        );
     }
 
     // doctor --fix on an unopenable (corrupt-header) DB: the writing
