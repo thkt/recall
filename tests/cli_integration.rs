@@ -574,7 +574,10 @@ fn setup_cached_default_model(hf_home: &Path) {
     // ruri-v3-310m is ModelId::DEFAULT; the revision keys the refs file name.
     let repo_slug = "cl-nagoya--ruri-v3-310m";
     let revision = "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3";
-    let commit = "abc123";
+    // hf-hub 1.0 resolves a 40-hex commit-hash revision directly to
+    // `snapshots/{revision}` (skipping `refs/`), so the snapshot dir must be
+    // named after the revision itself for the staged cache to resolve.
+    let commit = revision;
     let repo_dir = hf_home.join("hub").join(format!("models--{repo_slug}"));
     let refs_dir = repo_dir.join("refs");
     fs::create_dir_all(&refs_dir).unwrap();
