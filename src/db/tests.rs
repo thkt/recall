@@ -885,3 +885,16 @@ fn a_missing_parent_directory_stays_classified_writable_so_the_original_error_pr
          (the write probe's NotFound failure does not count as unwritable)"
     );
 }
+
+// T-007
+#[test]
+fn a_path_without_a_parent_component_stays_classified_writable() {
+    assert!(
+        !dir_is_unwritable(Path::new("recall.db")),
+        "a bare relative filename (empty parent) must not be classified unwritable"
+    );
+    assert!(
+        !dir_is_unwritable(Path::new("/")),
+        "the filesystem root (no parent) must not be classified unwritable"
+    );
+}
