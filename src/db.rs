@@ -229,8 +229,10 @@ pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
 
 /// A warning when the immutable (tier-2) open cannot see un-checkpointed `-wal`
 /// changes. Returns `None` on the `Direct` tier (SQLite reads the `-wal` fresh
-/// there, so a note would be a false positive) and when `<path>-wal` is absent or
-/// empty. No checkpoint is performed (byte-for-byte constraint, SOW assumption 3).
+/// there, so a note would be a false positive), when `<path>-wal` is absent or
+/// empty, and when its stat fails (e.g. EACCES — suppressing the advice on an
+/// ambiguous error is the safe default). No checkpoint is performed
+/// (byte-for-byte constraint, SOW assumption 3).
 pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
     if tier != OpenTier::Immutable {
         return None;
