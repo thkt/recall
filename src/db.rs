@@ -9,6 +9,7 @@ use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage::ensure_sqlite_vec;
 use rusqlite::{Connection, OpenFlags};
+use tracing::warn;
 
 const FTS_TOKENIZER: &str = "trigram";
 
@@ -35,7 +36,9 @@ pub enum SchemaState {
 
 /// Open the index read-only, never writing (no WAL/`-shm` sidecars, no schema
 /// creation). This is the read-command counterpart to [`open_db`]; the write
-/// path is left untouched (SOW NFR-001).
+/// path is left untouched (SOW NFR-001). The failed-open diagnosis path may
+/// create and remove a transient `.recall-write-probe-<pid>` file in the DB's
+/// parent directory (see [`dir_write_probe_fails`]); the DB itself stays untouched.
 ///
 /// Tier 1 opens with `SQLITE_OPEN_READ_ONLY`, which in a writable directory reads
 /// a live `-wal` fresh via the existing `-shm`. `open_with_flags` is lazy (it does
@@ -88,13 +91,9 @@ fn probe_readable(conn: &Connection) -> rusqlite::Result<()> {
 /// Corruption (`SQLITE_CORRUPT` -> `DatabaseCorrupt`) is a different primary code and
 /// never matches, so it always propagates.
 ///
-/// Directory writability is judged by [`dir_is_unwritable`], which checks the parent's
-/// permission mode bits first (covers the `chmod 0o555` case) and, only when those bits
-/// still look writable, falls back to an empirical write probe that also catches a
-/// genuine read-only mount (DMG, network share, most external media) whose directory
-/// bits still read `0o755`. A missing parent or unreadable metadata is treated as
-/// writable, so an ambiguous case propagates its original error rather than being
-/// wrongly frozen.
+/// Directory writability is judged by [`dir_is_unwritable`]; see its doc for the two
+/// signals (mode bits, then an empirical write probe) and the treated-as-writable
+/// ambiguous cases.
 fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
     let sidecar_failure = matches!(
         e.sqlite_error_code(),
@@ -142,13 +141,21 @@ fn dir_write_probe_fails(dir: &Path) -> bool {
         .open(&probe)
     {
         Ok(_) => {
-            let _ = fs::remove_file(&probe);
+            remove_write_probe(&probe);
             false
         }
         Err(e) => matches!(
             e.kind(),
             io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
         ),
+    }
+}
+
+/// Remove the transient write-probe file, warning instead of failing the read
+/// when the cleanup cannot complete and the probe file litters the directory.
+fn remove_write_probe(probe: &Path) {
+    if let Err(e) = fs::remove_file(probe) {
+        warn!(probe = %probe.display(), error = %e, "failed to remove write probe");
     }
 }
 
