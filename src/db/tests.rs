@@ -739,7 +739,7 @@ fn a_leftover_probe_file_reads_as_ambiguous_so_the_directory_stays_classified_wr
     let dir = tempfile::TempDir::new().unwrap();
     let leftover = dir
         .path()
-        .join(format!(".recall-write-probe-{}", std::process::id()));
+        .join(format!(".recall-write-probe-{}", process::id()));
     fs::write(&leftover, b"stale").unwrap();
 
     assert!(
