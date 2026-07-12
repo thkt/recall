@@ -1,5 +1,7 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::time::Duration;
 
 use amici::migration::notify_schema_change;
@@ -86,10 +88,13 @@ fn probe_readable(conn: &Connection) -> rusqlite::Result<()> {
 /// Corruption (`SQLITE_CORRUPT` -> `DatabaseCorrupt`) is a different primary code and
 /// never matches, so it always propagates.
 ///
-/// Directory writability is judged from the parent's permission mode bits, which covers
-/// the `chmod 0o555` case this feature targets. A read-only mount whose mode bits still
-/// show writable is not detected; such a read then propagates its original error rather
-/// than being wrongly frozen (a safe miss, not a regression).
+/// Directory writability is judged by [`dir_is_unwritable`], which checks the parent's
+/// permission mode bits first (covers the `chmod 0o555` case) and, only when those bits
+/// still look writable, falls back to an empirical write probe that also catches a
+/// genuine read-only mount (DMG, network share, most external media) whose directory
+/// bits still read `0o755`. A missing parent or unreadable metadata is treated as
+/// writable, so an ambiguous case propagates its original error rather than being
+/// wrongly frozen.
 fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
     let sidecar_failure = matches!(
         e.sqlite_error_code(),
@@ -98,17 +103,53 @@ fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
     sidecar_failure && dir_is_unwritable(db_path)
 }
 
-/// True when the DB file's parent directory has its write mode bits cleared (e.g.
-/// `chmod 0o555`). Reads mode bits only, so it never touches the filesystem's write
-/// path and is independent of the effective uid (a root process still sees `0o555` as
-/// read-only). A missing parent or unreadable metadata is treated as writable, so an
+/// True when the DB file's parent directory is unwritable, checked via two signals in
+/// order. First, permission mode bits (e.g. `chmod 0o555`), which is independent of the
+/// effective uid (a root process still sees `0o555` as read-only) and never touches the
+/// filesystem's write path. Only when those bits still look writable does it fall back
+/// to [`dir_write_probe_fails`], an empirical write attempt that also catches a genuine
+/// read-only mount (DMG, network share, most external media) whose directory bits still
+/// read `0o755`. A missing parent or unreadable metadata is treated as writable, so an
 /// ambiguous error propagates instead of being masked by the `immutable=1` fallback.
 fn dir_is_unwritable(db_path: &Path) -> bool {
-    db_path
-        .parent()
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .and_then(|dir| fs::metadata(dir).ok())
-        .is_some_and(|meta| meta.permissions().readonly())
+    let Some(dir) = db_path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
+        return false;
+    };
+    let Ok(meta) = fs::metadata(dir) else {
+        return false;
+    };
+    meta.permissions().readonly() || dir_write_probe_fails(dir)
+}
+
+/// True when `dir` rejects file creation (read-only mount, or write bits
+/// cleared as in `chmod 0o555`), determined empirically rather than from
+/// permission mode bits (unlike [`dir_is_unwritable`]): a `.recall-write-probe-<pid>`
+/// file is created with `create_new` (so it never collides with or clobbers an
+/// existing file) and immediately removed on success. Returns `true` only for
+/// `PermissionDenied` / `ReadOnlyFilesystem`; any other failure (e.g. `NotFound`
+/// from a missing directory, or an uncategorized error such as EMFILE) returns
+/// `false` so the caller falls back to propagating the original error instead of
+/// misreporting an ambiguous failure as a read-only directory.
+///
+/// Called from [`dir_is_unwritable`] only when the mode-bits check finds the
+/// directory writable, to also catch a read-only mount whose directory bits
+/// still read `0o755`.
+fn dir_write_probe_fails(dir: &Path) -> bool {
+    let probe = dir.join(format!(".recall-write-probe-{}", process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            false
+        }
+        Err(e) => matches!(
+            e.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+        ),
+    }
 }
 
 /// Tier 2: reopen via an `immutable=1` URI, which reads without any sidecar.

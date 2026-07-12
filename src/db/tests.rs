@@ -600,6 +600,23 @@ fn test_is_readonly_dir_error_writable_dir_rejects_immutable_fallback() {
     );
 }
 
+/// True when the effective user bypasses directory permission bits (e.g. running as
+/// root), detected empirically by attempting to create a file in `dir`. `dir` must
+/// already have its write bits cleared (e.g. `chmod 0o555`); when bypass is detected,
+/// the probe file is removed and `dir`'s permissions are restored to `0o755` so the
+/// caller can return early and let `TempDir`'s drop clean up.
+#[cfg(unix)]
+fn root_bypasses_permission_bits(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    let is_root = fs::File::create(dir.join(".root_probe")).is_ok();
+    if is_root {
+        let _ = fs::remove_file(dir.join(".root_probe"));
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    is_root
+}
+
 #[cfg(unix)]
 #[test]
 fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
@@ -612,11 +629,7 @@ fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
     let db = dir.path().join("recall.db");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Root ignores dir permission bits, so the read-only condition can't be reproduced.
-    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
-    if is_root {
-        let _ = fs::remove_file(dir.path().join(".root_probe"));
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    if root_bypasses_permission_bits(dir.path()) {
         return;
     }
 
@@ -655,11 +668,7 @@ fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
     let missing = dir.path().join("nope.db");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Root ignores dir permission bits, so the read-only condition can't be reproduced.
-    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
-    if is_root {
-        let _ = fs::remove_file(dir.path().join(".root_probe"));
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    if root_bypasses_permission_bits(dir.path()) {
         return;
     }
 
@@ -678,4 +687,214 @@ fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
 fn test_encode_uri_path_escapes_reserved_bytes() {
     let encoded = encode_uri_path(Path::new("/a b/c?d.db"));
     assert_eq!(encoded, "/a%20b/c%3Fd.db");
+}
+
+// ---- T-001/T-002: dir_write_probe_fails classifies directory writability ----
+
+#[test]
+fn write_probe_reports_a_writable_directory_as_writable_and_leaves_no_probe_file_behind() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let result = dir_write_probe_fails(dir.path());
+
+    assert!(
+        !result,
+        "a writable directory must not be reported as unwritable"
+    );
+    let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "probe file must be removed after a successful write, got entries: {entries:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn write_probe_reports_a_directory_with_cleared_write_bits_as_unwritable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    if root_bypasses_permission_bits(dir.path()) {
+        return;
+    }
+
+    let result = dir_write_probe_fails(dir.path());
+    // Restore write bits before the assert so TempDir's drop can clean up.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        result,
+        "a directory with cleared write bits (0o555) must be reported as unwritable (EACCES -> PermissionDenied)"
+    );
+}
+
+// ---- U-002: dir_is_unwritable as the shared (mode-bits OR write-probe) predicate ----
+//
+// A chmod 0o555 directory (used above) only reproduces the mode-bits signal. A genuine
+// read-only mount (DMG, network share, most external/optical media) commonly keeps 0o755
+// directory bits while every write syscall still fails; only dir_write_probe_fails catches
+// that case. T-003/T-004 exercise open_db_readonly / stale_wal_note against a real read-only
+// mount, and T-006 pins the remaining safety invariant (missing parent stays writable)
+// that the write-probe addition must not regress. The other invariant (writable dir
+// still propagates) is already covered above by
+// test_is_readonly_dir_error_writable_dir_rejects_immutable_fallback, which now also
+// exercises dir_write_probe_fails since is_readonly_dir_error calls through it.
+
+#[cfg(target_os = "macos")]
+fn shm_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push("-shm");
+    PathBuf::from(s)
+}
+
+/// Detaches the hdiutil-attached mountpoint on drop (including panic unwind, since
+/// `Drop::drop` still runs while unwinding), so a failing assertion never leaves the
+/// read-only image mounted for the next test run. `_dmg_dir` keeps the backing `.dmg`
+/// file alive for as long as the mount exists.
+#[cfg(target_os = "macos")]
+struct ReadOnlyMount {
+    mountpoint: tempfile::TempDir,
+    _dmg_dir: tempfile::TempDir,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ReadOnlyMount {
+    fn drop(&mut self) {
+        use std::process::Command;
+
+        let _ = Command::new("hdiutil")
+            .args(["detach", "-force", "-quiet"])
+            .arg(self.mountpoint.path())
+            .status();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ReadOnlyMount {
+    fn db_path(&self) -> PathBuf {
+        self.mountpoint.path().join("recall.db")
+    }
+}
+
+/// Build a WAL-mode recall.db, then leave a synthetic non-empty `-wal` with no
+/// `-shm` sidecar (the exact leftover of a checkpoint-in-progress crash), pack it
+/// into a UDZO image, and attach it read-only. The mountpoint's directory mode
+/// bits stay 0o755 (a real read-only mount, unlike the chmod-based tests above),
+/// so this exercises dir_write_probe_fails rather than the mode-bits check.
+#[cfg(target_os = "macos")]
+fn attach_readonly_wal_only_db() -> ReadOnlyMount {
+    use std::process::Command;
+
+    let stage = tempfile::TempDir::new().unwrap();
+    let src_dir = stage.path().join("src");
+    fs::create_dir(&src_dir).unwrap();
+    let db_path = src_dir.join("recall.db");
+    {
+        let conn = open_db(&db_path).unwrap();
+        drop(conn);
+    }
+    fs::remove_file(shm_path(&db_path)).ok();
+    fs::write(wal_path(&db_path), b"synthetic-uncommitted-wal-bytes").unwrap();
+
+    let dmg_path = stage.path().join("recall.dmg");
+    let create = Command::new("hdiutil")
+        .args(["create", "-volname", "recalltest", "-srcfolder"])
+        .arg(&src_dir)
+        .args(["-fs", "HFS+", "-format", "UDZO", "-ov"])
+        .arg(&dmg_path)
+        .output()
+        .expect("failed to spawn hdiutil create");
+    assert!(
+        create.status.success(),
+        "hdiutil create failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let mountpoint = tempfile::TempDir::new().unwrap();
+    let attach = Command::new("hdiutil")
+        .args(["attach", "-readonly", "-nobrowse", "-mountpoint"])
+        .arg(mountpoint.path())
+        .arg(&dmg_path)
+        .output()
+        .expect("failed to spawn hdiutil attach");
+    assert!(
+        attach.status.success(),
+        "hdiutil attach failed: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+
+    ReadOnlyMount {
+        mountpoint,
+        _dmg_dir: stage,
+    }
+}
+
+// T-003
+#[cfg(target_os = "macos")]
+#[test]
+fn open_db_readonly_on_a_read_only_mount_without_shm_falls_back_to_the_immutable_tier_and_reads_sqlite_master_successfully()
+ {
+    let mount = attach_readonly_wal_only_db();
+
+    let (conn, tier) = open_db_readonly(&mount.db_path())
+        .expect("open_db_readonly must succeed via the immutable fallback");
+    assert_eq!(
+        tier,
+        OpenTier::Immutable,
+        "a read-only mount without -shm must select the immutable tier"
+    );
+
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .expect("sqlite_master read must succeed (no SQLITE_CANTOPEN error 14)");
+}
+
+// T-004
+#[cfg(target_os = "macos")]
+#[test]
+fn stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_path_remedy_instead_of_a_bare_recall_index()
+ {
+    let mount = attach_readonly_wal_only_db();
+
+    let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable)
+        .expect("non-empty -wal on a read-only mount must warn");
+    assert!(
+        note.contains("write-ahead log"),
+        "note must carry the write-ahead-log wording, got: {note}"
+    );
+    assert!(
+        note.contains("recall index --db-path <copy>"),
+        "note must guide the copy-based remedy, got: {note}"
+    );
+    assert!(
+        !note.contains("run `recall index`"),
+        "a read-only mount cannot run a bare `recall index`; got: {note}"
+    );
+}
+
+// T-006
+#[test]
+fn a_missing_parent_directory_stays_classified_writable_so_the_original_error_propagates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("nonexistent_subdir").join("recall.db");
+
+    assert!(
+        !dir_is_unwritable(&db),
+        "a missing parent directory must not be classified unwritable \
+         (the write probe's NotFound failure does not count as unwritable)"
+    );
+}
+
+// T-007
+#[test]
+fn a_path_without_a_parent_component_stays_classified_writable() {
+    assert!(
+        !dir_is_unwritable(Path::new("recall.db")),
+        "a bare relative filename (empty parent) must not be classified unwritable"
+    );
+    assert!(
+        !dir_is_unwritable(Path::new("/")),
+        "the filesystem root (no parent) must not be classified unwritable"
+    );
 }
