@@ -9,6 +9,7 @@ use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage::ensure_sqlite_vec;
 use rusqlite::{Connection, OpenFlags};
+use tracing::warn;
 
 const FTS_TOKENIZER: &str = "trigram";
 
@@ -35,7 +36,9 @@ pub enum SchemaState {
 
 /// Open the index read-only, never writing (no WAL/`-shm` sidecars, no schema
 /// creation). This is the read-command counterpart to [`open_db`]; the write
-/// path is left untouched (SOW NFR-001).
+/// path is left untouched (SOW NFR-001). The failed-open diagnosis path may
+/// create and remove a transient `.recall-write-probe-<pid>` file in the DB's
+/// parent directory (see [`dir_write_probe_fails`]); the DB itself stays untouched.
 ///
 /// Tier 1 opens with `SQLITE_OPEN_READ_ONLY`, which in a writable directory reads
 /// a live `-wal` fresh via the existing `-shm`. `open_with_flags` is lazy (it does
@@ -142,13 +145,21 @@ fn dir_write_probe_fails(dir: &Path) -> bool {
         .open(&probe)
     {
         Ok(_) => {
-            let _ = fs::remove_file(&probe);
+            remove_write_probe(&probe);
             false
         }
         Err(e) => matches!(
             e.kind(),
             io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
         ),
+    }
+}
+
+/// Remove the transient write-probe file, warning instead of failing the read
+/// when the cleanup cannot complete and the probe file litters the directory.
+fn remove_write_probe(probe: &Path) {
+    if let Err(e) = fs::remove_file(probe) {
+        warn!(probe = %probe.display(), error = %e, "failed to remove write probe");
     }
 }
 

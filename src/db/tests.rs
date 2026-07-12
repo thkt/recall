@@ -730,6 +730,13 @@ fn write_probe_reports_a_directory_with_cleared_write_bits_as_unwritable() {
     );
 }
 
+#[test]
+fn probe_cleanup_failure_warns_instead_of_failing_the_read() {
+    // A probe path whose directory does not exist makes remove_file fail
+    // (NotFound); the cleanup must swallow it into a warn, not a panic/Err.
+    remove_write_probe(Path::new("/nonexistent-recall-dir/.recall-write-probe-0"));
+}
+
 // ---- U-002: dir_is_unwritable as the shared (mode-bits OR write-probe) predicate ----
 //
 // A chmod 0o555 directory (used above) only reproduces the mode-bits signal. A genuine
