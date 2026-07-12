@@ -91,13 +91,9 @@ fn probe_readable(conn: &Connection) -> rusqlite::Result<()> {
 /// Corruption (`SQLITE_CORRUPT` -> `DatabaseCorrupt`) is a different primary code and
 /// never matches, so it always propagates.
 ///
-/// Directory writability is judged by [`dir_is_unwritable`], which checks the parent's
-/// permission mode bits first (covers the `chmod 0o555` case) and, only when those bits
-/// still look writable, falls back to an empirical write probe that also catches a
-/// genuine read-only mount (DMG, network share, most external media) whose directory
-/// bits still read `0o755`. A missing parent or unreadable metadata is treated as
-/// writable, so an ambiguous case propagates its original error rather than being
-/// wrongly frozen.
+/// Directory writability is judged by [`dir_is_unwritable`]; see its doc for the two
+/// signals (mode bits, then an empirical write probe) and the treated-as-writable
+/// ambiguous cases.
 fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
     let sidecar_failure = matches!(
         e.sqlite_error_code(),
