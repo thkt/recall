@@ -771,10 +771,17 @@ impl Drop for ReadOnlyMount {
     fn drop(&mut self) {
         use std::process::Command;
 
-        let _ = Command::new("hdiutil")
+        match Command::new("hdiutil")
             .args(["detach", "-force", "-quiet"])
             .arg(self.mountpoint.path())
-            .status();
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            result => eprintln!(
+                "hdiutil detach {} failed ({result:?}); the recalltest volume may stay mounted",
+                self.mountpoint.path().display()
+            ),
+        }
     }
 }
 
