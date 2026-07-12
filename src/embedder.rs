@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::result::Result as StdResult;
 #[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use amici::storage::anon_placeholders;
@@ -10,6 +12,22 @@ use rurico::embed::Embed;
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
 use rusqlite::Connection;
 use tracing::warn;
+
+/// Per-call knobs for the index/rebuild embed pass, threaded from the
+/// `--token-budget` / `--forward-pause-ms` CLI flags down to rurico's
+/// `Embed::embed_documents_batch_with_options`. `None`/`None` (`Default`)
+/// preserves the pre-flag behavior. rurico's `Embedder` applies `token_budget`
+/// to forward-pass sub-batch sizing and sleeps `forward_pause` after each
+/// forward pass (per-forward, not per-batch), so a small budget plus a pause
+/// yields the GPU to interactive processes during large runs.
+pub(crate) use rurico::embed::EmbedOptions;
+
+/// Ceiling for `--token-budget` (index/rebuild CLI flag), matching rurico's
+/// `TOKEN_BUDGET` forward-pass ceiling (`docs/decisions/0009-...`). Values above
+/// this clamp down (never up) at clap parse time so an over-large flag cannot
+/// push a forward pass past the Metal OOM ceiling the const was chosen to avoid
+/// (rurico does not clamp; the caller owns this bound).
+pub(crate) const TOKEN_BUDGET_CEILING: usize = 256_000;
 
 #[derive(Default)]
 pub(crate) struct EmbedResult {
@@ -45,6 +63,7 @@ pub(crate) fn embed_chunks(
     embedder: &dyn Embed,
     chunks: &[(i64, String)],
     on_progress: Option<&dyn Fn(usize, usize)>,
+    options: &EmbedOptions,
 ) -> Result<EmbedResult> {
     if chunks.is_empty() {
         return Ok(EmbedResult::default());
@@ -60,7 +79,7 @@ pub(crate) fn embed_chunks(
 
     for batch_idx in sorted.chunks(EMBED_BATCH_SIZE) {
         let texts: Vec<&str> = batch_idx.iter().map(|&i| chunks[i].1.as_str()).collect();
-        match embedder.embed_documents_batch(&texts) {
+        match embedder.embed_documents_batch_with_options(&texts, options) {
             Ok(embeddings) => {
                 let tx = conn.transaction()?;
                 // Idempotent replay guard for stale concurrent work that reached
@@ -160,7 +179,13 @@ pub(crate) fn embed_recent_chunks(
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<EmbedResult> {
     let missing = pending_chunks(conn, budget)?;
-    embed_chunks(conn, embedder, &missing, on_progress)
+    embed_chunks(
+        conn,
+        embedder,
+        &missing,
+        on_progress,
+        &EmbedOptions::default(),
+    )
 }
 
 /// Returns deterministic 768-dim vectors derived from text bytes.
@@ -170,6 +195,10 @@ pub(crate) struct MockEmbedder {
     call_count: AtomicUsize,
     fail_after: Option<usize>,
     fail_on_text: Option<String>,
+    /// Last `EmbedOptions` seen by `embed_documents_batch_with_options`, for
+    /// tests asserting the CLI flags → `EmbedOptions` forwarding path
+    /// (T-005/T-006). `None` until a with-options call happens.
+    captured_options: Mutex<Option<EmbedOptions>>,
 }
 
 #[cfg(test)]
@@ -179,6 +208,7 @@ impl MockEmbedder {
             call_count: AtomicUsize::new(0),
             fail_after: None,
             fail_on_text: None,
+            captured_options: Mutex::new(None),
         }
     }
 
@@ -187,6 +217,7 @@ impl MockEmbedder {
             call_count: AtomicUsize::new(0),
             fail_after: Some(n),
             fail_on_text: None,
+            captured_options: Mutex::new(None),
         }
     }
 
@@ -197,7 +228,21 @@ impl MockEmbedder {
             call_count: AtomicUsize::new(0),
             fail_after: None,
             fail_on_text: Some(text.to_owned()),
+            captured_options: Mutex::new(None),
         }
+    }
+
+    /// A mock identical to [`Self::new`], named for tests (T-005/T-006) that
+    /// assert on [`Self::captured_options`] rather than embed behavior.
+    pub(crate) fn capturing_options() -> Self {
+        Self::new()
+    }
+
+    /// The `EmbedOptions` forwarded by the most recent
+    /// `embed_documents_batch_with_options` call, or `None` if that entry point
+    /// was never invoked.
+    pub(crate) fn captured_options(&self) -> Option<EmbedOptions> {
+        *self.captured_options.lock().unwrap()
     }
 
     /// Constructs the error inline: rurico's `EmbedError::inference` helpers are
@@ -265,6 +310,19 @@ impl Embed for MockEmbedder {
 
     fn embed_text(&self, text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
         Ok(Self::deterministic_vector(text))
+    }
+
+    /// Records `options` into `captured_options` before delegating
+    /// (T-005/T-006), overriding rurico's ignore-and-delegate default so tests
+    /// can assert the CLI flags → `EmbedOptions` forwarding path. Does not
+    /// sleep: pause application is rurico `Embedder`'s responsibility.
+    fn embed_documents_batch_with_options(
+        &self,
+        texts: &[&str],
+        options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+        *self.captured_options.lock().unwrap() = Some(*options);
+        self.embed_documents_batch(texts)
     }
 }
 

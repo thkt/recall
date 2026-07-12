@@ -14,13 +14,13 @@ test-support = ["rurico/test-support"]
 # amici pins its own rurico rev; a git source resolves to one rev across the
 # dependency graph, so the rurico rev below must match the one amici pins or
 # the build breaks on the rev conflict. When bumping amici, align rurico to it.
-amici = { git = "https://github.com/thkt/amici", rev = "8b8c51f" }
+amici = { git = "https://github.com/thkt/amici", rev = "e2f039739006d4077651501ab44d83350cd46fb3" }
 anyhow = "1.0.102"
 bytemuck = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
 dirs = "6.0.0"
 # Keep in lockstep with the rurico rev amici pins (see the amici note above).
-rurico = { git = "https://github.com/thkt/rurico", rev = "b78aae2" }
+rurico = { git = "https://github.com/thkt/rurico", rev = "2b011b0ae46d2af9bc5d31c840d7ab0fd8923c07" }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -28,8 +28,12 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
-amici = { git = "https://github.com/thkt/amici", rev = "8b8c51f", features = ["test-support"] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "b78aae2", features = ["test-support"] }
+amici = { git = "https://github.com/thkt/amici", rev = "e2f039739006d4077651501ab44d83350cd46fb3", features = [
+  "test-support",
+] }
+rurico = { git = "https://github.com/thkt/rurico", rev = "2b011b0ae46d2af9bc5d31c840d7ab0fd8923c07", features = [
+  "test-support",
+] }
 tempfile = "3"
 
 [lints.rust]

@@ -17,9 +17,11 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::fs::{OpenOptions, create_dir_all};
 use std::io::{self, ErrorKind, Write};
+use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use amici::cli::exit_code::codes;
 use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand, warning};
@@ -31,7 +33,7 @@ use amici::model::{
 use amici::storage::{collect_rows, filter::escape_like};
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use rurico::embed::{EMBEDDING_DIMS, Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
 use rusqlite::Connection;
@@ -67,10 +69,16 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Parse and chunk new session logs (incremental). No model calls.
-    Index,
+    Index {
+        #[command(flatten)]
+        embed_flags: EmbedFlags,
+    },
     /// Re-parse and re-embed every present session; a missing or unreadable
     /// source root keeps its existing index. No model calls.
-    Rebuild,
+    Rebuild {
+        #[command(flatten)]
+        embed_flags: EmbedFlags,
+    },
     /// Manage the embedding model.
     #[command(subcommand)]
     Model(ModelCommand),
@@ -145,6 +153,25 @@ enum Command {
 enum ModelCommand {
     /// Download the embedding model and verify it loads.
     Download,
+}
+
+/// Embed-pass tuning flags shared verbatim by `index` and `rebuild`
+/// (`#[command(flatten)]`), so the two subcommands' flag definitions and docs
+/// cannot drift apart.
+#[derive(Debug, Args)]
+struct EmbedFlags {
+    /// Forward-pass token budget override; smaller values shorten each GPU
+    /// forward so the host stays responsive during large embed runs. Clamped
+    /// down to 256_000 (never up) so it cannot exceed the embedder's own
+    /// OOM ceiling.
+    #[arg(long, env = "RECALL_TOKEN_BUDGET", value_parser = parse_token_budget)]
+    token_budget: Option<usize>,
+
+    /// Pause (in milliseconds) after each GPU forward pass, yielding the GPU
+    /// to interactive processes; trades throughput for host responsiveness
+    /// during large embed runs.
+    #[arg(long, env = "RECALL_FORWARD_PAUSE_MS")]
+    forward_pause_ms: Option<u64>,
 }
 
 fn create_db_file(path: &Path) -> io::Result<()> {
@@ -315,18 +342,59 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
 
 // -- Subcommands --
 
-fn run_index(db_path: &Option<PathBuf>) -> Result<IndexOutcome> {
-    index_and_report(db_path, false)
+/// Clap `value_parser` for `--token-budget`: clamps down (never up) to
+/// [`embedder::TOKEN_BUDGET_CEILING`] so an over-large flag cannot push a
+/// forward pass past the Metal OOM ceiling that ceiling was chosen to avoid.
+fn parse_token_budget(s: &str) -> Result<usize, ParseIntError> {
+    let value: usize = s.parse()?;
+    Ok(value.min(embedder::TOKEN_BUDGET_CEILING))
 }
 
-fn run_rebuild(db_path: &Option<PathBuf>) -> Result<IndexOutcome> {
-    index_and_report(db_path, true)
+fn run_index(
+    db_path: &Option<PathBuf>,
+    token_budget: Option<usize>,
+    forward_pause_ms: Option<u64>,
+) -> Result<IndexOutcome> {
+    index_and_report(
+        db_path,
+        false,
+        embed_options_from_flags(token_budget, forward_pause_ms),
+    )
+}
+
+fn run_rebuild(
+    db_path: &Option<PathBuf>,
+    token_budget: Option<usize>,
+    forward_pause_ms: Option<u64>,
+) -> Result<IndexOutcome> {
+    index_and_report(
+        db_path,
+        true,
+        embed_options_from_flags(token_budget, forward_pause_ms),
+    )
+}
+
+/// Builds the embed pass's [`embedder::EmbedOptions`] from the `--token-budget`
+/// / `--forward-pause-ms` CLI flags. Both absent (the pre-flag default) yields
+/// `EmbedOptions::default()`, preserving current behavior.
+fn embed_options_from_flags(
+    token_budget: Option<usize>,
+    forward_pause_ms: Option<u64>,
+) -> embedder::EmbedOptions {
+    embedder::EmbedOptions {
+        token_budget,
+        forward_pause: forward_pause_ms.map(Duration::from_millis),
+    }
 }
 
 /// Shared index pipeline for `index` (incremental) and `rebuild` (full).
 /// Resolves source dirs from the environment, then delegates to
 /// [`index_and_report_with`] with the real cached-embedder loader.
-fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<IndexOutcome> {
+fn index_and_report(
+    db_path: &Option<PathBuf>,
+    force: bool,
+    embed_options: embedder::EmbedOptions,
+) -> Result<IndexOutcome> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     let claude_dir = indexer::resolve_claude_dir(&home);
     let codex_dir = indexer::resolve_codex_dir(&home);
@@ -337,9 +405,12 @@ fn index_and_report(db_path: &Option<PathBuf>, force: bool) -> Result<IndexOutco
     };
     // Load silently: IndexOutcome carries the degraded note and the block below is
     // its single emitter, so passing cli_info to the loader too would print twice.
-    let outcome = index_and_report_with(db_path, &opts, || {
-        try_load_embedder_cached_with_reporter(open_cached_embedder, |_: &str| {})
-    })?;
+    let outcome = index_and_report_with_options(
+        db_path,
+        &opts,
+        || try_load_embedder_cached_with_reporter(open_cached_embedder, |_: &str| {}),
+        embed_options,
+    )?;
     if let Some(note) = &outcome.degraded_note {
         cli_info(note);
     }
@@ -446,10 +517,35 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
 /// degraded note. `load_embedder` is a seam: tests inject a `MockEmbedder` or a
 /// degraded `Err`, production passes [`try_load_embedder_cached`]. Source dirs
 /// arrive via `opts` so tests control them without `set_var`.
+/// Production calls [`index_and_report_with_options`] directly (it needs to
+/// thread the `--token-budget`/`--forward-pause-ms` `EmbedOptions`), so this
+/// default-options entry point is now test-only.
+#[cfg(test)]
 fn index_and_report_with<F>(
     db_path: &Option<PathBuf>,
     opts: &indexer::IndexOptions,
     load_embedder: F,
+) -> Result<IndexOutcome>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    index_and_report_with_options(
+        db_path,
+        opts,
+        load_embedder,
+        embedder::EmbedOptions::default(),
+    )
+}
+
+/// [`index_and_report_with`] plus an [`embedder::EmbedOptions`] threaded from
+/// the `--token-budget` / `--forward-pause-ms` CLI flags down to the embed
+/// step. `index_and_report_with` delegates here with `EmbedOptions::default()`
+/// so its existing callers keep the pre-flag behavior unchanged.
+fn index_and_report_with_options<F>(
+    db_path: &Option<PathBuf>,
+    opts: &indexer::IndexOptions,
+    load_embedder: F,
+    embed_options: embedder::EmbedOptions,
 ) -> Result<IndexOutcome>
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
@@ -542,7 +638,7 @@ where
     let preserved_embedded = stats.preserved_embedded;
     match load_result {
         Ok(embedder) => {
-            let result = embed_all_pending(&mut conn, embedder.as_ref())?;
+            let result = embed_all_pending(&mut conn, embedder.as_ref(), &embed_options)?;
             Ok(IndexOutcome {
                 degraded_note: None,
                 embedded: result.embedded,
@@ -567,7 +663,11 @@ where
 /// one and replaces its chunks, leaving them pending. The pending list is
 /// collected once and fed straight to
 /// `embed_chunks` — a separate COUNT would re-scan vec_chunks (#138).
-fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<embedder::EmbedResult> {
+fn embed_all_pending(
+    conn: &mut Connection,
+    embedder: &dyn Embed,
+    options: &embedder::EmbedOptions,
+) -> Result<embedder::EmbedResult> {
     let pending = embedder::pending_chunks(conn, usize::MAX)?;
     if pending.is_empty() {
         return Ok(embedder::EmbedResult::default());
@@ -578,6 +678,7 @@ fn embed_all_pending(conn: &mut Connection, embedder: &dyn Embed) -> Result<embe
         embedder,
         &pending,
         Some(&|done, total| sp.set_message(&format!("Embedding chunks... {done}/{total}"))),
+        options,
     )?;
     sp.finish(&format!("Embedded {} chunks", result.embedded));
     // A mid-run batch failure is non-fatal: chunks already embedded are committed,
@@ -1884,8 +1985,18 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     init_subscriber(default_filter);
 
     match cli.command {
-        Some(Command::Index) => run_index(&cli.db_path).map(|o| index_command_output(&o)),
-        Some(Command::Rebuild) => run_rebuild(&cli.db_path).map(|o| index_command_output(&o)),
+        Some(Command::Index { embed_flags }) => run_index(
+            &cli.db_path,
+            embed_flags.token_budget,
+            embed_flags.forward_pause_ms,
+        )
+        .map(|o| index_command_output(&o)),
+        Some(Command::Rebuild { embed_flags }) => run_rebuild(
+            &cli.db_path,
+            embed_flags.token_budget,
+            embed_flags.forward_pause_ms,
+        )
+        .map(|o| index_command_output(&o)),
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
@@ -2399,14 +2510,31 @@ mod tests {
     #[test]
     fn test_rebuild_is_a_distinct_subcommand() {
         let cli = Cli::try_parse_from(["recall", "rebuild"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Rebuild));
+        assert_matches!(cli.command, Some(Command::Rebuild { .. }));
     }
 
     #[test]
     fn test_index_no_longer_accepts_force_flag() {
         assert!(Cli::try_parse_from(["recall", "index", "--force"]).is_err());
         let cli = Cli::try_parse_from(["recall", "index"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Index));
+        assert_matches!(cli.command, Some(Command::Index { .. }));
+    }
+
+    // T-004: --token-budget は既定上限 256_000 にクランプされる
+    // given: --token-budget 500000（256_000 超）
+    // when: Index の clap 解析を通す
+    // then: 値が 256_000 にクランプされる
+    #[test]
+    fn index_token_budget_flag_clamps_above_256000_ceiling_down() {
+        let cli = Cli::try_parse_from(["recall", "index", "--token-budget", "500000"]).unwrap();
+        let Some(Command::Index { embed_flags }) = cli.command else {
+            panic!("expected Command::Index with a token_budget field");
+        };
+        assert_eq!(
+            embed_flags.token_budget,
+            Some(256_000),
+            "500_000 exceeds the 256_000 ceiling and must clamp down, never up"
+        );
     }
 
     #[test]
@@ -2822,7 +2950,12 @@ mod tests {
             db::seed_chunk(&conn, i, &format!("pending content {i}"));
         }
 
-        let result = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        let result = embed_all_pending(
+            &mut conn,
+            &embedder::MockEmbedder::new(),
+            &embedder::EmbedOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(result.embedded, 3, "every pending chunk embeds");
         assert_eq!(result.failed_count, 0, "a working embedder fails nothing");
@@ -2848,8 +2981,12 @@ mod tests {
             db::seed_chunk(&conn, i, &format!("pending content {i}"));
         }
 
-        let result =
-            embed_all_pending(&mut conn, &embedder::MockEmbedder::failing_on_text("x")).unwrap();
+        let result = embed_all_pending(
+            &mut conn,
+            &embedder::MockEmbedder::failing_on_text("x"),
+            &embedder::EmbedOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(
             result.embedded, 0,
@@ -2894,19 +3031,88 @@ mod tests {
         )
         .unwrap();
 
-        let first = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        let first = embed_all_pending(
+            &mut conn,
+            &embedder::MockEmbedder::new(),
+            &embedder::EmbedOptions::default(),
+        )
+        .unwrap();
         assert_eq!(
             first.embedded, 1,
             "the first run embeds only the pending chunk"
         );
         assert_eq!(vec_chunk_count(&conn), 2, "vec gains exactly the new chunk");
 
-        let second = embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+        let second = embed_all_pending(
+            &mut conn,
+            &embedder::MockEmbedder::new(),
+            &embedder::EmbedOptions::default(),
+        )
+        .unwrap();
         assert_eq!(second.embedded, 0, "the second run re-embeds nothing");
         assert_eq!(
             vec_chunk_count(&conn),
             2,
             "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
+        );
+    }
+
+    // T-005: index フラグが EmbedOptions として forward される
+    // given: --token-budget 2048 --forward-pause-ms 700 と options を捕捉する
+    //        MockEmbedder
+    // when: embed_all_pending が embed_chunks を呼ぶ
+    // then: EmbedOptions{token_budget:Some(2048), forward_pause:Some(700ms)} が
+    //       forward される
+    #[test]
+    fn embed_all_pending_forwards_index_flags_as_embed_options() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        db::seed_session(&conn, "s1");
+        db::seed_chunk(&conn, 1, "pending content");
+
+        let embedder = embedder::MockEmbedder::capturing_options();
+        let options = embedder::EmbedOptions {
+            token_budget: Some(2048),
+            forward_pause: Some(Duration::from_millis(700)),
+        };
+
+        embed_all_pending(&mut conn, &embedder, &options).unwrap();
+
+        assert_eq!(
+            embedder.captured_options(),
+            Some(options),
+            "--token-budget 2048 --forward-pause-ms 700 must forward as \
+             EmbedOptions{{token_budget:Some(2048), forward_pause:Some(700ms)}}"
+        );
+    }
+
+    // T-006: フラグ未指定時は default EmbedOptions が forward され現行挙動が
+    //        保たれる
+    // given: フラグ未指定と MockEmbedder
+    // when: index を実行
+    // then: EmbedOptions default（None/None）が forward される
+    #[test]
+    fn embed_all_pending_forwards_default_embed_options_when_flags_unset() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let mut conn = open_or_create_db(&db_path).unwrap();
+        db::seed_session(&conn, "s1");
+        db::seed_chunk(&conn, 1, "pending content");
+
+        let embedder = embedder::MockEmbedder::capturing_options();
+
+        let result =
+            embed_all_pending(&mut conn, &embedder, &embedder::EmbedOptions::default()).unwrap();
+
+        assert_eq!(
+            result.embedded, 1,
+            "default EmbedOptions must preserve current embed behavior"
+        );
+        assert_eq!(
+            embedder.captured_options(),
+            Some(embedder::EmbedOptions::default()),
+            "default EmbedOptions (None/None) must forward when no flags are set"
         );
     }
 
@@ -5278,7 +5484,12 @@ mod tests {
             // Embed the chunk so vec_chunks is non-empty: has_vec_data() is then
             // true and search takes the hybrid (vector) branch where the runtime
             // failure occurs. The embed itself uses a healthy mock.
-            embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+            embed_all_pending(
+                &mut conn,
+                &embedder::MockEmbedder::new(),
+                &embedder::EmbedOptions::default(),
+            )
+            .unwrap();
         }
 
         let out = run_search_with(
@@ -5335,7 +5546,12 @@ mod tests {
             .unwrap();
             // Embed both chunks so has_vec_data() is true and the hybrid path (with the
             // metadata prune) runs.
-            embed_all_pending(&mut conn, &embedder::MockEmbedder::new()).unwrap();
+            embed_all_pending(
+                &mut conn,
+                &embedder::MockEmbedder::new(),
+                &embedder::EmbedOptions::default(),
+            )
+            .unwrap();
         }
 
         let out = run_search_with(

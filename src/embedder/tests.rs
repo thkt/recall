@@ -35,6 +35,7 @@ fn test_embed_chunks_progress_callback() {
         Some(&|done, total| {
             calls.lock().unwrap().push((done, total));
         }),
+        &EmbedOptions::default(),
     )
     .unwrap();
 
@@ -53,9 +54,23 @@ fn test_embed_chunks_replaces_existing_vectors_for_stale_pending_work() {
     let embedder = MockEmbedder::new();
     let chunks: Vec<(i64, String)> = vec![(1, "content 0".into())];
 
-    let first = embed_chunks(&mut conn, &embedder, &chunks, None).unwrap();
+    let first = embed_chunks(
+        &mut conn,
+        &embedder,
+        &chunks,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
     assert_eq!(first.embedded, 1);
-    let second = embed_chunks(&mut conn, &embedder, &chunks, None).unwrap();
+    let second = embed_chunks(
+        &mut conn,
+        &embedder,
+        &chunks,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
     assert_eq!(second.embedded, 1);
 
     let vec_count: i64 = conn
@@ -112,7 +127,14 @@ fn test_embed_chunks_poison_batch_does_not_block_next_batch() {
     assert_eq!(chunks.len(), 129, "129 chunks span exactly two batches");
 
     let embedder = MockEmbedder::failing_on_text("x");
-    let result = embed_chunks(&mut conn, &embedder, &chunks, None).unwrap();
+    let result = embed_chunks(
+        &mut conn,
+        &embedder,
+        &chunks,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
 
     assert_eq!(
         result.embedded, 1,
@@ -153,7 +175,14 @@ fn test_embed_chunks_failed_batch_leaves_chunks_pending() {
     };
 
     let embedder = MockEmbedder::failing_on_text("x");
-    embed_chunks(&mut conn, &embedder, &chunks, None).unwrap();
+    embed_chunks(
+        &mut conn,
+        &embedder,
+        &chunks,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
 
     let vec_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
