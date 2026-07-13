@@ -950,6 +950,36 @@ fn skip_if_root_は_0o555_dir_で_create_失敗なら_probe_を残さず_false_�
     );
 }
 
+// ---- assert_copy_based_remedy negative branches: all three call sites feed
+// real passing output, so an inverted or loosened contains() would false-pass
+// in correlated fashion there; these synthetic notes pin the failure side ----
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "-shm sidecar")]
+fn assert_copy_based_remedy_は_shm_言及を欠く_note_を拒否する() {
+    root_skip::assert_copy_based_remedy(
+        "read-only open cannot see uncommitted changes in the write-ahead log; \
+         the directory is read-only, so copy the DB together with its `-wal` \
+         sidecar file elsewhere and run `recall index --db-path <copy>` to \
+         checkpoint it there.",
+        "negative self-test",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "cannot run a bare")]
+fn assert_copy_based_remedy_は_裸の_recall_index_案内を含む_note_を拒否する() {
+    root_skip::assert_copy_based_remedy(
+        "read-only open cannot see uncommitted changes in the write-ahead log; \
+         copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
+         files elsewhere and run `recall index --db-path <copy>`, or run \
+         `recall index` to checkpoint them.",
+        "negative self-test",
+    );
+}
+
 // ---- U-002: root detection unified onto root_skip::skip_if_root, plus a
 // canary that turns a root-run suite loud instead of silently skipping ----
 //

@@ -106,11 +106,12 @@ pub fn assert_probe_literal_not_inlined(source: &str, file_label: &str) {
 /// drifting inline trio asserts. `context` labels the calling site in failure
 /// messages.
 ///
-/// The four assertions, pinned against `src/db.rs`'s `stale_wal_note`
+/// The assertions, pinned against `src/db.rs`'s `stale_wal_note`
 /// read-only branch (production wording): the write-ahead-log wording survives;
-/// the copy-based `recall index --db-path <copy>` remedy is present; both the
-/// `-wal` and `-shm` sidecars are named; and no bare `recall index` run form
-/// (which a read-only dir cannot execute) leaks through.
+/// the copy-based `recall index --db-path <copy>` remedy is present; the
+/// `-wal` and `-shm` sidecars are each named; and no bare `recall index` run
+/// form (which a read-only dir cannot execute) leaks through.
+#[track_caller]
 pub fn assert_copy_based_remedy(note: &str, context: &str) {
     assert!(
         note.contains("write-ahead log"),
@@ -121,8 +122,12 @@ pub fn assert_copy_based_remedy(note: &str, context: &str) {
         "[{context}] note must guide a copy-based `recall index --db-path` remedy, got: {note}"
     );
     assert!(
-        note.contains("-wal") && note.contains("-shm"),
-        "[{context}] note must name the -wal and -shm sidecar files to copy, got: {note}"
+        note.contains("-wal"),
+        "[{context}] note must name the -wal sidecar file to copy, got: {note}"
+    );
+    assert!(
+        note.contains("-shm"),
+        "[{context}] note must name the -shm sidecar file to copy, got: {note}"
     );
     assert!(
         !note.contains("run `recall index`"),
