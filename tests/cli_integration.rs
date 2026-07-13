@@ -1103,16 +1103,7 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
             .unwrap_or_else(|| {
                 panic!("{name} should carry the stale write-ahead-log note, got: {stdout}")
             });
-        assert!(
-            remedy.contains("-wal")
-                && remedy.contains("-shm")
-                && remedy.contains("recall index --db-path <copy>"),
-            "{name} remedy must guide a read-only dir to copy the DB and its sidecars elsewhere, got: {remedy}"
-        );
-        assert!(
-            !remedy.contains("run `recall index`."),
-            "{name} remedy must not suggest a bare `recall index` run in a read-only dir, got: {remedy}"
-        );
+        root_skip::assert_copy_based_remedy(remedy, name);
     }
 }
 

@@ -13,6 +13,10 @@
 //! case: nextest captures stdout/stderr by default, so a marker would not
 //! surface anywhere a human or CI would see it. Making a root test run
 //! visible is a separate concern left to a canary test, not this helper.
+//!
+//! Read-only-dir test convention: a test that clears a dir's write bits routes
+//! through `skip_if_root` and restores the write bits (chmod 0o755) before any
+//! assert, so a panicking assert cannot leave the read-only TempDir undroppable.
 
 use std::path::Path;
 
@@ -91,5 +95,37 @@ pub fn assert_probe_literal_not_inlined(source: &str, file_label: &str) {
         0,
         "{probe_literal:?} must appear only in root_skip::skip_if_root's definition, \
          not duplicated inline in {file_label}"
+    );
+}
+
+/// Asserts `note` carries the read-only-dir "copy the DB elsewhere" remedy
+/// contract in one shared place, so the three tests that exercise it (the
+/// read-only-dir immutable-tier test and the macOS read-only-mount test in
+/// `src/db/tests.rs`, and the CLI `--json` degraded-note test in
+/// `tests/cli_integration.rs`) hold the same wording contract instead of
+/// drifting inline trio asserts. `context` labels the calling site in failure
+/// messages.
+///
+/// The four assertions, pinned against `src/db.rs`'s `stale_wal_note`
+/// read-only branch (production wording): the write-ahead-log wording survives;
+/// the copy-based `recall index --db-path <copy>` remedy is present; both the
+/// `-wal` and `-shm` sidecars are named; and no bare `recall index` run form
+/// (which a read-only dir cannot execute) leaks through.
+pub fn assert_copy_based_remedy(note: &str, context: &str) {
+    assert!(
+        note.contains("write-ahead log"),
+        "[{context}] note must carry the write-ahead-log wording, got: {note}"
+    );
+    assert!(
+        note.contains("recall index --db-path <copy>"),
+        "[{context}] note must guide a copy-based `recall index --db-path` remedy, got: {note}"
+    );
+    assert!(
+        note.contains("-wal") && note.contains("-shm"),
+        "[{context}] note must name the -wal and -shm sidecar files to copy, got: {note}"
+    );
+    assert!(
+        !note.contains("run `recall index`"),
+        "[{context}] a read-only location cannot run a bare `recall index`; got: {note}"
     );
 }

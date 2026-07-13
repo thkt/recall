@@ -496,22 +496,7 @@ fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_i
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
     let note = note.expect("non-empty -wal on Immutable tier must warn");
-    assert!(
-        note.contains("write-ahead log"),
-        "note must still carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        !note.contains("run `recall index`"),
-        "a read-only dir cannot run a bare `recall index`; got: {note}"
-    );
-    assert!(
-        note.contains("recall index --db-path <copy>"),
-        "note must guide a copy-based `recall index --db-path` remedy, got: {note}"
-    );
-    assert!(
-        note.contains("-wal") && note.contains("-shm"),
-        "note must tell the user to copy the -wal (and -shm) sidecar files, got: {note}"
-    );
+    root_skip::assert_copy_based_remedy(&note, "read-only dir immutable tier");
 }
 
 #[test]
@@ -870,18 +855,7 @@ fn stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_
 
     let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable)
         .expect("non-empty -wal on a read-only mount must warn");
-    assert!(
-        note.contains("write-ahead log"),
-        "note must carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        note.contains("recall index --db-path <copy>"),
-        "note must guide the copy-based remedy, got: {note}"
-    );
-    assert!(
-        !note.contains("run `recall index`"),
-        "a read-only mount cannot run a bare `recall index`; got: {note}"
-    );
+    root_skip::assert_copy_based_remedy(&note, "read-only mount immutable tier");
 }
 
 // T-006
