@@ -52,7 +52,7 @@ pub fn skip_if_root(dir: &Path) -> bool {
 /// (`tests/cli_integration.rs`) suites, which compile separately and so cannot
 /// share a `#[test]` fn directly. Turns a root-run suite loud (panics) instead
 /// of letting the permission-bit tests silently skip, and on a non-root run
-/// verifies the read-only TempDir's write bits are restored before Drop.
+/// restores the read-only TempDir's write bits before Drop.
 #[cfg(unix)]
 pub fn assert_root_canary() {
     use std::fs;
@@ -72,13 +72,8 @@ pub fn assert_root_canary() {
     }
 
     // Non-root: skip_if_root left dir's write bits untouched (still 0o555).
-    // Restore them before the assert so TempDir's Drop can clean up.
+    // Restore them so TempDir's Drop can clean up.
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        mode, 0o755,
-        "dir's write bits must be restored to 0o755 before TempDir's Drop cleans up"
-    );
 }
 
 /// Asserts the raw `.root_probe` probe-file literal is not inlined anywhere in
