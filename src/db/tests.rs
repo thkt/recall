@@ -496,22 +496,7 @@ fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_i
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
     let note = note.expect("non-empty -wal on Immutable tier must warn");
-    assert!(
-        note.contains("write-ahead log"),
-        "note must still carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        !note.contains("run `recall index`"),
-        "a read-only dir cannot run a bare `recall index`; got: {note}"
-    );
-    assert!(
-        note.contains("recall index --db-path <copy>"),
-        "note must guide a copy-based `recall index --db-path` remedy, got: {note}"
-    );
-    assert!(
-        note.contains("-wal") && note.contains("-shm"),
-        "note must tell the user to copy the -wal (and -shm) sidecar files, got: {note}"
-    );
+    root_skip::assert_copy_based_remedy(&note, "read-only dir immutable tier");
 }
 
 #[test]
@@ -870,18 +855,7 @@ fn stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_
 
     let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable)
         .expect("non-empty -wal on a read-only mount must warn");
-    assert!(
-        note.contains("write-ahead log"),
-        "note must carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        note.contains("recall index --db-path <copy>"),
-        "note must guide the copy-based remedy, got: {note}"
-    );
-    assert!(
-        !note.contains("run `recall index`"),
-        "a read-only mount cannot run a bare `recall index`; got: {note}"
-    );
+    root_skip::assert_copy_based_remedy(&note, "read-only mount immutable tier");
 }
 
 // T-006
@@ -973,6 +947,36 @@ fn skip_if_root_は_0o555_dir_で_create_失敗なら_probe_を残さず_false_�
         fs::read_dir(dir.path()).unwrap().count(),
         0,
         "no entry may remain directly under dir"
+    );
+}
+
+// ---- assert_copy_based_remedy negative branches: all three call sites feed
+// real passing output, so an inverted or loosened contains() would false-pass
+// in correlated fashion there; these synthetic notes pin the failure side ----
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "-shm sidecar")]
+fn assert_copy_based_remedy_は_shm_言及を欠く_note_を拒否する() {
+    root_skip::assert_copy_based_remedy(
+        "read-only open cannot see uncommitted changes in the write-ahead log; \
+         the directory is read-only, so copy the DB together with its `-wal` \
+         sidecar file elsewhere and run `recall index --db-path <copy>` to \
+         checkpoint it there.",
+        "negative self-test",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "cannot run a bare")]
+fn assert_copy_based_remedy_は_裸の_recall_index_案内を含む_note_を拒否する() {
+    root_skip::assert_copy_based_remedy(
+        "read-only open cannot see uncommitted changes in the write-ahead log; \
+         copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
+         files elsewhere and run `recall index --db-path <copy>`, or run \
+         `recall index` to checkpoint them.",
+        "negative self-test",
     );
 }
 
