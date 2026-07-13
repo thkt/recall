@@ -347,6 +347,12 @@ fn table_def(conn: &Connection, name: &str) -> Result<Option<String>> {
     }
 }
 
+/// Embeddings live only in this vec0 table, so a `DROP` here discards them and
+/// the next `recall index` re-embeds the whole corpus (minutes to hours on MLX).
+/// The legacy pre-sub_idx drop below predates that understanding and is kept
+/// as-is; any FUTURE vec_chunks schema migration must instead carry the
+/// embedding blobs across (stage `SELECT rowid, embedding, chunk_id, sub_idx`
+/// into a temp table, recreate vec_chunks, re-insert) rather than drop them.
 fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "vec_chunks")? else {
         return Ok(());
