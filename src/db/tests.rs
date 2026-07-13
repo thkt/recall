@@ -488,12 +488,7 @@ fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_i
     fs::write(&wal, b"uncommitted").unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
-    // Root bypasses directory permission bits, so the read-only condition can't
-    // be reproduced.
-    let is_root = fs::File::create(dir.path().join(".root_probe")).is_ok();
-    if is_root {
-        let _ = fs::remove_file(dir.path().join(".root_probe"));
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
@@ -600,23 +595,6 @@ fn test_is_readonly_dir_error_writable_dir_rejects_immutable_fallback() {
     );
 }
 
-/// True when the effective user bypasses directory permission bits (e.g. running as
-/// root), detected empirically by attempting to create a file in `dir`. `dir` must
-/// already have its write bits cleared (e.g. `chmod 0o555`); when bypass is detected,
-/// the probe file is removed and `dir`'s permissions are restored to `0o755` so the
-/// caller can return early and let `TempDir`'s drop clean up.
-#[cfg(unix)]
-fn root_bypasses_permission_bits(dir: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    let is_root = fs::File::create(dir.join(".root_probe")).is_ok();
-    if is_root {
-        let _ = fs::remove_file(dir.join(".root_probe"));
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    is_root
-}
-
 #[cfg(unix)]
 #[test]
 fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
@@ -629,7 +607,7 @@ fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
     let db = dir.path().join("recall.db");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
-    if root_bypasses_permission_bits(dir.path()) {
+    if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
@@ -668,7 +646,7 @@ fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
     let missing = dir.path().join("nope.db");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
-    if root_bypasses_permission_bits(dir.path()) {
+    if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
@@ -716,7 +694,7 @@ fn write_probe_reports_a_directory_with_cleared_write_bits_as_unwritable() {
     let dir = tempfile::TempDir::new().unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
-    if root_bypasses_permission_bits(dir.path()) {
+    if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
@@ -930,4 +908,89 @@ fn a_path_without_a_parent_component_stays_classified_writable() {
         !dir_is_unwritable(Path::new("/")),
         "the filesystem root (no parent) must not be classified unwritable"
     );
+}
+
+// ---- U-001: skip_if_root shared helper (tests/support/root_skip.rs) ----
+//
+// Locks the contract of the shared root-bypass probe now used in place of the
+// former inline duplicates (the old `root_bypasses_permission_bits` helper,
+// and a second inline copy in the `stale_wal_note` read-only-dir test).
+// Included via `#[path]` since `tests/support/` is a subdirectory Cargo does
+// not compile as its own integration-test binary.
+
+#[cfg(unix)]
+#[path = "../../tests/support/root_skip.rs"]
+mod root_skip;
+
+#[cfg(unix)]
+#[test]
+fn skip_if_root_は_create_成功時に_probe_を消し_write_bits_を_0o755_へ復元して_true_を返す() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Intentional violation of skip_if_root's documented precondition (the
+    // caller normally clears write bits to 0o555 first): this TempDir keeps
+    // its default 0o700, so the probe file's creation succeeds even for a
+    // non-root test runner. That walks the same "create succeeded" branch
+    // skip_if_root takes when it genuinely detects root, without requiring a
+    // root-privileged test run, and doubles as the diff-cover hit for that
+    // branch.
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let got = root_skip::skip_if_root(dir.path());
+
+    assert!(
+        got,
+        "create succeeding (root, or here a still-writable dir) must report true"
+    );
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "no entry (probe or otherwise) may remain directly under dir"
+    );
+    let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "dir's write bits must be restored to 0o755");
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_if_root_は_0o555_dir_で_create_失敗なら_probe_を残さず_false_を返す() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let got = root_skip::skip_if_root(dir.path());
+
+    // Restore write bits regardless of outcome so TempDir's Drop can clean up.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        !got,
+        "create failing (non-root, 0o555 dir) must report false"
+    );
+    assert_eq!(
+        fs::read_dir(dir.path()).unwrap().count(),
+        0,
+        "no entry may remain directly under dir"
+    );
+}
+
+// ---- U-002: root detection unified onto root_skip::skip_if_root, plus a
+// canary that turns a root-run suite loud instead of silently skipping ----
+//
+// T-003
+#[cfg(unix)]
+#[test]
+fn canary_は非_root_で_green_root_では_panic_してスイートを赤化する() {
+    root_skip::assert_root_canary();
+}
+
+// T-004: the probe-file literal must live only inside root_skip::skip_if_root's
+// own definition (tests/support/root_skip.rs), not duplicated inline in this
+// file. The four permission-bit-dependent tests above already exercise
+// root_skip::skip_if_root as their own #[test]s.
+#[cfg(unix)]
+#[test]
+fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
+    root_skip::assert_probe_literal_not_inlined(include_str!("tests.rs"), "src/db/tests.rs");
 }

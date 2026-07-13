@@ -8,6 +8,14 @@ use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
+// U-003: shared root-bypass probe (tests/support/root_skip.rs), the same
+// helper src/db/tests.rs's U-001/U-002 unified onto. `tests/support/` is a
+// subdirectory, so Cargo does not compile it as its own integration-test
+// binary; `#[path]` pulls it into this binary's module tree instead.
+#[cfg(unix)]
+#[path = "support/root_skip.rs"]
+mod root_skip;
+
 /// A `recall` invocation isolated from the developer's real sessions and DB.
 /// `RECALL_DB` points at a path inside `dir`; the source dirs point nowhere so
 /// indexing never touches `~/.claude` or `~/.codex`. `CLAUDE_CODE_SESSION_ID` is
@@ -970,11 +978,8 @@ fn read_commands_work_in_readonly_directory() {
     set_mode(0o555);
 
     // Root bypasses directory permission bits, so the read-only condition cannot
-    // be reproduced; probe by trying to write, and skip the body if it succeeds.
-    let probe = dir.path().join(".root_probe");
-    if fs::File::create(&probe).is_ok() {
-        let _ = fs::remove_file(&probe);
-        set_mode(0o755);
+    // be reproduced; skip the body when skip_if_root detects that.
+    if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
@@ -1040,10 +1045,7 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
     set_mode(0o555);
 
     // Root bypasses directory permission bits, so tier 2 cannot be forced; skip.
-    let probe = dir.path().join(".root_probe");
-    if fs::File::create(&probe).is_ok() {
-        let _ = fs::remove_file(&probe);
-        set_mode(0o755);
+    if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
@@ -1112,4 +1114,28 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
             "{name} remedy must not suggest a bare `recall index` run in a read-only dir, got: {remedy}"
         );
     }
+}
+
+// ---- U-003: inline root-bypass probes (974-979 / 1043-1048 above) unified
+// onto the shared root_skip::skip_if_root (tests/support/root_skip.rs),
+// mirroring src/db/tests.rs's U-001/U-002, plus an integration-side canary ----
+
+// T-006: the probe-file literal must live only inside root_skip::skip_if_root's
+// own definition (tests/support/root_skip.rs), not duplicated inline in this
+// file. The two permission-bit-dependent tests above already exercise
+// root_skip::skip_if_root as their own #[test]s.
+#[cfg(unix)]
+#[test]
+fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
+    root_skip::assert_probe_literal_not_inlined(
+        include_str!("cli_integration.rs"),
+        "tests/cli_integration.rs",
+    );
+}
+
+// T-005
+#[cfg(unix)]
+#[test]
+fn integration_canary_は非_root_で_green_root_では_panic_で赤化する() {
+    root_skip::assert_root_canary();
 }
