@@ -33,6 +33,11 @@ pub struct SearchResult {
     /// FTS5 20-token snippet (with `**` highlight markers), else the closest vector
     /// chunk, else empty.
     pub excerpt: String,
+    /// The `qa_chunks.id` the excerpt resolved to, for a chunk-backed hit (FTS
+    /// rowid-tier or vector-tier). `None` for a snippet-tier hit, whose excerpt is an
+    /// fts5 snippet with no backing chunk; the caller then guides to the whole
+    /// conversation (`recall show <id>`) rather than a `--chunk` drill-down (#282).
+    pub chunk_id: Option<i64>,
 }
 
 /// The ranked hits plus two independent degradation signals the caller forwards
@@ -323,18 +328,19 @@ fn fetch_session_metadata(
 fn build_candidates(
     ranked: Vec<(String, f64)>,
     meta_map: &mut HashMap<String, SessionData>,
-    mut get_snippet: impl FnMut(&str) -> String,
+    mut get_excerpt: impl FnMut(&str) -> (String, Option<i64>),
 ) -> Vec<(f64, SearchResult)> {
     ranked
         .into_iter()
         .filter_map(|(session_id, rank)| {
             let session = meta_map.remove(&session_id)?;
-            let snippet = get_snippet(&session_id);
+            let (excerpt, chunk_id) = get_excerpt(&session_id);
             Some((
                 rank,
                 SearchResult {
                     session,
-                    excerpt: snippet,
+                    excerpt,
+                    chunk_id,
                 },
             ))
         })
@@ -370,7 +376,12 @@ fn score_and_sort(
     results.into_iter().map(|(r, _)| r).collect()
 }
 
-fn snippet_or_default(result: rusqlite::Result<String>, session_id: &str) -> Option<String> {
+/// Map a per-session excerpt lookup to `Option`: a hit is `Some`, a
+/// `QueryReturnedNoRows` (no matching chunk/snippet in this tier) is a quiet `None`
+/// so the next tier runs, and any other SQLite error is logged and treated as a
+/// miss. Generic over the row shape so the rowid tier can return `(id, content)`
+/// while the other tiers return the content string alone.
+fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T> {
     match result {
         Ok(s) => Some(s),
         Err(rusqlite::Error::QueryReturnedNoRows) => None,
@@ -399,7 +410,10 @@ fn fetch_chunks(
     // one range → COUNT=N) collapsing to the snippet instead of an arbitrary sibling.
     // Restricted to `src_rowid_lo IS NOT NULL` so only linked (current or backfilled)
     // chunks take this path; legacy NULL rows fall through to the instr guess below.
-    let rowid_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
+    // `HAVING COUNT(*) = 1` forces the group to a single chunk, so the bare `c.id`
+    // is unambiguous alongside `MAX(c.content)` (it is that one row's id) — the
+    // drill-down anchor the excerpt resolved to (#282).
+    let rowid_match_sql = "SELECT c.id, MAX(c.content) FROM qa_chunks c \
         JOIN (SELECT rowid FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
           ON m.rowid BETWEEN c.src_rowid_lo AND c.src_rowid_hi \
         WHERE c.session_id = ?2 AND c.src_rowid_lo IS NOT NULL HAVING COUNT(*) = 1";
@@ -431,34 +445,42 @@ fn fetch_chunks(
         // the vector path. Skip the three MATCH-based snippet tiers (MATCH "" errors
         // and logs a warning per session) and use the vec-chunk content directly.
         if let Some(fts_query) = fts_query {
-            if let Some(content) = snippet_or_default(
-                rowid_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+            // rowid tier resolves the exact backing chunk, so return its id as the
+            // drill-down anchor.
+            if let Some((chunk_id, content)) = row_or_default(
+                rowid_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                }),
                 sid,
             ) {
-                return content;
+                return (content, Some(chunk_id));
             }
-            if let Some(content) = snippet_or_default(
+            // instr tier (legacy NULL-src_rowid chunk) and snippet tier carry no
+            // stable chunk anchor, so the caller guides to the full-conversation show.
+            if let Some(content) = row_or_default(
                 instr_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
                 sid,
             ) {
-                return content;
+                return (content, None);
             }
-            if let Some(snippet) = snippet_or_default(
+            if let Some(snippet) = row_or_default(
                 snippet_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
                 sid,
             ) {
-                return snippet;
+                return (snippet, None);
             }
         }
+        // Vector-only hit: the closest chunk id came from the knn ranking
+        // (`vec_chunks`), so it is the drill-down anchor directly.
         if let Some(&chunk_id) = vec_chunks.get(sid)
-            && let Some(content) = snippet_or_default(
+            && let Some(content) = row_or_default(
                 vec_chunk_stmt.query_row(rusqlite::params![chunk_id], |row| row.get(0)),
                 sid,
             )
         {
-            return content;
+            return (content, Some(chunk_id));
         }
-        String::new()
+        (String::new(), None)
     }))
 }
 

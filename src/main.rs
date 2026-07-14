@@ -36,7 +36,7 @@ use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand};
 use rurico::embed::{EMBEDDING_DIMS, Embed, ModelId, cached_artifacts};
 use rurico::handle_probe_if_needed;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, warn};
 
 use crate::envelope::{CommandOutput, render_json_error, render_json_success};
@@ -125,6 +125,12 @@ enum Command {
     Show {
         /// Session ID (prefix match supported)
         session_id: String,
+        /// Anchor on a qa_chunk id and show only its message range plus neighbors
+        #[arg(long)]
+        chunk: Option<i64>,
+        /// Per-side neighbor count around the anchored chunk (requires --chunk)
+        #[arg(long, default_value_t = DEFAULT_WINDOW)]
+        window: i64,
     },
     /// Classify existing sessions interactive/automated from their first user turn
     Classify {
@@ -922,7 +928,78 @@ where
     Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
 }
 
+/// Write the markdown header shared by every `recall show` render: title, the four
+/// always-present metadata bullets, any caller-supplied extra bullets (e.g.
+/// `- chunk:`, `- window:`), then the `- file:` bullet gated on `verbose`, followed
+/// by a blank line. Extracted because the full render, windowed render, and legacy
+/// chunk fallback all wrote this same block (#282).
+fn write_show_header(
+    buf: &mut Vec<u8>,
+    session: &parser::SessionData,
+    verbose: bool,
+    extra: &[String],
+) {
+    let _ = writeln!(buf, "# {}", session.slug);
+    let _ = writeln!(buf, "- session_id: {}", session.session_id);
+    let _ = writeln!(buf, "- date: {}", format_timestamp(session.timestamp));
+    let _ = writeln!(buf, "- project: {}", session.project);
+    let _ = writeln!(buf, "- source: {}", session.source);
+    for line in extra {
+        let _ = writeln!(buf, "{line}");
+    }
+    if verbose {
+        let _ = writeln!(buf, "- file: {}", session.file_path);
+    }
+    let _ = writeln!(buf);
+}
+
 fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<CommandOutput> {
+    let session = resolve_session(conn, session_id)?;
+
+    let mut msg_stmt =
+        conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
+    let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let messages: Vec<(String, String)> = collect_rows::<_, _, _, Error>(rows)?;
+
+    // Writes to an in-memory Vec are infallible; the pipe is only touched later
+    // by the single emit_success -> emit_success_to write path.
+    let mut buf = Vec::new();
+    write_show_header(&mut buf, &session, verbose, &[]);
+    for (role, text) in &messages {
+        let _ = writeln!(buf, "## [{role}]");
+        let _ = writeln!(buf, "{text}");
+        let _ = writeln!(buf);
+    }
+    let markdown = String::from_utf8_lossy(&buf).into_owned();
+
+    let data = serde_json::json!({
+        "session_id": session.session_id,
+        "slug": session.slug,
+        "project": session.project,
+        "source": session.source.to_string(),
+        "timestamp": session.timestamp,
+        "messages": messages
+            .iter()
+            .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
+            .collect::<Vec<_>>(),
+    });
+
+    Ok(CommandOutput::ok(markdown, data))
+}
+
+/// Default per-side neighbor count when `--chunk` is given without `--window`.
+const DEFAULT_WINDOW: i64 = 5;
+/// Upper bound on the per-side neighbor count so a windowed show stays bounded for
+/// agent consumption (contract: 片側 N に cap). A negative `--window` clamps to 0.
+const MAX_WINDOW: i64 = 50;
+/// Upper bound on one rendered message's character length (contract: 1 メッセージ
+/// 表示長に cap). Longer messages are truncated with an ellipsis marker.
+const MAX_MSG_CHARS: usize = 4000;
+
+/// Resolve a session-id prefix to exactly one session (prefix-match / no-match /
+/// ambiguous-match rules), shared by `show_session` and `show_session_windowed` so
+/// `--chunk` windowing uses the same resolution semantics as the full render.
+fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::SessionData> {
     let mut stmt = conn.prepare(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\' ORDER BY session_id",
@@ -955,29 +1032,129 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
         msg.push_str("Narrow the session ID prefix to match exactly one session");
         return Err(RecallError::Usage(msg).into());
     }
+    // len() == 1 is guaranteed by the two guards above.
+    Ok(matches.into_iter().next().expect("exactly one match"))
+}
 
-    let session = &matches[0];
-
-    let mut msg_stmt =
-        conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
-    let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let messages: Vec<(String, String)> = collect_rows::<_, _, _, Error>(rows)?;
-
-    // Writes to an in-memory Vec are infallible; the pipe is only touched later
-    // by the single emit_success -> emit_success_to write path.
-    let mut buf = Vec::new();
-    let _ = writeln!(buf, "# {}", session.slug);
-    let _ = writeln!(buf, "- session_id: {}", session.session_id);
-    let _ = writeln!(buf, "- date: {}", format_timestamp(session.timestamp));
-    let _ = writeln!(buf, "- project: {}", session.project);
-    let _ = writeln!(buf, "- source: {}", session.source);
-    if verbose {
-        let _ = writeln!(buf, "- file: {}", session.file_path);
+/// Truncate one message to `MAX_MSG_CHARS` characters (contract cap). Splits on a
+/// char boundary so multibyte text (Japanese) never panics.
+fn cap_message(text: &str) -> String {
+    if text.chars().count() <= MAX_MSG_CHARS {
+        return text.to_owned();
     }
-    let _ = writeln!(buf);
-    for (role, text) in &messages {
-        let _ = writeln!(buf, "## [{role}]");
-        let _ = writeln!(buf, "{text}");
+    let cut: String = text.chars().take(MAX_MSG_CHARS).collect();
+    format!("{cut}…")
+}
+
+/// `recall show <id> --chunk <cid> --window <N>`: anchor on a chunk and show only
+/// the same-session messages within its range plus N neighbors on each side.
+///
+/// `chunk = None` preserves the pre-feature full render (backward compat). A chunk
+/// whose `src_rowid_lo/hi` are NULL (pre-#192 legacy row) has no message anchor, so
+/// it falls back to its own body plus a pointer to the full `recall show`.
+fn show_session_windowed(
+    conn: &Connection,
+    session_id: &str,
+    verbose: bool,
+    chunk: Option<i64>,
+    window: i64,
+) -> Result<CommandOutput> {
+    let Some(chunk_id) = chunk else {
+        return show_session(conn, session_id, verbose);
+    };
+
+    let session = resolve_session(conn, session_id)?;
+
+    let anchor = conn
+        .query_row(
+            "SELECT session_id, content, src_rowid_lo, src_rowid_hi \
+             FROM qa_chunks WHERE id = ?1",
+            [chunk_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| RecallError::Usage(format!("No chunk found with id {chunk_id}")))?;
+    let (chunk_session, content, lo, hi) = anchor;
+
+    // `messages` is a single fts5 table shared by every session; a chunk belongs to
+    // exactly one session, so refuse to window it against a different one.
+    if chunk_session != session.session_id {
+        return Err(RecallError::Usage(format!(
+            "chunk {chunk_id} belongs to session '{chunk_session}', not '{}'",
+            session.session_id
+        ))
+        .into());
+    }
+
+    match (lo, hi) {
+        (Some(lo), Some(hi)) => render_windowed(conn, &session, chunk_id, lo, hi, window, verbose),
+        _ => Ok(render_chunk_fallback(&session, chunk_id, &content, verbose)),
+    }
+}
+
+/// Render the message-range body plus N same-session neighbors on each side.
+fn render_windowed(
+    conn: &Connection,
+    session: &parser::SessionData,
+    chunk_id: i64,
+    lo: i64,
+    hi: i64,
+    window: i64,
+    verbose: bool,
+) -> Result<CommandOutput> {
+    let n = window.clamp(0, MAX_WINDOW) as usize;
+
+    // The `session_id = ?1` filter is mandatory: `messages` rowids interleave
+    // across sessions (single shared fts5 table), so neighbors are only well
+    // defined as positions within this one session's rowid-ordered list. Slicing
+    // by session-local position is what keeps the window from leaking across the
+    // boundary.
+    let mut stmt = conn
+        .prepare("SELECT rowid, role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
+    let rows = stmt.query_map([&session.session_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let msgs: Vec<(i64, String, String)> = collect_rows::<_, _, _, Error>(rows)?;
+
+    // Body = messages whose rowid lands in [lo, hi]; neighbors are n positions to
+    // each side of that body within the same-session list.
+    let first_body = msgs.iter().position(|(rid, ..)| *rid >= lo);
+    let last_body = msgs.iter().rposition(|(rid, ..)| *rid <= hi);
+    let slice: &[(i64, String, String)] = match (first_body, last_body) {
+        (Some(f), Some(l)) if f <= l => {
+            let start = f.saturating_sub(n);
+            let end = (l + n).min(msgs.len() - 1);
+            &msgs[start..=end]
+        }
+        _ => &[],
+    };
+
+    let mut buf = Vec::new();
+    write_show_header(
+        &mut buf,
+        session,
+        verbose,
+        &[format!("- chunk: {chunk_id}"), format!("- window: {n}")],
+    );
+    for (rid, role, text) in slice {
+        let marker = if *rid >= lo && *rid <= hi {
+            " (chunk)"
+        } else {
+            ""
+        };
+        let _ = writeln!(buf, "## [{role}]{marker}");
+        let _ = writeln!(buf, "{}", cap_message(text));
         let _ = writeln!(buf);
     }
     let markdown = String::from_utf8_lossy(&buf).into_owned();
@@ -988,16 +1165,69 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
         "project": session.project,
         "source": session.source.to_string(),
         "timestamp": session.timestamp,
-        "messages": messages
+        "chunk": chunk_id,
+        "window": n,
+        "messages": slice
             .iter()
-            .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
+            .map(|(rid, role, text)| serde_json::json!({
+                "rowid": rid,
+                "role": role,
+                "text": cap_message(text),
+                "in_chunk": *rid >= lo && *rid <= hi,
+            }))
             .collect::<Vec<_>>(),
     });
 
     Ok(CommandOutput::ok(markdown, data))
 }
 
-fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+/// Render a pre-#192 legacy chunk that has no message-range anchor: its own body
+/// plus a pointer to the full `recall show` for the whole conversation.
+fn render_chunk_fallback(
+    session: &parser::SessionData,
+    chunk_id: i64,
+    content: &str,
+    verbose: bool,
+) -> CommandOutput {
+    let hint = format!(
+        "This chunk predates message-range tracking; run `recall show {}` for the full conversation.",
+        session.session_id
+    );
+
+    let mut buf = Vec::new();
+    write_show_header(
+        &mut buf,
+        session,
+        verbose,
+        &[format!("- chunk: {chunk_id}")],
+    );
+    let _ = writeln!(buf, "{}", cap_message(content));
+    let _ = writeln!(buf);
+    let _ = writeln!(buf, "{hint}");
+    let markdown = String::from_utf8_lossy(&buf).into_owned();
+
+    let data = serde_json::json!({
+        "session_id": session.session_id,
+        "slug": session.slug,
+        "project": session.project,
+        "source": session.source.to_string(),
+        "timestamp": session.timestamp,
+        "chunk": chunk_id,
+        "content": cap_message(content),
+        "windowed": false,
+        "next_step": hint,
+    });
+
+    CommandOutput::ok(markdown, data)
+}
+
+fn run_show(
+    session_id: &str,
+    verbose: bool,
+    chunk: Option<i64>,
+    window: i64,
+    db_path: &Option<PathBuf>,
+) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
     if !path.exists() {
         return Err(
@@ -1014,7 +1244,7 @@ fn run_show(session_id: &str, verbose: bool, db_path: &Option<PathBuf>) -> Resul
         .into()),
         state => {
             require_current_schema(state)?;
-            show_session(&conn, session_id, verbose)
+            show_session_windowed(&conn, session_id, verbose, chunk, window)
         }
     }
 }
@@ -1772,6 +2002,10 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
             writeln!(w, "    > {line}")?;
         }
     }
+    // Deep-dive guidance: anchor on the chunk id (chunk-backed hit) or point at the full
+    // show (snippet-tier hit). Uses the control-char-stripped session_id like the
+    // ID line above, keeping the copy-runnable command safe from stored escapes.
+    writeln!(w, "    inspect: {}", inspect_hint(&session_id, r.chunk_id))?;
     writeln!(w)?;
     Ok(())
 }
@@ -1792,6 +2026,18 @@ fn render_results(results: &[search::SearchResult]) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
+/// The deep-dive guidance for one hit: a chunk-backed hit (FTS rowid-tier /
+/// vector-tier) anchors `recall show` on the chunk id so an agent drills into just
+/// that message range plus a window of neighbors, while a chunk-less snippet-tier
+/// hit (no anchor) is steered to the full-conversation show. The session_id is
+/// printed in full — never a prefix — so the command is copy-runnable (#282).
+fn inspect_hint(session_id: &str, chunk_id: Option<i64>) -> String {
+    match chunk_id {
+        Some(id) => format!("recall show {session_id} --chunk {id} --window 3"),
+        None => format!("recall show {session_id}"),
+    }
+}
+
 /// The machine payload for one search hit (#67 Phase 2), built explicitly so the
 /// `--json` schema stays decoupled from [`search::SearchResult`]'s internal
 /// shape (which is deliberately not `Serialize`).
@@ -1804,6 +2050,8 @@ fn result_to_json(r: &search::SearchResult) -> serde_json::Value {
         "source": s.source.to_string(),
         "timestamp": s.timestamp,
         "excerpt": r.excerpt,
+        "chunk": r.chunk_id,
+        "inspect": inspect_hint(&s.session_id, r.chunk_id),
     })
 }
 
@@ -2032,7 +2280,11 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         .map(|o| index_command_output(&o)),
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
-        Some(Command::Show { session_id }) => run_show(&session_id, cli.verbose, &cli.db_path),
+        Some(Command::Show {
+            session_id,
+            chunk,
+            window,
+        }) => run_show(&session_id, cli.verbose, chunk, window, &cli.db_path),
         Some(Command::Classify { all, dry_run }) => run_classify(all, dry_run, &cli.db_path),
         Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
         Some(Command::Doctor { fix }) => run_doctor(cli.verbose, fix, &cli.db_path),
@@ -2399,6 +2651,7 @@ mod tests {
                 timestamp: Some(1709251200000),
             },
             excerpt: excerpt.to_owned(),
+            chunk_id: None,
         }
     }
 
@@ -2667,6 +2920,7 @@ mod tests {
                 timestamp: Some(1709251200000),
             },
             excerpt: "some text".to_owned(),
+            chunk_id: None,
         };
         let mut buf = Vec::new();
         format_result(&mut buf, 0, &r).unwrap();
@@ -2779,6 +3033,342 @@ mod tests {
         assert!(
             out.markdown.contains("- source: claude"),
             "an unknown stored source must fall back to claude, got: {}",
+            out.markdown
+        );
+    }
+
+    // T-001 "window は同一セッションの前後 N メッセージのみ返す" (verbatim scenario name;
+    // Rust identifiers cannot contain spaces / `N`-with-spaces, so the fn name below is
+    // the descriptive-name equivalent required by the repo's test-naming convention).
+    //
+    // Two sessions are indexed consecutively so the single shared fts5 `messages`
+    // table interleaves their global rowids (r1=sessA, r2=sessB, ...). Anchored on a
+    // sessA chunk with --window 2, show must return sessA's body range plus 2
+    // same-session neighbors each side and nothing else: not the 3rd neighbor on
+    // either side (before/after cap) and never a sessB row (no cross-session leak).
+    #[test]
+    fn window_returns_only_same_session_neighbors_within_n() {
+        let (_dir, conn) = db::setup_test_db();
+        db::seed_session(&conn, "sessA");
+        db::seed_session(&conn, "sessB");
+        for (sess, text) in [
+            ("sessA", "AMSG0"),
+            ("sessB", "BMSG0"),
+            ("sessA", "AMSG1"),
+            ("sessB", "BMSG1"),
+            ("sessA", "AMSG2"),
+            ("sessB", "BMSG2"),
+            ("sessA", "AMSG3_BODY"),
+            ("sessB", "BMSG3"),
+            ("sessA", "AMSG4"),
+            ("sessB", "BMSG4"),
+            ("sessA", "AMSG5"),
+            ("sessB", "BMSG5"),
+            ("sessA", "AMSG6"),
+            ("sessB", "BMSG6"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES (?1, 'user', ?2)",
+                rusqlite::params![sess, text],
+            )
+            .unwrap();
+        }
+        // The chunk body is one sessA message; anchor the window on it by its rowid.
+        let body: i64 = conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE session_id='sessA' AND text='AMSG3_BODY'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (100, 'sessA', 'AMSG3_BODY', 0, ?1, ?1)",
+            [body],
+        )
+        .unwrap();
+
+        let out = show_session_windowed(&conn, "sessA", false, Some(100), 2).unwrap();
+
+        for included in ["AMSG1", "AMSG2", "AMSG3_BODY", "AMSG4", "AMSG5"] {
+            assert!(
+                out.markdown.contains(included),
+                "window=2 must include same-session {included}, got: {}",
+                out.markdown
+            );
+        }
+        assert!(
+            !out.markdown.contains("AMSG0"),
+            "before-cap: the 3rd-earlier same-session message must be excluded, got: {}",
+            out.markdown
+        );
+        assert!(
+            !out.markdown.contains("AMSG6"),
+            "after-cap: the 3rd-later same-session message must be excluded, got: {}",
+            out.markdown
+        );
+        assert!(
+            !out.markdown.contains("BMSG"),
+            "must not cross into the adjacent session sharing interleaved rowids, got: {}",
+            out.markdown
+        );
+    }
+
+    // T-002 "src_rowid NULL の chunk は本文 + 全文誘導へ fallback する" (verbatim scenario
+    // name; the descriptive fn name below satisfies the repo's identifier-safe convention).
+    //
+    // A pre-#192 legacy chunk has NULL src_rowid_lo/hi, so it has no message-range
+    // anchor to window on. show must not error: it renders the chunk body and steers
+    // the reader to the full `recall show` for the whole conversation.
+    #[test]
+    fn null_src_rowid_chunk_falls_back_to_body_plus_full_show_hint() {
+        let (_dir, conn) = db::setup_test_db();
+        db::seed_session(&conn, "s1");
+        // seed_chunk inserts a chunk into s1 leaving src_rowid_lo/hi NULL — the exact
+        // legacy shape produced by ALTER ... ADD COLUMN on a pre-#192 DB.
+        db::seed_chunk(&conn, 200, "legacy chunk body TEXTMARK");
+
+        let out = show_session_windowed(&conn, "s1", false, Some(200), 3).unwrap();
+
+        assert!(
+            out.markdown.contains("legacy chunk body TEXTMARK"),
+            "the legacy chunk's own body must be shown, got: {}",
+            out.markdown
+        );
+        assert!(
+            out.markdown.contains("recall show"),
+            "must steer to the full `recall show` for the whole conversation, got: {}",
+            out.markdown
+        );
+    }
+
+    // T-003 "--chunk 無指定の show は全文のまま" (verbatim scenario name; the descriptive
+    // fn name below satisfies the repo's identifier-safe convention).
+    //
+    // chunk = None is the no-`--chunk` invocation: the dispatcher must preserve the
+    // pre-feature behavior and render every message of the session (backward compat).
+    #[test]
+    fn show_without_chunk_renders_full_session() {
+        let (_dir, conn) = setup_show_db();
+
+        let out = show_session_windowed(&conn, "abc-123", false, None, 3).unwrap();
+
+        assert!(
+            out.markdown.contains("hello world"),
+            "full render lost the user turn"
+        );
+        assert!(
+            out.markdown.contains("hi there"),
+            "full render lost the assistant turn"
+        );
+        assert!(out.markdown.contains("## [user]"));
+        assert!(out.markdown.contains("## [assistant]"));
+    }
+
+    /// Seed session `w1` with `count` sequential user messages (text `M0..M{count-1}`,
+    /// rowids 1..count since w1 is the only session), for the window guard tests.
+    fn seed_window_db(count: i64) -> (tempfile::TempDir, Connection) {
+        let (dir, conn) = db::setup_test_db();
+        db::seed_session(&conn, "w1");
+        for i in 0..count {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES ('w1', 'user', ?1)",
+                [format!("M{i}")],
+            )
+            .unwrap();
+        }
+        (dir, conn)
+    }
+
+    // A `--chunk` id that matches no qa_chunks row is a usage error, not an empty
+    // render: the anchor cannot be resolved so there is no range to window on.
+    #[test]
+    fn windowed_show_errors_when_chunk_id_is_absent() {
+        let (_dir, conn) = seed_window_db(3);
+        let err = show_session_windowed(&conn, "w1", false, Some(999), 2).unwrap_err();
+        assert!(
+            err.to_string().contains("No chunk found with id 999"),
+            "got: {err}"
+        );
+    }
+
+    // `messages` is one shared fts5 table, so a chunk's session must match the show
+    // target; `--chunk` pointing at another session's chunk is a usage error rather
+    // than a cross-session window.
+    #[test]
+    fn windowed_show_errors_when_chunk_belongs_to_another_session() {
+        let (_dir, conn) = seed_window_db(3);
+        db::seed_session(&conn, "w2");
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (50, 'w2', 'body', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let err = show_session_windowed(&conn, "w1", false, Some(50), 2).unwrap_err();
+
+        assert!(
+            err.to_string().contains("belongs to session 'w2'"),
+            "cross-session --chunk must name the mismatched session, got: {err}"
+        );
+    }
+
+    // A single message longer than MAX_MSG_CHARS is truncated with an ellipsis so the
+    // windowed output stays bounded (contract: 1 メッセージ表示長に cap).
+    #[test]
+    fn windowed_show_truncates_a_message_longer_than_the_cap() {
+        let (_dir, conn) = db::setup_test_db();
+        db::seed_session(&conn, "w1");
+        let long = "X".repeat(MAX_MSG_CHARS + 1);
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('w1', 'user', ?1)",
+            [&long],
+        )
+        .unwrap();
+        let rowid: i64 = conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE session_id='w1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (60, 'w1', 'body', 0, ?1, ?1)",
+            [rowid],
+        )
+        .unwrap();
+
+        let out = show_session_windowed(&conn, "w1", false, Some(60), 0).unwrap();
+
+        assert!(
+            out.markdown.contains('…'),
+            "an over-cap message must be marked truncated"
+        );
+        assert!(
+            !out.markdown.contains(&long),
+            "the full over-cap message must not be rendered verbatim"
+        );
+    }
+
+    // A chunk whose src_rowid range lands outside every current message rowid (e.g.
+    // its messages were deleted) yields an empty window: the metadata header still
+    // renders, but no message body does.
+    #[test]
+    fn windowed_show_renders_metadata_only_when_range_matches_no_message() {
+        let (_dir, conn) = seed_window_db(2);
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (70, 'w1', 'orphan-range', 0, 100000, 100001)",
+            [],
+        )
+        .unwrap();
+
+        let out = show_session_windowed(&conn, "w1", false, Some(70), 2).unwrap();
+
+        assert!(
+            out.markdown.contains("- chunk: 70"),
+            "metadata header must still render, got: {}",
+            out.markdown
+        );
+        assert!(
+            !out.markdown.contains("## ["),
+            "no message body should render for an out-of-range chunk, got: {}",
+            out.markdown
+        );
+    }
+
+    // The `--json` payload mirrors the windowed text: it carries the anchor chunk,
+    // the effective window, and each message flagged by whether it is inside the
+    // chunk's own range (contract: text / --json 両対応).
+    #[test]
+    fn windowed_show_json_payload_lists_anchored_messages_with_in_chunk_flag() {
+        let (_dir, conn) = seed_window_db(5);
+        // Anchor on M2 (rowid 3) with window 1 -> M1, M2, M3.
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (80, 'w1', 'M2', 0, 3, 3)",
+            [],
+        )
+        .unwrap();
+
+        let out = show_session_windowed(&conn, "w1", false, Some(80), 1).unwrap();
+
+        assert_eq!(out.data["chunk"], 80);
+        assert_eq!(out.data["window"], 1);
+        let msgs = out.data["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs.len(),
+            3,
+            "window=1 around a one-message body yields 3 messages"
+        );
+        assert_eq!(msgs[1]["text"], "M2");
+        assert_eq!(
+            msgs[1]["in_chunk"], true,
+            "the body message must be flagged in_chunk"
+        );
+        assert_eq!(
+            msgs[0]["in_chunk"], false,
+            "a neighbor must not be flagged in_chunk"
+        );
+        assert_eq!(msgs[2]["in_chunk"], false);
+    }
+
+    // Drive the whole `recall show --chunk --window` path through run_show against a
+    // real on-disk DB (resolve_db_path -> readonly open -> schema gate -> windowed
+    // render). verbose=true also exercises the `- file:` line the range render emits.
+    #[test]
+    fn run_show_windowed_reads_a_real_db_and_includes_file_when_verbose() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let conn = open_or_create_db(&db_path).unwrap();
+        db::seed_session(&conn, "s1");
+        for text in ["m0", "m1", "m2"] {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
+                [text],
+            )
+            .unwrap();
+        }
+        let rowid: i64 = conn
+            .query_row("SELECT rowid FROM messages WHERE text='m1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (1, 's1', 'm1', 0, ?1, ?1)",
+            [rowid],
+        )
+        .unwrap();
+        drop(conn);
+
+        let out = run_show("s1", true, Some(1), 1, &Some(db_path)).unwrap();
+
+        assert!(out.markdown.contains("- chunk: 1"));
+        assert!(
+            out.markdown.contains("- file: /f"),
+            "verbose windowed show must include the file path, got: {}",
+            out.markdown
+        );
+        for m in ["m0", "m1", "m2"] {
+            assert!(out.markdown.contains(m), "window=1 must include {m}");
+        }
+    }
+
+    // The NULL-src_rowid fallback also honors verbose, emitting the `- file:` line.
+    #[test]
+    fn windowed_show_fallback_includes_file_when_verbose() {
+        let (_dir, conn) = db::setup_test_db();
+        db::seed_session(&conn, "s1");
+        db::seed_chunk(&conn, 300, "legacy body");
+
+        let out = show_session_windowed(&conn, "s1", true, Some(300), 3).unwrap();
+
+        assert!(
+            out.markdown.contains("- file: /f"),
+            "verbose fallback must include the file path, got: {}",
             out.markdown
         );
     }
@@ -4170,7 +4760,7 @@ mod tests {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = bare_empty_db(db_dir.path());
 
-        let err = run_show("deadbeef", false, &Some(db_path)).unwrap_err();
+        let err = run_show("deadbeef", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
 
         assert!(
             err.to_string().contains("Database not found"),
@@ -5814,7 +6404,9 @@ mod tests {
         assert_eq!(
             payload_keys(&results[0]),
             [
+                "chunk",
                 "excerpt",
+                "inspect",
                 "project",
                 "session_id",
                 "slug",
@@ -5885,5 +6477,184 @@ mod tests {
     #[test]
     fn require_current_schema_empty_is_ok() {
         assert!(require_current_schema(db::SchemaState::Empty).is_ok());
+    }
+
+    // ---- U-002 (#282): search hits expose a chunk-id anchor + drill-down guidance ----
+    //
+    // Each test drives a real `search` so the hit's provenance (FTS rowid-tier /
+    // vec-tier / snippet-tier) is genuine, then renders the hit with
+    // `result_to_json` and asserts on the `--json` payload. Asserting on the
+    // rendered `Value` (never on a not-yet-existent `SearchResult.chunk_id` field)
+    // keeps the Red a runtime failure rather than a crate-wide build break.
+    //
+    // The `chunk` field name is pinned to the `render_windowed` / `resolve_chunk`
+    // precedent (`"chunk": qa_chunks.id`); the guidance is checked as a substring of
+    // the serialized JSON so the hint field's name stays free for the implementer.
+    //
+    // Rust identifiers cannot hold the scenario names verbatim (spaces / `--` / `/`),
+    // so each verbatim scenario name is preserved in the comment above its test, per
+    // this file's existing T-NNN comment convention.
+
+    // T-004: FTS 由来 hit の --json に chunk id と導線が含まれる
+    #[test]
+    fn u002_fts_hit_json_carries_chunk_id_and_inspect_guidance() {
+        let (_dir, conn) = db::setup_test_db();
+        // A full session_id (not a prefix): the guidance must print it un-shortened.
+        let sid = "a1b2c3d4-e5f6-7890-1234-567890abcdef";
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+             VALUES (?1, 'claude', '', '/proj', ?1, 1709251200000, 0.0)",
+            [sid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) \
+             VALUES (?1, 'user', 'how to implement authentication')",
+            [sid],
+        )
+        .unwrap();
+        // rowid-tier chunk (src_rowid_lo NOT NULL) whose [lo, hi] brackets the sole
+        // message rowid, so `fetch_chunks` resolves this exact chunk (id 42) via the
+        // rowid join — the primary FTS tier the contract extends to return the id.
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
+             VALUES (42, ?1, 'how to implement authentication — use JWT access tokens', 1709251200000, 1, 1000000)",
+            [sid],
+        )
+        .unwrap();
+
+        let results =
+            search::search(&conn, "authentication", &search::SearchOptions::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "setup guard: the FTS query must return the one session"
+        );
+
+        let json = result_to_json(&results[0]);
+        assert_eq!(
+            json["chunk"],
+            serde_json::json!(42),
+            "an FTS rowid-tier hit must expose its resolved chunk id as the drill-down anchor, got: {json}"
+        );
+        let payload = json.to_string();
+        assert!(
+            payload.contains(&format!("recall show {sid} --chunk 42 --window 3")),
+            "the hit must carry the inspect guidance line with the full (un-shortened) session_id, got: {payload}"
+        );
+    }
+
+    // T-005: vector 由来 hit でも chunk id と導線が含まれる
+    #[test]
+    fn u002_vector_hit_json_carries_chunk_id_and_inspect_guidance() {
+        let (_dir, conn) = db::setup_test_db();
+        let now_ms = 1_750_000_000_000_i64;
+        let sid = "0f9e8d7c-6b5a-4321-fedc-ba9876543210";
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+             VALUES (?1, 'claude', '', '/proj', ?1, ?2, 0.0)",
+            rusqlite::params![sid, now_ms],
+        )
+        .unwrap();
+        // The message holds no "authentication" term, so FTS cannot match; the hit
+        // can only come from the vector leg.
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) \
+             VALUES (?1, 'user', 'gardening and weather notes')",
+            [sid],
+        )
+        .unwrap();
+        // vec-tier chunk (id 7): content equals the query so the MockEmbedder vector
+        // is an exact match and this chunk is the closest for a vector-only hit.
+        let embedding = embedder::MockEmbedder::deterministic_vector("authentication");
+        let embedding_bytes: &[u8] = embedder::f32_as_bytes(&embedding);
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (7, ?1, 'authentication', ?2)",
+            rusqlite::params![sid, now_ms],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (7, ?1)",
+            rusqlite::params![embedding_bytes],
+        )
+        .unwrap();
+
+        let mock = embedder::MockEmbedder::new();
+        let opts = search::SearchOptions {
+            now_ms: Some(now_ms),
+            ..Default::default()
+        };
+        let outcome =
+            search::search_with_embedder(&conn, "authentication", &opts, Some(&mock)).unwrap();
+        let hit = outcome
+            .results
+            .iter()
+            .find(|r| r.session.session_id == sid)
+            .expect("setup guard: the vector leg must surface the session");
+
+        let json = result_to_json(hit);
+        assert_eq!(
+            json["chunk"],
+            serde_json::json!(7),
+            "a vector-tier hit must expose its closest chunk id as the drill-down anchor, got: {json}"
+        );
+        let payload = json.to_string();
+        assert!(
+            payload.contains(&format!("recall show {sid} --chunk 7 --window 3")),
+            "the vector hit must carry the inspect guidance line with the full (un-shortened) session_id, got: {payload}"
+        );
+    }
+
+    // T-006: snippet-tier hit は導線なしで全文 show を案内する
+    #[test]
+    fn u002_snippet_hit_json_guides_full_show_without_inspect_line() {
+        let (_dir, conn) = db::setup_test_db();
+        let sid = "deadbeef-0000-1111-2222-333344445555";
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+             VALUES (?1, 'claude', '', '/proj', ?1, 1709251200000, 0.0)",
+            [sid],
+        )
+        .unwrap();
+        // FTS matches the message, but the session has NO qa_chunk, so `fetch_chunks`
+        // falls through to the 20-token snippet tier: no chunk anchor exists.
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) \
+             VALUES (?1, 'user', 'authentication flow discussion')",
+            [sid],
+        )
+        .unwrap();
+
+        let results =
+            search::search(&conn, "authentication", &search::SearchOptions::default()).unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "setup guard: the FTS query must return the one session"
+        );
+        assert!(
+            results[0].excerpt.contains("**"),
+            "setup guard: the hit must be snippet-tier (** highlight markers), got: {:?}",
+            results[0].excerpt
+        );
+
+        let json = result_to_json(&results[0]);
+        let payload = json.to_string();
+        // Load-bearing Red: a chunk-less hit must still guide the agent to the whole
+        // conversation via `recall show <session_id>` (no --chunk anchor).
+        assert!(
+            payload.contains(&format!("recall show {sid}")),
+            "a snippet-tier hit must guide to the full-conversation show, got: {payload}"
+        );
+        // Guards: no chunk anchor and no per-chunk inspect line for a snippet-tier hit.
+        assert!(
+            json["chunk"].is_null(),
+            "a snippet-tier hit has no chunk anchor, got: {json}"
+        );
+        assert!(
+            !payload.contains("--chunk"),
+            "a snippet-tier hit must not emit a --chunk inspect line, got: {payload}"
+        );
     }
 }
