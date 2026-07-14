@@ -18,6 +18,7 @@ fn make_result(sid: &str, ts: i64) -> SearchResult {
             timestamp: Some(ts),
         },
         excerpt: String::new(),
+        chunk_id: None,
     }
 }
 
