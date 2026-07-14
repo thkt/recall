@@ -1,3 +1,13 @@
+//! テスト命名規約
+//!
+//! 新規テストは `test_` prefix を付けず、何を検証するかを表す記述的な文名にする。
+//! 名前は日本語・英語どちらでもよい。
+//! 例: `stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_path_remedy_instead_of_a_bare_recall_index`
+//!
+//! 既存の `test_<英語>` 名（例: `test_stale_wal_note_immutable_nonempty_wal_is_some`）は
+//! この規約で一括改名しない。対象テストに次に触れたときだけ no-prefix の記述文へ随時改名する。
+//! その改名は関数名の変更のみで、アサート内容は変えない。
+
 use super::*;
 use crate::embedder::f32_as_bytes;
 use tempfile::NamedTempFile;
