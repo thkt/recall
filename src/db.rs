@@ -344,8 +344,10 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
 /// Fetch a table's stored `CREATE` SQL from `sqlite_master`, or `None` if it
 /// does not exist. Virtual tables (fts5, vec0) are stored with `type='table'`,
-/// so this resolves regular and virtual tables alike.
-fn table_def(conn: &Connection, name: &str) -> Result<Option<String>> {
+/// so this resolves regular and virtual tables alike. `pub(crate)` so schema
+/// introspection stays in this module (search's `--file` legacy-DB gate probes
+/// through it instead of hand-rolling a second sqlite_master query).
+pub(crate) fn table_def(conn: &Connection, name: &str) -> Result<Option<String>> {
     match conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
         [name],
@@ -496,6 +498,17 @@ pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     conn.execute(
         "INSERT INTO sessions VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
         [session_id],
+    )
+    .unwrap();
+}
+
+/// Seeds one `session_files` row. Centralizes the INSERT like `seed_session`,
+/// so a session_files schema change breaks one helper, not every fixture.
+#[cfg(test)]
+pub(crate) fn seed_session_file(conn: &Connection, session_id: &str, path: &str) {
+    conn.execute(
+        "INSERT INTO session_files (session_id, path) VALUES (?1, ?2)",
+        [session_id, path],
     )
     .unwrap();
 }

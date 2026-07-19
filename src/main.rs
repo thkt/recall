@@ -631,13 +631,10 @@ where
             "linked legacy chunks to rowid ranges"
         );
     }
-    // Fill session_files for legacy sessions indexed before the feature existed:
-    // their JSONL mtime is unchanged, so index_from_dirs skips a re-parse and only
-    // this path-only pass can record their write-target paths. See
-    // `backfill_session_files` for the same-transaction marker and once-only gate.
-    // The pass re-parses every legacy JSONL and can run minutes on a large legacy
-    // set, so it reports per-session progress instead of leaving the chunk
-    // spinner text stale (long index passes read as hangs otherwise).
+    // Fill session_files for legacy sessions (see `backfill_session_files` for
+    // the contract). The pass re-parses every legacy JSONL and can run minutes on
+    // a large legacy set, so it reports per-session progress instead of leaving
+    // the chunk spinner text stale (long index passes read as hangs otherwise).
     let on_backfill_progress = |done: usize, total: usize| {
         sp.set_message(&format!("Recording file paths... {done}/{total} sessions"));
     };
@@ -876,11 +873,19 @@ where
         return Ok(search_idle_output());
     }
 
-    let embedder = load_embedder();
-    // A failed embedder load degrades search to FTS-only with a reason-aware note
-    // for the `--json` channel; see search_degraded_state.
-    let (mut degraded, mut notes) = search_degraded_state(&embedder);
-    let embedder = embedder.ok();
+    // The query-less --file list never runs the semantic leg (search routes it to
+    // a MATCH-free SELECT), so loading the embedder there would only pay a model
+    // load + probe forward pass to discard it — and, model-less, stamp a false
+    // degraded:true on a complete file list (#249 honest-degraded contract).
+    // A failed embedder load on the query path degrades search to FTS-only with
+    // a reason-aware note for the `--json` channel; see search_degraded_state.
+    let (mut degraded, mut notes, embedder) = if query.is_some() {
+        let embedder = load_embedder();
+        let (degraded, notes) = search_degraded_state(&embedder);
+        (degraded, notes, embedder.ok())
+    } else {
+        (false, Vec::new(), None)
+    };
 
     let outcome = search::search_with_embedder(
         &conn,
@@ -5165,6 +5170,14 @@ mod tests {
         rows.map(Result::unwrap).collect()
     }
 
+    /// Reset an indexed DB to the legacy pre-#283 shape the backfill targets:
+    /// `files_scanned` NULL and no `session_files` rows, body left intact.
+    fn reset_to_legacy_state(conn: &Connection) {
+        conn.execute("UPDATE sessions SET files_scanned = NULL", [])
+            .unwrap();
+        conn.execute("DELETE FROM session_files", []).unwrap();
+    }
+
     // T-004 (U-003): backfill が本文 index と embedding を変えない
     // (given: index 済みで files_scanned 未設定のセッション群（vec_chunks に
     //  embedding あり）/ when: recall index を実行 / then: session_files が埋まり、
@@ -5206,13 +5219,11 @@ mod tests {
         };
 
         // given: an indexed + embedded DB, then reset to the legacy pre-feature
-        // state (files_scanned NULL, no session_files rows), body left intact.
+        // state, body left intact.
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
         let before = {
             let conn = open_or_create_db(&db_path).unwrap();
-            conn.execute("UPDATE sessions SET files_scanned = NULL", [])
-                .unwrap();
-            conn.execute("DELETE FROM session_files", []).unwrap();
+            reset_to_legacy_state(&conn);
             assert!(
                 !collect_i64(&conn, "SELECT chunk_id FROM vec_chunks").is_empty(),
                 "precondition: the legacy DB must hold embeddings, or the invariant is vacuous"
@@ -5283,9 +5294,7 @@ mod tests {
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
         {
             let conn = open_or_create_db(&db_path).unwrap();
-            conn.execute("UPDATE sessions SET files_scanned = NULL", [])
-                .unwrap();
-            conn.execute("DELETE FROM session_files", []).unwrap();
+            reset_to_legacy_state(&conn);
         }
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
@@ -6450,6 +6459,69 @@ mod tests {
     /// load-time degraded state is false, yet `vec_search` fails mid-run.
     fn runtime_failing_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
         Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
+    }
+
+    /// Loader seam asserting it never runs: passed where the search path must not
+    /// touch the model at all (the query-less `--file` list), so a stray load —
+    /// which on a real install costs model weights + a probe forward pass —
+    /// panics instead of passing silently (same pattern as `no_recover`).
+    fn no_load() -> Result<Arc<dyn Embed>, DegradedReason> {
+        panic!("query-less --file must not load the embedder")
+    }
+
+    // polish P2 (PR #293): a query-less `--file` list never runs the semantic leg
+    // (search_with_embedder routes to file_list_outcome, which bypasses MATCH
+    // entirely), so the embedder must not be loaded and a model-less install must
+    // NOT stamp degraded:true / a semantic-search note on a complete file list —
+    // a false flag trains agent consumers to discount the honest-degraded
+    // contract (#249). The panicking loader pins the no-load half; the envelope
+    // asserts pin the honesty half. Perspective: hazard (false degradation on a
+    // complete result) + branch (the query-none arm of the embedder gate).
+    #[test]
+    fn run_search_query_less_file_list_skips_embedder_and_stays_nominal() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            db::seed_session(&conn, "s1");
+            db::seed_session_file(&conn, "s1", "/proj/a.rs");
+        }
+
+        let out = run_search_with(
+            Command::Search {
+                query: None,
+                project: None,
+                days: None,
+                source: None,
+                file: Some("/proj/a.rs".to_owned()),
+                limit: 10,
+                exclude_current: false,
+                include_current: false,
+                only_current: false,
+                include_automated: false,
+            },
+            &Some(db_path),
+            no_load,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.data["results"].as_array().unwrap().len(),
+            1,
+            "the file list itself must succeed, got: {}",
+            out.data
+        );
+        assert!(
+            !out.degraded,
+            "a complete query-less file list must not be marked degraded"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .all(|n| !n.contains("semantic search unavailable")),
+            "no semantic-search note may appear on the MATCH-free path, got: {:?}",
+            out.notes
+        );
     }
 
     // #204: a loaded embedder whose query-time embedding fails degrades the search

@@ -3,7 +3,7 @@ use std::fs;
 use amici::testing::hybrid::assert_filter_symmetric;
 
 use super::*;
-use crate::db::setup_test_db;
+use crate::db::{seed_session_file, setup_test_db};
 use crate::embedder::MockEmbedder;
 use crate::indexer::index_chunks;
 
@@ -38,11 +38,7 @@ fn insert_message(conn: &Connection, sid: &str, role: &str, text: &str) {
 }
 
 fn insert_session_file(conn: &Connection, sid: &str, path: &str) {
-    conn.execute(
-        "INSERT INTO session_files (session_id, path) VALUES (?1, ?2)",
-        rusqlite::params![sid, path],
-    )
-    .unwrap();
+    seed_session_file(conn, sid, path);
 }
 
 fn insert_chunk_with_embedding(conn: &Connection, chunk_id: i64, sid: &str, text: &str, ts: i64) {
@@ -949,6 +945,40 @@ fn file_リストは_落ちた行の分まで_limit_を埋める() {
         "a dropped newest row must not under-fill the limit: {ids:?}"
     );
     assert!(outcome.results_incomplete);
+}
+
+// polish P1 (PR #293): a pre-#283 DB opened read-only has no session_files
+// table (create_schema runs only on the write path) and schema_state
+// deliberately reports it Current (migrate_files_scanned_if_needed forces no
+// re-index), so `--file` used to surface a raw `no such table: session_files`
+// (exit 74, no recovery hint). The gate must turn that into actionable
+// guidance naming `recall index`, on both the query and query-less arms.
+// Perspective: error (legacy on-disk state) + hazard (agent stranded by an
+// opaque SQL error).
+#[test]
+fn file_指定は_session_files_不在の_db_で_index_案内エラーになる() {
+    let (_dir, conn) = setup_test_db();
+    conn.execute_batch("DROP TABLE session_files;").unwrap();
+    let opts = SearchOptions {
+        file: Some("/proj/a.rs".to_owned()),
+        ..Default::default()
+    };
+
+    let Err(query_less) = search_with_embedder(&conn, None, &opts, None) else {
+        panic!("query-less --file on a legacy DB must error");
+    };
+    assert!(
+        query_less.to_string().contains("recall index"),
+        "query-less --file on a legacy DB must name `recall index`, got: {query_less}"
+    );
+
+    let Err(with_query) = search_with_embedder(&conn, "auth", &opts, None) else {
+        panic!("query + --file on a legacy DB must error");
+    };
+    assert!(
+        with_query.to_string().contains("recall index"),
+        "query + --file on a legacy DB must name `recall index`, got: {with_query}"
+    );
 }
 
 #[test]

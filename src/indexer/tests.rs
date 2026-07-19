@@ -6,6 +6,14 @@ use crate::db::{seed_session, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use tempfile::TempDir;
 
+/// Collect a single-TEXT-column query into a Vec, replacing the verbose
+/// prepare / query_map / push loop at each assertion site.
+fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
 #[test]
 fn test_index_from_dirs_indexes_and_skips() {
     let (_dir, mut conn) = setup_test_db();
@@ -1911,16 +1919,7 @@ fn edit_write_の_file_path_が_session_files_に入る() {
     index_chunks(&mut conn, None).unwrap();
 
     // then: both file_path values are recorded in session_files.
-    let mut paths: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT path FROM session_files ORDER BY path")
-            .unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        for row in rows {
-            paths.push(row.unwrap());
-        }
-    }
+    let paths = collect_strings(&conn, "SELECT path FROM session_files ORDER BY path");
     assert_eq!(
         paths,
         vec![
@@ -1932,22 +1931,8 @@ fn edit_write_の_file_path_が_session_files_に入る() {
 
     // then: the tool_use-derived text (paths, write content) never leaks into the
     // searchable body — neither messages nor qa_chunks.
-    let mut message_texts: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn.prepare("SELECT text FROM messages").unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        for row in rows {
-            message_texts.push(row.unwrap());
-        }
-    }
-    let mut chunk_contents: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn.prepare("SELECT content FROM qa_chunks").unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        for row in rows {
-            chunk_contents.push(row.unwrap());
-        }
-    }
+    let message_texts = collect_strings(&conn, "SELECT text FROM messages");
+    let chunk_contents = collect_strings(&conn, "SELECT content FROM qa_chunks");
     for marker in ["alpha_marker", "beta_marker", "filecontents"] {
         assert!(
             !message_texts.iter().any(|t| t.contains(marker)),
@@ -2019,16 +2004,7 @@ fn 妥当でない値は捨てられる() {
     // then: only the valid path survives; the newline / over-length / empty values
     // are dropped. Asserting the exact set (not merely "invalids absent") keeps the
     // test from passing vacuously and pins the filter's effect.
-    let mut paths: Vec<String> = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT path FROM session_files ORDER BY path")
-            .unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        for row in rows {
-            paths.push(row.unwrap());
-        }
-    }
+    let paths = collect_strings(&conn, "SELECT path FROM session_files ORDER BY path");
     assert_eq!(
         paths,
         vec!["/proj/valid_control.rs".to_owned()],

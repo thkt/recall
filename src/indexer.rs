@@ -281,9 +281,8 @@ fn upsert_session(
         ])?;
     }
 
-    // Persist the session's write-target paths. Already deduped within the session
-    // by the parser; the (session_id, path) PK and the cleanup above keep re-parse
-    // from colliding, so a plain INSERT suffices.
+    // Persist the session's write-target paths (precondition upheld by the
+    // session_files DELETE above).
     insert_session_files(ctx.tx, &parsed.metadata.session_id, &parsed.scanned_files)?;
 
     Ok(())
@@ -339,11 +338,7 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         return Ok(IndexOutcome::Preserved);
     }
 
-    let result = match source {
-        Source::Claude => parse_claude_session(fpath),
-        Source::Codex => parse_codex_session(fpath),
-    };
-    let parsed = match result {
+    let parsed = match parse_session(fpath, *source) {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(IndexOutcome::Unchanged),
         Err(e) => {
@@ -925,27 +920,32 @@ pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     Ok(backfilled)
 }
 
+/// The single source→parser dispatch, shared by `index_file` and the backfill
+/// re-read so a new `Source` variant cannot update one site and miss the other.
+fn parse_session(fpath: &Path, source: Source) -> Result<Option<ParseResult>> {
+    match source {
+        Source::Claude => parse_claude_session(fpath),
+        Source::Codex => parse_codex_session(fpath),
+    }
+}
+
 /// Outcome of re-reading one session's JSONL for path extraction.
 enum RereadOutcome {
     /// A terminal read: parsed paths, a clean-but-empty (zero-touch) session,
     /// or an unrecognized source. Re-reading can never yield more, so the
     /// caller marks the session.
     Paths(Vec<String>),
-    /// The JSONL could not be read (open / I/O error) — possibly transient, so
-    /// the caller must NOT mark the session, letting a later `recall index`
-    /// retry (the same skip-and-retry stance as `check_freshness` on an
-    /// inaccessible mtime).
+    /// The JSONL could not be read (open / I/O error) — see
+    /// `backfill_session_files` for the retry contract.
     Unavailable,
 }
 
 /// Re-read the write-target paths from one session's JSONL for path extraction
-/// only. Dispatches on the stored source string; malformed lines are skipped by
-/// the parsers themselves, so an `Err` here is an I/O failure, not a content
-/// problem.
+/// only. Malformed lines are skipped by the parsers themselves, so an `Err`
+/// from the parse is an I/O failure, not a content problem.
 fn reread_scanned_files(fpath: &Path, source: &str) -> RereadOutcome {
     let result = match Source::from_db(source) {
-        Some(Source::Claude) => parse_claude_session(fpath),
-        Some(Source::Codex) => parse_codex_session(fpath),
+        Some(source) => parse_session(fpath, source),
         None => return RereadOutcome::Paths(Vec::new()),
     };
     match result {
@@ -1009,16 +1009,13 @@ pub(crate) fn backfill_session_files(
         }
         let scanned = match reread_scanned_files(Path::new(file_path), source) {
             RereadOutcome::Paths(paths) => paths,
-            // Unreadable JSONL: leave files_scanned NULL so the next index retries.
             RereadOutcome::Unavailable => continue,
         };
-        // `files_scanned IS NULL` guarantees no pre-existing rows under this id, so
-        // the shared insert never collides on the (session_id, path) PK.
+        // Precondition upheld by the `files_scanned IS NULL` scan above: no
+        // pre-existing session_files rows under this id.
         insert_session_files(&tx, session_id, &scanned)?;
-        tx.execute(
-            "UPDATE sessions SET files_scanned = 1 WHERE session_id = ?",
-            [session_id],
-        )?;
+        tx.prepare_cached("UPDATE sessions SET files_scanned = 1 WHERE session_id = ?")?
+            .execute([session_id])?;
         marked += 1;
     }
     tx.commit()?;

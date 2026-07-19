@@ -14,6 +14,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
+use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
 use crate::hybrid::rrf_merge_strings;
@@ -288,46 +289,26 @@ fn find_candidate_sessions(
 }
 
 /// Decode one `sessions` row shaped (session_id, source, file_path, project,
-/// slug, timestamp) into `SessionData`. `None` on an unrecognized `source`
-/// string, with a warning — the shared row mapping for every reader of this
-/// projection (`fetch_session_metadata`, `file_list_outcome`).
-fn session_data_from_row(
-    session_id: String,
-    source_str: &str,
-    file_path: String,
-    project: String,
-    slug: String,
-    timestamp: Option<i64>,
-) -> Option<SessionData> {
-    let Some(source) = Source::from_db(source_str) else {
+/// slug, timestamp) into `SessionData` — the shared positional decode for every
+/// reader of this projection (`fetch_session_metadata`, `file_list_outcome`),
+/// so a column-order drift breaks both readers at once instead of silently
+/// diverging. `Err` is a row-decode failure (e.g. NULL in a nullable column);
+/// `Ok(None)` is an unrecognized `source` string, warned here.
+fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> {
+    let session_id: String = row.get(0)?;
+    let source_str: String = row.get(1)?;
+    let Some(source) = Source::from_db(&source_str) else {
         warn!(source = %source_str, session_id, "unknown source");
-        return None;
+        return Ok(None);
     };
-    Some(SessionData {
+    Ok(Some(SessionData {
         session_id,
         source,
-        file_path,
-        project,
-        slug,
-        timestamp,
-    })
-}
-
-/// The `(session_id, source, file_path, project, slug, timestamp)` projection
-/// shared by `fetch_session_metadata` and `file_list_outcome`. Positional
-/// decode, so keeping it in one place makes a column-order drift break both
-/// readers at once instead of silently diverging.
-type SessionRow = (String, String, String, String, String, Option<i64>);
-
-fn decode_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-    ))
+        file_path: row.get(2)?,
+        project: row.get(3)?,
+        slug: row.get(4)?,
+        timestamp: row.get(5)?,
+    }))
 }
 
 fn fetch_session_metadata(
@@ -341,24 +322,18 @@ fn fetch_session_metadata(
     );
     let params = rusqlite::params_from_iter(ranked.iter().map(|(sid, _)| sid));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params, decode_session_row)?;
+    let rows = stmt.query_map(params, decode_session)?;
 
     let mut map = HashMap::new();
     let mut db_errors = 0;
     for r in rows {
         match r {
-            Ok((session_id, source_str, file_path, project, slug, timestamp)) => {
-                if let Some(session) = session_data_from_row(
-                    session_id,
-                    &source_str,
-                    file_path,
-                    project,
-                    slug,
-                    timestamp,
-                ) {
-                    map.insert(session.session_id.clone(), session);
-                }
+            Ok(Some(session)) => {
+                map.insert(session.session_id.clone(), session);
             }
+            // Unknown source: warned inside decode_session; pruning is surfaced
+            // by the caller's meta_map.len() < requested check.
+            Ok(None) => {}
             Err(e) => {
                 if db_errors == 0 {
                     warn!(error = %e, "metadata query error");
@@ -711,6 +686,19 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     }
 
+    // A pre-#283 DB opened read-only has no session_files table (create_schema
+    // runs only on the write path) and schema_state deliberately keeps such a DB
+    // Current (no forced re-index). Probe the table before any --file SQL so the
+    // legacy case surfaces as recovery guidance instead of a raw
+    // `no such table: session_files` error.
+    if opts.file.is_some() && table_def(conn, "session_files")?.is_none() {
+        return Err(RecallError::DataError(
+            "`--file` needs the scanned-files index; run `recall index` once to record it."
+                .to_owned(),
+        )
+        .into());
+    }
+
     let now_ms = resolve_now_ms(opts)?;
 
     // Query-less mode (#284/U-005): with no query, `--file` alone lists the
@@ -950,10 +938,7 @@ fn file_list_outcome(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        rusqlite::params_from_iter(params.iter()),
-        decode_session_row,
-    )?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), decode_session)?;
 
     let mut results = Vec::new();
     let mut skipped = 0;
@@ -963,24 +948,13 @@ fn file_list_outcome(
             break;
         }
         match r {
-            Ok((session_id, source_str, file_path, project, slug, timestamp)) => {
-                match session_data_from_row(
-                    session_id,
-                    &source_str,
-                    file_path,
-                    project,
-                    slug,
-                    timestamp,
-                ) {
-                    // `session_data_from_row` already warned on the unknown source.
-                    Some(session) => results.push(SearchResult {
-                        session,
-                        excerpt: String::new(),
-                        chunk_id: None,
-                    }),
-                    None => skipped += 1,
-                }
-            }
+            Ok(Some(session)) => results.push(SearchResult {
+                session,
+                excerpt: String::new(),
+                chunk_id: None,
+            }),
+            // Unknown source: warned inside decode_session.
+            Ok(None) => skipped += 1,
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some(e.to_string());
