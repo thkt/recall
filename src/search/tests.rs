@@ -672,7 +672,7 @@ fn test_project_filter_escapes_wildcards() {
 // RED: `file` フィールドが SearchOptions にまだ無く、このテストはコンパイルに失敗する
 // (唯一の原因は未実装のフィールド欠如)。
 #[test]
-fn クエリ_file_が_AND_で絞り込む() {
+fn クエリ_file_が_and_で絞り込む() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
     insert_message(&conn, "s1", "user", "authentication token rotation");
@@ -822,6 +822,133 @@ fn クエリなし_file_は新しい順に返る() {
         results.iter().all(|r| r.excerpt.is_empty()),
         "query-less --file list mode carries no excerpt (MATCH bypassed, no FTS/vector snippet resolution)"
     );
+}
+
+// #293 audit H-1 (a)+(b): file_list_outcome は行デコード失敗を sibling 経路
+// (find_candidate_sessions / fetch_session_metadata) と同じ契約で「落として数え、
+// results_incomplete に畳む」(#249 RC-003)。schema 上 source は nullable TEXT なので
+// NULL source は到達可能な実 DB 状態 (#249 の NULL-deserialize 前例)。
+// RED: 現行は行エラーを `?` で伝播し、search 全体が Err で abort する。
+#[test]
+fn file_リストは_null_行を落として_incomplete_を立てる() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "ok", "claude", "/proj", 2000);
+    insert_session_file(&conn, "ok", "/proj/shared.rs");
+    // NULL source は insert_session が常に source を入れるため直接 INSERT する。
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+         VALUES ('null_src', NULL, '', '/proj', 'null_src', 1000, 0.0)",
+        [],
+    )
+    .unwrap();
+    insert_session_file(&conn, "null_src", "/proj/shared.rs");
+
+    let outcome = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ok"],
+        "the NULL-source row must be dropped, not abort the whole list: {ids:?}"
+    );
+    assert!(
+        outcome.results_incomplete,
+        "a dropped row must be flagged as results_incomplete, not presented as complete"
+    );
+}
+
+// #293 audit H-1 (b): 未知 source の行は session_data_from_row が None で落とすが、
+// その間引きも results_incomplete に畳む。RED: 現行は `continue` で黙って落とし
+// nominal() を返すため、--json が degraded:false のまま under-report する。
+#[test]
+fn file_リストは_未知_source_行を落として_incomplete_を立てる() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "ok", "claude", "/proj", 2000);
+    insert_session_file(&conn, "ok", "/proj/shared.rs");
+    insert_session(&conn, "mystery", "perplexity", "/proj", 1000);
+    insert_session_file(&conn, "mystery", "/proj/shared.rs");
+
+    let outcome = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ok"],
+        "the unknown-source row must be dropped: {ids:?}"
+    );
+    assert!(
+        outcome.results_incomplete,
+        "an unknown-source drop must be flagged as results_incomplete"
+    );
+}
+
+// #293 audit H-1 (d): SQL 側 LIMIT が Rust 側の drop より先に効くと、落ちた行の分だけ
+// limit 未満に under-fill する。最新行がデコード不能でも次のデコード可能なセッションで
+// limit を埋める。RED: 現行は LIMIT ? で最新 1 行 (NULL source) だけ取得して落とすため
+// 結果が空になる。
+#[test]
+fn file_リストは_落ちた行の分まで_limit_を埋める() {
+    let (_dir, conn) = setup_test_db();
+    // 最新 (ts 2000) がデコード不能、その次 (ts 1000) が正常。
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+         VALUES ('null_src', NULL, '', '/proj', 'null_src', 2000, 0.0)",
+        [],
+    )
+    .unwrap();
+    insert_session_file(&conn, "null_src", "/proj/shared.rs");
+    insert_session(&conn, "ok", "claude", "/proj", 1000);
+    insert_session_file(&conn, "ok", "/proj/shared.rs");
+
+    let outcome = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            limit: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ok"],
+        "a dropped newest row must not under-fill the limit: {ids:?}"
+    );
+    assert!(outcome.results_incomplete);
 }
 
 #[test]
@@ -1970,6 +2097,52 @@ fn test_hybrid_exclude_current_drops_session_from_both_paths() {
                 &embedder,
                 &SearchOptions {
                     current: CurrentSession::Exclude("cur".to_owned()),
+                    now_ms: Some(now_ms),
+                    ..Default::default()
+                },
+            )
+        },
+        || {
+            hybrid_search_ids(
+                &conn,
+                &embedder,
+                &SearchOptions {
+                    now_ms: Some(now_ms),
+                    ..Default::default()
+                },
+            )
+        },
+    );
+}
+
+// conformance (#283 spec / PR #293): --file は FTS / vec 両 leg が共有 helper
+// (append_session_filter) 経由で継承する。vec 経路だけで到達できるセッションが
+// --file 不一致で落ちることを、project / days / source フィルタと同じ
+// assert_filter_symmetric パターンで固定する (両経路対称の根拠: T-CS002)。
+#[test]
+fn test_hybrid_file_filter_excludes_vec_only_mismatch() {
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    let embedder = MockEmbedder::new();
+
+    assert_filter_symmetric(
+        || {
+            insert_session(&conn, "keep", "claude", "/proj", now_ms);
+            insert_message(&conn, "keep", "user", "authentication flow discussion");
+            insert_session_file(&conn, "keep", "/proj/auth.rs");
+            // vec-only session touching another path: reachable only via the
+            // vector leg, so an FTS-only --file filter would fail to drop it.
+            insert_session(&conn, "other", "claude", "/proj", now_ms);
+            insert_chunk_with_embedding(&conn, 1, "other", "authentication", now_ms);
+            insert_session_file(&conn, "other", "/proj/unrelated.rs");
+            ("keep".to_owned(), "other".to_owned())
+        },
+        || {
+            hybrid_search_ids(
+                &conn,
+                &embedder,
+                &SearchOptions {
+                    file: Some("/proj/auth.rs".to_owned()),
                     now_ms: Some(now_ms),
                     ..Default::default()
                 },

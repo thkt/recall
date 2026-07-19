@@ -86,7 +86,10 @@ enum Command {
     Search {
         /// Search query. Optional when `--file` is given: a query-less
         /// `--file <path>` lists the sessions that touched the path, newest
-        /// first. A call with neither a query nor `--file` is a usage error.
+        /// first. A call with neither a query nor `--file` is a usage error —
+        /// rejected declaratively here, with `file_list_outcome` keeping the
+        /// same guard for direct (non-CLI) callers.
+        #[arg(required_unless_present = "file")]
         query: Option<String>,
 
         /// Filter by project path (prefix match)
@@ -632,7 +635,14 @@ where
     // their JSONL mtime is unchanged, so index_from_dirs skips a re-parse and only
     // this path-only pass can record their write-target paths. See
     // `backfill_session_files` for the same-transaction marker and once-only gate.
-    let scanned_backfilled = indexer::backfill_session_files(&mut conn)?;
+    // The pass re-parses every legacy JSONL and can run minutes on a large legacy
+    // set, so it reports per-session progress instead of leaving the chunk
+    // spinner text stale (long index passes read as hangs otherwise).
+    let on_backfill_progress = |done: usize, total: usize| {
+        sp.set_message(&format!("Recording file paths... {done}/{total} sessions"));
+    };
+    let scanned_backfilled =
+        indexer::backfill_session_files(&mut conn, Some(&on_backfill_progress))?;
     if scanned_backfilled > 0 {
         debug!(
             sessions = scanned_backfilled,
@@ -2812,6 +2822,18 @@ mod tests {
             Some("No sessions indexed. Run `recall index` first.")
         );
         assert_eq!(search_idle_message(5), None);
+    }
+
+    // #293 audit M: 「query か --file のどちらかは必須」を clap 層でも宣言的に
+    // 弾く（defense-in-depth）。runtime 側の同じ検証は file_list_outcome が持つ
+    // （直接呼び出しのテスト経路が clap を通らないため二重化が必要）。空 DB では
+    // idle 短絡が runtime の usage error より先に出るので、CLI 層で弾かないと
+    // 両方 None が「index を実行せよ」の案内にすり替わる。
+    #[test]
+    fn test_search_requires_query_or_file_at_parse_time() {
+        assert!(Cli::try_parse_from(["recall", "search"]).is_err());
+        assert!(Cli::try_parse_from(["recall", "search", "--file", "a.rs"]).is_ok());
+        assert!(Cli::try_parse_from(["recall", "search", "auth"]).is_ok());
     }
 
     #[test]

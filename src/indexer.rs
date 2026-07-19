@@ -925,20 +925,40 @@ pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     Ok(backfilled)
 }
 
+/// Outcome of re-reading one session's JSONL for path extraction.
+enum RereadOutcome {
+    /// A terminal read: parsed paths, a clean-but-empty (zero-touch) session,
+    /// or an unrecognized source. Re-reading can never yield more, so the
+    /// caller marks the session.
+    Paths(Vec<String>),
+    /// The JSONL could not be read (open / I/O error) — possibly transient, so
+    /// the caller must NOT mark the session, letting a later `recall index`
+    /// retry (the same skip-and-retry stance as `check_freshness` on an
+    /// inaccessible mtime).
+    Unavailable,
+}
+
 /// Re-read the write-target paths from one session's JSONL for path extraction
-/// only. Dispatches on the stored source string; an unrecognized source, an
-/// unreadable file, or a parse error yields no paths (the caller still marks the
-/// session so it is not re-read). A zero-touch session parses cleanly to an empty
-/// `scanned_files`.
-fn reread_scanned_files(fpath: &Path, source: &str) -> Vec<String> {
+/// only. Dispatches on the stored source string; malformed lines are skipped by
+/// the parsers themselves, so an `Err` here is an I/O failure, not a content
+/// problem.
+fn reread_scanned_files(fpath: &Path, source: &str) -> RereadOutcome {
     let result = match Source::from_db(source) {
         Some(Source::Claude) => parse_claude_session(fpath),
         Some(Source::Codex) => parse_codex_session(fpath),
-        None => return Vec::new(),
+        None => return RereadOutcome::Paths(Vec::new()),
     };
     match result {
-        Ok(Some(parsed)) => parsed.scanned_files,
-        _ => Vec::new(),
+        Ok(Some(parsed)) => RereadOutcome::Paths(parsed.scanned_files),
+        Ok(None) => RereadOutcome::Paths(Vec::new()),
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %fpath.display(),
+                "backfill: session JSONL unreadable; left unmarked for retry on the next index"
+            );
+            RereadOutcome::Unavailable
+        }
     }
 }
 
@@ -949,11 +969,19 @@ fn reread_scanned_files(fpath: &Path, source: &str) -> Vec<String> {
 /// Each unmarked session's JSONL is re-read for path extraction only, so messages
 /// / qa_chunks / vec_chunks are untouched. The `session_files` inserts and the
 /// `files_scanned` raise happen in ONE transaction, so an interruption never
-/// leaves the marker up with paths missing. A session whose JSONL is unreadable,
-/// or one with no write-target tool_use, still gets the marker so it is not
-/// re-read on a later index. A no-op once every session is marked, since the
-/// NULL-marker scan then finds no session. Returns the number of sessions marked.
-pub(crate) fn backfill_session_files(conn: &mut Connection) -> Result<usize> {
+/// leaves the marker up with paths missing. A session with no write-target
+/// tool_use, or an unrecognized source, still gets the marker so it is not
+/// re-read on a later index; a session whose JSONL cannot be READ stays unmarked
+/// so a transient failure is retried on the next index instead of being locked
+/// out permanently (the retry cost is one failed open per index run). A no-op
+/// once every session is marked, since the NULL-marker scan then finds no
+/// session. Reports per-session progress through `on_progress(done, total)`;
+/// propagates a panic from it like `index_chunks`. Returns the number of
+/// sessions marked.
+pub(crate) fn backfill_session_files(
+    conn: &mut Connection,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+) -> Result<usize> {
     let sessions: Vec<(String, String, String)> = {
         let unmarked_sessions_sql =
             "SELECT session_id, file_path, source FROM sessions WHERE files_scanned IS NULL";
@@ -972,9 +1000,18 @@ pub(crate) fn backfill_session_files(conn: &mut Connection) -> Result<usize> {
         return Ok(0);
     }
 
+    let total = sessions.len();
+    let mut marked = 0;
     let tx = conn.transaction()?;
-    for (session_id, file_path, source) in &sessions {
-        let scanned = reread_scanned_files(Path::new(file_path), source);
+    for (done, (session_id, file_path, source)) in sessions.iter().enumerate() {
+        if let Some(cb) = on_progress {
+            cb(done + 1, total);
+        }
+        let scanned = match reread_scanned_files(Path::new(file_path), source) {
+            RereadOutcome::Paths(paths) => paths,
+            // Unreadable JSONL: leave files_scanned NULL so the next index retries.
+            RereadOutcome::Unavailable => continue,
+        };
         // `files_scanned IS NULL` guarantees no pre-existing rows under this id, so
         // the shared insert never collides on the (session_id, path) PK.
         insert_session_files(&tx, session_id, &scanned)?;
@@ -982,10 +1019,11 @@ pub(crate) fn backfill_session_files(conn: &mut Connection) -> Result<usize> {
             "UPDATE sessions SET files_scanned = 1 WHERE session_id = ?",
             [session_id],
         )?;
+        marked += 1;
     }
     tx.commit()?;
 
-    Ok(sessions.len())
+    Ok(marked)
 }
 
 #[cfg(test)]

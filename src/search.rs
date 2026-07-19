@@ -313,6 +313,23 @@ fn session_data_from_row(
     })
 }
 
+/// The `(session_id, source, file_path, project, slug, timestamp)` projection
+/// shared by `fetch_session_metadata` and `file_list_outcome`. Positional
+/// decode, so keeping it in one place makes a column-order drift break both
+/// readers at once instead of silently diverging.
+type SessionRow = (String, String, String, String, String, Option<i64>);
+
+fn decode_session_row(row: &rusqlite::Row) -> rusqlite::Result<SessionRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
 fn fetch_session_metadata(
     conn: &Connection,
     ranked: &[(String, f64)],
@@ -324,16 +341,7 @@ fn fetch_session_metadata(
     );
     let params = rusqlite::params_from_iter(ranked.iter().map(|(sid, _)| sid));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params, |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<i64>>(5)?,
-        ))
-    })?;
+    let rows = stmt.query_map(params, decode_session_row)?;
 
     let mut map = HashMap::new();
     let mut db_errors = 0;
@@ -903,6 +911,13 @@ fn fts_only_outcome(
 /// result carries an empty excerpt (no MATCH hit to resolve a snippet or chunk
 /// from) and no chunk anchor. A query-less call with no `--file` is a usage error:
 /// there is no term and no path, so nothing to list.
+///
+/// Row decoding follows the same contract as the MATCH paths (#249 RC-003): a
+/// row that fails to decode (NULL in a nullable `sessions` column) or carries an
+/// unknown `source` is dropped and counted, folding into `results_incomplete`
+/// instead of aborting the command or presenting the thinned list as complete.
+/// The limit is applied in Rust after the drops, so a dropped row never
+/// under-fills the requested count while later matches exist.
 fn file_list_outcome(
     conn: &Connection,
     opts: &SearchOptions,
@@ -925,9 +940,9 @@ fn file_list_outcome(
     append_automated_filter(&mut sql, "s.session_id", opts.include_automated);
     // Pure timestamp DESC (newest first), not the recency-boosted bm25 blend the
     // MATCH paths use: there is no relevance score to blend here. NULL timestamps
-    // sort last under SQLite's DESC ordering.
-    sql.push_str(" ORDER BY s.timestamp DESC LIMIT ?");
-    params.push(Box::new(opts.limit as i64));
+    // sort last under SQLite's DESC ordering. No SQL LIMIT: the cap is applied in
+    // Rust below so a dropped row never under-fills the requested count.
+    sql.push_str(" ORDER BY s.timestamp DESC");
     debug_assert_eq!(
         params.len(),
         sql.matches('?').count(),
@@ -935,32 +950,54 @@ fn file_list_outcome(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<i64>>(5)?,
-        ))
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(params.iter()),
+        decode_session_row,
+    )?;
 
     let mut results = Vec::new();
+    let mut skipped = 0;
+    let mut first_error = None;
     for r in rows {
-        let (session_id, source_str, file_path, project, slug, timestamp) = r?;
-        let Some(session) =
-            session_data_from_row(session_id, &source_str, file_path, project, slug, timestamp)
-        else {
-            continue;
-        };
-        results.push(SearchResult {
-            session,
-            excerpt: String::new(),
-            chunk_id: None,
-        });
+        if results.len() >= opts.limit {
+            break;
+        }
+        match r {
+            Ok((session_id, source_str, file_path, project, slug, timestamp)) => {
+                match session_data_from_row(
+                    session_id,
+                    &source_str,
+                    file_path,
+                    project,
+                    slug,
+                    timestamp,
+                ) {
+                    // `session_data_from_row` already warned on the unknown source.
+                    Some(session) => results.push(SearchResult {
+                        session,
+                        excerpt: String::new(),
+                        chunk_id: None,
+                    }),
+                    None => skipped += 1,
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+                skipped += 1;
+            }
+        }
     }
-    Ok(SearchOutcome::nominal(results))
+    if skipped > 0 {
+        let err_msg = first_error.as_deref().unwrap_or("unknown source");
+        warn!(skipped, err_msg, "rows dropped in --file list");
+    }
+    Ok(SearchOutcome {
+        results,
+        vec_degraded: false,
+        results_incomplete: skipped > 0,
+    })
 }
 
 #[cfg(test)]
