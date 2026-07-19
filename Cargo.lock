@@ -28,7 +28,7 @@ dependencies = [
 [[package]]
 name = "amici"
 version = "0.1.0"
-source = "git+https://github.com/thkt/amici?rev=e2f039739006d4077651501ab44d83350cd46fb3#e2f039739006d4077651501ab44d83350cd46fb3"
+source = "git+https://github.com/thkt/amici?rev=4b2e0de8e0cca04fd454d30bc4c3edf1fe00d5ca#4b2e0de8e0cca04fd454d30bc4c3edf1fe00d5ca"
 dependencies = [
  "bytemuck",
  "rand 0.10.2",
@@ -900,9 +900,9 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
 name = "fastrand"
-version = "2.4.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "find-msvc-tools"
@@ -2505,7 +2505,7 @@ dependencies = [
 [[package]]
 name = "rurico"
 version = "0.2.0"
-source = "git+https://github.com/thkt/rurico?rev=2b011b0ae46d2af9bc5d31c840d7ab0fd8923c07#2b011b0ae46d2af9bc5d31c840d7ab0fd8923c07"
+source = "git+https://github.com/thkt/rurico?rev=7b2b2565a9e6ac80732d4a153bc64d47b137368b#7b2b2565a9e6ac80732d4a153bc64d47b137368b"
 dependencies = [
  "bytemuck",
  "hf-hub",
@@ -2523,7 +2523,7 @@ dependencies = [
 [[package]]
 name = "rurico-ffi"
 version = "0.1.0"
-source = "git+https://github.com/thkt/rurico?rev=2b011b0ae46d2af9bc5d31c840d7ab0fd8923c07#2b011b0ae46d2af9bc5d31c840d7ab0fd8923c07"
+source = "git+https://github.com/thkt/rurico?rev=7b2b2565a9e6ac80732d4a153bc64d47b137368b#7b2b2565a9e6ac80732d4a153bc64d47b137368b"
 dependencies = [
  "mlx-sys",
  "rusqlite",
