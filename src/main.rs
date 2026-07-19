@@ -84,8 +84,13 @@ enum Command {
     Model(ModelCommand),
     /// Search indexed sessions (default when query is provided)
     Search {
-        /// Search query
-        query: String,
+        /// Search query. Optional when `--file` is given: a query-less
+        /// `--file <path>` lists the sessions that touched the path, newest
+        /// first. A call with neither a query nor `--file` is a usage error —
+        /// rejected declaratively here, with `file_list_outcome` keeping the
+        /// same guard for direct (non-CLI) callers.
+        #[arg(required_unless_present = "file")]
+        query: Option<String>,
 
         /// Filter by project path (prefix match)
         #[arg(long)]
@@ -98,6 +103,12 @@ enum Command {
         /// Filter by source
         #[arg(long, value_enum)]
         source: Option<Source>,
+
+        /// Restrict to sessions that touched this file (exact path, or a
+        /// basename / tail sub-path suffix). While Codex file extraction is
+        /// unsupported, Codex sessions record no files and are never matched.
+        #[arg(long)]
+        file: Option<String>,
 
         /// Max results (1..=100)
         #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
@@ -620,6 +631,21 @@ where
             "linked legacy chunks to rowid ranges"
         );
     }
+    // Fill session_files for legacy sessions (see `backfill_session_files` for
+    // the contract). The pass re-parses every legacy JSONL and can run minutes on
+    // a large legacy set, so it reports per-session progress instead of leaving
+    // the chunk spinner text stale (long index passes read as hangs otherwise).
+    let on_backfill_progress = |done: usize, total: usize| {
+        sp.set_message(&format!("Recording file paths... {done}/{total} sessions"));
+    };
+    let scanned_backfilled =
+        indexer::backfill_session_files(&mut conn, Some(&on_backfill_progress))?;
+    if scanned_backfilled > 0 {
+        debug!(
+            sessions = scanned_backfilled,
+            "recorded scanned files for legacy sessions"
+        );
+    }
     if chunk_stats.chunks_created > 0 {
         sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
@@ -800,6 +826,7 @@ where
         project,
         days,
         source,
+        file,
         limit,
         exclude_current,
         include_current,
@@ -846,19 +873,28 @@ where
         return Ok(search_idle_output());
     }
 
-    let embedder = load_embedder();
-    // A failed embedder load degrades search to FTS-only with a reason-aware note
-    // for the `--json` channel; see search_degraded_state.
-    let (mut degraded, mut notes) = search_degraded_state(&embedder);
-    let embedder = embedder.ok();
+    // The query-less --file list never runs the semantic leg (search routes it to
+    // a MATCH-free SELECT), so loading the embedder there would only pay a model
+    // load + probe forward pass to discard it — and, model-less, stamp a false
+    // degraded:true on a complete file list (#249 honest-degraded contract).
+    // A failed embedder load on the query path degrades search to FTS-only with
+    // a reason-aware note for the `--json` channel; see search_degraded_state.
+    let (mut degraded, mut notes, embedder) = if query.is_some() {
+        let embedder = load_embedder();
+        let (degraded, notes) = search_degraded_state(&embedder);
+        (degraded, notes, embedder.ok())
+    } else {
+        (false, Vec::new(), None)
+    };
 
     let outcome = search::search_with_embedder(
         &conn,
-        &query,
+        query.as_deref(),
         &search::SearchOptions {
             project,
             days,
             source,
+            file,
             limit: limit.into(),
             current,
             include_automated,
@@ -2793,6 +2829,18 @@ mod tests {
         assert_eq!(search_idle_message(5), None);
     }
 
+    // #293 audit M: 「query か --file のどちらかは必須」を clap 層でも宣言的に
+    // 弾く（defense-in-depth）。runtime 側の同じ検証は file_list_outcome が持つ
+    // （直接呼び出しのテスト経路が clap を通らないため二重化が必要）。空 DB では
+    // idle 短絡が runtime の usage error より先に出るので、CLI 層で弾かないと
+    // 両方 None が「index を実行せよ」の案内にすり替わる。
+    #[test]
+    fn test_search_requires_query_or_file_at_parse_time() {
+        assert!(Cli::try_parse_from(["recall", "search"]).is_err());
+        assert!(Cli::try_parse_from(["recall", "search", "--file", "a.rs"]).is_ok());
+        assert!(Cli::try_parse_from(["recall", "search", "auth"]).is_ok());
+    }
+
     #[test]
     fn test_rebuild_is_a_distinct_subcommand() {
         let cli = Cli::try_parse_from(["recall", "rebuild"]).unwrap();
@@ -2940,12 +2988,12 @@ mod tests {
     fn setup_show_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0, NULL)",
+            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0, NULL, NULL)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0, NULL)",
+            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0, NULL, NULL)",
             [],
         )
         .unwrap();
@@ -3025,7 +3073,7 @@ mod tests {
     fn test_show_session_unknown_source_falls_back_to_claude() {
         let (_dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0, NULL)",
+            "INSERT INTO sessions VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0, NULL, NULL)",
             [],
         )
         .unwrap();
@@ -3380,7 +3428,7 @@ mod tests {
         // 'auto': first user turn is a slash-command wrapper; 'human': a normal
         // turn. Both start unclassified (session_type NULL).
         conn.execute(
-            "INSERT INTO sessions VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL)",
+            "INSERT INTO sessions VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL, NULL)",
             [],
         )
         .unwrap();
@@ -3390,7 +3438,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL)",
+            "INSERT INTO sessions VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL, NULL)",
             [],
         )
         .unwrap();
@@ -3458,7 +3506,7 @@ mod tests {
     fn test_012_reclassify_incremental_skips_already_tagged() {
         let (_dir, mut conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
+            "INSERT INTO sessions VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL, NULL)",
             [],
         )
         .unwrap();
@@ -3470,7 +3518,7 @@ mod tests {
         // 'tagged' carries an automated first turn but was already tagged interactive;
         // without --all it must stay interactive (not re-evaluated).
         conn.execute(
-            "INSERT INTO sessions VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive')",
+            "INSERT INTO sessions VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive', NULL)",
             [],
         )
         .unwrap();
@@ -5047,6 +5095,251 @@ mod tests {
         );
     }
 
+    // -- U-003 (#283): session_files backfill wired into the `recall index` path.
+    // A legacy DB (indexed before the session_files feature) has files_scanned
+    // NULL and no session_files rows; its JSONL is mtime-unchanged, so the body
+    // freshness check skips a re-parse. A path-only backfill pass must fill
+    // session_files from the write-target tool_use without touching the body
+    // index or embeddings, mark files_scanned, and never re-read a marked
+    // session. The two tests below exercise that end to end through
+    // `index_and_report_with`, the same seam T-192i uses for backfill_rowid_ranges.
+
+    /// One-session Claude JSONL: a user turn, plus an assistant `Edit` tool_use
+    /// targeting `edit_path` when `Some` (a write-target the session_files
+    /// backfill must extract). `None` yields a zero-touch session — no
+    /// write-target tool_use — whose only backfill effect is the marker.
+    /// Returns the written file's path. Built via serde_json so the JSON is
+    /// well-formed without brace-escaping.
+    fn write_backfill_session(
+        dir: &Path,
+        file: &str,
+        user_text: &str,
+        edit_path: Option<&str>,
+    ) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let user = serde_json::json!({
+            "type": "user",
+            "cwd": "/proj",
+            "message": {"role": "user", "content": user_text},
+            "timestamp": "2026-03-01T00:00:00Z"
+        });
+        let mut content = serde_json::to_string(&user).unwrap();
+        if let Some(path) = edit_path {
+            let assistant = serde_json::json!({
+                "type": "assistant",
+                "cwd": "/proj",
+                "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "editing"},
+                    {"type": "tool_use", "id": "t1", "name": "Edit",
+                     "input": {"file_path": path, "old_string": "x", "new_string": "y"}}
+                ]},
+                "timestamp": "2026-03-01T00:00:01Z"
+            });
+            content.push('\n');
+            content.push_str(&serde_json::to_string(&assistant).unwrap());
+        }
+        let full = dir.join(file);
+        fs::write(&full, content).unwrap();
+        full
+    }
+
+    /// Collect a single-i64-column query into a Vec, ordered by the query.
+    fn collect_i64(conn: &Connection, sql: &str) -> Vec<i64> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// Row counts + id sets of the searchable body: messages (fts5 rowid),
+    /// qa_chunks (id), vec_chunks (chunk_id). Sorted, so equality captures both
+    /// the row count (Vec length) and the id set (Vec contents).
+    fn body_snapshot(conn: &Connection) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+        (
+            collect_i64(conn, "SELECT rowid FROM messages ORDER BY rowid"),
+            collect_i64(conn, "SELECT id FROM qa_chunks ORDER BY id"),
+            collect_i64(conn, "SELECT chunk_id FROM vec_chunks ORDER BY chunk_id"),
+        )
+    }
+
+    /// All session_files paths, sorted.
+    fn session_file_paths(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT path FROM session_files ORDER BY path")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    /// Reset an indexed DB to the legacy pre-#283 shape the backfill targets:
+    /// `files_scanned` NULL and no `session_files` rows, body left intact.
+    fn reset_to_legacy_state(conn: &Connection) {
+        conn.execute("UPDATE sessions SET files_scanned = NULL", [])
+            .unwrap();
+        conn.execute("DELETE FROM session_files", []).unwrap();
+    }
+
+    // T-004 (U-003): backfill が本文 index と embedding を変えない
+    // (given: index 済みで files_scanned 未設定のセッション群（vec_chunks に
+    //  embedding あり）/ when: recall index を実行 / then: session_files が埋まり、
+    //  messages / qa_chunks / vec_chunks の行数と id 集合が実行前と一致する)
+    //
+    // Simulates a pre-session_files DB: index + embed two write-target sessions,
+    // then wipe files_scanned to NULL and clear session_files WITHOUT touching
+    // the on-disk JSONL. The stored mtime still matches the file, so the
+    // freshness check skips the body re-parse — only a path-only backfill pass
+    // can repopulate session_files. Perspective: state (legacy NULL → populated
+    // through the index command) + hazard (a backfill that re-inserts messages
+    // or re-embeds would shift the body snapshot). RED (no backfill) leaves
+    // session_files empty; the body snapshot is unchanged either way, so the
+    // test fails on the populate assertion for exactly the intended reason.
+    #[test]
+    fn backfill_が本文_index_と_embedding_を変えない() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        write_backfill_session(
+            &claude_dir,
+            "a.jsonl",
+            "session a probe",
+            Some("/proj/marker_a.rs"),
+        );
+        write_backfill_session(
+            &claude_dir,
+            "b.jsonl",
+            "session b probe",
+            Some("/proj/marker_b.rs"),
+        );
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+
+        // given: an indexed + embedded DB, then reset to the legacy pre-feature
+        // state, body left intact.
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let before = {
+            let conn = open_or_create_db(&db_path).unwrap();
+            reset_to_legacy_state(&conn);
+            assert!(
+                !collect_i64(&conn, "SELECT chunk_id FROM vec_chunks").is_empty(),
+                "precondition: the legacy DB must hold embeddings, or the invariant is vacuous"
+            );
+            body_snapshot(&conn)
+        };
+
+        // when: recall index runs again over the mtime-unchanged source.
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        // then: the searchable body and embeddings are stable across the backfill.
+        assert_eq!(
+            body_snapshot(&conn),
+            before,
+            "backfill must not change messages / qa_chunks / vec_chunks row counts or id sets"
+        );
+        // then: session_files is populated from the path-only re-read.
+        assert_eq!(
+            session_file_paths(&conn),
+            vec![
+                "/proj/marker_a.rs".to_owned(),
+                "/proj/marker_b.rs".to_owned(),
+            ],
+            "the backfill must fill session_files from the write-target tool_use paths"
+        );
+    }
+
+    // T-005 (U-003): 2 回目の index で backfill が再実行されない
+    // (given: T-004 実行後の DB（zero-touch セッション含む）/ when: recall index を
+    //  もう一度実行 / then: 全セッションの files_scanned が立っており、JSONL の
+    //  path-only 再読が発生しない)
+    //
+    // A legacy DB with a write-target session and a zero-touch session (no
+    // write-target tool_use). One backfill index marks files_scanned on both and
+    // fills session_files for the write session (the "T-004 execution"). A canary
+    // write-target path is then injected into the write session's JSONL with its
+    // mtime pinned to the pre-injection value, so the body freshness check still
+    // skips a re-parse. A second index must NOT re-read the JSONL: files_scanned
+    // gates the session out of the backfill, so the canary never reaches
+    // session_files. Perspective: state (marked → skipped) + hazard (an ungated
+    // backfill re-reads every session every run, resurfacing the canary). RED
+    // (no backfill) leaves files_scanned NULL, so the "all marked" assertion
+    // fails for exactly the intended reason.
+    #[test]
+    fn 二回目の_index_で_backfill_が再実行されない() {
+        let src = tempfile::TempDir::new().unwrap();
+        let claude_dir = src.path().join("claude");
+        let (_, codex_dir) = absent_source_dirs(src.path());
+        let write_path = write_backfill_session(
+            &claude_dir,
+            "write.jsonl",
+            "write session probe",
+            Some("/proj/orig_marker.rs"),
+        );
+        write_backfill_session(&claude_dir, "zero.jsonl", "zero touch probe", None);
+
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+
+        // given: an indexed + embedded DB reset to the legacy pre-feature state,
+        // then the first backfill index (the "T-004 execution").
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            reset_to_legacy_state(&conn);
+        }
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        // Inject a canary write-target into the write session's JSONL, then pin
+        // its mtime back to the pre-injection value so the body freshness check
+        // still treats the file as unchanged. A path-only re-read would surface
+        // the canary in session_files; a gated backfill never re-reads it.
+        let pinned = fs::metadata(&write_path).unwrap().modified().unwrap();
+        write_backfill_session(
+            &claude_dir,
+            "write.jsonl",
+            "write session probe",
+            Some("/proj/canary_marker.rs"),
+        );
+        let f = OpenOptions::new().write(true).open(&write_path).unwrap();
+        f.set_modified(pinned).unwrap();
+        drop(f);
+
+        // when: recall index runs a second time.
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+        let conn = open_or_create_db(&db_path).unwrap();
+        // then: every session carries the files_scanned marker — the zero-touch
+        // session included — so none is re-read on a later index.
+        let unmarked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unmarked, 0,
+            "every session (write-target and zero-touch) must carry files_scanned after the backfill"
+        );
+        // then: the second index did not re-read the JSONL — the canary injected
+        // after the first backfill never reached session_files.
+        assert!(
+            !session_file_paths(&conn)
+                .iter()
+                .any(|p| p == "/proj/canary_marker.rs"),
+            "a marked session must not be re-read: the canary path must not appear in session_files"
+        );
+    }
+
     // #165 follow-up (SF4-JSON, end-to-end): a source root that vanishes between
     // runs preserves its existing session AND threads the skipped root into the
     // returned IndexOutcome, so index_command_output can surface it on the --json
@@ -6110,10 +6403,11 @@ mod tests {
     /// drive `run_search_with` on the read-only search path.
     fn search_command(query: &str) -> Command {
         Command::Search {
-            query: query.to_owned(),
+            query: Some(query.to_owned()),
             project: None,
             days: None,
             source: None,
+            file: None,
             limit: 10,
             exclude_current: false,
             include_current: false,
@@ -6165,6 +6459,69 @@ mod tests {
     /// load-time degraded state is false, yet `vec_search` fails mid-run.
     fn runtime_failing_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
         Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
+    }
+
+    /// Loader seam asserting it never runs: passed where the search path must not
+    /// touch the model at all (the query-less `--file` list), so a stray load —
+    /// which on a real install costs model weights + a probe forward pass —
+    /// panics instead of passing silently (same pattern as `no_recover`).
+    fn no_load() -> Result<Arc<dyn Embed>, DegradedReason> {
+        panic!("query-less --file must not load the embedder")
+    }
+
+    // polish P2 (PR #293): a query-less `--file` list never runs the semantic leg
+    // (search_with_embedder routes to file_list_outcome, which bypasses MATCH
+    // entirely), so the embedder must not be loaded and a model-less install must
+    // NOT stamp degraded:true / a semantic-search note on a complete file list —
+    // a false flag trains agent consumers to discount the honest-degraded
+    // contract (#249). The panicking loader pins the no-load half; the envelope
+    // asserts pin the honesty half. Perspective: hazard (false degradation on a
+    // complete result) + branch (the query-none arm of the embedder gate).
+    #[test]
+    fn run_search_query_less_file_list_skips_embedder_and_stays_nominal() {
+        let db_dir = tempfile::TempDir::new().unwrap();
+        let db_path = db_dir.path().join("recall.db");
+        {
+            let conn = open_or_create_db(&db_path).unwrap();
+            db::seed_session(&conn, "s1");
+            db::seed_session_file(&conn, "s1", "/proj/a.rs");
+        }
+
+        let out = run_search_with(
+            Command::Search {
+                query: None,
+                project: None,
+                days: None,
+                source: None,
+                file: Some("/proj/a.rs".to_owned()),
+                limit: 10,
+                exclude_current: false,
+                include_current: false,
+                only_current: false,
+                include_automated: false,
+            },
+            &Some(db_path),
+            no_load,
+        )
+        .unwrap();
+
+        assert_eq!(
+            out.data["results"].as_array().unwrap().len(),
+            1,
+            "the file list itself must succeed, got: {}",
+            out.data
+        );
+        assert!(
+            !out.degraded,
+            "a complete query-less file list must not be marked degraded"
+        );
+        assert!(
+            out.notes
+                .iter()
+                .all(|n| !n.contains("semantic search unavailable")),
+            "no semantic-search note may appear on the MATCH-free path, got: {:?}",
+            out.notes
+        );
     }
 
     // #204: a loaded embedder whose query-time embedding fails degrades the search
@@ -6231,7 +6588,7 @@ mod tests {
             db::seed_chunk(&conn, 1, "authentication flow");
             // An unknown-source session that matches but gets pruned for its source.
             conn.execute(
-                "INSERT INTO sessions VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0, NULL)",
+                "INSERT INTO sessions VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
                 [],
             )
             .unwrap();

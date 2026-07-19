@@ -3,7 +3,7 @@ use std::fs;
 use amici::testing::hybrid::assert_filter_symmetric;
 
 use super::*;
-use crate::db::setup_test_db;
+use crate::db::{seed_session_file, setup_test_db};
 use crate::embedder::MockEmbedder;
 use crate::indexer::index_chunks;
 
@@ -35,6 +35,10 @@ fn insert_message(conn: &Connection, sid: &str, role: &str, text: &str) {
         rusqlite::params![sid, role, text],
     )
     .unwrap();
+}
+
+fn insert_session_file(conn: &Connection, sid: &str, path: &str) {
+    seed_session_file(conn, sid, path);
 }
 
 fn insert_chunk_with_embedding(conn: &Connection, chunk_id: i64, sid: &str, text: &str, ts: i64) {
@@ -651,6 +655,330 @@ fn test_project_filter_escapes_wildcards() {
     .unwrap();
 
     assert!(results.is_empty());
+}
+
+// T-006 (U-004): クエリ + --file が AND で絞り込む
+// (given: 同じパスに触れたセッション複数と、クエリに一致するのはその一部という DB /
+//  when: recall search "<クエリ>" --file <path> を実行 /
+//  then: パスとクエリの両方に該当するセッションのみ返る)
+//
+// s1 と s2 は同じ /proj/auth.rs に触れているが、クエリ "authentication" に一致する
+// のは s1 だけ。s3 はクエリに一致するが別パス (/proj/unrelated.rs) に触れている。
+// --file は {s1, s2} を残し、クエリは {s1, s3} を残すので、両者の AND は {s1} のみ。
+// RED: `file` フィールドが SearchOptions にまだ無く、このテストはコンパイルに失敗する
+// (唯一の原因は未実装のフィールド欠如)。
+#[test]
+fn クエリ_file_が_and_で絞り込む() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s1", "user", "authentication token rotation");
+    insert_session_file(&conn, "s1", "/proj/auth.rs");
+
+    insert_session(&conn, "s2", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s2", "user", "unrelated weather notes");
+    insert_session_file(&conn, "s2", "/proj/auth.rs");
+
+    insert_session(&conn, "s3", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s3", "user", "authentication token rotation");
+    insert_session_file(&conn, "s3", "/proj/unrelated.rs");
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            file: Some("/proj/auth.rs".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["s1"],
+        "only the session matching both the query and --file must return: {ids:?}"
+    );
+}
+
+// T-007 (U-004): suffix 一致が機能する
+// (given: 絶対パスで保存された session_files /
+//  when: recall search --file <basename または末尾サブパス> をクエリ併用で実行 /
+//  then: %/<suffix> 一致で該当セッションが返る（LIKE メタ文字を含むパスでも誤爆しない）)
+//
+// 保存パスは絶対なので完全一致 `=` では入力 "a_b.rs" にヒットしない。末尾一致
+// `%/a_b.rs` が拾う。入力は LIKE メタ文字 `_` を含むため、amici の escape_like +
+// ESCAPE を通すとリテラル下線パス (hit: /home/me/proj/src/a_b.rs) だけに一致し、
+// 未エスケープなら `_` がワイルドカードとして拾ってしまう decoy
+// (/home/me/proj/src/aXb.rs) には一致しない。両セッションはクエリを共有するので
+// --file が唯一の弁別軸。RED: `file` フィールドが SearchOptions にまだ無く、
+// コンパイルに失敗する。
+#[test]
+fn suffix_一致が機能する() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "hit", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "hit", "user", "authentication token rotation");
+    insert_session_file(&conn, "hit", "/home/me/proj/src/a_b.rs");
+
+    insert_session(&conn, "decoy", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "decoy", "user", "authentication token rotation");
+    insert_session_file(&conn, "decoy", "/home/me/proj/src/aXb.rs");
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            file: Some("a_b.rs".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["hit"],
+        "suffix match must return the literal-underscore path only, not the wildcard decoy: {ids:?}"
+    );
+}
+
+// T-008 (U-005): クエリなし --file は新しい順に返る
+// (given: 同じパスに触れたセッションが複数ある DB /
+//  when: recall search --file <path> のみ（クエリなし）で実行 /
+//  then: 該当セッションが timestamp 降順で返り、FTS / vector を経由しない)
+//
+// same_old / same_new / same_mid は同一パス /proj/shared.rs に触れ、timestamp は
+// 3000 > 2000 > 1000。挿入順は old→new→mid と timestamp 順にずらしてあるので、
+// 結果 [same_new, same_mid, same_old] は「専用 SELECT の timestamp DESC」でしか
+// 説明できず、挿入順や rowid 順では再現しない。decoy は timestamp 4000（最新）だが
+// 別パス /proj/unrelated.rs なので --file フィルタで除外される。もし専用 SELECT が
+// path 条件を落としていれば decoy が先頭に来て順序 assert が壊れる。
+//
+// クエリを None で渡すため MATCH 語は存在せず、結果は session_files JOIN sessions の
+// 専用パスからのみ得られる（FTS 経路なら空クエリで NoSearchableTerms → 0 件、順序も
+// recency-boosted bm25 で timestamp 純降順にならない）。excerpt が全件空であることは
+// FTS/vector の抜粋解決（snippet / chunk / vec-chunk）を通っていない直接の証拠。
+//
+// RED: `search_with_embedder` の query 位置引数がまだ `&str` で、`None` を渡せず
+// コンパイルに失敗する（唯一の原因は query が Option 化されていないこと）。
+#[test]
+fn クエリなし_file_は新しい順に返る() {
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // 同一パスに触れた 3 セッション。挿入順 (old→new→mid) と timestamp 順を
+    // 意図的にずらし、返り順が timestamp DESC であることを挿入順から弁別する。
+    insert_session(&conn, "same_old", "claude", "/proj", 1000);
+    insert_message(&conn, "same_old", "user", "alpha notes");
+    insert_session_file(&conn, "same_old", "/proj/shared.rs");
+
+    insert_session(&conn, "same_new", "claude", "/proj", 3000);
+    insert_message(&conn, "same_new", "user", "beta notes");
+    insert_session_file(&conn, "same_new", "/proj/shared.rs");
+
+    insert_session(&conn, "same_mid", "claude", "/proj", 2000);
+    insert_message(&conn, "same_mid", "user", "gamma notes");
+    insert_session_file(&conn, "same_mid", "/proj/shared.rs");
+
+    // 別パスに触れた decoy。timestamp は最新 (4000) なので、専用 SELECT が
+    // path 条件を落としていれば先頭に混入して順序 assert を壊す。
+    insert_session(&conn, "decoy", "claude", "/proj", 4000);
+    insert_message(&conn, "decoy", "user", "delta notes");
+    insert_session_file(&conn, "decoy", "/proj/unrelated.rs");
+
+    let results = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap()
+    .results;
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["same_new", "same_mid", "same_old"],
+        "query-less --file must return the file's sessions in timestamp-descending order, \
+         excluding the other-path decoy: {ids:?}"
+    );
+    assert!(
+        results.iter().all(|r| r.excerpt.is_empty()),
+        "query-less --file list mode carries no excerpt (MATCH bypassed, no FTS/vector snippet resolution)"
+    );
+}
+
+// #293 audit H-1 (a)+(b): file_list_outcome は行デコード失敗を sibling 経路
+// (find_candidate_sessions / fetch_session_metadata) と同じ契約で「落として数え、
+// results_incomplete に畳む」(#249 RC-003)。schema 上 source は nullable TEXT なので
+// NULL source は到達可能な実 DB 状態 (#249 の NULL-deserialize 前例)。
+// RED: 現行は行エラーを `?` で伝播し、search 全体が Err で abort する。
+#[test]
+fn file_リストは_null_行を落として_incomplete_を立てる() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "ok", "claude", "/proj", 2000);
+    insert_session_file(&conn, "ok", "/proj/shared.rs");
+    // NULL source は insert_session が常に source を入れるため直接 INSERT する。
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+         VALUES ('null_src', NULL, '', '/proj', 'null_src', 1000, 0.0)",
+        [],
+    )
+    .unwrap();
+    insert_session_file(&conn, "null_src", "/proj/shared.rs");
+
+    let outcome = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ok"],
+        "the NULL-source row must be dropped, not abort the whole list: {ids:?}"
+    );
+    assert!(
+        outcome.results_incomplete,
+        "a dropped row must be flagged as results_incomplete, not presented as complete"
+    );
+}
+
+// #293 audit H-1 (b): 未知 source の行は session_data_from_row が None で落とすが、
+// その間引きも results_incomplete に畳む。RED: 現行は `continue` で黙って落とし
+// nominal() を返すため、--json が degraded:false のまま under-report する。
+#[test]
+fn file_リストは_未知_source_行を落として_incomplete_を立てる() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "ok", "claude", "/proj", 2000);
+    insert_session_file(&conn, "ok", "/proj/shared.rs");
+    insert_session(&conn, "mystery", "perplexity", "/proj", 1000);
+    insert_session_file(&conn, "mystery", "/proj/shared.rs");
+
+    let outcome = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ok"],
+        "the unknown-source row must be dropped: {ids:?}"
+    );
+    assert!(
+        outcome.results_incomplete,
+        "an unknown-source drop must be flagged as results_incomplete"
+    );
+}
+
+// #293 audit H-1 (d): SQL 側 LIMIT が Rust 側の drop より先に効くと、落ちた行の分だけ
+// limit 未満に under-fill する。最新行がデコード不能でも次のデコード可能なセッションで
+// limit を埋める。RED: 現行は LIMIT ? で最新 1 行 (NULL source) だけ取得して落とすため
+// 結果が空になる。
+#[test]
+fn file_リストは_落ちた行の分まで_limit_を埋める() {
+    let (_dir, conn) = setup_test_db();
+    // 最新 (ts 2000) がデコード不能、その次 (ts 1000) が正常。
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+         VALUES ('null_src', NULL, '', '/proj', 'null_src', 2000, 0.0)",
+        [],
+    )
+    .unwrap();
+    insert_session_file(&conn, "null_src", "/proj/shared.rs");
+    insert_session(&conn, "ok", "claude", "/proj", 1000);
+    insert_session_file(&conn, "ok", "/proj/shared.rs");
+
+    let outcome = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            limit: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["ok"],
+        "a dropped newest row must not under-fill the limit: {ids:?}"
+    );
+    assert!(outcome.results_incomplete);
+}
+
+// polish P1 (PR #293): a pre-#283 DB opened read-only has no session_files
+// table (create_schema runs only on the write path) and schema_state
+// deliberately reports it Current (migrate_files_scanned_if_needed forces no
+// re-index), so `--file` used to surface a raw `no such table: session_files`
+// (exit 74, no recovery hint). The gate must turn that into actionable
+// guidance naming `recall index`, on both the query and query-less arms.
+// Perspective: error (legacy on-disk state) + hazard (agent stranded by an
+// opaque SQL error).
+#[test]
+fn file_指定は_session_files_不在の_db_で_index_案内エラーになる() {
+    let (_dir, conn) = setup_test_db();
+    conn.execute_batch("DROP TABLE session_files;").unwrap();
+    let opts = SearchOptions {
+        file: Some("/proj/a.rs".to_owned()),
+        ..Default::default()
+    };
+
+    let Err(query_less) = search_with_embedder(&conn, None, &opts, None) else {
+        panic!("query-less --file on a legacy DB must error");
+    };
+    assert!(
+        query_less.to_string().contains("recall index"),
+        "query-less --file on a legacy DB must name `recall index`, got: {query_less}"
+    );
+
+    let Err(with_query) = search_with_embedder(&conn, "auth", &opts, None) else {
+        panic!("query + --file on a legacy DB must error");
+    };
+    assert!(
+        with_query.to_string().contains("recall index"),
+        "query + --file on a legacy DB must name `recall index`, got: {with_query}"
+    );
 }
 
 #[test]
@@ -1799,6 +2127,52 @@ fn test_hybrid_exclude_current_drops_session_from_both_paths() {
                 &embedder,
                 &SearchOptions {
                     current: CurrentSession::Exclude("cur".to_owned()),
+                    now_ms: Some(now_ms),
+                    ..Default::default()
+                },
+            )
+        },
+        || {
+            hybrid_search_ids(
+                &conn,
+                &embedder,
+                &SearchOptions {
+                    now_ms: Some(now_ms),
+                    ..Default::default()
+                },
+            )
+        },
+    );
+}
+
+// conformance (#283 spec / PR #293): --file は FTS / vec 両 leg が共有 helper
+// (append_session_filter) 経由で継承する。vec 経路だけで到達できるセッションが
+// --file 不一致で落ちることを、project / days / source フィルタと同じ
+// assert_filter_symmetric パターンで固定する (両経路対称の根拠: T-CS002)。
+#[test]
+fn test_hybrid_file_filter_excludes_vec_only_mismatch() {
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    let embedder = MockEmbedder::new();
+
+    assert_filter_symmetric(
+        || {
+            insert_session(&conn, "keep", "claude", "/proj", now_ms);
+            insert_message(&conn, "keep", "user", "authentication flow discussion");
+            insert_session_file(&conn, "keep", "/proj/auth.rs");
+            // vec-only session touching another path: reachable only via the
+            // vector leg, so an FTS-only --file filter would fail to drop it.
+            insert_session(&conn, "other", "claude", "/proj", now_ms);
+            insert_chunk_with_embedding(&conn, 1, "other", "authentication", now_ms);
+            insert_session_file(&conn, "other", "/proj/unrelated.rs");
+            ("keep".to_owned(), "other".to_owned())
+        },
+        || {
+            hybrid_search_ids(
+                &conn,
+                &embedder,
+                &SearchOptions {
+                    file: Some("/proj/auth.rs".to_owned()),
                     now_ms: Some(now_ms),
                     ..Default::default()
                 },

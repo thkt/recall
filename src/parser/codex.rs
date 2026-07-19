@@ -142,6 +142,8 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
             timestamp: state.earliest_ts,
         },
         messages,
+        // Codex rollouts carry no Claude Code write-tool metadata (contract U-002).
+        scanned_files: Vec::new(),
         skipped_lines,
     }))
 }

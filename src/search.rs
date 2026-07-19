@@ -3,7 +3,7 @@ use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use amici::storage::filter::{
-    append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter,
+    append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
 };
 use amici::storage::{anon_placeholders, fts::clean_for_trigram};
 use anyhow::{Context, Result};
@@ -14,6 +14,7 @@ use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
+use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
 use crate::hybrid::rrf_merge_strings;
@@ -96,6 +97,10 @@ pub struct SearchOptions {
     pub project: Option<String>,
     pub days: Option<i64>,
     pub source: Option<Source>,
+    /// Restrict to sessions that touched this file path. Matched against
+    /// `session_files.path` by exact equality or a `%/<suffix>` LIKE, so a
+    /// basename or tail sub-path resolves an absolute stored path (#283).
+    pub file: Option<String>,
     pub limit: usize,
     /// How to treat the invoking session (see `CurrentSession`).
     pub current: CurrentSession,
@@ -112,6 +117,7 @@ impl Default for SearchOptions {
             project: None,
             days: None,
             source: None,
+            file: None,
             limit: 10,
             current: CurrentSession::Ignore,
             include_automated: false,
@@ -136,20 +142,37 @@ fn append_session_filter(
     opts: &SearchOptions,
     now_ms: i64,
 ) {
-    if opts.project.is_none() && opts.days.is_none() && opts.source.is_none() {
-        return;
+    if opts.project.is_some() || opts.days.is_some() || opts.source.is_some() {
+        sql.push_str(" AND ");
+        sql.push_str(column);
+        sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
+        if let Some(ref project) = opts.project {
+            append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
+        }
+        let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
+        append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
+        let source_str = opts.source.as_ref().map(Source::as_str);
+        append_eq_filter(sql, params, "s2.source", source_str);
+        sql.push(')');
     }
-    sql.push_str(" AND ");
-    sql.push_str(column);
-    sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
-    if let Some(ref project) = opts.project {
-        append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
+    // File axis (#283): restrict to sessions that touched the path, joined from
+    // `session_files` (Codex sessions have no rows here, so `--file` excludes
+    // them while Codex extraction is unsupported). Exact equality catches an
+    // absolute path; the `%/<suffix>` LIKE catches a basename or tail sub-path.
+    // The suffix is `escape_like`-escaped so LIKE metacharacters in the input
+    // (e.g. `_`) match literally under `ESCAPE '\'`.
+    if let Some(ref file) = opts.file {
+        sql.push_str(" AND ");
+        sql.push_str(column);
+        sql.push_str(
+            " IN (SELECT sf.session_id FROM session_files sf \
+             WHERE sf.path = ? OR sf.path LIKE ? ESCAPE '\\')",
+        );
+        params.push(Box::new(file.clone()));
+        let mut suffix = String::from("%/");
+        suffix.push_str(&escape_like(file));
+        params.push(Box::new(suffix));
     }
-    let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
-    append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
-    let source_str = opts.source.as_ref().map(Source::as_str);
-    append_eq_filter(sql, params, "s2.source", source_str);
-    sql.push(')');
 }
 
 /// Append ` AND {column} <> ?` (Exclude) or ` AND {column} = ?` (Only) for the
@@ -265,6 +288,29 @@ fn find_candidate_sessions(
     Ok((ranked, skipped))
 }
 
+/// Decode one `sessions` row shaped (session_id, source, file_path, project,
+/// slug, timestamp) into `SessionData` — the shared positional decode for every
+/// reader of this projection (`fetch_session_metadata`, `file_list_outcome`),
+/// so a column-order drift breaks both readers at once instead of silently
+/// diverging. `Err` is a row-decode failure (e.g. NULL in a nullable column);
+/// `Ok(None)` is an unrecognized `source` string, warned here.
+fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> {
+    let session_id: String = row.get(0)?;
+    let source_str: String = row.get(1)?;
+    let Some(source) = Source::from_db(&source_str) else {
+        warn!(source = %source_str, session_id, "unknown source");
+        return Ok(None);
+    };
+    Ok(Some(SessionData {
+        session_id,
+        source,
+        file_path: row.get(2)?,
+        project: row.get(3)?,
+        slug: row.get(4)?,
+        timestamp: row.get(5)?,
+    }))
+}
+
 fn fetch_session_metadata(
     conn: &Connection,
     ranked: &[(String, f64)],
@@ -276,41 +322,18 @@ fn fetch_session_metadata(
     );
     let params = rusqlite::params_from_iter(ranked.iter().map(|(sid, _)| sid));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params, |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, Option<i64>>(5)?,
-        ))
-    })?;
+    let rows = stmt.query_map(params, decode_session)?;
 
     let mut map = HashMap::new();
     let mut db_errors = 0;
     for r in rows {
         match r {
-            Ok((session_id, source_str, file_path, project, slug, timestamp)) => {
-                let source = match Source::from_db(&source_str) {
-                    Some(s) => s,
-                    None => {
-                        warn!(source = %source_str, session_id, "unknown source");
-                        continue;
-                    }
-                };
-                map.insert(
-                    session_id.clone(),
-                    SessionData {
-                        session_id,
-                        source,
-                        file_path,
-                        project,
-                        slug,
-                        timestamp,
-                    },
-                );
+            Ok(Some(session)) => {
+                map.insert(session.session_id.clone(), session);
             }
+            // Unknown source: warned inside decode_session; pruning is surfaced
+            // by the caller's meta_map.len() < requested check.
+            Ok(None) => {}
             Err(e) => {
                 if db_errors == 0 {
                     warn!(error = %e, "metadata query error");
@@ -653,9 +676,9 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
     Ok(search_with_embedder(conn, query, opts, None)?.results)
 }
 
-pub fn search_with_embedder(
+pub fn search_with_embedder<'q>(
     conn: &Connection,
-    query: &str,
+    query: impl Into<Option<&'q str>>,
     opts: &SearchOptions,
     embedder: Option<&dyn Embed>,
 ) -> Result<SearchOutcome> {
@@ -663,7 +686,28 @@ pub fn search_with_embedder(
         return Ok(SearchOutcome::nominal(Vec::new()));
     }
 
+    // A pre-#283 DB opened read-only has no session_files table (create_schema
+    // runs only on the write path) and schema_state deliberately keeps such a DB
+    // Current (no forced re-index). Probe the table before any --file SQL so the
+    // legacy case surfaces as recovery guidance instead of a raw
+    // `no such table: session_files` error.
+    if opts.file.is_some() && table_def(conn, "session_files")?.is_none() {
+        return Err(RecallError::DataError(
+            "`--file` needs the scanned-files index; run `recall index` once to record it."
+                .to_owned(),
+        )
+        .into());
+    }
+
     let now_ms = resolve_now_ms(opts)?;
+
+    // Query-less mode (#284/U-005): with no query, `--file` alone lists the
+    // sessions that touched the path, newest first, via a dedicated SELECT that
+    // bypasses the FTS/vector MATCH path. `Some("")` (an explicit empty query) is
+    // distinct — it flows on to the MATCH path and its NoSearchableTerms handling.
+    let Some(query) = query.into() else {
+        return file_list_outcome(conn, opts, now_ms);
+    };
     // Normalization disabled to stay symmetric with the index: the indexer writes
     // raw message text into FTS (no normalize_for_fts pass), so query-side NFKC /
     // lowercase / whitespace folding would silently miss full-width and CJK matches.
@@ -844,6 +888,89 @@ fn fts_only_outcome(
         results: score_and_sort(candidates, now_ms, opts.limit),
         vec_degraded,
         results_incomplete: incomplete,
+    })
+}
+
+/// Query-less `--file` list mode (#284/U-005): with no query, list the sessions
+/// that touched `opts.file`, newest first, via a dedicated SELECT that bypasses
+/// the FTS/vector MATCH path entirely. Reuses the same session/current/automated
+/// filters as the search paths, so `--project` / `--days` / `--source` and the
+/// current/automated policies narrow the list identically to a query search. Each
+/// result carries an empty excerpt (no MATCH hit to resolve a snippet or chunk
+/// from) and no chunk anchor. A query-less call with no `--file` is a usage error:
+/// there is no term and no path, so nothing to list.
+///
+/// Row decoding follows the same contract as the MATCH paths (#249 RC-003): a
+/// row that fails to decode (NULL in a nullable `sessions` column) or carries an
+/// unknown `source` is dropped and counted, folding into `results_incomplete`
+/// instead of aborting the command or presenting the thinned list as complete.
+/// The limit is applied in Rust after the drops, so a dropped row never
+/// under-fills the requested count while later matches exist.
+fn file_list_outcome(
+    conn: &Connection,
+    opts: &SearchOptions,
+    now_ms: i64,
+) -> Result<SearchOutcome> {
+    if opts.file.is_none() {
+        return Err(RecallError::Usage("A search query or --file is required.".to_owned()).into());
+    }
+
+    // `append_session_filter` appends the `--file` subquery (exact path or
+    // `%/<suffix>` LIKE) plus any project/days/source filter; with `--file` set it
+    // never early-returns. The subquery aliases (s2/s3/sf) do not collide with the
+    // outer `s`.
+    let mut sql = "SELECT s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
+                   FROM sessions s WHERE 1 = 1"
+        .to_owned();
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    append_session_filter(&mut sql, &mut params, "s.session_id", opts, now_ms);
+    append_current_session_filter(&mut sql, &mut params, "s.session_id", &opts.current);
+    append_automated_filter(&mut sql, "s.session_id", opts.include_automated);
+    // Pure timestamp DESC (newest first), not the recency-boosted bm25 blend the
+    // MATCH paths use: there is no relevance score to blend here. NULL timestamps
+    // sort last under SQLite's DESC ordering. No SQL LIMIT: the cap is applied in
+    // Rust below so a dropped row never under-fills the requested count.
+    sql.push_str(" ORDER BY s.timestamp DESC");
+    debug_assert_eq!(
+        params.len(),
+        sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), decode_session)?;
+
+    let mut results = Vec::new();
+    let mut skipped = 0;
+    let mut first_error = None;
+    for r in rows {
+        if results.len() >= opts.limit {
+            break;
+        }
+        match r {
+            Ok(Some(session)) => results.push(SearchResult {
+                session,
+                excerpt: String::new(),
+                chunk_id: None,
+            }),
+            // Unknown source: warned inside decode_session.
+            Ok(None) => skipped += 1,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 0 {
+        let err_msg = first_error.as_deref().unwrap_or("unknown source");
+        warn!(skipped, err_msg, "rows dropped in --file list");
+    }
+    Ok(SearchOutcome {
+        results,
+        vec_degraded: false,
+        results_incomplete: skipped > 0,
     })
 }
 

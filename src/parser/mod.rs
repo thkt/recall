@@ -85,10 +85,49 @@ pub struct Message {
 pub struct ParseResult {
     pub metadata: SessionData,
     pub messages: Vec<Message>,
+    /// Distinct filesystem paths this session edited, extracted from write-type
+    /// tool_use blocks (Edit / Write / MultiEdit / NotebookEdit). Never routed
+    /// into `messages` / `qa_chunks`; the indexer persists them to `session_files`.
+    pub scanned_files: Vec<String>,
     pub skipped_lines: usize,
 }
 
 const TEXT_BLOCK_TYPES: &[&str] = &["text", "input_text", "output_text"];
+
+/// Claude Code tools whose `input` names a file that the assistant wrote to.
+/// Read / Grep / Bash carry no such target, so they are excluded (contract U-002).
+const PATH_TOOL_NAMES: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+/// Longest path value kept as a scanned file. Beyond this the value is not a real
+/// filesystem path (PATH_MAX is 1024 on macOS, 4096 on Linux), so it is dropped by
+/// the validity filter rather than stored.
+const MAX_SCANNED_PATH_LEN: usize = 4096;
+
+/// Extract the target path from one message content block when it is a write-type
+/// tool_use (`Edit` / `Write` / `MultiEdit` use `file_path`, `NotebookEdit` uses
+/// `notebook_path`). Returns `None` for any other block, so text / thinking /
+/// tool_result blocks and non-write tools (Read / Grep / Bash) contribute nothing.
+pub(super) fn extract_tool_use_path(block: &Value) -> Option<&str> {
+    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+        return None;
+    }
+    let name = block.get("name").and_then(|v| v.as_str())?;
+    if !PATH_TOOL_NAMES.contains(&name) {
+        return None;
+    }
+    let input = block.get("input")?;
+    input
+        .get("file_path")
+        .or_else(|| input.get("notebook_path"))
+        .and_then(|v| v.as_str())
+}
+
+/// Whether a tool_use path value is a plausible filesystem path worth recording.
+/// Three independent checks mirror the three invalid shapes the contract filters:
+/// non-empty (path shape), no embedded newline, and within the length cap.
+pub(super) fn is_valid_scanned_path(path: &str) -> bool {
+    !path.is_empty() && !path.contains(['\n', '\r']) && path.len() <= MAX_SCANNED_PATH_LEN
+}
 
 /// Remove noise tags from text while preserving valuable tags like `<local-command-stdout>`.
 ///

@@ -75,6 +75,27 @@ fn test_claude_empty_messages_returns_none() {
     assert!(parse_claude_session(tmp.path()).unwrap().is_none());
 }
 
+// U-002 dedupe: a write-target path repeated across tool_use blocks — within one
+// assistant turn and again in a later turn — collapses to a single scanned_files
+// entry, preserving first-seen order. T-002/T-003 never repeat a path, so this is
+// the only cover for the contract's "セッション内 dedupe" clause. The two assistant
+// turns carry no text block, so this also pins that a tool_use-only turn still
+// contributes paths (extraction runs before the empty-text early return).
+#[test]
+fn test_claude_scanned_files_deduped_within_session() {
+    let tmp = write_jsonl(&[
+        r#"{"type":"user","message":{"role":"user","content":"edit the file twice"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/same.rs","old_string":"a","new_string":"b"}},{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"/proj/other.rs","content":"c"}}]},"timestamp":"2026-03-01T00:00:01Z"}"#,
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Edit","input":{"file_path":"/proj/same.rs","old_string":"b","new_string":"d"}}]},"timestamp":"2026-03-01T00:00:02Z"}"#,
+    ]);
+    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
+    assert_eq!(
+        result.scanned_files,
+        vec!["/proj/same.rs".to_owned(), "/proj/other.rs".to_owned()],
+        "the repeated path is recorded once, in first-seen order, across both turns"
+    );
+}
+
 // T-001: isMeta entries are skipped
 #[test]
 fn test_claude_is_meta_skipped() {
