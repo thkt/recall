@@ -1839,3 +1839,248 @@ fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
          search can find it; orphaning it leaves it FTS-only and vector-invisible"
     );
 }
+
+// T-001 (U-001): deleting a session through delete_session_dependents must also
+// remove its session_files scanned-file markers, so a session deletion / re-parse
+// leaves no orphaned rows. The schema is built via the real setup_test_db →
+// open_db → create_schema path, so this guards both halves of the contract: if
+// the table exists but the DELETE is missing, the count assertion fails at 1.
+#[test]
+fn セッション削除で_session_files_の行も消える() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    // given: the session owns a session_files row
+    conn.execute(
+        "INSERT INTO session_files (session_id, path) VALUES ('s1', '/proj/s1.jsonl')",
+        [],
+    )
+    .unwrap();
+
+    // when: the session is deleted via delete_session_dependents
+    let tx = conn.transaction().unwrap();
+    delete_session_dependents(&tx, "s1").unwrap();
+    tx.commit().unwrap();
+
+    // then: no session_files row remains for that session_id
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_files WHERE session_id = 's1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "session_files rows must be deleted together with the session"
+    );
+}
+
+// T-002 (U-002): Edit/Write の file_path が session_files に入る（given: Edit と Write の
+// tool_use を含む Claude JSONL / when: recall index を実行 / then: session_files に両パスが
+// 入り、messages / qa_chunks の内容は tool_use 由来のテキストを含まない）
+#[test]
+fn edit_write_の_file_path_が_session_files_に入る() {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+    // given: an assistant turn issues an Edit and a Write tool_use, each with a
+    // distinctive file_path marker that appears nowhere in any text block.
+    fs::write(
+        claude_dir.join("edit_session.jsonl"),
+        concat!(
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"please make the edits"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":[{"type":"text","text":"doing the edits"},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/alpha_marker.rs","old_string":"x","new_string":"y"}},{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"/proj/beta_marker.rs","content":"filecontents"}}]},"timestamp":"2026-03-01T00:00:01Z"}"#,
+        ),
+    )
+    .unwrap();
+    let codex_dir = tmp.path().join("codex_sessions");
+
+    // when: recall index (index_from_dirs) then chunk the session.
+    index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+        true,
+    )
+    .unwrap();
+    index_chunks(&mut conn, None).unwrap();
+
+    // then: both file_path values are recorded in session_files.
+    let mut paths: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT path FROM session_files ORDER BY path")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        for row in rows {
+            paths.push(row.unwrap());
+        }
+    }
+    assert_eq!(
+        paths,
+        vec![
+            "/proj/alpha_marker.rs".to_owned(),
+            "/proj/beta_marker.rs".to_owned(),
+        ],
+        "Edit and Write file_path values must land in session_files"
+    );
+
+    // then: the tool_use-derived text (paths, write content) never leaks into the
+    // searchable body — neither messages nor qa_chunks.
+    let mut message_texts: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT text FROM messages").unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        for row in rows {
+            message_texts.push(row.unwrap());
+        }
+    }
+    let mut chunk_contents: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT content FROM qa_chunks").unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        for row in rows {
+            chunk_contents.push(row.unwrap());
+        }
+    }
+    for marker in ["alpha_marker", "beta_marker", "filecontents"] {
+        assert!(
+            !message_texts.iter().any(|t| t.contains(marker)),
+            "tool_use text {marker:?} must not appear in messages"
+        );
+        assert!(
+            !chunk_contents.iter().any(|c| c.contains(marker)),
+            "tool_use text {marker:?} must not appear in qa_chunks"
+        );
+    }
+}
+
+// T-003 (U-002): 妥当でない値は捨てられる（given: 改行入り・長さ超過・非パス形状の
+// file_path を含む tool_use / when: parse する / then: session_files に入らない）
+#[test]
+fn 妥当でない値は捨てられる() {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+
+    // given: one valid Edit file_path as a control, plus three invalid ones, each
+    // failing exactly one validity rule: an embedded newline, an over-length path
+    // (~100k chars — unambiguously beyond any filesystem PATH_MAX so the test does
+    // not hinge on Green's exact cap), and an empty (non-path-shaped) value.
+    // Built via serde_json so the newline is stored as the JSON escape `\n` on one
+    // physical line and decodes back to a real newline at parse time.
+    let long_path = format!("/proj/{}.rs", "a".repeat(100_000));
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "cwd": "/proj",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "editing"},
+                {"type": "tool_use", "id": "t1", "name": "Edit",
+                 "input": {"file_path": "/proj/valid_control.rs", "old_string": "x", "new_string": "y"}},
+                {"type": "tool_use", "id": "t2", "name": "Edit",
+                 "input": {"file_path": "/proj/bad\nname.rs", "old_string": "x", "new_string": "y"}},
+                {"type": "tool_use", "id": "t3", "name": "Write",
+                 "input": {"file_path": long_path, "content": "z"}},
+                {"type": "tool_use", "id": "t4", "name": "Edit",
+                 "input": {"file_path": "", "old_string": "x", "new_string": "y"}}
+            ]
+        },
+        "timestamp": "2026-03-01T00:00:01Z"
+    });
+    let user_line = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"edit these files"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+    let contents = format!(
+        "{}\n{}\n",
+        user_line,
+        serde_json::to_string(&assistant).unwrap()
+    );
+    fs::write(claude_dir.join("filter_session.jsonl"), contents).unwrap();
+    let codex_dir = tmp.path().join("codex_sessions");
+
+    // when: recall index parses the session.
+    index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+        true,
+    )
+    .unwrap();
+
+    // then: only the valid path survives; the newline / over-length / empty values
+    // are dropped. Asserting the exact set (not merely "invalids absent") keeps the
+    // test from passing vacuously and pins the filter's effect.
+    let mut paths: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT path FROM session_files ORDER BY path")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        for row in rows {
+            paths.push(row.unwrap());
+        }
+    }
+    assert_eq!(
+        paths,
+        vec!["/proj/valid_control.rs".to_owned()],
+        "only the valid file_path is kept; newline / over-length / empty are filtered"
+    );
+}
+
+// U-003 contract ("JSONL が読めないセッションは skip してマーカーを立てる"): a legacy
+// session whose stored file_path no longer resolves to a readable JSONL must still
+// be marked files_scanned = 1 with no session_files rows, so the backfill records it
+// as scanned-once and never re-reads it. seed_session stores file_path '/f', which
+// does not exist, so reread_scanned_files takes its parse-failure arm and yields no
+// paths. Perspective: Error (unreadable input) + Hazard (an unmarked session on a
+// vanished file would be re-read on every later index, resurfacing the same failure).
+#[test]
+fn 読めない_jsonl_のセッションはマーカーだけ立てて_path_を残さない() {
+    let (_dir, mut conn) = setup_test_db();
+    // given: a legacy session (files_scanned NULL) whose file_path '/f' is unreadable.
+    seed_session(&conn, "gone-session");
+    let unmarked_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unmarked_before, 1, "precondition: one unmarked session");
+
+    // when: the path-only backfill runs over the unreadable JSONL.
+    let marked = backfill_session_files(&mut conn).unwrap();
+
+    // then: the session is marked, with no session_files rows written.
+    assert_eq!(
+        marked, 1,
+        "the unreadable session must be counted as marked"
+    );
+    let unmarked_after: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        unmarked_after, 0,
+        "an unreadable JSONL must still raise files_scanned so it is not re-read"
+    );
+    let file_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        file_rows, 0,
+        "an unreadable JSONL yields no session_files rows"
+    );
+}

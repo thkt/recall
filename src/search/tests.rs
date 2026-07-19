@@ -37,6 +37,14 @@ fn insert_message(conn: &Connection, sid: &str, role: &str, text: &str) {
     .unwrap();
 }
 
+fn insert_session_file(conn: &Connection, sid: &str, path: &str) {
+    conn.execute(
+        "INSERT INTO session_files (session_id, path) VALUES (?1, ?2)",
+        rusqlite::params![sid, path],
+    )
+    .unwrap();
+}
+
 fn insert_chunk_with_embedding(conn: &Connection, chunk_id: i64, sid: &str, text: &str, ts: i64) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, ?2, ?3, ?4)",
@@ -651,6 +659,169 @@ fn test_project_filter_escapes_wildcards() {
     .unwrap();
 
     assert!(results.is_empty());
+}
+
+// T-006 (U-004): クエリ + --file が AND で絞り込む
+// (given: 同じパスに触れたセッション複数と、クエリに一致するのはその一部という DB /
+//  when: recall search "<クエリ>" --file <path> を実行 /
+//  then: パスとクエリの両方に該当するセッションのみ返る)
+//
+// s1 と s2 は同じ /proj/auth.rs に触れているが、クエリ "authentication" に一致する
+// のは s1 だけ。s3 はクエリに一致するが別パス (/proj/unrelated.rs) に触れている。
+// --file は {s1, s2} を残し、クエリは {s1, s3} を残すので、両者の AND は {s1} のみ。
+// RED: `file` フィールドが SearchOptions にまだ無く、このテストはコンパイルに失敗する
+// (唯一の原因は未実装のフィールド欠如)。
+#[test]
+fn クエリ_file_が_AND_で絞り込む() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s1", "user", "authentication token rotation");
+    insert_session_file(&conn, "s1", "/proj/auth.rs");
+
+    insert_session(&conn, "s2", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s2", "user", "unrelated weather notes");
+    insert_session_file(&conn, "s2", "/proj/auth.rs");
+
+    insert_session(&conn, "s3", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s3", "user", "authentication token rotation");
+    insert_session_file(&conn, "s3", "/proj/unrelated.rs");
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            file: Some("/proj/auth.rs".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["s1"],
+        "only the session matching both the query and --file must return: {ids:?}"
+    );
+}
+
+// T-007 (U-004): suffix 一致が機能する
+// (given: 絶対パスで保存された session_files /
+//  when: recall search --file <basename または末尾サブパス> をクエリ併用で実行 /
+//  then: %/<suffix> 一致で該当セッションが返る（LIKE メタ文字を含むパスでも誤爆しない）)
+//
+// 保存パスは絶対なので完全一致 `=` では入力 "a_b.rs" にヒットしない。末尾一致
+// `%/a_b.rs` が拾う。入力は LIKE メタ文字 `_` を含むため、amici の escape_like +
+// ESCAPE を通すとリテラル下線パス (hit: /home/me/proj/src/a_b.rs) だけに一致し、
+// 未エスケープなら `_` がワイルドカードとして拾ってしまう decoy
+// (/home/me/proj/src/aXb.rs) には一致しない。両セッションはクエリを共有するので
+// --file が唯一の弁別軸。RED: `file` フィールドが SearchOptions にまだ無く、
+// コンパイルに失敗する。
+#[test]
+fn suffix_一致が機能する() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "hit", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "hit", "user", "authentication token rotation");
+    insert_session_file(&conn, "hit", "/home/me/proj/src/a_b.rs");
+
+    insert_session(&conn, "decoy", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "decoy", "user", "authentication token rotation");
+    insert_session_file(&conn, "decoy", "/home/me/proj/src/aXb.rs");
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            file: Some("a_b.rs".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["hit"],
+        "suffix match must return the literal-underscore path only, not the wildcard decoy: {ids:?}"
+    );
+}
+
+// T-008 (U-005): クエリなし --file は新しい順に返る
+// (given: 同じパスに触れたセッションが複数ある DB /
+//  when: recall search --file <path> のみ（クエリなし）で実行 /
+//  then: 該当セッションが timestamp 降順で返り、FTS / vector を経由しない)
+//
+// same_old / same_new / same_mid は同一パス /proj/shared.rs に触れ、timestamp は
+// 3000 > 2000 > 1000。挿入順は old→new→mid と timestamp 順にずらしてあるので、
+// 結果 [same_new, same_mid, same_old] は「専用 SELECT の timestamp DESC」でしか
+// 説明できず、挿入順や rowid 順では再現しない。decoy は timestamp 4000（最新）だが
+// 別パス /proj/unrelated.rs なので --file フィルタで除外される。もし専用 SELECT が
+// path 条件を落としていれば decoy が先頭に来て順序 assert が壊れる。
+//
+// クエリを None で渡すため MATCH 語は存在せず、結果は session_files JOIN sessions の
+// 専用パスからのみ得られる（FTS 経路なら空クエリで NoSearchableTerms → 0 件、順序も
+// recency-boosted bm25 で timestamp 純降順にならない）。excerpt が全件空であることは
+// FTS/vector の抜粋解決（snippet / chunk / vec-chunk）を通っていない直接の証拠。
+//
+// RED: `search_with_embedder` の query 位置引数がまだ `&str` で、`None` を渡せず
+// コンパイルに失敗する（唯一の原因は query が Option 化されていないこと）。
+#[test]
+fn クエリなし_file_は新しい順に返る() {
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+
+    // 同一パスに触れた 3 セッション。挿入順 (old→new→mid) と timestamp 順を
+    // 意図的にずらし、返り順が timestamp DESC であることを挿入順から弁別する。
+    insert_session(&conn, "same_old", "claude", "/proj", 1000);
+    insert_message(&conn, "same_old", "user", "alpha notes");
+    insert_session_file(&conn, "same_old", "/proj/shared.rs");
+
+    insert_session(&conn, "same_new", "claude", "/proj", 3000);
+    insert_message(&conn, "same_new", "user", "beta notes");
+    insert_session_file(&conn, "same_new", "/proj/shared.rs");
+
+    insert_session(&conn, "same_mid", "claude", "/proj", 2000);
+    insert_message(&conn, "same_mid", "user", "gamma notes");
+    insert_session_file(&conn, "same_mid", "/proj/shared.rs");
+
+    // 別パスに触れた decoy。timestamp は最新 (4000) なので、専用 SELECT が
+    // path 条件を落としていれば先頭に混入して順序 assert を壊す。
+    insert_session(&conn, "decoy", "claude", "/proj", 4000);
+    insert_message(&conn, "decoy", "user", "delta notes");
+    insert_session_file(&conn, "decoy", "/proj/unrelated.rs");
+
+    let results = search_with_embedder(
+        &conn,
+        None,
+        &SearchOptions {
+            file: Some("/proj/shared.rs".to_owned()),
+            now_ms: Some(now_ms),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap()
+    .results;
+
+    let ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["same_new", "same_mid", "same_old"],
+        "query-less --file must return the file's sessions in timestamp-descending order, \
+         excluding the other-path decoy: {ids:?}"
+    );
+    assert!(
+        results.iter().all(|r| r.excerpt.is_empty()),
+        "query-less --file list mode carries no excerpt (MATCH bypassed, no FTS/vector snippet resolution)"
+    );
 }
 
 #[test]

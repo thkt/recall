@@ -276,7 +276,8 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             slug TEXT,
             timestamp INTEGER,
             mtime REAL,
-            session_type TEXT
+            session_type TEXT,
+            files_scanned INTEGER
         );",
     )?;
 
@@ -285,6 +286,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     migrate_qa_chunks_if_needed(conn)?;
     migrate_qa_chunk_rowid_link_if_needed(conn)?;
     migrate_session_type_if_needed(conn)?;
+    migrate_files_scanned_if_needed(conn)?;
 
     // embedded_chunk_ids (a removed ledger) was dropped inside two separate
     // migrations; collapse those into one unconditional drop so every pre-cleanup
@@ -294,6 +296,14 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
          CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);",
+    )?;
+
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS session_files (
+            session_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            PRIMARY KEY (session_id, path)
+        );",
     )?;
 
     conn.execute_batch(&format!(
@@ -431,6 +441,24 @@ fn migrate_session_type_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add files_scanned to pre-session_files databases. ALTER ... ADD COLUMN keeps
+/// every existing row (the new column is NULL, meaning the session's scanned-file
+/// set has not been recorded yet), so no re-index is forced — the marker is
+/// populated on the next `recall index` alongside the session_files rows.
+fn migrate_files_scanned_if_needed(conn: &mut Connection) -> Result<()> {
+    let Some(sql) = table_def(conn, "sessions")? else {
+        return Ok(());
+    };
+
+    if !sql.contains("files_scanned") {
+        let tx = conn.transaction()?;
+        tx.execute_batch("ALTER TABLE sessions ADD COLUMN files_scanned INTEGER;")?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "messages")? else {
         return Ok(());
@@ -466,7 +494,7 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
 #[cfg(test)]
 pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     conn.execute(
-        "INSERT INTO sessions VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL)",
+        "INSERT INTO sessions VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
         [session_id],
     )
     .unwrap();

@@ -3,7 +3,7 @@ use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use amici::storage::filter::{
-    append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter,
+    append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
 };
 use amici::storage::{anon_placeholders, fts::clean_for_trigram};
 use anyhow::{Context, Result};
@@ -96,6 +96,10 @@ pub struct SearchOptions {
     pub project: Option<String>,
     pub days: Option<i64>,
     pub source: Option<Source>,
+    /// Restrict to sessions that touched this file path. Matched against
+    /// `session_files.path` by exact equality or a `%/<suffix>` LIKE, so a
+    /// basename or tail sub-path resolves an absolute stored path (#283).
+    pub file: Option<String>,
     pub limit: usize,
     /// How to treat the invoking session (see `CurrentSession`).
     pub current: CurrentSession,
@@ -112,6 +116,7 @@ impl Default for SearchOptions {
             project: None,
             days: None,
             source: None,
+            file: None,
             limit: 10,
             current: CurrentSession::Ignore,
             include_automated: false,
@@ -136,20 +141,37 @@ fn append_session_filter(
     opts: &SearchOptions,
     now_ms: i64,
 ) {
-    if opts.project.is_none() && opts.days.is_none() && opts.source.is_none() {
-        return;
+    if opts.project.is_some() || opts.days.is_some() || opts.source.is_some() {
+        sql.push_str(" AND ");
+        sql.push_str(column);
+        sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
+        if let Some(ref project) = opts.project {
+            append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
+        }
+        let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
+        append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
+        let source_str = opts.source.as_ref().map(Source::as_str);
+        append_eq_filter(sql, params, "s2.source", source_str);
+        sql.push(')');
     }
-    sql.push_str(" AND ");
-    sql.push_str(column);
-    sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
-    if let Some(ref project) = opts.project {
-        append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
+    // File axis (#283): restrict to sessions that touched the path, joined from
+    // `session_files` (Codex sessions have no rows here, so `--file` excludes
+    // them while Codex extraction is unsupported). Exact equality catches an
+    // absolute path; the `%/<suffix>` LIKE catches a basename or tail sub-path.
+    // The suffix is `escape_like`-escaped so LIKE metacharacters in the input
+    // (e.g. `_`) match literally under `ESCAPE '\'`.
+    if let Some(ref file) = opts.file {
+        sql.push_str(" AND ");
+        sql.push_str(column);
+        sql.push_str(
+            " IN (SELECT sf.session_id FROM session_files sf \
+             WHERE sf.path = ? OR sf.path LIKE ? ESCAPE '\\')",
+        );
+        params.push(Box::new(file.clone()));
+        let mut suffix = String::from("%/");
+        suffix.push_str(&escape_like(file));
+        params.push(Box::new(suffix));
     }
-    let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
-    append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
-    let source_str = opts.source.as_ref().map(Source::as_str);
-    append_eq_filter(sql, params, "s2.source", source_str);
-    sql.push(')');
 }
 
 /// Append ` AND {column} <> ?` (Exclude) or ` AND {column} = ?` (Only) for the
@@ -265,6 +287,32 @@ fn find_candidate_sessions(
     Ok((ranked, skipped))
 }
 
+/// Decode one `sessions` row shaped (session_id, source, file_path, project,
+/// slug, timestamp) into `SessionData`. `None` on an unrecognized `source`
+/// string, with a warning — the shared row mapping for every reader of this
+/// projection (`fetch_session_metadata`, `file_list_outcome`).
+fn session_data_from_row(
+    session_id: String,
+    source_str: &str,
+    file_path: String,
+    project: String,
+    slug: String,
+    timestamp: Option<i64>,
+) -> Option<SessionData> {
+    let Some(source) = Source::from_db(source_str) else {
+        warn!(source = %source_str, session_id, "unknown source");
+        return None;
+    };
+    Some(SessionData {
+        session_id,
+        source,
+        file_path,
+        project,
+        slug,
+        timestamp,
+    })
+}
+
 fn fetch_session_metadata(
     conn: &Connection,
     ranked: &[(String, f64)],
@@ -292,24 +340,16 @@ fn fetch_session_metadata(
     for r in rows {
         match r {
             Ok((session_id, source_str, file_path, project, slug, timestamp)) => {
-                let source = match Source::from_db(&source_str) {
-                    Some(s) => s,
-                    None => {
-                        warn!(source = %source_str, session_id, "unknown source");
-                        continue;
-                    }
-                };
-                map.insert(
-                    session_id.clone(),
-                    SessionData {
-                        session_id,
-                        source,
-                        file_path,
-                        project,
-                        slug,
-                        timestamp,
-                    },
-                );
+                if let Some(session) = session_data_from_row(
+                    session_id,
+                    &source_str,
+                    file_path,
+                    project,
+                    slug,
+                    timestamp,
+                ) {
+                    map.insert(session.session_id.clone(), session);
+                }
             }
             Err(e) => {
                 if db_errors == 0 {
@@ -653,9 +693,9 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
     Ok(search_with_embedder(conn, query, opts, None)?.results)
 }
 
-pub fn search_with_embedder(
+pub fn search_with_embedder<'q>(
     conn: &Connection,
-    query: &str,
+    query: impl Into<Option<&'q str>>,
     opts: &SearchOptions,
     embedder: Option<&dyn Embed>,
 ) -> Result<SearchOutcome> {
@@ -664,6 +704,14 @@ pub fn search_with_embedder(
     }
 
     let now_ms = resolve_now_ms(opts)?;
+
+    // Query-less mode (#284/U-005): with no query, `--file` alone lists the
+    // sessions that touched the path, newest first, via a dedicated SELECT that
+    // bypasses the FTS/vector MATCH path. `Some("")` (an explicit empty query) is
+    // distinct — it flows on to the MATCH path and its NoSearchableTerms handling.
+    let Some(query) = query.into() else {
+        return file_list_outcome(conn, opts, now_ms);
+    };
     // Normalization disabled to stay symmetric with the index: the indexer writes
     // raw message text into FTS (no normalize_for_fts pass), so query-side NFKC /
     // lowercase / whitespace folding would silently miss full-width and CJK matches.
@@ -845,6 +893,74 @@ fn fts_only_outcome(
         vec_degraded,
         results_incomplete: incomplete,
     })
+}
+
+/// Query-less `--file` list mode (#284/U-005): with no query, list the sessions
+/// that touched `opts.file`, newest first, via a dedicated SELECT that bypasses
+/// the FTS/vector MATCH path entirely. Reuses the same session/current/automated
+/// filters as the search paths, so `--project` / `--days` / `--source` and the
+/// current/automated policies narrow the list identically to a query search. Each
+/// result carries an empty excerpt (no MATCH hit to resolve a snippet or chunk
+/// from) and no chunk anchor. A query-less call with no `--file` is a usage error:
+/// there is no term and no path, so nothing to list.
+fn file_list_outcome(
+    conn: &Connection,
+    opts: &SearchOptions,
+    now_ms: i64,
+) -> Result<SearchOutcome> {
+    if opts.file.is_none() {
+        return Err(RecallError::Usage("A search query or --file is required.".to_owned()).into());
+    }
+
+    // `append_session_filter` appends the `--file` subquery (exact path or
+    // `%/<suffix>` LIKE) plus any project/days/source filter; with `--file` set it
+    // never early-returns. The subquery aliases (s2/s3/sf) do not collide with the
+    // outer `s`.
+    let mut sql = "SELECT s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
+                   FROM sessions s WHERE 1 = 1"
+        .to_owned();
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    append_session_filter(&mut sql, &mut params, "s.session_id", opts, now_ms);
+    append_current_session_filter(&mut sql, &mut params, "s.session_id", &opts.current);
+    append_automated_filter(&mut sql, "s.session_id", opts.include_automated);
+    // Pure timestamp DESC (newest first), not the recency-boosted bm25 blend the
+    // MATCH paths use: there is no relevance score to blend here. NULL timestamps
+    // sort last under SQLite's DESC ordering.
+    sql.push_str(" ORDER BY s.timestamp DESC LIMIT ?");
+    params.push(Box::new(opts.limit as i64));
+    debug_assert_eq!(
+        params.len(),
+        sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, Option<i64>>(5)?,
+        ))
+    })?;
+
+    let mut results = Vec::new();
+    for r in rows {
+        let (session_id, source_str, file_path, project, slug, timestamp) = r?;
+        let Some(session) =
+            session_data_from_row(session_id, &source_str, file_path, project, slug, timestamp)
+        else {
+            continue;
+        };
+        results.push(SearchResult {
+            session,
+            excerpt: String::new(),
+            chunk_id: None,
+        });
+    }
+    Ok(SearchOutcome::nominal(results))
 }
 
 #[cfg(test)]

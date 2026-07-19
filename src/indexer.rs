@@ -167,7 +167,9 @@ fn resolve_mtime(fpath: &Path) -> Mtime {
     }
 }
 
-/// Delete all dependent data for a session (messages, chunks, embeddings).
+/// Delete all dependent data for a session (messages, chunks, embeddings, and
+/// scanned-file markers). Removing the session_files rows here keeps a session
+/// deletion / re-parse from leaving orphaned scanned-file markers behind.
 fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     tx.execute("DELETE FROM messages WHERE session_id = ?", [session_id])?;
     tx.execute(
@@ -175,6 +177,24 @@ fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
         [session_id],
     )?;
     tx.execute("DELETE FROM qa_chunks WHERE session_id = ?", [session_id])?;
+    tx.execute(
+        "DELETE FROM session_files WHERE session_id = ?",
+        [session_id],
+    )?;
+    Ok(())
+}
+
+/// Persist a session's write-target paths to `session_files`. Callers are
+/// responsible for clearing any pre-existing rows under `session_id` first (the
+/// `(session_id, path)` PK would otherwise collide on a re-parse / re-backfill),
+/// so a plain INSERT suffices here. Shared by `upsert_session` (fresh parse) and
+/// `backfill_session_files` (path-only re-read of a legacy session).
+fn insert_session_files(tx: &Transaction, session_id: &str, paths: &[String]) -> Result<()> {
+    let mut stmt =
+        tx.prepare_cached("INSERT INTO session_files (session_id, path) VALUES (?1, ?2)")?;
+    for path in paths {
+        stmt.execute(rusqlite::params![session_id, path])?;
+    }
     Ok(())
 }
 
@@ -203,6 +223,12 @@ fn upsert_session(
             "DELETE FROM messages WHERE session_id = ?",
             [&parsed.metadata.session_id],
         )?;
+        // Clear any scanned-file markers a prior file under this id left behind, so
+        // the fresh inserts below cannot collide on the (session_id, path) PK.
+        ctx.tx.execute(
+            "DELETE FROM session_files WHERE session_id = ?",
+            [&parsed.metadata.session_id],
+        )?;
     }
 
     // Classify from the first user turn so `recall search` can exclude automated
@@ -218,8 +244,11 @@ fn upsert_session(
     )
     .as_str();
 
+    // files_scanned = 1 marks that scanned-file extraction ran for this session,
+    // distinct from NULL (never recorded). Set on every upsert, so the re-parse
+    // path — where the DELETE FROM sessions above drops the marker — re-raises it.
     ctx.tx.execute(
-        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             parsed.metadata.session_id,
             parsed.metadata.source.as_str(),
@@ -229,6 +258,7 @@ fn upsert_session(
             parsed.metadata.timestamp,
             mtime,
             session_type,
+            1,
         ],
     )?;
 
@@ -250,6 +280,11 @@ fn upsert_session(
             msg.text
         ])?;
     }
+
+    // Persist the session's write-target paths. Already deduped within the session
+    // by the parser; the (session_id, path) PK and the cleanup above keep re-parse
+    // from colliding, so a plain INSERT suffices.
+    insert_session_files(ctx.tx, &parsed.metadata.session_id, &parsed.scanned_files)?;
 
     Ok(())
 }
@@ -888,6 +923,69 @@ pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     tx.commit()?;
 
     Ok(backfilled)
+}
+
+/// Re-read the write-target paths from one session's JSONL for path extraction
+/// only. Dispatches on the stored source string; an unrecognized source, an
+/// unreadable file, or a parse error yields no paths (the caller still marks the
+/// session so it is not re-read). A zero-touch session parses cleanly to an empty
+/// `scanned_files`.
+fn reread_scanned_files(fpath: &Path, source: &str) -> Vec<String> {
+    let result = match Source::from_db(source) {
+        Some(Source::Claude) => parse_claude_session(fpath),
+        Some(Source::Codex) => parse_codex_session(fpath),
+        None => return Vec::new(),
+    };
+    match result {
+        Ok(Some(parsed)) => parsed.scanned_files,
+        _ => Vec::new(),
+    }
+}
+
+/// Fill `session_files` for legacy sessions indexed before the feature existed.
+/// Such a session has `files_scanned` NULL and no `session_files` rows; its JSONL
+/// mtime is unchanged, so `index_file`'s freshness check skips a re-parse and
+/// `upsert_session` never runs — only this pass can record its write-target paths.
+/// Each unmarked session's JSONL is re-read for path extraction only, so messages
+/// / qa_chunks / vec_chunks are untouched. The `session_files` inserts and the
+/// `files_scanned` raise happen in ONE transaction, so an interruption never
+/// leaves the marker up with paths missing. A session whose JSONL is unreadable,
+/// or one with no write-target tool_use, still gets the marker so it is not
+/// re-read on a later index. A no-op once every session is marked, since the
+/// NULL-marker scan then finds no session. Returns the number of sessions marked.
+pub(crate) fn backfill_session_files(conn: &mut Connection) -> Result<usize> {
+    let sessions: Vec<(String, String, String)> = {
+        let unmarked_sessions_sql =
+            "SELECT session_id, file_path, source FROM sessions WHERE files_scanned IS NULL";
+        let mut stmt = conn.prepare(unmarked_sessions_sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<StdResult<Vec<_>, _>>()?
+    };
+
+    if sessions.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    for (session_id, file_path, source) in &sessions {
+        let scanned = reread_scanned_files(Path::new(file_path), source);
+        // `files_scanned IS NULL` guarantees no pre-existing rows under this id, so
+        // the shared insert never collides on the (session_id, path) PK.
+        insert_session_files(&tx, session_id, &scanned)?;
+        tx.execute(
+            "UPDATE sessions SET files_scanned = 1 WHERE session_id = ?",
+            [session_id],
+        )?;
+    }
+    tx.commit()?;
+
+    Ok(sessions.len())
 }
 
 #[cfg(test)]

@@ -4,14 +4,17 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::{
-    Message, ParseResult, Role, SessionData, Source, extract_text, parse_iso_timestamp,
-    parse_jsonl_entries, session_id_from_path, update_earliest,
+    Message, ParseResult, Role, SessionData, Source, extract_text, extract_tool_use_path,
+    is_valid_scanned_path, parse_iso_timestamp, parse_jsonl_entries, session_id_from_path,
+    update_earliest,
 };
 
 struct ClaudeParseState {
     project: String,
     slug: String,
     earliest_ts: Option<i64>,
+    /// Distinct write-target paths seen across the session, in first-seen order.
+    scanned_files: Vec<String>,
 }
 
 fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<Message> {
@@ -63,6 +66,19 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
         _ => entry.get("content"),
     };
 
+    // Collect write-target paths before the empty-text early return: an assistant
+    // turn that is only tool_use (no text block) still carries scanned files.
+    if let Some(Value::Array(blocks)) = msg_content {
+        for block in blocks {
+            if let Some(path) = extract_tool_use_path(block)
+                && is_valid_scanned_path(path)
+                && !state.scanned_files.iter().any(|p| p == path)
+            {
+                state.scanned_files.push(path.to_owned());
+            }
+        }
+    }
+
     let text = extract_text(msg_content);
     if text.is_empty() {
         return None;
@@ -79,6 +95,7 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
         project: String::new(),
         slug: String::new(),
         earliest_ts: None,
+        scanned_files: Vec::new(),
     };
 
     let (messages, skipped_lines) =
@@ -102,6 +119,7 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
             timestamp: state.earliest_ts,
         },
         messages,
+        scanned_files: state.scanned_files,
         skipped_lines,
     }))
 }
