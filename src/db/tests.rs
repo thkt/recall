@@ -49,9 +49,6 @@ fn test_open_db_idempotent() {
     let _conn2 = open_db(tmp.path()).unwrap();
 }
 
-// T-009 (#24/FR-004): opening a DB whose sessions table predates session_type
-// adds the column non-destructively — existing rows survive with NULL (treated
-// as interactive by the search filter), not a destructive rebuild.
 #[test]
 fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
     use crate::indexer::index_chunks;
@@ -122,6 +119,9 @@ fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
     }
 }
 
+// T-009 (#24/FR-004): opening a DB whose sessions table predates session_type
+// adds the column non-destructively — existing rows survive with NULL (treated
+// as interactive by the search filter), not a destructive rebuild.
 #[test]
 fn test_session_type_migration_adds_column_preserving_rows() {
     let tmp = NamedTempFile::new().unwrap();

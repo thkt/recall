@@ -515,7 +515,7 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
 #[cfg(test)]
 pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0)",
         [session_id],
     )
     .unwrap();

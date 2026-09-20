@@ -316,14 +316,9 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         return Ok(IndexOutcome::Unchanged);
     };
 
-    // Preserve-in-place (#215): when the model is absent, a re-index of a session
-    // that already holds embeddings must not run — `upsert_session` would delete
-    // its chunks/embeddings before the embed gate, which cannot rebuild them this
-    // run, leaving search degraded. Skip before parsing so its rows (and mtime)
-    // stay untouched; a later model-present run re-indexes it (mtime drives the
-    // self-heal for changed files, the embed gate for unchanged ones). A cached
-    // session without embeddings, or a new path, falls through to parsing;
-    // the parsed session_id must also be checked before replacement.
+    // Without embedding, preserve this path's stored session and mtime so a later
+    // run can retry. Upsert would delete vectors we cannot regenerate. Check the
+    // cached ID before parsing: the file may now resolve to a different ID.
     if let Some(embedded) = &ctx.embedded_sessions
         && let Some(entry) = ctx.existing.get(&fpath_str)
         && embedded.contains(&entry.session_id)
@@ -750,10 +745,8 @@ pub(crate) struct ChunkStats {
     pub messages_read: usize,
 }
 
-// A batch admits at most 64 sessions and 8 MiB of source text. A single larger
-// session runs alone: the existing chunker needs its complete conversation, so
-// peak memory is bounded by this budget OR the largest individual session (plus
-// chunk output). No corpus-wide collection of message bodies is built.
+// Batch by session count and source bytes. A session over 8 MiB runs alone because
+// the chunker needs the whole conversation; this is not an absolute memory cap.
 const CHUNK_BATCH_SESSIONS: usize = 64;
 const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
 
@@ -794,17 +787,15 @@ pub(crate) fn index_chunks(
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<ChunkStats> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let total: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM sessions WHERE chunks_indexed IS NULL",
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE chunks_indexed IS NULL)",
         [],
         |row| row.get(0),
     )?;
-    let total = usize::try_from(total)?;
-    if total == 0 {
+    if !pending {
         return Ok(ChunkStats::default());
     }
 
-    info!(count = total, "Chunking sessions");
     tx.execute_batch(
         "CREATE TEMP TABLE chunk_message_rows (
             session_id TEXT NOT NULL,
@@ -824,6 +815,8 @@ pub(crate) fn index_chunks(
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<StdResult<_, _>>()?
     };
+    let total = sessions.len();
+    info!(count = total, "Chunking sessions");
 
     let mut stats = ChunkStats {
         message_scans: 1,

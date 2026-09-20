@@ -2173,7 +2173,7 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
     let (_dir, mut conn) = setup_test_db();
     // 未知 source: 再読しても解釈できるようにはならない終端ケース。
     conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL)",
         [],
     )
     .unwrap();
@@ -2182,7 +2182,7 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
     let empty = tmp.path().join("empty-session.jsonl");
     fs::write(&empty, "").unwrap();
     conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES ('zero', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('zero', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL)",
         [empty.to_string_lossy().to_string()],
     )
     .unwrap();
