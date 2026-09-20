@@ -98,7 +98,15 @@ recall index            # parse, chunk, and embed new session logs (incremental)
 recall rebuild          # re-parse and re-embed every present session; missing roots keep their rows
 ```
 
+Chunk generation records completion even for zero Q&A pairs, so unchanged sessions need no further body retrieval or chunking. Re-parsing a changed session clears completion. Chunks and completion commit together; failures or interruptions leave the pass pending. Upgrades preserve existing chunks and embeddings and process previously empty sessions once.
+
+When embedding is unavailable, updates to embedded sessions wait until it is available again. Their stored content, chunks and embeddings are preserved, including when a different file path uses the same session ID.
+
 Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
+
+Overlapping `index` or `rebuild` runs save an embedding only if the chunk still has the same content and generation inside the save transaction. Results for updated, deleted, or replaced chunks are discarded without deleting another run's current vectors or increasing the embedded count. Any replacement still missing an embedding is eligible on the next `recall index`. This protects new writes when all overlapping runs use this guard; it does not detect previously stored content/vector mismatches. With a working model and available source logs, `recall rebuild` regenerates those embeddings.
+
+An otherwise compatible index without generation tracking remains readable by `search`, `status`, and `show`, without migration or a rebuild. Opening it for writing adds generation tracking while preserving existing chunks and embeddings.
 
 `recall index` and `recall rebuild` accept two flags (also settable via env, useful for the [Hook](#hook)) that tune the embed pass:
 

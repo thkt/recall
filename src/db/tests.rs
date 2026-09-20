@@ -49,6 +49,76 @@ fn test_open_db_idempotent() {
     let _conn2 = open_db(tmp.path()).unwrap();
 }
 
+#[test]
+fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
+    use crate::indexer::index_chunks;
+
+    let tmp = NamedTempFile::new().unwrap();
+    create_pre_cleanup_db(tmp.path());
+    {
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
+             INSERT INTO messages (session_id, role, text) VALUES
+                 ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
+             CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE ON sessions
+             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        )
+        .unwrap();
+    }
+    let error = open_db(tmp.path()).err().unwrap();
+    assert!(error.to_string().contains("injected migration failure"));
+    {
+        let conn = Connection::open(tmp.path()).unwrap();
+        assert!(
+            !table_def(&conn, "sessions")
+                .unwrap()
+                .unwrap()
+                .contains("chunks_indexed")
+        );
+        conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
+            .unwrap();
+    }
+    for pass in 0..2 {
+        let mut conn = open_db(tmp.path()).unwrap();
+        let complete: i64 = conn
+            .query_row(
+                "SELECT chunks_indexed FROM sessions WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 1);
+        let stats = index_chunks(&mut conn, None).unwrap();
+        assert_eq!(stats.sessions_chunked, if pass == 0 { 2 } else { 0 });
+        assert_eq!(stats.chunks_created, if pass == 0 { 1 } else { 0 });
+        let original: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT content, src_rowid_lo, src_rowid_hi FROM qa_chunks WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(original, ("q\na".to_owned(), None, None));
+        let (id, embedding): (i64, Vec<u8>) = conn
+            .query_row("SELECT chunk_id, embedding FROM vec_chunks", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(embedding, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sessions WHERE chunks_indexed = 1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+    }
+}
+
 // T-009 (#24/FR-004): opening a DB whose sessions table predates session_type
 // adds the column non-destructively — existing rows survive with NULL (treated
 // as interactive by the search filter), not a destructive rebuild.
@@ -318,12 +388,13 @@ const SESSIONS_FULL: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path
      project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT";
 const SESSIONS_NO_TYPE: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
      project TEXT, slug TEXT, timestamp INTEGER, mtime REAL";
-const QA_FULL: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
+const QA_NO_GENERATION: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
      timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER";
-const QA_NO_ROWID: &str =
-    "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER";
+const QA_FULL: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
+     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, generation INTEGER NOT NULL DEFAULT 0";
+const QA_NO_ROWID: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER, generation INTEGER NOT NULL DEFAULT 0";
 const QA_CHUNK_HASH: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
-     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, chunk_hash TEXT";
+     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, chunk_hash TEXT, generation INTEGER NOT NULL DEFAULT 0";
 const VEC_FULL: &str = "+chunk_id INTEGER, +sub_idx INTEGER";
 const VEC_NO_SUB: &str = "+chunk_id INTEGER";
 
@@ -1008,4 +1079,100 @@ fn canary_は非_root_で_green_root_では_panic_してスイートを赤化す
 #[test]
 fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
     root_skip::assert_probe_literal_not_inlined(include_str!("tests.rs"), "src/db/tests.rs");
+}
+
+#[test]
+fn generation_upgrade_preserves_embeddings_and_reopen_keeps_generation_identity() {
+    let tmp = NamedTempFile::new().unwrap();
+    // The pre-#319 shape, including rowid links and sub-vectors, needs only the
+    // new generation migration; it must not force destructive re-indexing.
+    build_schema(
+        tmp.path(),
+        SESSIONS_FULL,
+        "trigram",
+        QA_NO_GENERATION,
+        VEC_FULL,
+    );
+    let conn = Connection::open(tmp.path()).unwrap();
+    seed_chunk(&conn, 1, "existing content");
+    let vector = vec![0.25_f32; EMBEDDING_DIMS];
+    conn.execute(
+        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (1, 0, ?1)",
+        [f32_as_bytes(&vector)],
+    )
+    .unwrap();
+    assert!(
+        !table_def(&conn, "qa_chunks")
+            .unwrap()
+            .unwrap()
+            .contains("generation")
+    );
+    assert!(table_def(&conn, "qa_chunk_generation").unwrap().is_none());
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
+    drop(conn);
+
+    let conn = open_db(tmp.path()).unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
+    let (content, generation): (String, i64) = conn
+        .query_row(
+            "SELECT content, generation FROM qa_chunks WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(content, "existing content");
+    assert_eq!(generation, 0, "legacy rows receive the migration default");
+    let saved: (i64, Vec<u8>, i64, i64) = conn
+        .query_row(
+            "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(saved.1, f32_as_bytes(&vector));
+    assert_eq!((saved.2, saved.3), (1, 0));
+    seed_chunk(&conn, 2, "new content");
+    let new_generation: i64 = conn
+        .query_row("SELECT generation FROM qa_chunks WHERE id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_ne!(new_generation, generation);
+    drop(conn);
+
+    let conn = open_db(tmp.path()).unwrap();
+    let reopened: (i64, Vec<u8>, i64, i64) = conn
+        .query_row(
+            "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(reopened, saved);
+    // Metadata backfill is not a new inference input and must not invalidate it.
+    conn.execute(
+        "UPDATE qa_chunks SET src_rowid_lo = 1, src_rowid_hi = 2",
+        [],
+    )
+    .unwrap();
+    let generations: Vec<i64> = conn
+        .prepare("SELECT generation FROM qa_chunks ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(generations, vec![generation, new_generation]);
+    conn.execute("DELETE FROM qa_chunks WHERE id = 2", [])
+        .unwrap();
+    seed_chunk(&conn, 2, "new content");
+    let replacement: i64 = conn
+        .query_row("SELECT generation FROM qa_chunks WHERE id = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(
+        replacement > new_generation,
+        "re-open must not reset the counter"
+    );
 }

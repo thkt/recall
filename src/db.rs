@@ -8,7 +8,7 @@ use amici::migration::notify_schema_change;
 use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage::ensure_sqlite_vec;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tracing::warn;
 
 const FTS_TOKENIZER: &str = "trigram";
@@ -22,15 +22,15 @@ pub enum OpenTier {
     Immutable,
 }
 
-/// On-disk schema currency, derived by reading `sqlite_master` only.
+/// On-disk schema compatibility with read commands, derived from `sqlite_master`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaState {
     /// No `sessions` table: recall never indexed this DB.
     Empty,
     /// Current shape: usable by the read commands as-is.
     Current,
-    /// Present but an old shape a `migrate_*` pass would rewrite; a read-only
-    /// open cannot migrate it, so the read commands hard-fail (see main.rs).
+    /// Present but incompatible with read commands; a read-only open cannot
+    /// migrate it, so the read commands hard-fail (see main.rs).
     Stale,
 }
 
@@ -191,10 +191,9 @@ fn wal_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Classify the on-disk schema by reading `sqlite_master` only (never writes),
-/// reusing [`table_def`] so "current shape" is defined next to the `migrate_*`
-/// sniffs it mirrors. Each `Stale` condition is a `migrate_*` check inverted to
-/// "a migration would run".
+/// Check read compatibility using `sqlite_master` only (never writes).
+/// Write-only migrations, such as chunk generation tracking, do not make a
+/// readable index stale; [`open_db`] applies them before writing.
 pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
     let Some(sessions_sql) = table_def(conn, "sessions")? else {
         return Ok(SchemaState::Empty);
@@ -277,7 +276,8 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             timestamp INTEGER,
             mtime REAL,
             session_type TEXT,
-            files_scanned INTEGER
+            files_scanned INTEGER,
+            chunks_indexed INTEGER
         );",
     )?;
 
@@ -322,10 +322,13 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             content TEXT NOT NULL,
             timestamp INTEGER,
             src_rowid_lo INTEGER,
-            src_rowid_hi INTEGER
+            src_rowid_hi INTEGER,
+            generation INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);",
     )?;
+
+    migrate_qa_chunk_generation_if_needed(conn)?;
 
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
@@ -339,6 +342,44 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
     )?;
 
+    migrate_chunks_indexed_if_needed(conn)?;
+
+    Ok(())
+}
+
+/// A persistent counter prevents ABA (delete/reinsert or old/new/old updates),
+/// including equal-text replacements. Triggers cover every INSERT and input
+/// UPDATE, while rowid-link backfills leave the generation alone. Legacy rows
+/// can share generation 0: validation also checks their ID and exact content.
+/// No chunks or embeddings are discarded. Check the shape under a writer lock
+/// so two processes upgrading the same old DB cannot both ADD the column.
+fn migrate_qa_chunk_generation_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("generation")) {
+        tx.execute_batch(
+            "ALTER TABLE qa_chunks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qa_chunk_generation (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            value INTEGER NOT NULL CHECK (typeof(value) = 'integer' AND value >= 0)
+         );
+         INSERT OR IGNORE INTO qa_chunk_generation VALUES (1, 0);
+         CREATE TRIGGER IF NOT EXISTS qa_chunks_insert_generation
+         AFTER INSERT ON qa_chunks BEGIN
+            UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
+            UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
+            WHERE id = NEW.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS qa_chunks_update_generation
+         AFTER UPDATE OF id, session_id, content ON qa_chunks BEGIN
+            UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
+            UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
+            WHERE id = NEW.id;
+         END;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -461,6 +502,23 @@ fn migrate_files_scanned_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Existing chunks were committed atomically by index_chunks, including legacy
+/// NULL-range chunks. Preserve their ids/embeddings; only sessions without chunks
+/// need a first pass. The column and backfill commit together, so interrupted
+/// upgrades cannot leave existing chunks marked pending and duplicate them.
+fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("chunks_indexed")) {
+        tx.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN chunks_indexed INTEGER;
+             UPDATE sessions SET chunks_indexed = 1
+             WHERE EXISTS (SELECT 1 FROM qa_chunks c WHERE c.session_id = sessions.session_id);",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "messages")? else {
         return Ok(());
@@ -491,12 +549,11 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
 }
 
 /// Seeds the minimal valid session row used across test modules. Centralizes
-/// the 8-column positional INSERT so a schema change breaks one helper, not
-/// every fixture (#24 broke them all when session_type was added).
+/// the named-column INSERT so new nullable columns use their defaults.
 #[cfg(test)]
 pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     conn.execute(
-        "INSERT INTO sessions VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0)",
         [session_id],
     )
     .unwrap();

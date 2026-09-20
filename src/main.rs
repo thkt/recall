@@ -742,8 +742,8 @@ fn search_idle_output() -> CommandOutput {
     CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
 }
 
-/// Gate the non-doctor read commands (`search`, `status`, `show`) on schema
-/// currency. A read-only open cannot migrate, so a stale on-disk schema surfaces
+/// Gate the non-doctor read commands (`search`, `status`, `show`) on read
+/// compatibility. A read-only open cannot migrate, so an incompatible schema surfaces
 /// as an explicit `DataError` naming `recall rebuild` rather than a silent stale
 /// result (SOW assumption 1). `Empty` is handled by each command's own empty path
 /// before this is called, so it maps to `Ok` here (never reached in practice).
@@ -2988,12 +2988,12 @@ mod tests {
     fn setup_show_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
@@ -3070,10 +3070,10 @@ mod tests {
     // Claude (with a warn) so the session still renders. Covers the
     // unknown-source guard in show_session's query_map closure.
     #[test]
-    fn test_show_session_unknown_source_falls_back_to_claude() {
+    fn show_session_unknown_source_falls_back_to_claude() {
         let (_dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
@@ -3428,7 +3428,7 @@ mod tests {
         // 'auto': first user turn is a slash-command wrapper; 'human': a normal
         // turn. Both start unclassified (session_type NULL).
         conn.execute(
-            "INSERT INTO sessions VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -3438,7 +3438,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -3503,10 +3503,10 @@ mod tests {
     // T-012 (#24/FR-008): without --all, only unclassified (NULL) sessions are
     // (re)classified; an already-tagged session is left untouched.
     #[test]
-    fn test_012_reclassify_incremental_skips_already_tagged() {
+    fn reclassify_incremental_skips_already_tagged() {
         let (_dir, mut conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -3518,7 +3518,7 @@ mod tests {
         // 'tagged' carries an automated first turn but was already tagged interactive;
         // without --all it must stay interactive (not re-evaluated).
         conn.execute(
-            "INSERT INTO sessions VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive', NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive')",
             [],
         )
         .unwrap();
@@ -6454,6 +6454,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_commands_use_pre_generation_index_without_migrating_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("recall.db");
+        let conn = open_or_create_db(&path).unwrap();
+        // Restore the pre-#319 shape, retaining an otherwise readable index.
+        conn.execute_batch(
+            "DROP TRIGGER qa_chunks_insert_generation;
+             DROP TRIGGER qa_chunks_update_generation;
+             DROP TABLE qa_chunk_generation;
+             ALTER TABLE qa_chunks DROP COLUMN generation;",
+        )
+        .unwrap();
+        db::seed_session(&conn, "s1");
+        let content = "synthetic legacy content";
+        db::seed_chunk(&conn, 1, content);
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
+            [content],
+        )
+        .unwrap();
+        let vector = embedder::MockEmbedder::deterministic_vector(content);
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+            [embedder::f32_as_bytes(&vector)],
+        )
+        .unwrap();
+        let schema_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+
+        let db_path = Some(path.clone());
+        let status = run_status(false, &db_path).unwrap();
+        assert_eq!(status.data["sessions"], 1);
+        assert_eq!(status.data["qa_chunks"], 1);
+        assert_eq!(status.data["embedded"], 1);
+        let show = run_show("s1", false, None, DEFAULT_WINDOW, &db_path).unwrap();
+        assert!(show.markdown.contains(content));
+        let search = run_search_with(search_command(content), &db_path, mock_loader).unwrap();
+        assert!(!search.degraded);
+        let results = search.data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["session_id"], "s1");
+        assert!(search.markdown.contains(content));
+
+        let (conn, _) = db::open_db_readonly(&path).unwrap();
+        let after: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, schema_version,
+            "read commands must not migrate the DB"
+        );
+        assert_eq!(vec_chunk_count(&conn), 1);
+        let saved: Vec<u8> = conn
+            .query_row("SELECT embedding FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(saved, embedder::f32_as_bytes(&vector));
+    }
+
     /// A loader that hands `run_search_with` an embedder which loads cleanly but
     /// errors at query time. This reproduces the #204 runtime degradation: the
     /// load-time degraded state is false, yet `vec_search` fails mid-run.
@@ -6588,7 +6649,7 @@ mod tests {
             db::seed_chunk(&conn, 1, "authentication flow");
             // An unknown-source session that matches but gets pruned for its source.
             conn.execute(
-                "INSERT INTO sessions VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+                "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0)",
                 [],
             )
             .unwrap();
