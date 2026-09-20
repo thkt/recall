@@ -742,8 +742,8 @@ fn search_idle_output() -> CommandOutput {
     CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
 }
 
-/// Gate the non-doctor read commands (`search`, `status`, `show`) on schema
-/// currency. A read-only open cannot migrate, so a stale on-disk schema surfaces
+/// Gate the non-doctor read commands (`search`, `status`, `show`) on read
+/// compatibility. A read-only open cannot migrate, so an incompatible schema surfaces
 /// as an explicit `DataError` naming `recall rebuild` rather than a silent stale
 /// result (SOW assumption 1). `Empty` is handled by each command's own empty path
 /// before this is called, so it maps to `Ok` here (never reached in practice).
@@ -6452,6 +6452,67 @@ mod tests {
             0,
             "search must not embed: vec_chunks stays empty even with an embedder present"
         );
+    }
+
+    #[test]
+    fn read_commands_use_pre_generation_index_without_migrating_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("recall.db");
+        let conn = open_or_create_db(&path).unwrap();
+        // Restore the pre-#319 shape, retaining an otherwise readable index.
+        conn.execute_batch(
+            "DROP TRIGGER qa_chunks_insert_generation;
+             DROP TRIGGER qa_chunks_update_generation;
+             DROP TABLE qa_chunk_generation;
+             ALTER TABLE qa_chunks DROP COLUMN generation;",
+        )
+        .unwrap();
+        db::seed_session(&conn, "s1");
+        let content = "synthetic legacy content";
+        db::seed_chunk(&conn, 1, content);
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
+            [content],
+        )
+        .unwrap();
+        let vector = embedder::MockEmbedder::deterministic_vector(content);
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+            [embedder::f32_as_bytes(&vector)],
+        )
+        .unwrap();
+        let schema_version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+
+        let db_path = Some(path.clone());
+        let status = run_status(false, &db_path).unwrap();
+        assert_eq!(status.data["sessions"], 1);
+        assert_eq!(status.data["qa_chunks"], 1);
+        assert_eq!(status.data["embedded"], 1);
+        let show = run_show("s1", false, None, DEFAULT_WINDOW, &db_path).unwrap();
+        assert!(show.markdown.contains(content));
+        let search = run_search_with(search_command(content), &db_path, mock_loader).unwrap();
+        assert!(!search.degraded);
+        let results = search.data["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["session_id"], "s1");
+        assert!(search.markdown.contains(content));
+
+        let (conn, _) = db::open_db_readonly(&path).unwrap();
+        let after: i64 = conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after, schema_version,
+            "read commands must not migrate the DB"
+        );
+        assert_eq!(vec_chunk_count(&conn), 1);
+        let saved: Vec<u8> = conn
+            .query_row("SELECT embedding FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(saved, embedder::f32_as_bytes(&vector));
     }
 
     /// A loader that hands `run_search_with` an embedder which loads cleanly but

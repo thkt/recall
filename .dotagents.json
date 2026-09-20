@@ -1,0 +1,13 @@
+{
+  "repository": "thkt/recall",
+  "remote": "origin",
+  "baseBranch": "main",
+  "setup": [["cargo", "fetch", "--locked"]],
+  "check": [
+    "sh",
+    "-ec",
+    "cargo fmt -- --check\ncargo nextest run --profile ci --locked\ncargo clippy --locked --all-targets --all-features -- -D warnings"
+  ],
+  "ciChecks": ["test", "coverage", "security", "zizmor"],
+  "capture": null
+}
