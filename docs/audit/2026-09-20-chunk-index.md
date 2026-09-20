@@ -2,7 +2,7 @@
 
 ## 対象と根拠
 
-合意した範囲は[Issue #320](https://github.com/thkt/recall/issues/320)の空結果の永続化と、新規・更新会話の本文取得である。初回の開始版は `b4e4eb86beacafea66c723f61a371e321af08c4c`。初回実測・回帰検証はその版に対する未commitの実装差分の記録であり、後続の保護修正と公開後の依存修正・再測定は末尾の各節で版を分けて示す。別の調査報告は指定されていない。
+合意した範囲は[Issue #320](https://github.com/thkt/recall/issues/320)の空結果の永続化と、新規・更新会話の本文取得である。初回の開始版は `b4e4eb86beacafea66c723f61a371e321af08c4c`。初回実測・回帰検証はその版に対する未commitの実装差分の記録であり、後続の保護修正、公開後の依存修正・再測定、coverage集計の修正は末尾の各節で版を分けて示す。別の調査報告は指定されていない。
 
 Issueが参照する[調査版のindexer](https://github.com/thkt/recall/blob/f4e3c552a0cbf9221996b3fa3af470d79990c6a8/src/indexer.rs#L757)と初回開始版は、`git diff`で `src/` に差分がないことを確認した。`Cargo.lock` は異なるため、Issueの実DB実測や当時のMetalビルド停止を、後続の成功や速度の根拠として流用しない。初回の比較では両経路に初回開始版の同じ依存を使った。
 
@@ -20,7 +20,7 @@ Issueが参照する[調査版のindexer](https://github.com/thkt/recall/blob/f4
 
 ## 初回実装時の合成データ実測（履歴）
 
-実行環境はmacOS 27.0、arm64、Rust 1.98.1、bundled SQLite 3.53.2、debug testビルド。再現用の[benchmark](../../src/indexer/benchmarks.rs)は製品のindexer・chunker・SQLiteを使い、旧方式だけを開始版から比較用に保持する。通常のCIには大規模データの生成・反復比較を課さず、明示実行にする。
+実行環境はmacOS 27.0、arm64、Rust 1.98.1、bundled SQLite 3.53.2、debug testビルド。再現用の[benchmark（`benchmarks::chunk_index_scale`）](../../src/indexer.rs#L1109)は製品のindexer・chunker・SQLiteを使い、旧方式だけを開始版から比較用に保持する。通常のCIには大規模データの生成・反復比較を課さず、明示実行にする。
 
 ```sh
 cargo test --locked --bin recall chunk_index_scale -- --ignored --nocapture --test-threads=1
@@ -102,3 +102,28 @@ cargo test --offline --locked --bin recall chunk_index_scale -- --ignored --noca
 修正後の `cargo check --offline --locked` と `cargo nextest run --offline --locked --profile ci -E 'test(indexer::tests) | test(db::tests::chunk_completion_upgrade)'` が成功した（対象50件成功、396件は選択対象外、0.871秒）。既存の空結果→再open→追記、SQL失敗・panic→再試行、移行時の原子性・embedding保持、65会話の混入・順序・未知role・検索rowid・実行計画、別パス同一IDのモデル不在保護を再利用した。単なる件数一致では見逃す再処理、失敗の成功扱い、誤った検索範囲、既存embedding消失を検出するため保持し、依存番号だけを固定する新規テストは追加していない。検出条件の削除はなく、従来統合した未知roleの条件も残る。小さいSQLite/MockEmbedder検証と明示実行benchmarkの分担を維持し、異なる実行範囲の過去の時間からテスト高速化は主張しない。
 
 `cargo fmt -- --check` と `git diff --check` も成功した。構成済み完全check、最終差分・文書を含む独立評価、修正後headのCI（test・coverage・security・zizmor）はホストで更新する。この記録はそれらの成功を先取りしない。前PR本文の「445件成功」「accepted」「benchmark未再実行」は今回の成果物の説明へ転用せず、今回の結果と未確認事項を用いる。提示された前PR本文にアップロード媒体へのリンクはなく、captureは不要のままである。
+
+## 公開後のcoverage集計修正（2026-09-20）
+
+今回の開始版は公開済みhead `93383d1f502021d75de11ad24f4a8bb5801b1e19`。[この版のcoverage job](https://github.com/thkt/recall/actions/runs/35508213196/job/106071481804)の保存ログでは、Rustテストと既存filterの26テストは成功し、変更行coverageだけが45%で95%の基準を満たさなかった。内訳は `src/db.rs` 100%、`src/indexer.rs` 98.9%（未到達801行）、`src/indexer/benchmarks.rs` 0%（123行）。製品の未検証範囲が増えたのではなく、外部モジュール宣言の `#[cfg(test)]` が別ファイルへ伝播しないfilterに、手動benchmarkの実装行が含まれたことが原因だった。
+
+既存filterが示す「テストコードを変更行coverageから除外する」方針に合わせ、benchmarkを宣言位置のインライン `#[cfg(test)] mod benchmarks` へ移した。`src/main.rs` にもある形式で、インデント1段を除く本体・fixture・assertion・コメントは開始版と完全一致し、テスト名と手動実行コマンドも変わらない。製品コード、95%の基準、filter、CI、依存pin、日英READMEの段落位置、移動済みのDB移行テストは変更していない。再現元は上の[benchmarkリンク](../../src/indexer.rs#L1109)を参照する。
+
+変更前後のソース各行に人工のDA/BRDAと関数のFN/FNDAを与え、変更していないfilterへ通した。修正後の除外範囲は既存テスト宣言1106–1107行とbenchmark全体1109–1286行だけで、製品側2,272レコードは変更前後で完全一致し、未到達801行のレコードも残った。これは範囲とレコード保持の局所検証であり、実際のllvm-covや修正後coverage率の測定ではない。ローカルの `python3 -m pytest .github/scripts/test_filter_lcov_cfg_test.py -q -p no:cacheprovider` はpytest未導入で実行できず、既存Pythonテスト群の再実行はホストに残る。
+
+共有targetの別ソース由来のバイナリを使わないよう現checkoutのRustソースのmtimeを更新し、`Compiling recall` を確認してから、同じ `CARGO_TARGET_DIR=/private/tmp/recall-hardening-target-20260920` で次を実行した。**1 passed / 0 ignored**、テスト本体31.15秒。macOS 27.0（26A428）/ arm64、Rust・Cargo 1.98.1、SQLite 3.53.2、debug testビルド、依存セットと生成条件は直前の測定と同じで、この計測中に別のビルド・テストは起動していない。
+
+```sh
+cargo test --offline --locked --bin recall chunk_index_scale -- --ignored --nocapture --test-threads=1
+```
+
+| 条件 | 旧方式の秒数（3回） | 新方式の秒数（3回） | 中央値 旧 → 新 |
+| --- | --- | --- | --- |
+| 無変更 | 3.732589 / 3.743320 / 3.774617 | 0.001507 / 0.001483 / 0.001641 | 3.743320 → 0.001507 |
+| 1会話追記 | 3.949021 / 3.895734 / 3.756030 | 0.292476 / 0.294683 / 0.297680 | 3.895734 → 0.294683 |
+
+20,580会話・245,757メッセージ・14,898,284 bytesで、無変更の処理会話・空会話再処理・FTS全走査statementは61→0、取得本文589→0。追記時の処理会話・走査は61→1、無変更の空会話再処理60→0、取得本文590→11。各回の全チャンク内容・timestamp・rowid範囲は一致し、総数は無変更20,519、追記20,520だった。従来の測定値は各版の履歴として保持する。これは配置修正後のチャンク生成passの再現確認であり、配置変更による速度改善や総index時間の比較ではない。
+
+今回の検証定義の変更は配置だけで、新規・削除・統合したテストや失った検出条件はない。benchmarkを削除すると、小さい回帰検証では確認できない実DB相当件数での無変更・追記時の走査数と結果一致の再現手段を失うため、費用の大きい実行は引き続き手動に限定する。空結果の永続化・無効化、SQL失敗/panicのrollback、反復移行・embedding保持、65会話の順序・未知role・rowidと実行計画、別パス同一IDの保護は既存の小さいテストを維持する。製品実装の増減はなく、テスト本体175行を移し、文書の参照と今回の証拠を更新した。ファイル移動や過去の32.28秒との差を費用・速度改善とは扱わない。
+
+`cargo fmt -- --check` と `git diff --check` は成功。構成済み完全check、変更文書を含む最終独立評価、修正後headのCIはホストで行い、公開本文の確認とready切替はその後の担当AIに残す。短い合成本文・warm cache・新方式由来の初期snapshot・statement数という測定条件、8 MiBが絶対メモリ上限でないこと、実DB・release時間・ピークメモリ・実モデル障害・電源断・追加の同時実行実験の未確認は引き続き有効である。
