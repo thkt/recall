@@ -2,9 +2,9 @@
 
 ## 対象と根拠
 
-合意した範囲は[Issue #320](https://github.com/thkt/recall/issues/320)の空結果の永続化と、新規・更新会話の本文取得である。開始版は `b4e4eb86beacafea66c723f61a371e321af08c4c`、以下はその版に対する未commitの実装差分の測定。別の調査報告は指定されていない。
+合意した範囲は[Issue #320](https://github.com/thkt/recall/issues/320)の空結果の永続化と、新規・更新会話の本文取得である。初回の開始版は `b4e4eb86beacafea66c723f61a371e321af08c4c`。初回実測・回帰検証はその版に対する未commitの実装差分の記録であり、後続の保護修正と公開後の依存修正・再測定は末尾の各節で版を分けて示す。別の調査報告は指定されていない。
 
-Issueが参照する[調査版のindexer](https://github.com/thkt/recall/blob/f4e3c552a0cbf9221996b3fa3af470d79990c6a8/src/indexer.rs#L757)と開始版は、`git diff`で `src/` に差分がないことを確認した。`Cargo.lock` は異なるため、Issueの実DB実測や当時のMetalビルド停止を、今回の成功や速度の根拠として流用しない。今回の比較では両経路に開始版の同じ依存を使う。
+Issueが参照する[調査版のindexer](https://github.com/thkt/recall/blob/f4e3c552a0cbf9221996b3fa3af470d79990c6a8/src/indexer.rs#L757)と初回開始版は、`git diff`で `src/` に差分がないことを確認した。`Cargo.lock` は異なるため、Issueの実DB実測や当時のMetalビルド停止を、後続の成功や速度の根拠として流用しない。初回の比較では両経路に初回開始版の同じ依存を使った。
 
 適用した既存の合意は、[ADR-0005](../decisions/0005-resolve-fts-hits-to-chunks-by-source-message-rowid-range.md)の順序・rowid範囲、[ADR-0007](../decisions/0007-evolve-the-index-schema-without-a-version-table.md)の形状検出・反復可能な移行、[ADR-0012](../decisions/0012-adopt-no-prefix-descriptive-test-names-repo-wide.md)の新規テスト命名。いずれも開始版でacceptedの文書を参照した。Issueが要求する#121のセッション単位の進捗と、単一transactionのロールバックを維持した。
 
@@ -18,7 +18,7 @@ Issueが参照する[調査版のindexer](https://github.com/thkt/recall/blob/f4
 
 変更対象は新規チャンク生成。旧NULL範囲の `backfill_rowid_ranges`、ファイル情報のbackfill、show、DELETE全体、embedding処理は引き続き別経路である。index全体のFTS走査が常に一度になるとは扱わない。
 
-## 合成データでの実測
+## 初回実装時の合成データ実測（履歴）
 
 実行環境はmacOS 27.0、arm64、Rust 1.98.1、bundled SQLite 3.53.2、debug testビルド。再現用の[benchmark](../../src/indexer/benchmarks.rs)は製品のindexer・chunker・SQLiteを使い、旧方式だけを開始版から比較用に保持する。通常のCIには大規模データの生成・反復比較を課さず、明示実行にする。
 
@@ -71,3 +71,34 @@ cargo test --locked --bin recall chunk_index_scale -- --ignored --nocapture --te
 修正前コードに新規テストを適用すると、索引更新0の期待に対して1となり失敗した（[修正前ログ](/private/tmp/recall-320-r1-before.log)）。修正後の衝突2テストは成功、テスト本体0.03秒（[修正後ログ](/private/tmp/recall-320-r1-after.log)）。関連するモデル不在・推論失敗のnextest 8テストも成功、0.222秒（[保護検証ログ](/private/tmp/recall-320-r1-protection.log)、新規テストを含み衝突テスト実行と1件重複）。いずれも単回の対象検証であり、以前のindexer全体の時間とは実行範囲・並列条件が異なるため比較しない。変更Rustファイルの `rustfmt --check --edition 2024 --config skip_children=true` と `git diff --check` も成功した。
 
 上記の合成benchmark・初回検証結果は修正前の履歴として保持し、今回再実行していない。新規回帰テストは実モデルの障害や意味検索の品質を実測せず、既存embeddingの保持を確認する。構成済み全検証と最終独立評価は、修正後成果物についてホストで更新する。
+
+## 公開後の依存修正と再測定（2026-09-20）
+
+今回の開始版は、draft PR #329の公開済みhead `db6e29b3d772713085fcea18b26a18d04ede717a`。上の初回実装・保護修正の検証と独立評価は、それぞれの版の履歴であり、今回の依存セットの成功として扱わない。[PR #329自身のsecurityログ](https://github.com/thkt/recall/actions/runs/35507536691/job/106069775153)で、このheadとmain `95cfc62755a265c4b31660bd0264663fb15b0e60`のmerge版 `c77d26cc290334fb6841438c4f155282667988f3`、および以下の2件の失敗を確認した。PR #328の結果から同じ原因と推定したものではない。
+
+- h2 0.4.15 → 0.4.16: RUSTSEC-2026-0258（空DATAフレームの無制限なキュー蓄積）。
+- rustls 0.23.42 → 0.23.45: RUSTSEC-2026-0285（TLS 1.3の暗号化レベル境界をまたぐhandshakeメッセージの誤受入れ）。
+- 必要な推移依存のみ、rustls-webpki 0.103.13 → 0.103.14、aws-lc-rs 1.17.3 → 1.18.0、aws-lc-sys 0.43.0 → 0.44.0へ更新した。取得済み公式registry packageのmanifestでも要求を確認した。
+
+`cargo update --offline -p h2 --precise 0.4.16`、`cargo update --offline -p rustls --precise 0.23.45`で解決した。Cargoが併せて変更した無関係なWindows/getrandomの依存選択は開始版へ戻し、lockfileの差分が上記5件のversion/checksumだけで、他のentry・依存選択・source pinが一致することを照合した。`cargo metadata --offline --locked --format-version 1`と`cargo fetch --offline --locked`が成功した。最終Cargo.lockのSHA-256は `c5f50a82a39f2c821f0ef4f0f8b20874c3fe0730a9ba7c5f4433ec86a3c0be2f`。amici/rurico、CI、advisory設定、`.dotagents.json`は変更していない。
+
+チャンク生成・モデル不在時の同一ID置換保護の実装とbenchmark定義は公開版から変更していない。日英READMEは文言を変えず、チャンク完了とモデル不在時の保護の2段落をモデル取得段落の前にまとめ、#319 / PR #328との挿入位置の競合を避けた。#319の実装は含めていない。
+
+再測定はmacOS 27.0（26A428）/ arm64、Rust・Cargo 1.98.1、bundled SQLite 3.53.2、debug testビルド。ホストがMetalとCMake deployment target 14.0を準備した既存の `CARGO_TARGET_DIR=/private/tmp/recall-hardening-target-20260920`を使用した。最初の呼出しは共有targetの古いテストバイナリを再利用し、対象0件だったため成功に数えていない。現checkoutのRustソースを再コンパイルし、次を明示実行して **1 passed / 0 ignored**、テスト本体32.28秒を確認した。
+
+```sh
+cargo test --offline --locked --bin recall chunk_index_scale -- --ignored --nocapture --test-threads=1
+```
+
+旧・新とも上記の最終依存セットを使用。合成20,580会話・245,757メッセージ・14,898,284 bytes、assistantのみ61会話・589メッセージ、WAL DB、実行順の交互化、各3回、計測外の初期生成・snapshot・復元は初回測定と同じ条件である。今回の計測中は別のビルド・テストを起動していない。
+
+| 条件 | 旧方式の秒数（3回） | 新方式の秒数（3回） | 中央値 旧 → 新 |
+| --- | --- | --- | --- |
+| 無変更 | 4.060929 / 3.894806 / 3.990312 | 0.001490 / 0.001865 / 0.001604 | 3.990312 → 0.001604 |
+| 1会話追記 | 3.931716 / 3.887037 / 3.969410 | 0.311015 / 0.300477 / 0.303307 | 3.931716 → 0.303307 |
+
+無変更時は処理会話・空会話再処理・FTS全走査statementが各61 → 0、取得本文589 → 0、新規チャンク0。追記時は処理会話・走査61 → 1、無変更の空会話再処理60 → 0、取得本文590 → 11、新規チャンク1。各回の全チャンクのsession_id・内容・timestamp・rowid範囲が一致し、総チャンク数は無変更20,519、追記20,520だった。これはチャンク生成passの比較であり、依存更新による速度改善や総index時間の速度比を示さない。初期snapshotが新方式由来、短い合成本文、warm cache、statement数と内部ページ読取り数の違いという制限は初回測定と同じ。8 MiBは絶対メモリ上限ではなく、実DB・release時間・ピークメモリ・実モデル障害・電源断・追加の同時実行実験は未確認である。
+
+修正後の `cargo check --offline --locked` と `cargo nextest run --offline --locked --profile ci -E 'test(indexer::tests) | test(db::tests::chunk_completion_upgrade)'` が成功した（対象50件成功、396件は選択対象外、0.871秒）。既存の空結果→再open→追記、SQL失敗・panic→再試行、移行時の原子性・embedding保持、65会話の混入・順序・未知role・検索rowid・実行計画、別パス同一IDのモデル不在保護を再利用した。単なる件数一致では見逃す再処理、失敗の成功扱い、誤った検索範囲、既存embedding消失を検出するため保持し、依存番号だけを固定する新規テストは追加していない。検出条件の削除はなく、従来統合した未知roleの条件も残る。小さいSQLite/MockEmbedder検証と明示実行benchmarkの分担を維持し、異なる実行範囲の過去の時間からテスト高速化は主張しない。
+
+`cargo fmt -- --check` と `git diff --check` も成功した。構成済み完全check、最終差分・文書を含む独立評価、修正後headのCI（test・coverage・security・zizmor）はホストで更新する。この記録はそれらの成功を先取りしない。前PR本文の「445件成功」「accepted」「benchmark未再実行」は今回の成果物の説明へ転用せず、今回の結果と未確認事項を用いる。提示された前PR本文にアップロード媒体へのリンクはなく、captureは不要のままである。

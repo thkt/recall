@@ -100,9 +100,9 @@ recall rebuild          # re-parse and re-embed every present session; missing r
 
 Chunking records successful completion even when a session produces no Q&A pairs (for example, an assistant-only conversation). In this chunk-generation pass, an unchanged session is not read or chunked again; re-parsing an updated session clears that completion state. Upgrades preserve existing chunks and embeddings, and process previously empty sessions once on the next index. Chunk storage and completion markers commit together, so an interrupted pass is retried.
 
-Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
-
 When embedding is unavailable, re-indexing defers updates to existing embedded sessions and preserves their stored content and embeddings. This also protects against replacement by a different file path with the same session ID. Updates can proceed once embedding is available again.
+
+Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
 
 `recall index` and `recall rebuild` accept two flags (also settable via env, useful for the [Hook](#hook)) that tune the embed pass:
 

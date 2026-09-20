@@ -98,9 +98,9 @@ recall rebuild          # 存在する全セッションを再解析・再embedd
 
 チャンク化は、assistantのみの会話などQ&Aが0件になる場合も完了状態を保存します。このチャンク生成処理では変更のない会話の本文の再取得・チャンク化を行わず、更新された会話を再解析すると完了状態が解除されます。アップグレード時は既存のチャンクとembeddingを保持し、従来0件だった会話は次のindexで一度処理します。チャンクと完了状態は同じtransactionで保存するため、中断した処理は再実行されます。
 
-embedding にはモデルが必要です。`recall model download`（約1.2GB）で一度取得してください。モデルがない場合 `recall index` はFTS5のみ構築し、ダウンロードを促す note を出します。モデル導入後の次回 index が backlog を embedding します。
-
 embeddingが利用できない間は、再indexで既にembeddingを持つ会話の更新を延期し、保存済み本文とembeddingを保持します。同じセッションIDを持つ別パスのファイルによる置換も保護対象です。embeddingが再び利用可能になると更新できます。
+
+embedding にはモデルが必要です。`recall model download`（約1.2GB）で一度取得してください。モデルがない場合 `recall index` はFTS5のみ構築し、ダウンロードを促す note を出します。モデル導入後の次回 index が backlog を embedding します。
 
 インデックスはデフォルトで `~/.local/share/recall/recall.db` に置かれます（`--db-path` または環境変数 `RECALL_DB` で上書き可能。親ディレクトリは初回実行時に作成します）。`~/.recall.db` に保存する旧ビルドからの移行時は、再 index の前に旧ファイルを移動してください。移動しないと recall は新パスに空のインデックスを作り直し、過去セッションが検索から不可視になります。
 
