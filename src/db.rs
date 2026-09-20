@@ -277,7 +277,8 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             timestamp INTEGER,
             mtime REAL,
             session_type TEXT,
-            files_scanned INTEGER
+            files_scanned INTEGER,
+            chunks_indexed INTEGER
         );",
     )?;
 
@@ -338,6 +339,8 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
     )?;
+
+    migrate_chunks_indexed_if_needed(conn)?;
 
     Ok(())
 }
@@ -461,6 +464,23 @@ fn migrate_files_scanned_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Existing chunks were committed atomically by index_chunks, including legacy
+/// NULL-range chunks. Preserve their ids/embeddings; only sessions without chunks
+/// need a first pass. The column and backfill commit together, so interrupted
+/// upgrades cannot leave existing chunks marked pending and duplicate them.
+fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("chunks_indexed")) {
+        tx.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN chunks_indexed INTEGER;
+             UPDATE sessions SET chunks_indexed = 1
+             WHERE EXISTS (SELECT 1 FROM qa_chunks c WHERE c.session_id = sessions.session_id);",
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "messages")? else {
         return Ok(());
@@ -491,12 +511,11 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
 }
 
 /// Seeds the minimal valid session row used across test modules. Centralizes
-/// the 8-column positional INSERT so a schema change breaks one helper, not
-/// every fixture (#24 broke them all when session_type was added).
+/// the named-column INSERT so new nullable columns use their defaults.
 #[cfg(test)]
 pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     conn.execute(
-        "INSERT INTO sessions VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES (?1, 'claude', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
         [session_id],
     )
     .unwrap();

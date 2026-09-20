@@ -8,7 +8,7 @@ use std::result::Result as StdResult;
 use std::time::{Instant, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Transaction};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info, warn};
 
 use crate::chunker;
@@ -214,21 +214,12 @@ fn upsert_session(
         delete_session_dependents(ctx.tx, &entry.session_id)?;
     }
 
-    // New session_id differs from cached — clean up any orphaned messages under the new ID
+    // New session_id differs from cached — clean up all dependent data under the new ID
     // (e.g. left over from a renamed file that previously used it).
     let same_session_id =
         matches!(cached, Some(entry) if entry.session_id == parsed.metadata.session_id);
     if !same_session_id {
-        ctx.tx.execute(
-            "DELETE FROM messages WHERE session_id = ?",
-            [&parsed.metadata.session_id],
-        )?;
-        // Clear any scanned-file markers a prior file under this id left behind, so
-        // the fresh inserts below cannot collide on the (session_id, path) PK.
-        ctx.tx.execute(
-            "DELETE FROM session_files WHERE session_id = ?",
-            [&parsed.metadata.session_id],
-        )?;
+        delete_session_dependents(ctx.tx, &parsed.metadata.session_id)?;
     }
 
     // Classify from the first user turn so `recall search` can exclude automated
@@ -244,6 +235,8 @@ fn upsert_session(
     )
     .as_str();
 
+    // INSERT OR REPLACE omits chunks_indexed: any newly parsed body is pending,
+    // even when this id previously completed with zero chunks.
     // files_scanned = 1 marks that scanned-file extraction ran for this session,
     // distinct from NULL (never recorded). Set on every upsert, so the re-parse
     // path — where the DELETE FROM sessions above drops the marker — re-raises it.
@@ -329,8 +322,8 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
     // run, leaving search degraded. Skip before parsing so its rows (and mtime)
     // stay untouched; a later model-present run re-indexes it (mtime drives the
     // self-heal for changed files, the embed gate for unchanged ones). A cached
-    // session without embeddings, or a new session, is not in the set and falls
-    // through to the normal FTS-only index.
+    // session without embeddings, or a new path, falls through to parsing;
+    // the parsed session_id must also be checked before replacement.
     if let Some(embedded) = &ctx.embedded_sessions
         && let Some(entry) = ctx.existing.get(&fpath_str)
         && embedded.contains(&entry.session_id)
@@ -349,6 +342,14 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
             )));
         }
     };
+
+    // A different path can resolve to an existing session_id. Upsert clears
+    // dependents under that ID too, so protect it before any destructive write.
+    if let Some(embedded) = &ctx.embedded_sessions
+        && embedded.contains(&parsed.metadata.session_id)
+    {
+        return Ok(IndexOutcome::Preserved);
+    }
 
     upsert_session(ctx, &fpath_str, mtime, &parsed)?;
     Ok(IndexOutcome::Indexed)
@@ -740,72 +741,151 @@ fn collect_from_entries(
     fully_read
 }
 
+#[derive(Default)]
 pub(crate) struct ChunkStats {
     pub chunks_created: usize,
+    pub sessions_chunked: usize,
+    pub message_batches: usize,
+    pub message_scans: usize,
+    pub messages_read: usize,
 }
 
-/// Chunks every un-chunked session inside a single transaction. `on_progress`
-/// receives `(done_sessions, total_sessions)` after each session — session
-/// units, unlike `embed_chunks` whose callback counts chunks. Progress counts
-/// staged work, not durable state: the callback fires before the final commit,
-/// whereas `embed_chunks` commits each batch before firing.
-///
-/// # Panics
-///
-/// Propagates a panic from `on_progress`; the unwind drops the open
-/// transaction and rusqlite rolls back every staged chunk.
+// A batch admits at most 64 sessions and 8 MiB of source text. A single larger
+// session runs alone: the existing chunker needs its complete conversation, so
+// peak memory is bounded by this budget OR the largest individual session (plus
+// chunk output). No corpus-wide collection of message bodies is built.
+const CHUNK_BATCH_SESSIONS: usize = 64;
+const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
+
+// CROSS JOIN fixes messages as the outer loop: session_id is UNINDEXED in FTS5.
+// Scan it once for the entire pending set, then use direct rowid lookups for all
+// body batches. The temporary B-tree holds only ids and byte counts, not bodies.
+const STAGE_CHUNK_MESSAGES: &str =
+    "INSERT INTO chunk_message_rows (session_id, message_rowid, text_bytes)
+     SELECT m.session_id, m.rowid, length(CAST(m.text AS BLOB))
+     FROM messages m CROSS JOIN sessions s ON s.session_id = m.session_id
+     WHERE s.chunks_indexed IS NULL";
+const READ_CHUNK_BATCH: &str = "SELECT r.session_id, m.rowid, m.role, m.text
+     FROM chunk_message_rows r CROSS JOIN messages m ON m.rowid = r.message_rowid
+     WHERE r.session_id >= ?1 AND r.session_id <= ?2
+     ORDER BY r.session_id, r.message_rowid";
+
+type PendingChunkSession = (String, Option<i64>, i64);
+
+fn chunk_batch_len(sessions: &[PendingChunkSession]) -> usize {
+    let mut bytes = 0_i64;
+    let mut count = 0;
+    for (_, _, size) in sessions.iter().take(CHUNK_BATCH_SESSIONS) {
+        if count > 0 && size.saturating_add(bytes) > CHUNK_BATCH_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(*size);
+        count += 1;
+    }
+    count
+}
+
+/// Chunk pending sessions, including successful empty results, in one transaction.
+/// Progress reports staged sessions, before commit (#121). Error or callback panic
+/// rolls back chunks AND completion markers. An immediate transaction keeps the
+/// pending selection and bodies in the same snapshot and excludes other writers.
 pub(crate) fn index_chunks(
     conn: &mut Connection,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<ChunkStats> {
-    let sessions: Vec<(String, Option<i64>)> = {
-        let mut stmt = conn.prepare(
-            "SELECT s.session_id, s.timestamp FROM sessions s \
-             WHERE NOT EXISTS (SELECT 1 FROM qa_chunks c WHERE c.session_id = s.session_id)",
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let total: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM sessions WHERE chunks_indexed IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let total = usize::try_from(total)?;
+    if total == 0 {
+        return Ok(ChunkStats::default());
+    }
+
+    info!(count = total, "Chunking sessions");
+    tx.execute_batch(
+        "CREATE TEMP TABLE chunk_message_rows (
+            session_id TEXT NOT NULL,
+            message_rowid INTEGER NOT NULL,
+            text_bytes INTEGER NOT NULL,
+            PRIMARY KEY (session_id, message_rowid)
+        ) WITHOUT ROWID;",
+    )?;
+    tx.execute(STAGE_CHUNK_MESSAGES, [])?;
+    let sessions: Vec<PendingChunkSession> = {
+        let mut stmt = tx.prepare(
+            "SELECT s.session_id, s.timestamp, COALESCE(SUM(r.text_bytes), 0)
+             FROM sessions s LEFT JOIN chunk_message_rows r ON r.session_id = s.session_id
+             WHERE s.chunks_indexed IS NULL
+             GROUP BY s.session_id ORDER BY s.session_id",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
-        })?;
-        rows.collect::<StdResult<Vec<_>, _>>()?
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<StdResult<_, _>>()?
     };
 
-    if sessions.is_empty() {
-        return Ok(ChunkStats { chunks_created: 0 });
-    }
-
-    info!(count = sessions.len(), "Chunking sessions");
-
-    let total = sessions.len();
-    let tx = conn.transaction()?;
-    let mut chunks_created = 0;
-    for (done, (session_id, timestamp)) in sessions.iter().enumerate() {
-        let messages = read_session_messages(&tx, session_id)?;
-
-        let chunks = chunker::chunk_messages(session_id, &messages, *timestamp);
-
-        for chunk in &chunks {
+    let mut stats = ChunkStats {
+        message_scans: 1,
+        ..ChunkStats::default()
+    };
+    let mut remaining = sessions.as_slice();
+    while !remaining.is_empty() {
+        let (batch, rest) = remaining.split_at(chunk_batch_len(remaining));
+        let mut messages: HashMap<String, Vec<(i64, Message)>> = HashMap::new();
+        {
+            let mut stmt = tx.prepare_cached(READ_CHUNK_BATCH)?;
+            let mut rows = stmt.query(rusqlite::params![batch[0].0, batch[batch.len() - 1].0])?;
+            while let Some(row) = rows.next()? {
+                let session_id: String = row.get(0)?;
+                let rowid = row.get(1)?;
+                let role_str: String = row.get(2)?;
+                let text = row.get(3)?;
+                stats.messages_read += 1;
+                let Some(role) = Role::from_db(&role_str) else {
+                    debug!(role = %role_str, session_id, "unknown role");
+                    continue;
+                };
+                messages
+                    .entry(session_id)
+                    .or_default()
+                    .push((rowid, Message { role, text }));
+            }
+        }
+        stats.message_batches += 1;
+        for (session_id, timestamp, _) in batch {
+            let body = messages.remove(session_id).unwrap_or_default();
+            let chunks = chunker::chunk_messages(session_id, &body, *timestamp);
+            for chunk in &chunks {
+                tx.execute(
+                    "INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![chunk.session_id, chunk.content, chunk.timestamp,
+                                      chunk.src_rowid_lo, chunk.src_rowid_hi],
+                )?;
+                stats.chunks_created += 1;
+            }
             tx.execute(
-                "INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    chunk.session_id,
-                    chunk.content,
-                    chunk.timestamp,
-                    chunk.src_rowid_lo,
-                    chunk.src_rowid_hi
-                ],
+                "UPDATE sessions SET chunks_indexed = 1 WHERE session_id = ?",
+                [session_id],
             )?;
-            chunks_created += 1;
+            stats.sessions_chunked += 1;
+            if let Some(cb) = on_progress {
+                cb(stats.sessions_chunked, total);
+            }
         }
-
-        if let Some(cb) = &on_progress {
-            cb(done + 1, total);
-        }
+        remaining = rest;
     }
-
+    tx.execute_batch("DROP TABLE chunk_message_rows;")?;
     tx.commit()?;
-
-    Ok(ChunkStats { chunks_created })
+    debug!(
+        sessions = stats.sessions_chunked,
+        batches = stats.message_batches,
+        scans = stats.message_scans,
+        messages = stats.messages_read,
+        "Chunking complete"
+    );
+    Ok(stats)
 }
 
 /// Read a session's messages in rowid order, paired with their fts5 rowid. The
@@ -1025,3 +1105,6 @@ pub(crate) fn backfill_session_files(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod benchmarks;

@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::*;
-use crate::db::{seed_session, setup_test_db};
+use crate::db::{open_db, seed_session, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use tempfile::TempDir;
 
@@ -1253,6 +1253,7 @@ fn test_session_id_collision_cleans_old_messages() {
     )
     .unwrap();
     assert_eq!(stats.indexed, 1);
+    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
 
     let stats2 = index_from_dirs(
         &mut conn,
@@ -1274,6 +1275,99 @@ fn test_session_id_collision_cleans_old_messages() {
         )
         .unwrap();
     assert_eq!(msg_count, 1);
+    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["from dir b"]
+    );
+}
+
+#[test]
+fn model_absent_session_id_collision_preserves_data_until_embedding_is_available() {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude");
+    let dir_a = claude_dir.join("a");
+    let dir_b = claude_dir.join("b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let original = dir_a.join("collision.jsonl");
+    fs::write(
+        &original,
+        r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    let codex_dir = tmp.path().join("codex");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+    let embedder = MockEmbedder::new();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &embedder, 8192, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+
+    // Include rowids/ranges and embedding bytes: equal counts alone would miss
+    // replacing the body while leaving stale chunks or vectors behind.
+    let snapshot = |conn: &Connection| {
+        [
+            "SELECT json_array(session_id, file_path, mtime, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
+            "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
+            "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
+            "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
+        ]
+        .map(|sql| collect_strings(conn, sql))
+    };
+    let before = snapshot(&conn);
+    let replacement = dir_b.join("collision.jsonl");
+    fs::write(
+        &replacement,
+        r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Both paths remain in the scanned root, so orphan cleanup cannot explain
+    // loss of the original session. No mtime changes or sleeps are required.
+    assert!(original.is_file());
+    let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!(stats.indexed, 0);
+    assert_eq!(stats.preserved_embedded, 1);
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(stats.parse_errors, 0);
+    assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
+    assert_eq!(snapshot(&conn), before);
+
+    // Once embedding is available, the same pending replacement must proceed
+    // and remove the old vectors/chunks before generating the new content.
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(stats.preserved_embedded, 0);
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [replacement.to_str().unwrap()]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["replacement question"]
+    );
+    for table in ["qa_chunks", "vec_chunks"] {
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "old {table} must be removed on replacement");
+    }
+    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["replacement question"]
+    );
 }
 
 #[test]
@@ -1351,38 +1445,75 @@ fn test_collect_from_entries_incomplete_on_entry_error_still_collects() {
 
 #[test]
 fn test_011_index_chunks_incremental() {
-    let (_dir, mut conn) = setup_test_db();
+    let (dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
-
     let claude_dir = tmp.path().join("claude_projects");
     fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-            claude_dir.join("s1.jsonl"),
-            concat!(
-                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"role":"assistant","content":"hi there"}}"#,
-            ),
-        )
-        .unwrap();
+    let path = claude_dir.join("s1.jsonl");
+    let assistant = r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":"hi there"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+    fs::write(&path, assistant).unwrap();
     let codex_dir = tmp.path().join("codex_sessions");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    let first = index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        (
+            first.chunks_created,
+            first.sessions_chunked,
+            first.messages_read
+        ),
+        (0, 1, 1)
+    );
 
-    index_from_dirs(
+    // Durability matters: another hook opens a fresh connection.
+    drop(conn);
+    let mut conn = open_db(&dir.path().join("test.db")).unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+    let unchanged = index_chunks(
         &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        },
-        true,
+        Some(&|_, _| panic!("unchanged session processed")),
     )
     .unwrap();
+    assert_eq!(
+        (
+            unchanged.chunks_created,
+            unchanged.sessions_chunked,
+            unchanged.messages_read,
+            unchanged.message_scans,
+            unchanged.message_batches
+        ),
+        (0, 0, 0, 0, 0)
+    );
 
-    let stats1 = index_chunks(&mut conn, None).unwrap();
-    assert_eq!(stats1.chunks_created, 1);
-
-    let stats2 = index_chunks(&mut conn, None).unwrap();
-    assert_eq!(stats2.chunks_created, 0);
+    fs::write(
+        &path,
+        format!(
+            "{assistant}\n{}",
+            r#"{"type":"user","message":{"role":"user","content":"hello"}}"#
+        ),
+    )
+    .unwrap();
+    // Avoid depending on filesystem timestamp precision for the append.
+    conn.execute("UPDATE sessions SET mtime = 0", []).unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    let appended = index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        (
+            appended.chunks_created,
+            appended.sessions_chunked,
+            appended.messages_read
+        ),
+        (1, 1, 2)
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["hello"]
+    );
+    assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
 }
 
 #[test]
@@ -1769,43 +1900,6 @@ fn test_229b_backfill_skips_count_match_with_content_drift() {
     );
 }
 
-// T-192h (#192): read_session_messages skips rows whose role is neither user nor
-// assistant (Role::from_db returns None). recall only writes those two roles, so
-// this is defensive, but an unknown role must never leak into a chunk's content or
-// shift the rowid range. Perspective: Error (invalid role input) + Hazard (foreign
-// text contaminating an excerpt). Here a 'system' row sits between two real
-// messages; the re-derived chunk must contain only the user/assistant text.
-#[test]
-fn test_192h_unknown_role_message_is_skipped() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    seed_message(&conn, "user", "how do vaccines train immunity");
-    // 'system' is not a known role; read_session_messages must drop it.
-    seed_message(&conn, "system", "INTERNAL_SYSTEM_NOTE do not index");
-    seed_message(&conn, "assistant", "they present a harmless antigen");
-
-    let stats = index_chunks(&mut conn, None).unwrap();
-    assert_eq!(
-        stats.chunks_created, 1,
-        "the user message pairs with the adjacent assistant; the system row is dropped"
-    );
-
-    let content: String = conn
-        .query_row(
-            "SELECT content FROM qa_chunks WHERE session_id = 's1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        !content.contains("INTERNAL_SYSTEM_NOTE")
-            && content.contains("how do vaccines train immunity")
-            && content.contains("they present a harmless antigen"),
-        "the chunk holds only the user and assistant text, never the skipped system \
-         row: {content:?}"
-    );
-}
-
 // T-229 (#229): in a multi-assistant tool-use turn the parser drops the
 // tool_result-only user turns between assistant messages, leaving consecutive
 // assistant rows in the DB. The trailing assistant's text reaches FTS (every
@@ -2079,7 +2173,7 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
     let (_dir, mut conn) = setup_test_db();
     // 未知 source: 再読しても解釈できるようにはならない終端ケース。
     conn.execute(
-        "INSERT INTO sessions VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
         [],
     )
     .unwrap();
@@ -2088,7 +2182,7 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
     let empty = tmp.path().join("empty-session.jsonl");
     fs::write(&empty, "").unwrap();
     conn.execute(
-        "INSERT INTO sessions VALUES ('zero', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL, NULL)",
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES ('zero', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL, NULL)",
         [empty.to_string_lossy().to_string()],
     )
     .unwrap();
@@ -2113,5 +2207,179 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
     assert_eq!(
         file_rows, 0,
         "neither terminal case yields session_files rows"
+    );
+}
+
+// #320: failures after staged work must not turn pending sessions into permanent
+// empty successes. Exercise both SQL failure and #121's callback interruption.
+#[test]
+fn chunk_completion_rolls_back_with_chunks_and_retries() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    for interrupt in [false, true] {
+        let (_dir, mut conn) = setup_test_db();
+        seed_session(&conn, "empty");
+        seed_session(&conn, "s1");
+        seed_message(&conn, "user", "question");
+        if !interrupt {
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER fail_completion BEFORE UPDATE OF chunks_indexed ON sessions
+                 WHEN NEW.session_id = 's1'
+                 BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+            )
+            .unwrap();
+            let error = index_chunks(&mut conn, None).err().unwrap();
+            assert!(error.to_string().contains("injected completion failure"));
+        } else {
+            assert!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    index_chunks(
+                        &mut conn,
+                        Some(&|done, _| {
+                            if done == 2 {
+                                panic!("injected interruption");
+                            }
+                        }),
+                    )
+                    .unwrap();
+                }))
+                .is_err()
+            );
+        }
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM qa_chunks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sessions WHERE chunks_indexed IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        conn.execute_batch("DROP TRIGGER IF EXISTS fail_completion;")
+            .unwrap();
+        let retried = index_chunks(&mut conn, None).unwrap();
+        assert_eq!((retried.chunks_created, retried.sessions_chunked), (1, 2));
+        assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
+    }
+}
+
+#[test]
+fn chunk_batches_limit_session_count_and_source_bytes() {
+    let small = vec![("s".to_owned(), None, 1); CHUNK_BATCH_SESSIONS + 1];
+    assert_eq!(chunk_batch_len(&small), 64);
+    let sizes = [
+        CHUNK_BATCH_BYTES / 2,
+        CHUNK_BATCH_BYTES / 2,
+        1,
+        CHUNK_BATCH_BYTES + 1,
+        0,
+    ];
+    let sessions: Vec<_> = sizes
+        .iter()
+        .map(|size| ("s".to_owned(), None, *size))
+        .collect();
+    assert_eq!(
+        chunk_batch_len(&sessions),
+        2,
+        "exact byte budget is allowed"
+    );
+    assert_eq!(
+        chunk_batch_len(&sessions[2..]),
+        1,
+        "do not add an oversized session"
+    );
+    assert_eq!(
+        chunk_batch_len(&sessions[3..]),
+        1,
+        "oversized conversation runs alone"
+    );
+    assert_eq!(
+        chunk_batch_len(&sessions[4..]),
+        1,
+        "empty conversation still finishes"
+    );
+}
+
+#[test]
+fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
+    let (_dir, mut conn) = setup_test_db();
+    // Insert sessions and messages in opposite orders; 65 sessions cross the
+    // batch boundary. Unknown roles and consecutive answers must not disturb it.
+    for i in 0..65 {
+        seed_session(&conn, &format!("s{i:03}"));
+    }
+    for (turn, role) in [
+        (0, "user"),
+        (1, "system"),
+        (2, "assistant"),
+        (3, "assistant"),
+    ] {
+        for i in (0..65).rev() {
+            conn.execute(
+                "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
+                rusqlite::params![format!("s{i:03}"), role, format!("session {i} turn {turn}")],
+            )
+            .unwrap();
+        }
+    }
+    let stats = index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        (
+            stats.chunks_created,
+            stats.sessions_chunked,
+            stats.message_batches,
+            stats.messages_read,
+            stats.message_scans
+        ),
+        (65, 65, 2, 260, 1)
+    );
+    let mut stmt = conn.prepare("SELECT session_id, content, src_rowid_lo, src_rowid_hi FROM qa_chunks ORDER BY session_id").unwrap();
+    let actual: Vec<(String, String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    for (i, (sid, content, lo, hi)) in (0_i64..65).zip(actual) {
+        assert_eq!(sid, format!("s{i:03}"));
+        assert_eq!(
+            content,
+            format!("session {i} turn 0\nsession {i} turn 2\nsession {i} turn 3")
+        );
+        assert_eq!((lo, hi), (65 - i, 260 - i));
+    }
+    // Pin the performance contract to SQLite's actual plan, not just counters:
+    // rowid lookups must not silently become a full FTS scan per batch/session.
+    conn.execute_batch("CREATE TEMP TABLE chunk_message_rows (session_id TEXT, message_rowid INTEGER, text_bytes INTEGER, PRIMARY KEY(session_id, message_rowid)) WITHOUT ROWID;").unwrap();
+    let stage_plan: Vec<String> = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {STAGE_CHUNK_MESSAGES}"))
+        .unwrap()
+        .query_map([], |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        stage_plan[0].contains("SCAN m VIRTUAL TABLE"),
+        "FTS must be the single outer scan: {stage_plan:?}"
+    );
+    assert!(
+        stage_plan[1].contains("SEARCH s USING INDEX"),
+        "each message probes the session primary key: {stage_plan:?}"
+    );
+    let plan: Vec<String> = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {READ_CHUNK_BATCH}"))
+        .unwrap()
+        .query_map(["s000", "s064"], |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        plan.iter()
+            .any(|line| line.contains("VIRTUAL TABLE INDEX") && line.contains('=')),
+        "expected FTS rowid equality lookup: {plan:?}"
     );
 }
