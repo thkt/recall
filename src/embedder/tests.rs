@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::db::{seed_chunk, seed_session, setup_test_db};
+use crate::db::{open_db, seed_chunk, seed_session, setup_test_db};
 
 #[test]
 fn test_embed_recent_chunks_budget_zero() {
@@ -13,7 +13,7 @@ fn test_embed_recent_chunks_budget_zero() {
 }
 
 #[test]
-fn test_embed_chunks_progress_callback() {
+fn embed_chunks_reports_committed_progress() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
     for i in 0..3 {
@@ -21,11 +21,7 @@ fn test_embed_chunks_progress_callback() {
     }
 
     let embedder = MockEmbedder::new();
-    let chunks: Vec<(i64, String)> = vec![
-        (1, "content 0".into()),
-        (2, "content 1".into()),
-        (3, "content 2".into()),
-    ];
+    let chunks = pending_chunks(&conn, usize::MAX).unwrap();
 
     let calls = Mutex::new(Vec::new());
     let result = embed_chunks(
@@ -46,13 +42,13 @@ fn test_embed_chunks_progress_callback() {
 }
 
 #[test]
-fn test_embed_chunks_replaces_existing_vectors_for_stale_pending_work() {
+fn replaying_the_same_generation_replaces_vectors_without_duplicates() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
     seed_chunk(&conn, 1, "content 0");
 
     let embedder = MockEmbedder::new();
-    let chunks: Vec<(i64, String)> = vec![(1, "content 0".into())];
+    let chunks = pending_chunks(&conn, usize::MAX).unwrap();
 
     let first = embed_chunks(
         &mut conn,
@@ -93,118 +89,6 @@ fn seed_chunks(conn: &Connection, count: usize, content: impl Fn(i64) -> String)
     }
 }
 
-// Decision table for embed_chunks under a one-batch poison (EMBED_BATCH_SIZE=128):
-// | batch | contains poison "x" | embed_documents_batch | committed | counted as |
-// | ----- | ------------------- | --------------------- | --------- | ---------- |
-// | 1     | yes (sorted first)  | Err (all-or-nothing)  | no        | failed     |
-// | 2     | no                  | Ok                    | yes       | embedded   |
-//
-// T-001 (FR-001, FR-002): a poison batch does not stop the next batch. Given 129
-// chunks — poison text "x" (shortest, so it sorts into batch 1) plus 128 longer
-// "content_NNNN" texts — and failing_on_text("x"), embed_chunks continues past
-// the failed batch 1: batch 2 (1 chunk) embeds, batch 1 (128 chunks) is counted
-// failed, and the first batch error is reported.
-// Perspective: branch (the Err arm now continues, not breaks) + boundary (the
-// batch-1/batch-2 split at EMBED_BATCH_SIZE).
-#[test]
-fn test_embed_chunks_poison_batch_does_not_block_next_batch() {
-    let (_dir, mut conn) = setup_test_db();
-    // 128 healthy chunks (uniform length 12, all longer than "x") + 1 poison.
-    // Ascending length-sort puts "x" at index 0 → batch 1 (with 127 healthy);
-    // the single remaining healthy chunk is batch 2.
-    seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
-    seed_chunk(&conn, 129, "x");
-
-    let chunks: Vec<(i64, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, content FROM qa_chunks ORDER BY id")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(StdResult::unwrap)
-            .collect()
-    };
-    assert_eq!(chunks.len(), 129, "129 chunks span exactly two batches");
-
-    let embedder = MockEmbedder::failing_on_text("x");
-    let result = embed_chunks(
-        &mut conn,
-        &embedder,
-        &chunks,
-        None,
-        &EmbedOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        result.embedded, 1,
-        "batch 2 (the single non-poison chunk) embeds despite batch 1 failing"
-    );
-    assert_eq!(
-        result.failed_count, 128,
-        "the whole poison batch (128 chunks) is counted failed, not just the poison chunk"
-    );
-    let err = result.first_error.as_deref().unwrap_or_default();
-    assert!(
-        err.contains("poison text: x"),
-        "first_error carries the batch error content, not a fallback, got: {err:?}"
-    );
-}
-
-// T-002 (FR-003): chunks in a failed batch keep no embedding so the next index
-// retries them. Given the same poison batch as T-001, after embed_chunks the
-// poison batch's 128 chunks have no vec_chunks row (the failed batch's tx never
-// commits), while batch 2's single chunk does. The pending set (NOT EXISTS) is
-// exactly the failed batch.
-// Perspective: hazard (a half-applied batch would leave a chunk embedded with no
-// record, or strand a poison chunk as permanently skipped).
-#[test]
-fn test_embed_chunks_failed_batch_leaves_chunks_pending() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
-    seed_chunk(&conn, 129, "x");
-
-    let chunks: Vec<(i64, String)> = {
-        let mut stmt = conn
-            .prepare("SELECT id, content FROM qa_chunks ORDER BY id")
-            .unwrap();
-        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .map(StdResult::unwrap)
-            .collect()
-    };
-
-    let embedder = MockEmbedder::failing_on_text("x");
-    embed_chunks(
-        &mut conn,
-        &embedder,
-        &chunks,
-        None,
-        &EmbedOptions::default(),
-    )
-    .unwrap();
-
-    let vec_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        vec_count, 1,
-        "only batch 2's chunk is embedded; the failed poison batch commits nothing"
-    );
-    let pending: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks c \
-                 WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        pending, 128,
-        "the failed batch's 128 chunks stay pending for the next index to retry"
-    );
-}
-
 // T-007 (FR-002, FR-004): when every batch fails, the embed run is non-fatal and
 // fully retryable. Given 1 pending chunk and failing_after(0) (every batch
 // fails), embed_recent_chunks returns Ok (the index does not abort), counts the
@@ -238,19 +122,15 @@ fn test_embed_recent_chunks_all_batches_fail_is_non_fatal_and_retryable() {
     );
 }
 
-// T-008 (FR-003): the failed batch is actually picked up by the next run — the
-// cross-invocation half of T-002's "stays pending" promise (OUTCOME Behavior 2:
-// repeated `recall index` fills the un-embedded chunks). Given the T-001 poison
-// state (batch 1 failed, 128 pending), a second embed_recent_chunks with a
-// healthy embedder embeds exactly those 128 and leaves nothing pending.
-// Perspective: state (a two-invocation invariant that single-run C0/C1 misses).
+// One poison batch exercises continuation, atomic batch failure, and retry
+// together; checking only the retry would miss wrong first-run accounting.
 #[test]
-fn test_embed_recent_chunks_second_run_embeds_previously_failed_batch() {
+fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     let (_dir, mut conn) = setup_test_db();
     seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
     seed_chunk(&conn, 129, "x");
 
-    // Run 1: the poison strands batch 1 (its accounting is T-001/T-002's job).
+    // Shortest text sorts into the first batch; the second batch still commits.
     let poisoned = MockEmbedder::failing_on_text("x");
     let first = embed_recent_chunks(&mut conn, &poisoned, 129, None).unwrap();
     assert_eq!(
@@ -258,7 +138,20 @@ fn test_embed_recent_chunks_second_run_embeds_previously_failed_batch() {
         "precondition: only batch 2 embeds on run 1"
     );
 
-    // Run 2: a healthy embedder picks the 128 up via the NOT EXISTS gate.
+    assert_eq!(first.failed_count, 128);
+    assert!(
+        first
+            .first_error
+            .as_deref()
+            .unwrap()
+            .contains("poison text: x")
+    );
+    let stored: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stored, 1, "a failed batch must not partially commit");
+    assert_eq!(pending_chunks(&conn, 129).unwrap().len(), 128);
+
     let healthy = MockEmbedder::new();
     let second = embed_recent_chunks(&mut conn, &healthy, 129, None).unwrap();
     assert_eq!(
@@ -306,4 +199,280 @@ fn test_embed_recent_chunks_budget_prefers_newest_chunk() {
         embedded_id, 2,
         "budget 1 must pick the chunk with the newest timestamp (ts=300)"
     );
+}
+
+/// Interrupt after vectors have been computed but before embed_chunks can save.
+/// The production Embed boundary gives deterministic scheduling without a
+/// product flag, model download, or timing-dependent inference delay.
+struct InterruptedEmbedder<F>(F);
+
+impl<F: Fn() + Send + Sync> Embed for InterruptedEmbedder<F> {
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        MockEmbedder::new().embed_query(text)
+    }
+
+    fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+        MockEmbedder::new().embed_document(text)
+    }
+
+    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+        let result = MockEmbedder::new().embed_documents_batch(texts)?;
+        (self.0)();
+        Ok(result)
+    }
+
+    fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
+        MockEmbedder::new().embed_text(text, prefix)
+    }
+}
+
+fn assert_vectors_match_current_content(conn: &Connection) {
+    let mut stmt = conn
+        .prepare(
+            "SELECT v.embedding, c.content, v.sub_idx FROM vec_chunks v \
+             LEFT JOIN qa_chunks c ON c.id = v.chunk_id",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, Vec<u8>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (bytes, content, sub_idx) = row.unwrap(); // NULL content fails for orphans.
+        assert_eq!(
+            bytes,
+            f32_as_bytes(&MockEmbedder::deterministic_vector(&content))
+        );
+        assert_eq!(sub_idx, 0);
+    }
+}
+
+#[test]
+fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_vectors() {
+    let (dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 7, |id| {
+        if id == 1 {
+            // This valid result sorts AFTER the discarded ones, exposing any
+            // accidental re-pairing of filtered IDs with unfiltered vectors.
+            "unchanged input that sorts last".to_owned()
+        } else {
+            format!("old {id}")
+        }
+    });
+    let other_saved = Mutex::new(None);
+    let embedder = InterruptedEmbedder(|| {
+        let mut other = open_db(&dir.path().join("test.db")).unwrap();
+        let tx = other.transaction().unwrap();
+        tx.execute_batch(
+            "UPDATE qa_chunks SET content = 'updated content' WHERE id = 2;
+             DELETE FROM qa_chunks WHERE id IN (3, 4, 5, 7);
+             INSERT INTO qa_chunks (id, session_id, content) VALUES
+                (4, 's1', 'replacement content'), (5, 's1', 'old 5'),
+                (7, 's1', 'another worker saved this');
+             UPDATE qa_chunks SET content = 'intermediate' WHERE id = 6;
+             UPDATE qa_chunks SET content = 'old 6' WHERE id = 6;",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let current: Vec<_> = pending_chunks(&other, 10)
+            .unwrap()
+            .into_iter()
+            .filter(|chunk| chunk.id == 7)
+            .collect();
+        let result = embed_chunks(
+            &mut other,
+            &MockEmbedder::new(),
+            &current,
+            None,
+            &EmbedOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(result.embedded, 1);
+        *other_saved.lock().unwrap() = Some(
+            other
+                .query_row(
+                    "SELECT rowid, embedding FROM vec_chunks WHERE chunk_id = 7",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+                )
+                .unwrap(),
+        );
+    });
+    let progress = Mutex::new(Vec::new());
+    let chunks = pending_chunks(&conn, 10).unwrap();
+    let result = embed_chunks(
+        &mut conn,
+        &embedder,
+        &chunks,
+        Some(&|done, total| progress.lock().unwrap().push((done, total))),
+        &EmbedOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(result.embedded, 1, "only the unchanged chunk is a success");
+    assert_eq!(
+        result.failed_count, 0,
+        "stale work is not an inference failure"
+    );
+    assert_eq!(*progress.lock().unwrap(), vec![(1, 7)]);
+    let preserved = conn
+        .query_row(
+            "SELECT rowid, embedding FROM vec_chunks WHERE chunk_id = 7",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(Some(preserved), other_saved.into_inner().unwrap());
+    assert_vectors_match_current_content(&conn);
+    let mut pending: Vec<_> = pending_chunks(&conn, 10)
+        .unwrap()
+        .iter()
+        .map(|c| c.id)
+        .collect();
+    pending.sort_unstable();
+    assert_eq!(pending, vec![2, 4, 5, 6]);
+    let retry = embed_recent_chunks(&mut conn, &MockEmbedder::new(), 10, None).unwrap();
+    assert_eq!(retry.embedded, 4);
+    assert!(pending_chunks(&conn, 10).unwrap().is_empty());
+    assert_vectors_match_current_content(&conn);
+}
+
+// The same test executable is launched twice, each invoking the index command's
+// real orchestration with a deterministic embedder. Files are barriers, not
+// sleeps intended to guess inference duration. Keep all inputs synthetic.
+#[test]
+fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
+    use std::env;
+    use std::fs;
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use crate::index_and_report_with;
+    use crate::indexer::IndexOptions;
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready() {
+            assert!(Instant::now() < deadline, "index process barrier timed out");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    struct Worker(Child);
+    impl Worker {
+        fn finish(&mut self) {
+            wait_until(|| match self.0.try_wait().unwrap() {
+                Some(status) => {
+                    assert!(status.success(), "index worker failed: {status}");
+                    true
+                }
+                None => false,
+            });
+        }
+    }
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn write_session(root: &Path, text: &str) {
+        fs::write(root.join("claude/session.jsonl"), format!(
+            "{{\"type\":\"user\",\"cwd\":\"/synthetic\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}},\"timestamp\":\"2026-09-20T00:00:00Z\"}}\n"
+        )).unwrap();
+    }
+
+    if let Some(root) = env::var_os("RECALL_EMBED_RACE_ROOT") {
+        let root = Path::new(&root);
+        let pause = env::var("RECALL_EMBED_RACE_ROLE").unwrap() == "old";
+        let owned_root = root.to_path_buf();
+        let embedder = InterruptedEmbedder(move || {
+            if pause {
+                fs::write(owned_root.join("inference-ready"), b"ready").unwrap();
+                wait_until(|| owned_root.join("resume").exists());
+            }
+        });
+        let result = index_and_report_with(
+            &Some(root.join("race.db")),
+            &IndexOptions {
+                force: true,
+                claude_dir: &root.join("claude"),
+                codex_dir: &root.join("codex"),
+            },
+            || Ok(Arc::new(embedder) as Arc<dyn Embed>),
+        )
+        .unwrap();
+        assert_eq!(result.embedded, if pause { 0 } else { 1 });
+        assert_eq!(result.failed_count, 0);
+        assert!(result.degraded_note.is_none());
+        return;
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir(root.join("claude")).unwrap();
+    fs::create_dir(root.join("codex")).unwrap();
+    write_session(root, "old synthetic question");
+    let spawn = |role| {
+        Worker(Command::new(env::current_exe().unwrap())
+        .args(["--exact", "embedder::tests::overlapping_index_processes_keep_vectors_for_the_replacement_text", "--nocapture"])
+        .env("RECALL_EMBED_RACE_ROOT", root)
+        .env("RECALL_EMBED_RACE_ROLE", role)
+        .spawn().unwrap())
+    };
+    let mut old = spawn("old");
+    wait_until(|| {
+        assert!(
+            old.0.try_wait().unwrap().is_none(),
+            "old worker exited before inference"
+        );
+        root.join("inference-ready").exists()
+    });
+    let conn = open_db(&root.join("race.db")).unwrap();
+    let original: (i64, i64) = conn
+        .query_row("SELECT id, generation FROM qa_chunks", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    write_session(root, "new synthetic question");
+    let mut new = spawn("new");
+    new.finish();
+    let replacement: (i64, i64, String) = conn
+        .query_row("SELECT id, generation, content FROM qa_chunks", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(replacement.0, original.0, "exercise actual tail-ID reuse");
+    assert_ne!(replacement.1, original.1);
+    assert!(replacement.2.contains("new synthetic question"));
+    let saved: (i64, Vec<u8>) = conn
+        .query_row("SELECT rowid, embedding FROM vec_chunks", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    fs::write(root.join("resume"), b"resume").unwrap();
+    old.finish();
+    let after: (i64, Vec<u8>) = conn
+        .query_row("SELECT rowid, embedding FROM vec_chunks", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        after, saved,
+        "discarding stale work must not touch current vectors"
+    );
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(pending_chunks(&conn, 10).unwrap().is_empty());
+    assert_vectors_match_current_content(&conn);
 }
