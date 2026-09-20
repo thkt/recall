@@ -10,7 +10,7 @@ use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use tracing::warn;
 
 /// Per-call knobs for the index/rebuild embed pass, threaded from the
@@ -52,6 +52,14 @@ impl EmbedResult {
 
 pub(crate) const EMBED_BATCH_SIZE: usize = 128;
 
+/// Identity and input captured together before inference. Generation survives
+/// deletion of other rows and changes even when an ID is reused with equal text.
+pub(crate) struct PendingChunk {
+    id: i64,
+    content: String,
+    generation: i64,
+}
+
 /// Reinterprets an f32 slice as its raw byte view for sqlite-vec storage.
 /// Replaces `rurico::storage::f32_as_bytes`, removed in rurico a573655 (#78).
 pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
@@ -61,7 +69,7 @@ pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
 pub(crate) fn embed_chunks(
     conn: &mut Connection,
     embedder: &dyn Embed,
-    chunks: &[(i64, String)],
+    chunks: &[PendingChunk],
     on_progress: Option<&dyn Fn(usize, usize)>,
     options: &EmbedOptions,
 ) -> Result<EmbedResult> {
@@ -70,7 +78,7 @@ pub(crate) fn embed_chunks(
     }
 
     let mut sorted: Vec<usize> = (0..chunks.len()).collect();
-    sorted.sort_by_key(|&i| chunks[i].1.len());
+    sorted.sort_by_key(|&i| chunks[i].content.len());
 
     let total = chunks.len();
     let mut embedded = 0;
@@ -78,35 +86,56 @@ pub(crate) fn embed_chunks(
     let mut first_error = None;
 
     for batch_idx in sorted.chunks(EMBED_BATCH_SIZE) {
-        let texts: Vec<&str> = batch_idx.iter().map(|&i| chunks[i].1.as_str()).collect();
+        let texts: Vec<&str> = batch_idx
+            .iter()
+            .map(|&i| chunks[i].content.as_str())
+            .collect();
         match embedder.embed_documents_batch_with_options(&texts, options) {
             Ok(embeddings) => {
-                let tx = conn.transaction()?;
-                // Idempotent replay guard for stale concurrent work that reached
-                // this tx after the pending query. Batched into one
-                // IN-delete: vec0's +chunk_id is an unindexed auxiliary column, so
-                // each `DELETE WHERE chunk_id = ?` is a full O(N) scan (EXPLAIN
-                // reports "SCAN vec_chunks VIRTUAL TABLE") — per-chunk deletes were
-                // O(batch × N). Keyed on batch_idx (non-empty by the early return);
-                // on the NOT EXISTS path nothing matches, so it is a no-op there.
-                let batch_ids: Vec<i64> = batch_idx.iter().map(|&i| chunks[i].0).collect();
+                // Acquire the writer lock BEFORE reading the current generations:
+                // no writer can replace a checked row before this batch commits.
+                // Inference itself never holds the lock.
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let mut current = Vec::new();
+                {
+                    let mut check = tx.prepare_cached(
+                        "SELECT EXISTS(SELECT 1 FROM qa_chunks \
+                         WHERE id = ?1 AND content = ?2 AND generation = ?3)",
+                    )?;
+                    for (chunked, &i) in embeddings.iter().zip(batch_idx) {
+                        let chunk = &chunks[i];
+                        if check.query_row(
+                            rusqlite::params![chunk.id, chunk.content, chunk.generation],
+                            |row| row.get::<_, bool>(0),
+                        )? {
+                            current.push((chunked, chunk.id));
+                        }
+                    }
+                }
+                if current.is_empty() {
+                    continue;
+                }
+                // Delete only validated IDs, preserving another worker's current
+                // vectors when our result is stale. Keep one IN-delete per batch:
+                // vec0's +chunk_id is unindexed, so per-chunk deletes are O(batch × N).
+                let batch_ids: Vec<i64> = current.iter().map(|(_, id)| *id).collect();
                 let placeholders = anon_placeholders(batch_ids.len());
                 tx.execute(
                     &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
                     rusqlite::params_from_iter(batch_ids.iter()),
                 )?;
-                for (chunked, &i) in embeddings.iter().zip(batch_idx) {
+                for (chunked, id) in &current {
                     for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
                         let embedding_bytes = f32_as_bytes(sub_emb);
                         tx.execute(
                             "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
                              VALUES (?1, ?2, ?3)",
-                            rusqlite::params![embedding_bytes, chunks[i].0, sub_idx as i64],
+                            rusqlite::params![embedding_bytes, id, sub_idx as i64],
                         )?;
                     }
                 }
                 tx.commit()?;
-                embedded += embeddings.len();
+                embedded += current.len();
                 if let Some(cb) = &on_progress {
                     cb(embedded, total);
                 }
@@ -137,7 +166,7 @@ pub(crate) fn embed_chunks(
 /// re-scanned vec_chunks per qa_chunks row — its `+chunk_id` is an unindexed
 /// auxiliary column (see the DELETE note in `embed_chunks`), so at 38k chunks
 /// that was O(N×M) ≈ 15-20 minutes of silence before the first batch.
-pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<(i64, String)>> {
+pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<PendingChunk>> {
     if budget == 0 {
         return Ok(Vec::new());
     }
@@ -149,7 +178,7 @@ pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<(i6
     };
 
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.content FROM qa_chunks c \
+        "SELECT c.id, c.content, c.generation FROM qa_chunks c \
          ORDER BY c.timestamp DESC NULLS LAST",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -159,9 +188,13 @@ pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<(i6
             // columns a row actually reads.
             return Ok(None);
         }
-        Ok(Some((id, row.get::<_, String>(1)?)))
+        Ok(Some(PendingChunk {
+            id,
+            content: row.get(1)?,
+            generation: row.get(2)?,
+        }))
     })?;
-    let missing: Vec<(i64, String)> = rows
+    let missing = rows
         .filter_map(StdResult::transpose)
         .take(budget)
         .collect::<StdResult<_, _>>()?;

@@ -8,7 +8,7 @@ use amici::migration::notify_schema_change;
 use anyhow::Result;
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage::ensure_sqlite_vec;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tracing::warn;
 
 const FTS_TOKENIZER: &str = "trigram";
@@ -218,7 +218,8 @@ pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
         || !messages_sql.contains(FTS_TOKENIZER)
         || !vec_sql.contains("sub_idx")
         || qa_sql.contains("chunk_hash")
-        || !qa_sql.contains("src_rowid_lo");
+        || !qa_sql.contains("src_rowid_lo")
+        || !qa_sql.contains("generation");
 
     Ok(if stale {
         SchemaState::Stale
@@ -322,10 +323,13 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             content TEXT NOT NULL,
             timestamp INTEGER,
             src_rowid_lo INTEGER,
-            src_rowid_hi INTEGER
+            src_rowid_hi INTEGER,
+            generation INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);",
     )?;
+
+    migrate_qa_chunk_generation_if_needed(conn)?;
 
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
@@ -339,6 +343,42 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
     )?;
 
+    Ok(())
+}
+
+/// A persistent counter prevents ABA (delete/reinsert or old/new/old updates),
+/// including equal-text replacements. Triggers cover every INSERT and input
+/// UPDATE, while rowid-link backfills leave the generation alone. Legacy rows
+/// can share generation 0: validation also checks their ID and exact content.
+/// No chunks or embeddings are discarded. Check the shape under a writer lock
+/// so two processes upgrading the same old DB cannot both ADD the column.
+fn migrate_qa_chunk_generation_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("generation")) {
+        tx.execute_batch(
+            "ALTER TABLE qa_chunks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qa_chunk_generation (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            value INTEGER NOT NULL CHECK (typeof(value) = 'integer' AND value >= 0)
+         );
+         INSERT OR IGNORE INTO qa_chunk_generation VALUES (1, 0);
+         CREATE TRIGGER IF NOT EXISTS qa_chunks_insert_generation
+         AFTER INSERT ON qa_chunks BEGIN
+            UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
+            UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
+            WHERE id = NEW.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS qa_chunks_update_generation
+         AFTER UPDATE OF id, session_id, content ON qa_chunks BEGIN
+            UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
+            UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
+            WHERE id = NEW.id;
+         END;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
