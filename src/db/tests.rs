@@ -1031,7 +1031,14 @@ fn generation_upgrade_preserves_embeddings_and_reopen_keeps_generation_identity(
         [f32_as_bytes(&vector)],
     )
     .unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
+    assert!(
+        !table_def(&conn, "qa_chunks")
+            .unwrap()
+            .unwrap()
+            .contains("generation")
+    );
+    assert!(table_def(&conn, "qa_chunk_generation").unwrap().is_none());
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
     drop(conn);
 
     let conn = open_db(tmp.path()).unwrap();
@@ -1044,6 +1051,7 @@ fn generation_upgrade_preserves_embeddings_and_reopen_keeps_generation_identity(
         )
         .unwrap();
     assert_eq!(content, "existing content");
+    assert_eq!(generation, 0, "legacy rows receive the migration default");
     let saved: (i64, Vec<u8>, i64, i64) = conn
         .query_row(
             "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",

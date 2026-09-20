@@ -152,7 +152,6 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     assert_eq!(stored, 1, "a failed batch must not partially commit");
     assert_eq!(pending_chunks(&conn, 129).unwrap().len(), 128);
 
-    // Run 2: a healthy embedder picks the 128 up via the NOT EXISTS gate.
     let healthy = MockEmbedder::new();
     let second = embed_recent_chunks(&mut conn, &healthy, 129, None).unwrap();
     assert_eq!(

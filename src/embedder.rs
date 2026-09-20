@@ -118,11 +118,10 @@ pub(crate) fn embed_chunks(
                 // Delete only validated IDs, preserving another worker's current
                 // vectors when our result is stale. Keep one IN-delete per batch:
                 // vec0's +chunk_id is unindexed, so per-chunk deletes are O(batch × N).
-                let batch_ids: Vec<i64> = current.iter().map(|(_, id)| *id).collect();
-                let placeholders = anon_placeholders(batch_ids.len());
+                let placeholders = anon_placeholders(current.len());
                 tx.execute(
                     &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
-                    rusqlite::params_from_iter(batch_ids.iter()),
+                    rusqlite::params_from_iter(current.iter().map(|(_, id)| id)),
                 )?;
                 for (chunked, id) in &current {
                     for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {

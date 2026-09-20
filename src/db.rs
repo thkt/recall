@@ -22,15 +22,15 @@ pub enum OpenTier {
     Immutable,
 }
 
-/// On-disk schema currency, derived by reading `sqlite_master` only.
+/// On-disk schema compatibility with read commands, derived from `sqlite_master`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaState {
     /// No `sessions` table: recall never indexed this DB.
     Empty,
     /// Current shape: usable by the read commands as-is.
     Current,
-    /// Present but an old shape a `migrate_*` pass would rewrite; a read-only
-    /// open cannot migrate it, so the read commands hard-fail (see main.rs).
+    /// Present but incompatible with read commands; a read-only open cannot
+    /// migrate it, so the read commands hard-fail (see main.rs).
     Stale,
 }
 
@@ -191,10 +191,9 @@ fn wal_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Classify the on-disk schema by reading `sqlite_master` only (never writes),
-/// reusing [`table_def`] so "current shape" is defined next to the `migrate_*`
-/// sniffs it mirrors. Each `Stale` condition is a `migrate_*` check inverted to
-/// "a migration would run".
+/// Check read compatibility using `sqlite_master` only (never writes).
+/// Write-only migrations, such as chunk generation tracking, do not make a
+/// readable index stale; [`open_db`] applies them before writing.
 pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
     let Some(sessions_sql) = table_def(conn, "sessions")? else {
         return Ok(SchemaState::Empty);
@@ -218,8 +217,7 @@ pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
         || !messages_sql.contains(FTS_TOKENIZER)
         || !vec_sql.contains("sub_idx")
         || qa_sql.contains("chunk_hash")
-        || !qa_sql.contains("src_rowid_lo")
-        || !qa_sql.contains("generation");
+        || !qa_sql.contains("src_rowid_lo");
 
     Ok(if stale {
         SchemaState::Stale
