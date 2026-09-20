@@ -49,6 +49,76 @@ fn test_open_db_idempotent() {
     let _conn2 = open_db(tmp.path()).unwrap();
 }
 
+#[test]
+fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
+    use crate::indexer::index_chunks;
+
+    let tmp = NamedTempFile::new().unwrap();
+    create_pre_cleanup_db(tmp.path());
+    {
+        let conn = Connection::open(tmp.path()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
+             INSERT INTO messages (session_id, role, text) VALUES
+                 ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
+             CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE ON sessions
+             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+        )
+        .unwrap();
+    }
+    let error = open_db(tmp.path()).err().unwrap();
+    assert!(error.to_string().contains("injected migration failure"));
+    {
+        let conn = Connection::open(tmp.path()).unwrap();
+        assert!(
+            !table_def(&conn, "sessions")
+                .unwrap()
+                .unwrap()
+                .contains("chunks_indexed")
+        );
+        conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
+            .unwrap();
+    }
+    for pass in 0..2 {
+        let mut conn = open_db(tmp.path()).unwrap();
+        let complete: i64 = conn
+            .query_row(
+                "SELECT chunks_indexed FROM sessions WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(complete, 1);
+        let stats = index_chunks(&mut conn, None).unwrap();
+        assert_eq!(stats.sessions_chunked, if pass == 0 { 2 } else { 0 });
+        assert_eq!(stats.chunks_created, if pass == 0 { 1 } else { 0 });
+        let original: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT content, src_rowid_lo, src_rowid_hi FROM qa_chunks WHERE id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(original, ("q\na".to_owned(), None, None));
+        let (id, embedding): (i64, Vec<u8>) = conn
+            .query_row("SELECT chunk_id, embedding FROM vec_chunks", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(embedding, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]));
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM sessions WHERE chunks_indexed = 1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+    }
+}
+
 // T-009 (#24/FR-004): opening a DB whose sessions table predates session_type
 // adds the column non-destructively — existing rows survive with NULL (treated
 // as interactive by the search filter), not a destructive rebuild.

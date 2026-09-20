@@ -2988,12 +2988,12 @@ mod tests {
     fn setup_show_db() -> (tempfile::TempDir, Connection) {
         let (dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
@@ -3070,10 +3070,10 @@ mod tests {
     // Claude (with a warn) so the session still renders. Covers the
     // unknown-source guard in show_session's query_map closure.
     #[test]
-    fn test_show_session_unknown_source_falls_back_to_claude() {
+    fn show_session_unknown_source_falls_back_to_claude() {
         let (_dir, conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
@@ -3428,7 +3428,7 @@ mod tests {
         // 'auto': first user turn is a slash-command wrapper; 'human': a normal
         // turn. Both start unclassified (session_type NULL).
         conn.execute(
-            "INSERT INTO sessions VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -3438,7 +3438,7 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -3503,10 +3503,10 @@ mod tests {
     // T-012 (#24/FR-008): without --all, only unclassified (NULL) sessions are
     // (re)classified; an already-tagged session is left untouched.
     #[test]
-    fn test_012_reclassify_incremental_skips_already_tagged() {
+    fn reclassify_incremental_skips_already_tagged() {
         let (_dir, mut conn) = db::setup_test_db();
         conn.execute(
-            "INSERT INTO sessions VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL, NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
             [],
         )
         .unwrap();
@@ -3518,7 +3518,7 @@ mod tests {
         // 'tagged' carries an automated first turn but was already tagged interactive;
         // without --all it must stay interactive (not re-evaluated).
         conn.execute(
-            "INSERT INTO sessions VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive', NULL)",
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive')",
             [],
         )
         .unwrap();
@@ -6649,7 +6649,7 @@ mod tests {
             db::seed_chunk(&conn, 1, "authentication flow");
             // An unknown-source session that matches but gets pruned for its source.
             conn.execute(
-                "INSERT INTO sessions VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0, NULL, NULL)",
+                "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0)",
                 [],
             )
             .unwrap();
