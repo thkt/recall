@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::*;
-use crate::db::{open_db, seed_session, setup_test_db};
+use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use tempfile::TempDir;
 
@@ -1288,6 +1288,137 @@ fn test_cleanup_deletes_real_orphan_when_new_file_added() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Malformed JSON is skipped; an unreadable file exercises a real parser
+    // error. Both must allow cleanup after complete directory enumeration.
+    for (replacement, unreadable) in [("", false), ("invalid JSON\n", false), ("", true)] {
+        for incomplete_codex in [false, true] {
+            let (_dir, mut conn) = setup_test_db();
+            let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+            index_chunks(&mut conn, None).unwrap();
+            let embedder = MockEmbedder::new();
+            assert_eq!(
+                embed_recent_chunks(&mut conn, &embedder, 100, None)
+                    .unwrap()
+                    .embedded,
+                2
+            );
+            for sid in ["c", "s1"] {
+                seed_session_file(&conn, sid, &format!("/proj/{sid}.rs"));
+            }
+
+            // Compare actual rows and vector bytes, not just counts: a cleanup
+            // that rewrites the survivor or leaves dangling vectors must fail.
+            let snapshot = |conn: &Connection, sid: &str| {
+                [
+                    "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions WHERE session_id = ? ORDER BY session_id",
+                    "SELECT json_array(rowid, role, text) FROM messages WHERE session_id = ? ORDER BY rowid",
+                    "SELECT json_array(id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks WHERE session_id = ? ORDER BY id",
+                    "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?) ORDER BY rowid",
+                    "SELECT path FROM session_files WHERE session_id = ? ORDER BY path",
+                ]
+                .map(|sql| {
+                    conn.prepare(sql)
+                        .unwrap()
+                        .query_map([sid], |row| row.get::<_, String>(0))
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .collect::<Vec<_>>()
+                })
+            };
+            let survivor = snapshot(&conn, "s1");
+            assert!(
+                survivor.iter().all(|rows| rows.len() == 1),
+                "survivor row counts: {:?}",
+                survivor.each_ref().map(Vec::len)
+            );
+            assert!(snapshot(&conn, "c").iter().all(|rows| rows.len() == 1));
+
+            if incomplete_codex {
+                let mut deep = codex_dir.clone();
+                for _ in 0..MAX_DIR_DEPTH {
+                    deep = deep.join("nested");
+                }
+                fs::create_dir_all(&deep).unwrap();
+                fs::rename(codex_dir.join("2026/04/27/s1.jsonl"), deep.join("s1.jsonl")).unwrap();
+                // Keep the observed file count equal even when the original
+                // Codex file is hidden below the enumeration depth limit.
+                fs::write(codex_dir.join("empty.jsonl"), "").unwrap();
+            }
+            fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+            let fresh = claude_dir.join("fresh.jsonl");
+            fs::write(&fresh, replacement).unwrap();
+            let opts = IndexOptions {
+                force: false,
+                claude_dir: &claude_dir,
+                codex_dir: &codex_dir,
+            };
+            assert_eq!(collect_sources(&opts).sources.len(), 2);
+
+            for _ in 0..2 {
+                let permissions = fs::metadata(&fresh).unwrap().permissions();
+                if unreadable {
+                    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                // Model absence must not retain genuinely deleted embedded
+                // sessions when no parsed replacement identifies their ID.
+                let stats = index_from_dirs(&mut conn, &opts, false);
+                fs::set_permissions(&fresh, permissions).unwrap();
+                let stats = stats.unwrap();
+                assert_eq!(stats.indexed, 0);
+                assert_eq!(stats.parse_errors, usize::from(unreadable));
+                assert_eq!(
+                    stats.total_sessions, 1,
+                    "exactly the Claude orphan is deleted"
+                );
+                assert_eq!(snapshot(&conn, "s1"), survivor);
+                assert!(snapshot(&conn, "c").iter().all(Vec::is_empty));
+                for table in ["messages", "qa_chunks", "vec_chunks", "session_files"] {
+                    let count: i64 = conn
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(count, 1, "only the survivor's data remains in {table}");
+                }
+                assert_eq!(stats.skipped_roots.len(), usize::from(incomplete_codex));
+                if incomplete_codex {
+                    let skipped = &stats.skipped_roots[0];
+                    assert_eq!(skipped.source, Source::Codex);
+                    assert_eq!(skipped.reason, SkippedReason::IncompleteEnumeration);
+                    assert_eq!(skipped.preserved_sessions, 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn complete_scan_preserves_sessions_with_unknown_source() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "unknown");
+    conn.execute("UPDATE sessions SET source = 'unknown'", [])
+        .unwrap();
+    let root = TempDir::new().unwrap();
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: root.path(),
+            codex_dir: root.path(),
+        },
+        true,
+    )
+    .unwrap();
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["unknown"]
+    );
+}
+
 // #177: `rebuild` (force) with a missing source root must not destroy that
 // root's index. The force path used to bulk-delete every table before re-scan,
 // so a transient root outage wiped the preserved root's sessions and their
@@ -1556,90 +1687,100 @@ fn test_session_id_collision_cleans_old_messages() {
 
 #[test]
 fn model_absent_session_id_collision_preserves_data_until_embedding_is_available() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-    let claude_dir = tmp.path().join("claude");
-    let dir_a = claude_dir.join("a");
-    let dir_b = claude_dir.join("b");
-    fs::create_dir_all(&dir_a).unwrap();
-    fs::create_dir_all(&dir_b).unwrap();
-    let original = dir_a.join("collision.jsonl");
-    fs::write(
-        &original,
-        r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    let codex_dir = tmp.path().join("codex");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-    };
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
-    let embedder = MockEmbedder::new();
-    assert_eq!(
-        embed_recent_chunks(&mut conn, &embedder, 8192, None)
-            .unwrap()
-            .embedded,
-        1
-    );
+    for remove_original in [false, true] {
+        let (_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude");
+        let dir_a = claude_dir.join("a");
+        let dir_b = claude_dir.join("b");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+        let original = dir_a.join("collision.jsonl");
+        fs::write(
+            &original,
+            r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let codex_dir = tmp.path().join("codex");
+        let opts = IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+        let embedder = MockEmbedder::new();
+        assert_eq!(
+            embed_recent_chunks(&mut conn, &embedder, 8192, None)
+                .unwrap()
+                .embedded,
+            1
+        );
 
-    // Include rowids/ranges and embedding bytes: equal counts alone would miss
-    // replacing the body while leaving stale chunks or vectors behind.
-    let snapshot = |conn: &Connection| {
-        [
-            "SELECT json_array(session_id, file_path, mtime, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
-            "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
-            "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
-            "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
-        ]
-        .map(|sql| collect_strings(conn, sql))
-    };
-    let before = snapshot(&conn);
-    let replacement = dir_b.join("collision.jsonl");
-    fs::write(
-        &replacement,
-        r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
-    )
-    .unwrap();
+        // Include rowids/ranges and embedding bytes: equal counts alone would miss
+        // replacing the body while leaving stale chunks or vectors behind.
+        let snapshot = |conn: &Connection| {
+            [
+                "SELECT json_array(session_id, file_path, mtime, file_size, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
+                "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
+                "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
+                "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
+                "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
+            ]
+            .map(|sql| collect_strings(conn, sql))
+        };
+        seed_session_file(&conn, "collision", "/proj/original.rs");
+        let before = snapshot(&conn);
+        let replacement = dir_b.join("collision.jsonl");
+        fs::write(
+            &replacement,
+            r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
+        )
+        .unwrap();
 
-    // Both paths remain in the scanned root, so orphan cleanup cannot explain
-    // loss of the original session. No mtime changes or sleeps are required.
-    assert!(original.is_file());
-    let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-    assert_eq!(stats.indexed, 0);
-    assert_eq!(stats.preserved_embedded, 1);
-    assert_eq!(stats.total_sessions, 1);
-    assert_eq!(stats.parse_errors, 0);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
-    assert_eq!(snapshot(&conn), before);
+        // Exercise both a collision with the old file still present and a move.
+        // Cleanup must honor the deferred update across repeated runs. No mtime
+        // changes or sleeps are required.
+        assert!(original.is_file());
+        if remove_original {
+            fs::remove_file(&original).unwrap();
+        }
+        for _ in 0..2 {
+            let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+            assert_eq!(stats.indexed, 0);
+            assert_eq!(stats.preserved_embedded, 1);
+            assert_eq!(stats.total_sessions, 1);
+            assert_eq!(stats.parse_errors, 0);
+            assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
+            assert_eq!(snapshot(&conn), before);
+        }
 
-    // Once embedding is available, the same pending replacement must proceed
-    // and remove the old vectors/chunks before generating the new content.
-    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.preserved_embedded, 0);
-    assert_eq!(stats.total_sessions, 1);
-    assert_eq!(
-        collect_strings(&conn, "SELECT file_path FROM sessions"),
-        [replacement.to_str().unwrap()]
-    );
-    assert_eq!(
-        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-        ["replacement question"]
-    );
-    for table in ["qa_chunks", "vec_chunks"] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "old {table} must be removed on replacement");
+        // Once embedding is available, the same pending replacement must proceed
+        // and remove the old vectors/chunks before generating the new content.
+        let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(stats.preserved_embedded, 0);
+        assert_eq!(stats.total_sessions, 1);
+        assert_eq!(
+            collect_strings(&conn, "SELECT file_path FROM sessions"),
+            [replacement.to_str().unwrap()]
+        );
+        assert_eq!(
+            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+            ["replacement question"]
+        );
+        for table in ["qa_chunks", "vec_chunks", "session_files"] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "old {table} must be removed on replacement");
+        }
+        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+        assert_eq!(
+            collect_strings(&conn, "SELECT content FROM qa_chunks"),
+            ["replacement question"]
+        );
     }
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
-    assert_eq!(
-        collect_strings(&conn, "SELECT content FROM qa_chunks"),
-        ["replacement question"]
-    );
 }
 
 #[test]

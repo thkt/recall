@@ -98,9 +98,11 @@ recall index            # parse, chunk, and embed new session logs (incremental)
 recall rebuild          # re-parse and re-embed every present session; missing roots keep their rows
 ```
 
+After fully enumerating a source tree, `index` and `rebuild` remove from the index any sessions whose file paths are absent from that tree, together with their messages, chunks, embeddings, and edited-file records. This also applies when a deleted log is replaced by an empty or unparseable log at a different path and the file count stays the same. A missing root, directory or entry read failure, or depth limit prevents orphan cleanup for that source; sessions with an unknown source are also retained.
+
 Chunk generation records completion even for zero Q&A pairs, so unchanged sessions need no further body retrieval or chunking. Re-parsing a changed session clears completion. Chunks and completion commit together; failures or interruptions leave the pass pending. Upgrades preserve existing chunks and embeddings and process previously empty sessions once.
 
-When embedding is unavailable, updates to embedded sessions wait until it is available again. Their stored content, chunks and embeddings are preserved, including when a different file path uses the same session ID.
+When embedding is unavailable, updates to embedded sessions wait until it is available again. Their stored content, chunks, embeddings, and edited-file records are preserved, including when a parsed replacement containing messages at a different path uses the same session ID and the old file has been deleted. Such deferred updates are excluded from orphan cleanup for that run; deleted logs without such a replacement remain subject to the cleanup rules above.
 
 Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
 
