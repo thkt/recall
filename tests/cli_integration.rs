@@ -440,6 +440,21 @@ fn index_json_emits_structured_embed_summary() {
         serde_json::json!(0),
         "an empty index has no embed failures, got: {stdout}"
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for stage in [
+        "model_load_probe",
+        "enumeration",
+        "fts_transaction",
+        "chunking",
+        "pending_extraction",
+    ] {
+        assert!(
+            stderr.contains(&format!("index: {stage}: started")),
+            "{stderr}"
+        );
+    }
+    assert!(v["data"]["observations"]["seconds"]["total"].is_number());
+    assert_eq!(v["data"]["observations"]["counts"]["files_discovered"], 0);
 }
 
 // T-CLI027: `rebuild --json` mirrors the index envelope contract through the

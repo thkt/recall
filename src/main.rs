@@ -7,6 +7,7 @@ mod embedder;
 mod envelope;
 mod error;
 mod hybrid;
+mod index_observer;
 mod indexer;
 mod output;
 mod parser;
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use amici::cli::exit_code::codes;
-use amici::cli::{Spinner, done, exit_error, info as cli_info, try_expand_shorthand, warning};
+use amici::cli::{done, exit_error, info as cli_info, try_expand_shorthand, warning};
 use amici::logging::init_subscriber;
 use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
 use amici::model::{
@@ -461,6 +462,7 @@ struct IndexOutcome {
     /// silently rebuilt-then-degraded.
     preserved_embedded: usize,
     parse_diagnostics: Vec<indexer::FileParseDiagnostics>,
+    observations: serde_json::Value,
 }
 
 /// Cap on the `first_error` portion of the embed-stop note (chars, not bytes, so
@@ -536,6 +538,7 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         })
         .collect();
     let data = serde_json::json!({
+        "observations": outcome.observations,
         "parse_diagnostics": parse_diagnostics,
         "embedded": outcome.embedded,
         "failed_count": outcome.failed_count,
@@ -585,8 +588,30 @@ fn index_and_report_with_options<F>(
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
+    index_and_report_observed(
+        db_path,
+        opts,
+        load_embedder,
+        embed_options,
+        &index_observer::Observer::stderr(),
+    )
+}
+
+fn index_and_report_observed<F>(
+    db_path: &Option<PathBuf>,
+    opts: &indexer::IndexOptions,
+    load_embedder: F,
+    embed_options: embedder::EmbedOptions,
+    observer: &index_observer::Observer,
+) -> Result<IndexOutcome>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    let pipeline = observer.stage("total");
     let path = resolve_db_path(db_path)?;
+    let opening = observer.stage("database_open");
     let mut conn = open_or_create_db(&path)?;
+    opening.finish("complete");
 
     // Load the embedder once, up front: its presence gates whether indexing
     // preserves embedded sessions (model absent) or re-indexes them (model
@@ -604,6 +629,7 @@ where
     // before collapsing to the coarse reason (amici ADR-0009 house rule). The probe
     // input is a non-degenerate string; an empty one would make pooling reject a
     // healthy model's all-zero mask.
+    let loading = observer.stage("model_load_probe");
     let load_result = load_embedder().and_then(|embedder| {
         embedder
             .embed_document("probe")
@@ -614,9 +640,14 @@ where
             ))
     });
     let embed_capable = load_result.is_ok();
+    loading.finish(if embed_capable {
+        "ready"
+    } else {
+        "unavailable; embedding deferred"
+    });
 
-    let sp = Spinner::new("Indexing sessions...");
-    let stats = indexer::index_from_dirs(&mut conn, opts, embed_capable)?;
+    let stats = indexer::index_from_dirs_observed(&mut conn, opts, embed_capable, observer)?;
+    observer.count("sessions_stored", stats.total_sessions);
     let main_msg = if stats.indexed > 0 {
         format!(
             "Indexed {} sessions in {:.1}s",
@@ -631,7 +662,7 @@ where
     } else {
         format!("{} sessions up to date", stats.total_sessions)
     };
-    sp.finish(&main_msg);
+    done(&main_msg);
     for skipped in &stats.skipped_roots {
         warning(
             &skipped
@@ -641,11 +672,8 @@ where
     }
     let skipped_roots = stats.skipped_roots;
 
-    let sp = Spinner::new("Creating chunks...");
-    let on_progress = |done: usize, total: usize| {
-        sp.set_message(&format!("Creating chunks... {done}/{total} sessions"));
-    };
-    let chunk_stats = indexer::index_chunks(&mut conn, Some(&on_progress))?;
+    let chunk_stats = indexer::index_chunks_observed(&mut conn, None, observer)?;
+    let backfill = observer.stage("legacy_backfill");
     // Link pre-#192 chunks to their source message rowid range; see
     // `backfill_rowid_ranges` for the no-op-once-linked and count-mismatch behavior.
     let backfilled = indexer::backfill_rowid_ranges(&mut conn)?;
@@ -660,7 +688,7 @@ where
     // a large legacy set, so it reports per-session progress instead of leaving
     // the chunk spinner text stale (long index passes read as hangs otherwise).
     let on_backfill_progress = |done: usize, total: usize| {
-        sp.set_message(&format!("Recording file paths... {done}/{total} sessions"));
+        backfill.progress(done.saturating_sub(1), total, 0);
     };
     let scanned_backfilled =
         indexer::backfill_session_files(&mut conn, Some(&on_backfill_progress))?;
@@ -678,10 +706,11 @@ where
             "recorded scanned files for legacy sessions"
         );
     }
+    backfill.finish("committed");
     if chunk_stats.chunks_created > 0 {
-        sp.finish(&format!("Created {} chunks", chunk_stats.chunks_created));
+        done(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
-        sp.finish("Chunks up to date");
+        done("Chunks up to date");
     }
 
     // #221: a force rebuild is the full, destructive repair path, so self-heal any
@@ -700,9 +729,29 @@ where
     // (FR-004a/004b). The model-absent run also preserved any embedded sessions it
     // would otherwise have re-indexed (#215); that count rides along either arm.
     let preserved_embedded = stats.preserved_embedded;
-    match load_result {
+    let extraction = observer.stage("pending_extraction");
+    let pending = if embed_capable {
+        embedder::pending_chunks(&conn, usize::MAX)?
+    } else {
+        Vec::new()
+    };
+    let pending_total = if embed_capable {
+        pending.len()
+    } else {
+        embedder::pending_count(&conn)?
+    };
+    extraction.finish("complete");
+    let outcome: Result<IndexOutcome> = match load_result {
         Ok(embedder) => {
-            let result = embed_all_pending(&mut conn, embedder.as_ref(), &embed_options)?;
+            let result = embedder::embed_chunks_observed(
+                &mut conn,
+                embedder.as_ref(),
+                &pending,
+                None,
+                &embed_options,
+                observer,
+            )?;
+            result.warn_if_batches_failed();
             Ok(IndexOutcome {
                 degraded_note: None,
                 embedded: result.embedded,
@@ -711,16 +760,24 @@ where
                 skipped_roots,
                 preserved_embedded,
                 parse_diagnostics,
+                observations: serde_json::Value::Null,
             })
         }
-        Err(reason) => Ok(IndexOutcome {
-            degraded_note: search_degraded_note(reason),
-            skipped_roots,
-            preserved_embedded,
-            parse_diagnostics,
-            ..IndexOutcome::default()
-        }),
-    }
+        Err(reason) => {
+            observer.start_embedding(pending_total);
+            Ok(IndexOutcome {
+                degraded_note: search_degraded_note(reason),
+                skipped_roots,
+                preserved_embedded,
+                parse_diagnostics,
+                ..IndexOutcome::default()
+            })
+        }
+    };
+    pipeline.finish("complete; see counts for deferred or failed work");
+    let mut outcome: IndexOutcome = outcome?;
+    outcome.observations = observer.snapshot();
+    Ok(outcome)
 }
 
 /// Embed every chunk absent from `vec_chunks`. Incremental by the one-pass
@@ -729,6 +786,7 @@ where
 /// one and replaces its chunks, leaving them pending. The pending list is
 /// collected once and fed straight to
 /// `embed_chunks` — a separate COUNT would re-scan vec_chunks (#138).
+#[cfg(test)]
 fn embed_all_pending(
     conn: &mut Connection,
     embedder: &dyn Embed,
@@ -738,15 +796,7 @@ fn embed_all_pending(
     if pending.is_empty() {
         return Ok(embedder::EmbedResult::default());
     }
-    let sp = Spinner::new("Embedding chunks...");
-    let result = embedder::embed_chunks(
-        conn,
-        embedder,
-        &pending,
-        Some(&|done, total| sp.set_message(&format!("Embedding chunks... {done}/{total}"))),
-        options,
-    )?;
-    sp.finish(&format!("Embedded {} chunks", result.embedded));
+    let result = embedder::embed_chunks(conn, embedder, &pending, None, options)?;
     // A mid-run batch failure is non-fatal: chunks already embedded are committed,
     // the rest stay pending, and the parsed FTS content stays queryable. The next
     // `recall index` retries the remaining pending via the pending gate, so we
@@ -3703,7 +3753,7 @@ mod tests {
         );
         let err = result.first_error.as_deref().unwrap_or_default();
         assert!(
-            err.contains("poison text"),
+            err == "batch inference failed",
             "the first batch error is carried up for the --json note, got: {err:?}"
         );
         assert_eq!(
@@ -3765,25 +3815,34 @@ mod tests {
     // T-005: index フラグが EmbedOptions として forward される
     // given: --token-budget 2048 --forward-pause-ms 700 と options を捕捉する
     //        MockEmbedder
-    // when: embed_all_pending が embed_chunks を呼ぶ
+    // when: 本番の index 経路が入力会話から pending を作り埋め込む
     // then: EmbedOptions{token_budget:Some(2048), forward_pause:Some(700ms)} が
     //       forward される
     #[test]
-    fn embed_all_pending_forwards_index_flags_as_embed_options() {
+    fn index_and_report_forwards_index_flags_as_embed_options() {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 1, "pending content");
+        let claude_dir = db_dir.path().join("claude");
+        let codex_dir = db_dir.path().join("codex");
+        seed_claude_source(&claude_dir);
+        fs::create_dir(&codex_dir).unwrap();
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
 
-        let embedder = embedder::MockEmbedder::capturing_options();
+        let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
         let options = embedder::EmbedOptions {
             token_budget: Some(2048),
             forward_pause: Some(Duration::from_millis(700)),
         };
 
-        embed_all_pending(&mut conn, &embedder, &options).unwrap();
+        let result =
+            index_and_report_with_options(&Some(db_path), &opts, || Ok(embedder.clone()), options)
+                .unwrap();
 
+        assert_eq!(result.embedded, 1);
         assert_eq!(
             embedder.captured_options(),
             Some(options),
@@ -3798,17 +3857,22 @@ mod tests {
     // when: index を実行
     // then: EmbedOptions default（None/None）が forward される
     #[test]
-    fn embed_all_pending_forwards_default_embed_options_when_flags_unset() {
+    fn index_and_report_forwards_default_embed_options_when_flags_unset() {
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 1, "pending content");
+        let claude_dir = db_dir.path().join("claude");
+        let codex_dir = db_dir.path().join("codex");
+        seed_claude_source(&claude_dir);
+        fs::create_dir(&codex_dir).unwrap();
+        let opts = indexer::IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
 
-        let embedder = embedder::MockEmbedder::capturing_options();
+        let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
 
-        let result =
-            embed_all_pending(&mut conn, &embedder, &embedder::EmbedOptions::default()).unwrap();
+        let result = index_and_report_with(&Some(db_path), &opts, || Ok(embedder.clone())).unwrap();
 
         assert_eq!(
             result.embedded, 1,
@@ -5490,6 +5554,19 @@ mod tests {
             outcome.is_ok(),
             "a model-less index must complete FTS and exit 0, not abort"
         );
+        let outcome = outcome.unwrap();
+        let counts = &outcome.observations["counts"];
+        assert_eq!(counts["chunks_pending_snapshot"], 1);
+        assert_eq!(counts["chunks_unattempted"], 1);
+        assert_eq!(counts["chunks_remaining_snapshot"], 1);
+        for key in [
+            "chunks_saved",
+            "chunks_failed",
+            "chunks_stale",
+            "chunks_save_failed",
+        ] {
+            assert_eq!(counts[key], 0);
+        }
 
         let conn = open_or_create_db(&db_path).unwrap();
         let search_opts = search::SearchOptions::default();
@@ -6185,6 +6262,7 @@ mod tests {
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         }
     }
 
@@ -6199,6 +6277,7 @@ mod tests {
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         }
     }
 
@@ -6213,6 +6292,7 @@ mod tests {
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         }
     }
 
@@ -6394,6 +6474,7 @@ mod tests {
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         };
 
         let out = index_command_output(&outcome);
@@ -6436,6 +6517,7 @@ mod tests {
             }],
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         };
 
         let out = index_command_output(&outcome);
@@ -6489,6 +6571,7 @@ mod tests {
             }],
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         };
 
         let out = index_command_output(&outcome);
@@ -6850,6 +6933,7 @@ mod tests {
             }],
             preserved_embedded: 0,
             parse_diagnostics: Vec::new(),
+            observations: serde_json::Value::Null,
         };
 
         let out = index_command_output(&outcome);
@@ -6859,6 +6943,7 @@ mod tests {
             [
                 "embedded",
                 "failed_count",
+                "observations",
                 "parse_diagnostics",
                 "preserved_embedded",
                 "skipped_roots"

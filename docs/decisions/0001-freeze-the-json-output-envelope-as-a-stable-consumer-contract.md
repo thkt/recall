@@ -76,6 +76,12 @@ Internal persistence and cleanup distinguish the original path bytes, including 
 
 Repository consumers are the CLI output builder and its unit/integration contract tests. The payload-key golden includes `parse_diagnostics`; the real CLI test checks the outer key set and the populated diagnostic shape. External consumers must accept this additional data field; no external consumer execution is claimed here.
 
+### Index observations
+
+[Issue #324](https://github.com/thkt/recall/issues/324) requires stage timings and unambiguous progress/save counts. The additive `data.observations` object contains `seconds` and `counts`, maps from fixed diagnostic names to numeric values. The outer envelope and existing data fields retain their keys and meanings. Human progress remains on stderr for both TTY and non-TTY output; stdout remains one success envelope. No source strings enter observations. See the [field definitions](../index-observability.md) for overlapping timers, count units, omitted stages, and snapshot limits. Error exits retain the existing error envelope and place available partial observations on stderr, not success stdout. Existing payload-key and real CLI contract tests cover this extension; external consumers have not been executed.
+
+Embedding inference failures now retain a generic diagnostic rather than model error text, since backend errors can echo input. Failure counts, retry behavior, and existing note keys are unchanged; detailed backend error wording is no longer exposed by the batch failure path.
+
 ### Reassessment Triggers
 
 - A v2 JSON schema is introduced (then version the envelope explicitly)

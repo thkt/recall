@@ -120,6 +120,8 @@ embedding にはモデルが必要です。`recall model download`（約1.2GB）
 mkdir -p ~/.local/share/recall && mv ~/.recall.db ~/.local/share/recall/recall.db
 ```
 
+indexとrebuildは、モデルロード/probe、未処理抽出を含む段階の開始をTTY・非TTYともstderrへ表示します。transaction途中の処理件数とcommit済み件数を区別し、埋め込みは保存済み・推論失敗・保存失敗・競合による破棄・未試行を確認できます。`--json` は外側のenvelopeを維持し、`data.observations` に時間と件数を追加します。埋め込み残数は抽出時の集合に対する値で、現在のDB全体を再走査した総数ではありません。[計測の定義とホストでの4ケース比較手順](docs/index-observability.md)に、時間の重複、空完了、中断、比較条件を記載しています。
+
 ### モデル
 
 ```sh
