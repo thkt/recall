@@ -113,7 +113,7 @@ enum IndexOutcome {
     Unchanged,
     /// A re-index was due, but the session already has embeddings and the model
     /// is absent this run, so its rows were left untouched to protect them (#215).
-    Preserved,
+    Preserved(String),
     ParseError(String),
 }
 
@@ -325,7 +325,7 @@ fn index_file_with_parser(
         && let Some(entry) = ctx.existing.get(&fpath_str)
         && embedded.contains(&entry.session_id)
     {
-        return Ok(IndexOutcome::Preserved);
+        return Ok(IndexOutcome::Preserved(entry.session_id.clone()));
     }
 
     let mut parsed = match parse(fpath, *source) {
@@ -358,7 +358,7 @@ fn index_file_with_parser(
     if let Some(embedded) = &ctx.embedded_sessions
         && embedded.contains(&parsed.metadata.session_id)
     {
-        return Ok(IndexOutcome::Preserved);
+        return Ok(IndexOutcome::Preserved(parsed.metadata.session_id));
     }
 
     // Use exact pre/post metadata equality here, not the freshness epsilon.
@@ -440,6 +440,9 @@ struct IndexTotals {
     parse_errors: usize,
     first_error: Option<String>,
     preserved_embedded: usize,
+    /// IDs whose updates were deferred this run, including replacements at a
+    /// new path. Cleanup must not undo the ingestion decision to preserve them.
+    preserved_sessions: HashSet<String>,
 }
 
 fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexTotals> {
@@ -447,12 +450,16 @@ fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexT
     let mut parse_errors = 0;
     let mut first_error = None;
     let mut preserved_embedded = 0;
+    let mut preserved_sessions = HashSet::new();
 
     for (fpath, source) in sources {
         match index_file(ctx, fpath, source)? {
             IndexOutcome::Indexed => indexed += 1,
             IndexOutcome::Unchanged => {}
-            IndexOutcome::Preserved => preserved_embedded += 1,
+            IndexOutcome::Preserved(session_id) => {
+                preserved_embedded += 1;
+                preserved_sessions.insert(session_id);
+            }
             IndexOutcome::ParseError(msg) => {
                 parse_errors += 1;
                 if first_error.is_none() {
@@ -467,6 +474,7 @@ fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexT
         parse_errors,
         first_error,
         preserved_embedded,
+        preserved_sessions,
     })
 }
 
@@ -514,6 +522,7 @@ pub(crate) fn index_from_dirs(
     };
     let scan = collect_sources(opts);
     let sources = &scan.sources;
+    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
 
     info!(count = sources.len(), "Found source files");
 
@@ -530,7 +539,13 @@ pub(crate) fn index_from_dirs(
         embedded_sessions,
     };
     let totals = index_all(&ctx, sources)?;
-    cleanup_orphans(&tx, &existing, sources, &scan.scanned, totals.indexed)?;
+    cleanup_orphans(
+        &tx,
+        &existing,
+        &source_paths,
+        &scan.scanned,
+        &totals.preserved_sessions,
+    )?;
     tx.commit().context("Failed to commit transaction")?;
 
     finalize_fts(conn, totals.indexed, opts.force)?;
@@ -546,7 +561,7 @@ pub(crate) fn index_from_dirs(
         first_error: totals.first_error,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
-        skipped_roots: summarize_skipped_roots(&existing, sources, &scan.skipped),
+        skipped_roots: summarize_skipped_roots(&existing, &source_paths, &scan.skipped),
         preserved_embedded: totals.preserved_embedded,
     })
 }
@@ -581,7 +596,7 @@ fn embedded_session_ids(conn: &Connection) -> Result<HashSet<String>> {
 
 /// Counts, per source whose root was not scanned this run, how many existing
 /// sessions were preserved from orphan cleanup. Only rows whose file is absent
-/// from `sources` are counted — mirroring the deletion condition in
+/// from `source_paths` are counted — mirroring the deletion condition in
 /// `cleanup_orphans` — so a partially-failed scan that re-indexed some files of
 /// the source does not over-report the at-risk magnitude. A `MissingRoot` with
 /// zero preserved rows is omitted so a user who simply never used one tool sees
@@ -591,10 +606,9 @@ fn embedded_session_ids(conn: &Connection) -> Result<HashSet<String>> {
 /// consistent with cleanup_orphans preserving them unconditionally.
 fn summarize_skipped_roots(
     existing: &HashMap<String, SessionEntry>,
-    sources: &[(PathBuf, Source)],
+    source_paths: &HashSet<&Path>,
     skipped: &HashMap<Source, SkippedReason>,
 ) -> Vec<SkippedRoot> {
-    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
     [Source::Claude, Source::Codex]
         .into_iter()
         .filter_map(|source| {
@@ -654,21 +668,22 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEn
 fn cleanup_orphans(
     tx: &Transaction,
     existing: &HashMap<String, SessionEntry>,
-    sources: &[(PathBuf, Source)],
+    source_paths: &HashSet<&Path>,
     scanned: &HashSet<Source>,
-    indexed: usize,
+    preserved_sessions: &HashSet<String>,
 ) -> Result<()> {
-    if existing.is_empty() || (indexed == 0 && sources.len() == existing.len()) {
+    if existing.is_empty() {
         return Ok(());
     }
-    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
+    // Equal file counts do not prove equal paths: a replacement may be empty
+    // or fail parsing, leaving the indexed count at zero despite a deletion.
     for (fp, entry) in existing {
         // Only a successfully scanned root proves its files were deleted. A row
         // whose source root was missing or unreadable this run is preserved, not
         // treated as orphaned — otherwise a transient root outage wipes the index
         // (#165). A `None` source (unrecognized DB value) is likewise preserved.
         let scanned_here = entry.source.is_some_and(|s| scanned.contains(&s));
-        if !scanned_here {
+        if !scanned_here || preserved_sessions.contains(&entry.session_id) {
             continue;
         }
         if !source_paths.contains(Path::new(fp.as_str())) {
