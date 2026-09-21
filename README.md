@@ -185,7 +185,7 @@ Add to `~/.claude/settings.json`:
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file but re-parses only those modified since they were last indexed.
+**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file and skips the body only when its stored size matches and its mtime differs by less than 1 ms. Size changes trigger a re-parse even when mtime is preserved. If metadata changes during parsing, the next index run retries the file. Older indexes without stored sizes are re-read once; embedded sessions remain pending while embedding is unavailable. Same-size replacements with mtime unchanged (or differing by less than 1 ms) are not detected; use `recall rebuild` with a working model to refresh them. Files are not fully hashed for freshness.
 
 **Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
 
@@ -199,7 +199,7 @@ Add to `~/.claude/settings.json`:
 src/
 ├── main.rs       CLI subcommands (index, search, show, status)
 ├── parser/       JSONL parsers for Claude Code and Codex formats
-├── indexer.rs    Incremental indexer with mtime tracking + chunk generation
+├── indexer.rs    Incremental indexer with mtime/size tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
 ├── embedder.rs   Index-time embedding orchestration (batches chunks via rurico)

@@ -275,6 +275,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             slug TEXT,
             timestamp INTEGER,
             mtime REAL,
+            file_size INTEGER,
             session_type TEXT,
             files_scanned INTEGER,
             chunks_indexed INTEGER
@@ -287,6 +288,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     migrate_qa_chunk_rowid_link_if_needed(conn)?;
     migrate_session_type_if_needed(conn)?;
     migrate_files_scanned_if_needed(conn)?;
+    migrate_file_size_if_needed(conn)?;
 
     // embedded_chunk_ids (a removed ledger) was dropped inside two separate
     // migrations; collapse those into one unconditional drop so every pre-cleanup
@@ -344,6 +346,18 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     migrate_chunks_indexed_if_needed(conn)?;
 
+    Ok(())
+}
+
+/// NULL means the stored body has no known size, so it must be re-read before
+/// freshness can skip it. Do not backfill from today's file metadata: that could
+/// acknowledge an append that the legacy body never included.
+fn migrate_file_size_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !table_def(&tx, "sessions")?.is_some_and(|sql| sql.contains("file_size")) {
+        tx.execute_batch("ALTER TABLE sessions ADD COLUMN file_size INTEGER;")?;
+    }
+    tx.commit()?;
     Ok(())
 }
 

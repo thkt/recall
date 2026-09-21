@@ -5,7 +5,7 @@ use std::fs::{self, DirEntry};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
@@ -15,6 +15,7 @@ use crate::chunker;
 use crate::classify::classify_first_turn;
 use crate::parser::{
     Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session,
+    parse_session_including_empty,
 };
 
 struct SessionEntry {
@@ -23,6 +24,7 @@ struct SessionEntry {
     /// preserved by orphan cleanup since its origin root can't be confirmed scanned.
     source: Option<Source>,
     mtime: Option<f64>,
+    file_size: Option<u64>,
 }
 
 pub struct IndexStats {
@@ -135,36 +137,29 @@ pub(crate) struct IndexOptions<'a> {
     pub codex_dir: &'a Path,
 }
 
-enum Mtime {
-    Value(f64),
-    /// File exists but mtime unavailable — index without freshness check.
-    Unknown,
-    /// File cannot be stat'd — skip entirely.
-    Inaccessible,
+/// Metadata observed before parsing. A changed post-read stamp must never be
+/// saved as if it described the bytes just parsed (#321).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    mtime: Option<SystemTime>,
+    size: u64,
 }
 
-fn resolve_mtime(fpath: &Path) -> Mtime {
-    let meta = match fs::metadata(fpath) {
-        Ok(m) => m,
-        Err(_) => {
-            debug!(path = %fpath.display(), "cannot stat");
-            return Mtime::Inaccessible;
-        }
-    };
-    let mtime = match meta.modified() {
-        Ok(t) => t,
-        Err(e) => {
-            debug!(path = %fpath.display(), error = %e, "mtime unavailable");
-            return Mtime::Unknown;
-        }
-    };
-    match mtime.duration_since(UNIX_EPOCH) {
-        Ok(d) => Mtime::Value(d.as_secs_f64()),
-        Err(e) => {
-            debug!(path = %fpath.display(), error = %e, "mtime before epoch");
-            Mtime::Unknown
-        }
+impl FileStamp {
+    fn mtime_secs(self) -> Option<f64> {
+        self.mtime?
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs_f64())
     }
+}
+
+fn resolve_file_stamp(fpath: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(fpath).ok()?;
+    Some(FileStamp {
+        mtime: meta.modified().ok(),
+        size: meta.len(),
+    })
 }
 
 /// Delete all dependent data for a session (messages, chunks, embeddings, and
@@ -201,7 +196,7 @@ fn insert_session_files(tx: &Transaction, session_id: &str, paths: &[String]) ->
 fn upsert_session(
     ctx: &IndexContext,
     fpath_str: &str,
-    mtime: Option<f64>,
+    stamp: Option<FileStamp>,
     parsed: &ParseResult,
 ) -> Result<()> {
     let cached = ctx.existing.get(fpath_str);
@@ -241,7 +236,7 @@ fn upsert_session(
     // distinct from NULL (never recorded). Set on every upsert, so the re-parse
     // path — where the DELETE FROM sessions above drops the marker — re-raises it.
     ctx.tx.execute(
-        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned, file_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             parsed.metadata.session_id,
             parsed.metadata.source.as_str(),
@@ -249,9 +244,10 @@ fn upsert_session(
             parsed.metadata.project,
             parsed.metadata.slug,
             parsed.metadata.timestamp,
-            mtime,
+            stamp.and_then(FileStamp::mtime_secs),
             session_type,
             1,
+            stamp.and_then(|s| i64::try_from(s.size).ok()),
         ],
     )?;
 
@@ -281,7 +277,7 @@ fn upsert_session(
     Ok(())
 }
 
-fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f64>)> {
+fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, FileStamp)> {
     let fpath_str = match fpath.to_str() {
         Some(s) => s.to_owned(),
         None => {
@@ -290,33 +286,39 @@ fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, Option<f
         }
     };
 
-    let mtime = match resolve_mtime(fpath) {
-        Mtime::Value(v) => Some(v),
-        Mtime::Unknown => None,
-        Mtime::Inaccessible => return None,
-    };
+    let stamp = resolve_file_stamp(fpath)?;
 
     // Epsilon 0.001s tolerates filesystem mtime rounding (HFS+ 1s, ext4 nano→f64).
     // Force bypasses the skip so a `rebuild` re-parses every present file even
     // when its mtime is unchanged.
     if !ctx.force
-        && let Some(new_mt) = mtime
+        && let Some(new_mt) = stamp.mtime_secs()
         && let Some(entry) = ctx.existing.get(&fpath_str)
         && let Some(old_mt) = entry.mtime
+        && entry.file_size == Some(stamp.size)
         && (old_mt - new_mt).abs() < 0.001
     {
         return None;
     }
 
-    Some((fpath_str, mtime))
+    Some((fpath_str, stamp))
 }
 
 fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<IndexOutcome> {
-    let Some((fpath_str, mtime)) = check_freshness(ctx, fpath) else {
+    index_file_with_parser(ctx, fpath, source, parse_session_including_empty)
+}
+
+fn index_file_with_parser(
+    ctx: &IndexContext,
+    fpath: &Path,
+    source: &Source,
+    parse: impl FnOnce(&Path, Source) -> Result<Option<ParseResult>>,
+) -> Result<IndexOutcome> {
+    let Some((fpath_str, before)) = check_freshness(ctx, fpath) else {
         return Ok(IndexOutcome::Unchanged);
     };
 
-    // Without embedding, preserve this path's stored session and mtime so a later
+    // Without embedding, preserve this path's stored session and stamp so a later
     // run can retry. Upsert would delete vectors we cannot regenerate. Check the
     // cached ID before parsing: the file may now resolve to a different ID.
     if let Some(embedded) = &ctx.embedded_sessions
@@ -326,7 +328,7 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         return Ok(IndexOutcome::Preserved);
     }
 
-    let parsed = match parse_session(fpath, *source) {
+    let mut parsed = match parse(fpath, *source) {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(IndexOutcome::Unchanged),
         Err(e) => {
@@ -338,6 +340,19 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         }
     };
 
+    if parsed.messages.is_empty() {
+        // A complete empty/metadata-only read can replace a known body. Keep
+        // its identity and stamp so subsequent unchanged runs skip parsing.
+        // Malformed input is not proof of an empty session; leave it pending.
+        let Some(entry) = ctx.existing.get(&fpath_str) else {
+            return Ok(IndexOutcome::Unchanged);
+        };
+        if parsed.skipped_lines > 0 {
+            return Ok(IndexOutcome::Unchanged);
+        }
+        parsed.metadata.session_id.clone_from(&entry.session_id);
+    }
+
     // A different path can resolve to an existing session_id. Upsert clears
     // dependents under that ID too, so protect it before any destructive write.
     if let Some(embedded) = &ctx.embedded_sessions
@@ -346,7 +361,11 @@ fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<Index
         return Ok(IndexOutcome::Preserved);
     }
 
-    upsert_session(ctx, &fpath_str, mtime, &parsed)?;
+    // Use exact pre/post metadata equality here, not the freshness epsilon.
+    // If a writer appended while parsing (even with restored mtime), NULL
+    // markers force a retry. Never acknowledge a post-read size for an old body.
+    let stable_stamp = (resolve_file_stamp(fpath) == Some(before)).then_some(before);
+    upsert_session(ctx, &fpath_str, stable_stamp, &parsed)?;
     Ok(IndexOutcome::Indexed)
 }
 
@@ -474,7 +493,7 @@ pub(crate) fn index_from_dirs(
 ) -> Result<IndexStats> {
     let start = Instant::now();
 
-    // Always full-scan: file-level mtime checks in check_freshness keep indexing
+    // Always full-scan: file-level mtime/size checks in check_freshness keep indexing
     // incremental. A directory-mtime skip optimization here used to miss new files
     // added to existing deep dirs (Codex Y/M/D, Claude subagents) — #52 / #70.
     //
@@ -605,24 +624,27 @@ fn summarize_skipped_roots(
 }
 
 fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEntry>> {
-    let mut stmt = conn.prepare("SELECT file_path, session_id, source, mtime FROM sessions")?;
+    let mut stmt =
+        conn.prepare("SELECT file_path, session_id, source, mtime, file_size FROM sessions")?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, String>(2)?,
             row.get::<_, Option<f64>>(3)?,
+            row.get::<_, Option<i64>>(4)?,
         ))
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (fp, sid, src, mt) = row?;
+        let (fp, sid, src, mt, size) = row?;
         map.insert(
             fp,
             SessionEntry {
                 session_id: sid,
                 source: Source::from_db(&src),
                 mtime: mt,
+                file_size: size.and_then(|size| u64::try_from(size).ok()),
             },
         );
     }
@@ -993,8 +1015,8 @@ pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     Ok(backfilled)
 }
 
-/// The single source→parser dispatch, shared by `index_file` and the backfill
-/// re-read so a new `Source` variant cannot update one site and miss the other.
+/// Nonempty-session parsing for path backfill. Ingestion separately retains
+/// empty reads so a known session can acknowledge a truncation.
 fn parse_session(fpath: &Path, source: Source) -> Result<Option<ParseResult>> {
     match source {
         Source::Claude => parse_claude_session(fpath),
@@ -1036,9 +1058,9 @@ fn reread_scanned_files(fpath: &Path, source: &str) -> RereadOutcome {
 }
 
 /// Fill `session_files` for legacy sessions indexed before the feature existed.
-/// Such a session has `files_scanned` NULL and no `session_files` rows; its JSONL
-/// mtime is unchanged, so `index_file`'s freshness check skips a re-parse and
-/// `upsert_session` never runs — only this pass can record its write-target paths.
+/// A session still marked `files_scanned` NULL after indexing (for example, an
+/// embedded session preserved while the model is unavailable) needs this pass
+/// to record write-target paths without replacing its body or embeddings.
 /// Each unmarked session's JSONL is re-read for path extraction only, so messages
 /// / qa_chunks / vec_chunks are untouched. The `session_files` inserts and the
 /// `files_scanned` raise happen in ONE transaction, so an interruption never

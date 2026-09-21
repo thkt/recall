@@ -180,6 +180,278 @@ fn test_index_from_dirs_reindexes_appended_file() {
     );
 }
 
+// Synthetic records only; no private session fixtures (#321).
+const FRESHNESS_QUESTION: &str = concat!(
+    r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"original question"}}"#,
+    "\n",
+);
+const FRESHNESS_ANSWER: &str = concat!(
+    r#"{"type":"assistant","message":{"role":"assistant","content":"appended answer"}}"#,
+    "\n",
+);
+
+fn rewrite_with_mtime(path: &Path, body: &str, mtime: SystemTime) {
+    fs::write(path, body).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+#[test]
+fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
+    for (source, question, answer, metadata) in [
+        (
+            Source::Claude,
+            FRESHNESS_QUESTION,
+            FRESHNESS_ANSWER,
+            r#"{"type":"system","cwd":"/proj"}"#,
+        ),
+        (
+            Source::Codex,
+            "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"original question\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"role\":\"assistant\",\"content\":\"appended answer\"}}\n",
+            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#,
+        ),
+    ] {
+        for offset in [Duration::ZERO, Duration::from_micros(500)] {
+            let (_db_dir, mut conn) = setup_test_db();
+            let root = TempDir::new().unwrap();
+            let file = root.path().join("s.jsonl");
+            let absent = root.path().join("absent");
+            let opts = IndexOptions {
+                force: false,
+                claude_dir: if source == Source::Claude {
+                    root.path()
+                } else {
+                    &absent
+                },
+                codex_dir: if source == Source::Codex {
+                    root.path()
+                } else {
+                    &absent
+                },
+            };
+            let initial = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+            rewrite_with_mtime(&file, question, initial);
+            index_from_dirs(&mut conn, &opts, true).unwrap();
+
+            // Same-size edits still depend on mtime. An mtime-only regression must
+            // not hide behind the new size check.
+            rewrite_with_mtime(
+                &file,
+                &question.replace("original", "modified"),
+                initial + Duration::from_secs(2),
+            );
+            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+            assert_eq!(
+                collect_strings(&conn, "SELECT text FROM messages"),
+                ["modified question"]
+            );
+            // Invalid truncation is not a successful empty read and must not erase
+            // the old body or acknowledge its stamp.
+            rewrite_with_mtime(&file, "{", initial + Duration::from_secs(2));
+            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+            assert_eq!(
+                collect_strings(&conn, "SELECT text FROM messages"),
+                ["modified question"]
+            );
+            let appended = format!("{question}{answer}");
+            for (body, expected) in [
+                (
+                    appended.as_str(),
+                    vec!["original question", "appended answer"],
+                ),
+                (question, vec!["original question"]),
+                (metadata, vec![]),
+                ("", vec![]),
+            ] {
+                let old = fs::metadata(&file).unwrap().modified().unwrap();
+                rewrite_with_mtime(&file, body, old + offset);
+                let observed = fs::metadata(&file).unwrap().modified().unwrap();
+                assert_eq!(observed.duration_since(old).unwrap(), offset);
+                assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+                index_chunks(&mut conn, None).unwrap();
+                assert_eq!(
+                    collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+                    expected
+                );
+                assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+            }
+            let existing = load_existing_sessions(&conn).unwrap();
+            let tx = conn.transaction().unwrap();
+            let ctx = IndexContext {
+                tx: &tx,
+                existing: &existing,
+                force: false,
+                embedded_sessions: None,
+            };
+            assert!(matches!(
+                index_file_with_parser(&ctx, &file, &source, |_, _| panic!(
+                    "unchanged empty body must not be parsed"
+                ))
+                .unwrap(),
+                IndexOutcome::Unchanged
+            ));
+            drop(tx);
+            assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+        }
+    }
+}
+
+#[test]
+fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
+    // Append after the first stat, after EOF, or after the final stat. The last
+    // order must keep the old stamp; the other orders must leave a pending mark.
+    for order in 0..3 {
+        let (_db_dir, mut conn) = setup_test_db();
+        let root = TempDir::new().unwrap();
+        let file = root.path().join("s.jsonl");
+        fs::write(&file, FRESHNESS_QUESTION).unwrap();
+        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+        let append = || {
+            rewrite_with_mtime(
+                &file,
+                &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+                mtime,
+            )
+        };
+        let existing = load_existing_sessions(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let ctx = IndexContext {
+            tx: &tx,
+            existing: &existing,
+            force: false,
+            embedded_sessions: None,
+        };
+        let outcome = index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
+            if order == 0 {
+                append();
+            }
+            let parsed = parse_session_including_empty(path, source);
+            if order == 1 {
+                append();
+            }
+            parsed
+        })
+        .unwrap();
+        assert!(matches!(outcome, IndexOutcome::Indexed));
+        if order == 2 {
+            append();
+        }
+        tx.commit().unwrap();
+        let saved: Option<i64> = conn
+            .query_row("SELECT file_size FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            saved,
+            if order == 2 {
+                Some(i64::try_from(FRESHNESS_QUESTION.len()).unwrap())
+            } else {
+                None
+            }
+        );
+
+        let absent = root.path().join("absent");
+        let opts = IndexOptions {
+            force: false,
+            claude_dir: root.path(),
+            codex_dir: &absent,
+        };
+        assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+        assert_eq!(
+            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+            ["original question", "appended answer"]
+        );
+        let existing = load_existing_sessions(&conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let ctx = IndexContext {
+            tx: &tx,
+            existing: &existing,
+            force: false,
+            embedded_sessions: None,
+        };
+        assert!(matches!(
+            index_file_with_parser(&ctx, &file, &Source::Claude, |_, _| panic!(
+                "unchanged body must not be parsed"
+            ))
+            .unwrap(),
+            IndexOutcome::Unchanged
+        ));
+    }
+}
+
+#[test]
+fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
+    let db_dir = TempDir::new().unwrap();
+    let db_path = db_dir.path().join("index.db");
+    let mut conn = open_db(&db_path).unwrap();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    fs::write(&file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: root.path(),
+        codex_dir: &absent,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    let snapshot = |conn: &Connection| {
+        [
+            collect_strings(
+                conn,
+                "SELECT json_array(session_id, mtime, chunks_indexed, files_scanned) FROM sessions",
+            ),
+            collect_strings(conn, "SELECT json_array(rowid, text) FROM messages"),
+            collect_strings(
+                conn,
+                "SELECT json_array(id, content, src_rowid_lo, src_rowid_hi) FROM qa_chunks",
+            ),
+            collect_strings(
+                conn,
+                "SELECT json_array(rowid, chunk_id, hex(embedding)) FROM vec_chunks",
+            ),
+        ]
+    };
+    let before = snapshot(&conn);
+    assert!(!before[3].is_empty());
+    // Reconstruct the immediate predecessor's sessions shape, retaining real
+    // rows, chunks and vectors. Migration must not bless today's changed size.
+    conn.execute_batch("ALTER TABLE sessions DROP COLUMN file_size;")
+        .unwrap();
+    drop(conn);
+    rewrite_with_mtime(
+        &file,
+        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+        mtime,
+    );
+    for _ in 0..2 {
+        let mut conn = open_db(&db_path).unwrap();
+        assert_eq!(snapshot(&conn), before);
+        let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+        assert_eq!((stats.indexed, stats.preserved_embedded), (0, 1));
+        assert_eq!(snapshot(&conn), before);
+        let size: Option<i64> = conn
+            .query_row("SELECT file_size FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(size, None);
+    }
+    let mut conn = open_db(&db_path).unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+    drop(conn);
+    let mut conn = open_db(&db_path).unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+}
+
 fn index_one_claude_session(content: &str) -> Option<String> {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();

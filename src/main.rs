@@ -5096,9 +5096,10 @@ mod tests {
     }
 
     // -- U-003 (#283): session_files backfill wired into the `recall index` path.
-    // A legacy DB (indexed before the session_files feature) has files_scanned
-    // NULL and no session_files rows; its JSONL is mtime-unchanged, so the body
-    // freshness check skips a re-parse. A path-only backfill pass must fill
+    // Sessions needing path backfill have files_scanned NULL and no session_files
+    // rows. These fixtures retain matching mtime/size stamps to isolate backfill
+    // from body ingestion; migration of missing sizes is covered in indexer tests.
+    // A path-only backfill pass must fill
     // session_files from the write-target tool_use without touching the body
     // index or embeddings, mark files_scanned, and never re-read a marked
     // session. The two tests below exercise that end to end through
@@ -5170,8 +5171,8 @@ mod tests {
         rows.map(Result::unwrap).collect()
     }
 
-    /// Reset an indexed DB to the legacy pre-#283 shape the backfill targets:
-    /// `files_scanned` NULL and no `session_files` rows, body left intact.
+    /// Reset only the path-backfill state: `files_scanned` NULL and no
+    /// `session_files` rows, with body and freshness stamps left intact.
     fn reset_to_legacy_state(conn: &Connection) {
         conn.execute("UPDATE sessions SET files_scanned = NULL", [])
             .unwrap();
@@ -5183,9 +5184,9 @@ mod tests {
     //  embedding あり）/ when: recall index を実行 / then: session_files が埋まり、
     //  messages / qa_chunks / vec_chunks の行数と id 集合が実行前と一致する)
     //
-    // Simulates a pre-session_files DB: index + embed two write-target sessions,
+    // Simulates missing path-backfill state: index + embed two write-target sessions,
     // then wipe files_scanned to NULL and clear session_files WITHOUT touching
-    // the on-disk JSONL. The stored mtime still matches the file, so the
+    // the on-disk JSONL. The stored mtime and size still match the file, so the
     // freshness check skips the body re-parse — only a path-only backfill pass
     // can repopulate session_files. Perspective: state (legacy NULL → populated
     // through the index command) + hazard (a backfill that re-inserts messages
@@ -5218,8 +5219,8 @@ mod tests {
             codex_dir: &codex_dir,
         };
 
-        // given: an indexed + embedded DB, then reset to the legacy pre-feature
-        // state, body left intact.
+        // given: an indexed + embedded DB, then reset its path-backfill state,
+        // leaving the body and freshness stamps intact.
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
         let before = {
             let conn = open_or_create_db(&db_path).unwrap();
@@ -5257,17 +5258,18 @@ mod tests {
     //  もう一度実行 / then: 全セッションの files_scanned が立っており、JSONL の
     //  path-only 再読が発生しない)
     //
-    // A legacy DB with a write-target session and a zero-touch session (no
+    // Missing path-backfill state for a write-target and a zero-touch session (no
     // write-target tool_use). One backfill index marks files_scanned on both and
     // fills session_files for the write session (the "T-004 execution"). A canary
-    // write-target path is then injected into the write session's JSONL with its
-    // mtime pinned to the pre-injection value, so the body freshness check still
+    // write-target path of equal byte length replaces the original in the JSONL,
+    // with mtime pinned to the original value, so the body freshness check still
     // skips a re-parse. A second index must NOT re-read the JSONL: files_scanned
     // gates the session out of the backfill, so the canary never reaches
     // session_files. Perspective: state (marked → skipped) + hazard (an ungated
     // backfill re-reads every session every run, resurfacing the canary). RED
     // (no backfill) leaves files_scanned NULL, so the "all marked" assertion
-    // fails for exactly the intended reason.
+    // fails for exactly the intended reason. Clearing the marker at the end must
+    // expose the canary, proving this fixture detects a path-only re-read.
     #[test]
     fn 二回目の_index_で_backfill_が再実行されない() {
         let src = tempfile::TempDir::new().unwrap();
@@ -5289,7 +5291,7 @@ mod tests {
             codex_dir: &codex_dir,
         };
 
-        // given: an indexed + embedded DB reset to the legacy pre-feature state,
+        // given: an indexed + embedded DB with its path-backfill state reset,
         // then the first backfill index (the "T-004 execution").
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
         {
@@ -5298,20 +5300,22 @@ mod tests {
         }
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
-        // Inject a canary write-target into the write session's JSONL, then pin
-        // its mtime back to the pre-injection value so the body freshness check
-        // still treats the file as unchanged. A path-only re-read would surface
-        // the canary in session_files; a gated backfill never re-reads it.
-        let pinned = fs::metadata(&write_path).unwrap().modified().unwrap();
+        // Keep both freshness inputs equal to isolate the path-only backfill.
+        // Size changes must trigger body ingestion even with pinned mtime (#321).
+        let original = fs::metadata(&write_path).unwrap();
+        let pinned = original.modified().unwrap();
         write_backfill_session(
             &claude_dir,
             "write.jsonl",
             "write session probe",
-            Some("/proj/canary_marker.rs"),
+            Some("/proj/next_marker.rs"),
         );
         let f = OpenOptions::new().write(true).open(&write_path).unwrap();
         f.set_modified(pinned).unwrap();
         drop(f);
+        let replaced = fs::metadata(&write_path).unwrap();
+        assert_eq!(replaced.len(), original.len(), "canary must preserve size");
+        assert_eq!(replaced.modified().unwrap(), pinned);
 
         // when: recall index runs a second time.
         index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
@@ -5335,9 +5339,23 @@ mod tests {
         assert!(
             !session_file_paths(&conn)
                 .iter()
-                .any(|p| p == "/proj/canary_marker.rs"),
+                .any(|p| p == "/proj/next_marker.rs"),
             "a marked session must not be re-read: the canary path must not appear in session_files"
         );
+
+        // Positive control: the same file becomes visible to backfill when its
+        // marker is absent, without changing mtime or size.
+        conn.execute("DELETE FROM session_files WHERE session_id = 'write'", [])
+            .unwrap();
+        conn.execute(
+            "UPDATE sessions SET files_scanned = NULL WHERE session_id = 'write'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert!(session_file_paths(&conn).contains(&"/proj/next_marker.rs".to_owned()));
     }
 
     // #165 follow-up (SF4-JSON, end-to-end): a source root that vanishes between

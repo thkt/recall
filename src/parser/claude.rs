@@ -87,6 +87,11 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
 }
 
 pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
+    Ok(parse_claude_session_including_empty(path)?.filter(|p| !p.messages.is_empty()))
+}
+
+/// Retain successful empty reads so an indexer can acknowledge a truncation.
+pub(super) fn parse_claude_session_including_empty(path: &Path) -> Result<Option<ParseResult>> {
     let Some(session_id) = session_id_from_path(path) else {
         return Ok(None);
     };
@@ -100,10 +105,6 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
 
     let (messages, skipped_lines) =
         parse_jsonl_entries(path, |entry| process_claude_entry(entry, &mut state))?;
-
-    if messages.is_empty() {
-        return Ok(None);
-    }
 
     if state.slug.is_empty() {
         state.slug = session_id.chars().take(12).collect();

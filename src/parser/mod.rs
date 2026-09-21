@@ -92,6 +92,16 @@ pub struct ParseResult {
     pub skipped_lines: usize,
 }
 
+pub(crate) fn parse_session_including_empty(
+    path: &Path,
+    source: Source,
+) -> Result<Option<ParseResult>> {
+    match source {
+        Source::Claude => claude::parse_claude_session_including_empty(path),
+        Source::Codex => codex::parse_codex_session_including_empty(path),
+    }
+}
+
 const TEXT_BLOCK_TYPES: &[&str] = &["text", "input_text", "output_text"];
 
 /// Claude Code tools whose `input` names a file that the assistant wrote to.
