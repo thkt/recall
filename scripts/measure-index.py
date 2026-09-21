@@ -13,6 +13,7 @@ from pathlib import Path
 import platform
 import subprocess
 import sqlite3
+import sys
 import time
 
 
@@ -29,12 +30,21 @@ def main():
                         help="Q&A pairs in the first session; use 512 for the #325 append comparison")
     parser.add_argument("--verify-reuse", action="store_true",
                         help="assert #325 inference/reuse counts; omit for the old binary")
+    parser.add_argument("--body-profile", choices=("short", "mixed", "long"), default="short",
+                        help="fixed input lengths for #326; mixed alternates short and long pairs")
+    pending_mode = parser.add_mutually_exclusive_group()
+    pending_mode.add_argument("--verify-bounded-pending", action="store_true",
+                              help="check the changed binary's pending body/page bounds")
+    pending_mode.add_argument("--all-body-baseline", action="store_true",
+                              help="#326 baseline only: derive retained body bytes from its all-body, shortest-first algorithm")
     parser.add_argument("--model", required=True, help="model ID, revision and artifact identity")
     parser.add_argument("--conditions", required=True, help="hardware/RAM, OS, toolchain, cache state, settings, commit")
     parser.add_argument("--baseline", action="store_true", help="older binary without commit notifications: omit interrupt/resume")
     args = parser.parse_args()
     if args.long_session_turns < 1:
         parser.error("long-session-turns must be positive")
+    if (args.verify_bounded_pending or args.all_body_baseline) and args.baseline:
+        parser.error("bounded pending verification needs observations and interruption support")
     if args.verify_reuse and args.baseline:
         parser.error("verify-reuse applies to the changed binary, not the baseline")
     if args.sessions < 256:
@@ -50,7 +60,8 @@ def main():
     env.update(RECALL_CLAUDE_DIR=str(source), RECALL_CODEX_DIR=str(output / "absent-codex"))
 
     def turn(number):
-        return "".join(json.dumps({"type": role, "message": {"role": role, "content": f"Synthetic {role} turn {number}: indexing measurement only."}}) + "\n" for role in ("user", "assistant"))
+        repeats = 64 if args.body_profile == "long" or (args.body_profile == "mixed" and number % 2) else 1
+        return "".join(json.dumps({"type": role, "message": {"role": role, "content": f"Synthetic {role} turn {number}: indexing measurement only." * repeats}}) + "\n" for role in ("user", "assistant"))
 
     for i in range(args.sessions):
         text = turn(i)
@@ -63,6 +74,9 @@ def main():
         "model": args.model, "conditions": args.conditions, "sessions": args.sessions,
         "data": "synthetic Q&A pairs; one pair appended to the first file",
         "long_session_turns": args.long_session_turns,
+        "body_profile": args.body_profile,
+        "pending_mode": "bounded" if args.verify_bounded_pending else "all-body" if args.all_body_baseline else None,
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "append_pairs": 1,
         "cache": "each invocation is a new process; filesystem/model-cache state is operator-supplied",
         "options": "default token budget and forward pause; inherited overrides removed",
@@ -96,6 +110,7 @@ def main():
     def run(name, db, interrupt=False, rebuild=False):
         env["RECALL_DB"] = str(db)
         start = time.monotonic()
+        usage = None
         interrupted = False
         last_counts = None
         with (output / f"{name}.stdout").open("w") as stdout, (output / f"{name}.stderr").open("w") as stderr:
@@ -108,19 +123,48 @@ def main():
                         if interrupt and not interrupted and last_counts["chunks_saved"] > 0 and last_counts["chunks_remaining_snapshot"] > 0:
                             process.terminate()
                             interrupted = True
-                code = process.wait()
+                # Reap this exact child, not cumulative RUSAGE_CHILDREN across cases.
+                _, status, usage = os.wait4(process.pid, 0)
+                code = os.waitstatus_to_exitcode(status)
+                process.returncode = code
             finally:
                 if process.poll() is None:
                     process.terminate()
                     process.wait()
                 process.stderr.close()
         summary = {"case": name, "wall_seconds": time.monotonic() - start, "exit_code": code,
-                   "interruption_requested": interrupted, "last_reported_counts": last_counts}
+                   "interruption_requested": interrupted, "last_reported_counts": last_counts,
+                   "max_rss_bytes": usage.ru_maxrss * (1 if sys.platform == "darwin" else 1024)}
         if code == 0:
             envelope = json.loads((output / f"{name}.stdout").read_text())
             summary["data"] = envelope["data"]
             summary["degraded"] = envelope["degraded"]
             summary["stored"] = stored_data(db)
+            counts = envelope["data"].get("observations", {}).get("counts", {})
+            if name in ("initial", "rebuild-final", "resume") and (args.verify_bounded_pending or args.all_body_baseline):
+                with closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+                    lengths = sorted(row[0] for row in conn.execute("SELECT length(CAST(content AS BLOB)) FROM qa_chunks"))
+                if args.all_body_baseline and "pending_body_bytes_peak" in counts:
+                    raise RuntimeError("all-body-baseline must use the unmodified pre-#326 binary")
+                pending = counts["chunks_pending_snapshot"]
+                if pending <= 0 or counts["chunks_remaining_snapshot"] != 0 or counts["chunks_saved"] != pending:
+                    raise RuntimeError("measurement requires a nonempty, completely embedded snapshot")
+                summary["corpus_body_bytes"] = sum(lengths)
+                summary["largest_chunk_bytes"] = max(lengths)
+                if args.verify_bounded_pending:
+                    peak = counts["pending_body_bytes_peak"]
+                    if not (0 < peak <= max(8 * 1024 * 1024, max(lengths))) or not (0 < counts["pending_page_chunks_peak"] <= 1024):
+                        raise RuntimeError("pending body/page bounds violated")
+                    if pending > 1024 and counts["pending_pages"] < 2:
+                        raise RuntimeError("multiple pages were not exercised")
+                    summary["pending_body_bytes_peak"] = peak
+                else:
+                    # #326's unmodified baseline loads every missing body and
+                    # embeds globally shortest-first. In these single-writer,
+                    # all-success fixtures, resume leaves the longest suffix.
+                    # Equal-length tie order cannot change its byte sum.
+                    summary["baseline_pending_body_bytes_derived"] = sum(lengths[-pending:])
+                    summary["baseline_body_derivation"] = "all-body baseline only; snapshot count and longest remaining suffix after interruption"
             if envelope["degraded"]:
                 record(output / f"{name}.json", summary)
                 raise RuntimeError("model or indexing degraded; this is not a valid real-model timing sample")
@@ -154,7 +198,7 @@ def main():
                 counts = result["data"]["observations"]["counts"]
                 if counts["inference_chunks"] != 0:
                     raise RuntimeError("unchanged content was inferred again")
-    if args.long_session_turns > 1:
+    if args.long_session_turns > 1 or args.verify_bounded_pending or args.all_body_baseline:
         rebuilt = run("rebuild-final", db, rebuild=True)
         results.append(rebuilt)
         if rebuilt["stored"]["body_sha256"] != appended["stored"]["body_sha256"]:
@@ -166,6 +210,8 @@ def main():
         results.append(run("resume", resume_db))
         interrupted_counts = results[-2]["last_reported_counts"]
         resumed_data = results[-1]["data"]
+        if results[-1]["stored"]["body_sha256"] != appended["stored"]["body_sha256"]:
+            raise RuntimeError("resumed bodies or source links differ from uninterrupted indexing")
         if not (0 < resumed_data["embedded"] <= interrupted_counts["chunks_remaining_snapshot"]):
             raise RuntimeError("resume did not demonstrate a preserved partial save; repeat with a larger corpus")
     record(output / "comparison.json", results)

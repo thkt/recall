@@ -10,7 +10,7 @@ use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
-use rusqlite::{Connection, Result as SqlResult, Row, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Row, TransactionBehavior};
 use tracing::warn;
 
 use crate::index_observer::Observer;
@@ -42,7 +42,7 @@ impl EmbedResult {
     pub(crate) fn warn_if_batches_failed(&self) {
         if self.failed_count > 0 {
             // first_error is always Some when failed_count > 0 (both are set in
-            // embed_chunks' Err arm together); the fallback is defensive only.
+            // embed_page's inference error arm together); the fallback is defensive only.
             let first_error = self.first_error.as_deref().unwrap_or("unknown");
             warn!(
                 failed_count = self.failed_count,
@@ -53,6 +53,36 @@ impl EmbedResult {
 }
 
 pub(crate) const EMBED_BATCH_SIZE: usize = 128;
+// Host measurements compare these bounds with the former all-body selection.
+const PENDING_PAGE_CHUNKS: usize = 1024;
+const PENDING_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
+struct PendingIdentity {
+    id: i64,
+    generation: i64,
+    bytes: usize,
+}
+
+#[derive(Default)]
+struct EmbeddingProgress {
+    total: usize,
+    attempted: usize,
+    stale: usize,
+    batches: usize,
+    inferred: usize,
+    save_failed: usize,
+    first_save_error: Option<anyhow::Error>,
+    result: EmbedResult,
+}
+
+impl EmbeddingProgress {
+    fn finish(self) -> Result<EmbedResult> {
+        match self.first_save_error {
+            Some(error) => Err(error),
+            None => Ok(self.result),
+        }
+    }
+}
 
 /// Identity and input captured together before inference. Generation survives
 /// deletion of other rows and changes even when an ID is reused with equal text.
@@ -86,6 +116,7 @@ pub(crate) fn embed_chunks(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn embed_chunks_observed(
     conn: &mut Connection,
     embedder: &dyn Embed,
@@ -95,24 +126,39 @@ pub(crate) fn embed_chunks_observed(
     observer: &Observer,
 ) -> Result<EmbedResult> {
     observer.start_embedding(chunks.len());
+    let mut progress = EmbeddingProgress {
+        total: chunks.len(),
+        ..Default::default()
+    };
+    embed_page(
+        conn,
+        embedder,
+        chunks,
+        on_progress,
+        options,
+        observer,
+        &mut progress,
+    );
+    progress.finish()
+}
 
-    let mut sorted: Vec<usize> = (0..chunks.len()).collect();
-    sorted.sort_by_key(|&i| chunks[i].content.len());
-
-    let total = chunks.len();
-    let mut embedded = 0;
-    let mut failed_count = 0;
-    let mut first_error = None;
-    let mut stale = 0;
-    let mut attempted = 0;
-
-    for (batch_number, batch_idx) in sorted.chunks(EMBED_BATCH_SIZE).enumerate() {
-        let texts: Vec<&str> = batch_idx
-            .iter()
-            .map(|&i| chunks[i].content.as_str())
-            .collect();
-        observer.count("inference_batches", batch_number + 1);
-        observer.count("inference_chunks", attempted + batch_idx.len());
+fn embed_page(
+    conn: &mut Connection,
+    embedder: &dyn Embed,
+    chunks: &[PendingChunk],
+    on_progress: Option<&dyn Fn(usize, usize)>,
+    options: &EmbedOptions,
+    observer: &Observer,
+    progress: &mut EmbeddingProgress,
+) {
+    // load_page preserves the snapshot's (byte length, ID) order, including
+    // when changed or deleted generations are omitted.
+    for batch in chunks.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<&str> = batch.iter().map(|chunk| chunk.content.as_str()).collect();
+        progress.batches += 1;
+        progress.inferred += batch.len();
+        observer.count("inference_batches", progress.batches);
+        observer.count("inference_chunks", progress.inferred);
         let inference = observer.stage("inference");
         let result = embedder.embed_documents_batch_with_options(&texts, options);
         inference.finish(if result.is_ok() {
@@ -120,8 +166,8 @@ pub(crate) fn embed_chunks_observed(
         } else {
             "failed; not saved"
         });
-        attempted += batch_idx.len();
-        observer.count("chunks_unattempted", total - attempted);
+        progress.attempted += batch.len();
+        observer.count("chunks_unattempted", progress.total - progress.attempted);
         match result {
             Ok(embeddings) => {
                 // Acquire the writer lock BEFORE reading the current generations:
@@ -136,8 +182,7 @@ pub(crate) fn embed_chunks_observed(
                             "SELECT EXISTS(SELECT 1 FROM qa_chunks \
                          WHERE id = ?1 AND content = ?2 AND generation = ?3)",
                         )?;
-                        for (chunked, &i) in embeddings.iter().zip(batch_idx) {
-                            let chunk = &chunks[i];
+                        for (chunked, chunk) in embeddings.iter().zip(batch) {
                             if check.query_row(
                                 rusqlite::params![chunk.id, chunk.content, chunk.generation],
                                 |row| row.get::<_, bool>(0),
@@ -173,16 +218,24 @@ pub(crate) fn embed_chunks_observed(
                 let saved = match saved {
                     Ok(saved) => saved,
                     Err(error) => {
-                        observer.count("chunks_save_failed", batch_idx.len());
+                        progress.save_failed += batch.len();
+                        observer.count("chunks_save_failed", progress.save_failed);
+                        if progress.first_save_error.is_none() {
+                            progress.first_save_error = Some(error);
+                        }
+                        save.finish("failed; batch rolled back");
                         observer.embedding_progress();
-                        return Err(error);
+                        continue;
                     }
                 };
-                stale += batch_idx.len() - saved;
-                embedded += saved;
-                observer.count("chunks_stale", stale);
-                observer.count("chunks_saved", embedded);
-                observer.count("chunks_remaining_snapshot", total - embedded);
+                progress.stale += batch.len() - saved;
+                progress.result.embedded += saved;
+                observer.count("chunks_stale", progress.stale);
+                observer.count("chunks_saved", progress.result.embedded);
+                observer.count(
+                    "chunks_remaining_snapshot",
+                    progress.total - progress.result.embedded,
+                );
                 save.finish(if saved == 0 {
                     "no current results to save"
                 } else {
@@ -191,7 +244,7 @@ pub(crate) fn embed_chunks_observed(
                 if saved > 0
                     && let Some(cb) = &on_progress
                 {
-                    cb(embedded, total);
+                    cb(progress.result.embedded, progress.total);
                 }
             }
             Err(_) => {
@@ -199,74 +252,163 @@ pub(crate) fn embed_chunks_observed(
                 // whole ≤128-batch (all-or-nothing) but must not block the rest of
                 // the backlog. The chunks stay pending (no tx committed here) for
                 // the next index to retry via the pending gate.
-                failed_count += batch_idx.len();
-                observer.count("chunks_failed", failed_count);
-                if first_error.is_none() {
-                    first_error = Some("batch inference failed".to_owned());
+                progress.result.failed_count += batch.len();
+                observer.count("chunks_failed", progress.result.failed_count);
+                if progress.result.first_error.is_none() {
+                    progress.result.first_error = Some("batch inference failed".to_owned());
                 }
             }
         }
         observer.embedding_progress();
     }
-
-    Ok(EmbedResult {
-        embedded,
-        failed_count,
-        first_error,
-    })
 }
 
-/// Collect up to `budget` chunks that have no `vec_chunks` row, newest first.
-///
-/// One pass over each table (#138): the previous correlated `NOT EXISTS` form
-/// re-scanned vec_chunks per qa_chunks row — its `+chunk_id` is an unindexed
-/// auxiliary column (see the DELETE note in `embed_chunks`), so at 38k chunks
-/// that was O(N×M) ≈ 15-20 minutes of silence before the first batch.
-pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<PendingChunk>> {
-    if budget == 0 {
-        return Ok(Vec::new());
-    }
-
-    let mut missing = Vec::new();
-    visit_pending(conn, budget, true, |row| {
-        missing.push(PendingChunk {
+/// Capture only identities and byte lengths in one read snapshot. No body sort
+/// in SQLite, no per-page anti-join against vec0's unindexed auxiliary column.
+fn pending_snapshot(conn: &Connection) -> Result<Vec<PendingIdentity>> {
+    let tx = conn.unchecked_transaction()?;
+    let mut pending = Vec::new();
+    visit_pending(&tx, true, |row| {
+        pending.push(PendingIdentity {
             id: row.get(0)?,
-            content: row.get(1)?,
-            generation: row.get(2)?,
+            generation: row.get(1)?,
+            // SQLite limits a single value to at most 2^31-1 bytes.
+            bytes: row.get::<_, u32>(2)? as usize,
         });
         Ok(())
     })?;
-    Ok(missing)
+    tx.commit()?;
+    // Preserve global length bucketing with O(pending IDs) metadata, avoiding
+    // padding inflation from timestamp-local pages. No sort scratch allocation.
+    pending.sort_unstable_by_key(|chunk| (chunk.bytes, chunk.id));
+    Ok(pending)
+}
+
+fn load_page(conn: &Connection, identities: &[PendingIdentity]) -> Result<Vec<PendingChunk>> {
+    let mut query =
+        conn.prepare_cached("SELECT content FROM qa_chunks WHERE id = ?1 AND generation = ?2")?;
+    let mut chunks = Vec::with_capacity(identities.len());
+    for identity in identities {
+        if let Some(content) = query
+            .query_row(rusqlite::params![identity.id, identity.generation], |row| {
+                row.get(0)
+            })
+            .optional()?
+        {
+            chunks.push(PendingChunk {
+                id: identity.id,
+                generation: identity.generation,
+                content,
+            });
+        }
+    }
+    Ok(chunks)
+}
+
+/// A finite, immutable worklist ensures failed pages are tried only once per
+/// invocation. New or replaced generations are selected on the next invocation.
+pub(crate) fn embed_pending_observed(
+    conn: &mut Connection,
+    embedder: &dyn Embed,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+    options: &EmbedOptions,
+    observer: &Observer,
+) -> Result<EmbedResult> {
+    let extraction = observer.stage("pending_extraction");
+    let pending = pending_snapshot(conn)?;
+    extraction.finish("complete; identity snapshot");
+    observer.start_embedding(pending.len());
+    observer.count(
+        "pending_metadata_bytes",
+        pending.capacity() * size_of::<PendingIdentity>(),
+    );
+    observer.count("pending_body_bytes_peak", 0);
+    observer.count("pending_page_chunks_peak", 0);
+    observer.count("pending_pages", 0);
+    let mut progress = EmbeddingProgress {
+        total: pending.len(),
+        ..Default::default()
+    };
+    let mut offset = 0;
+    let mut pages = 0;
+    let mut peak_bytes = 0;
+    let mut peak_chunks = 0;
+    while offset < pending.len() {
+        let extraction = observer.stage("pending_extraction");
+        let mut end = offset;
+        let mut bytes = 0;
+        while end < pending.len() && end - offset < PENDING_PAGE_CHUNKS {
+            let next = pending[end].bytes;
+            if end > offset && next > PENDING_PAGE_BYTES.saturating_sub(bytes) {
+                break;
+            }
+            bytes += next;
+            end += 1;
+        }
+        // A single oversized chunk travels alone, unchanged; the model's own
+        // tokenizer/subchunking still applies. Never truncate or loop on it.
+        let chunks = load_page(conn, &pending[offset..end])?;
+        let disappeared = end - offset - chunks.len();
+        progress.stale += disappeared;
+        progress.attempted += disappeared;
+        observer.count("chunks_stale", progress.stale);
+        observer.count("chunks_unattempted", progress.total - progress.attempted);
+        peak_bytes = peak_bytes.max(chunks.iter().map(|chunk| chunk.content.len()).sum());
+        peak_chunks = peak_chunks.max(chunks.len());
+        pages += 1;
+        observer.count("pending_body_bytes_peak", peak_bytes);
+        observer.count("pending_page_chunks_peak", peak_chunks);
+        observer.count("pending_pages", pages);
+        extraction.finish("page loaded");
+        embed_page(
+            conn,
+            embedder,
+            &chunks,
+            on_progress,
+            options,
+            observer,
+            &mut progress,
+        );
+        offset = end;
+        if chunks.is_empty() {
+            observer.embedding_progress();
+        }
+        // Drop this page before loading the next; no body is retained in pending.
+    }
+    progress.finish()
+}
+
+/// Test adapter for scheduling mutations between selection and inference.
+#[cfg(test)]
+pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<PendingChunk>> {
+    let pending = pending_snapshot(conn)?;
+    load_page(conn, &pending[..pending.len().min(budget)])
 }
 
 /// Same single-pass selection without loading bodies when inference is unavailable.
 pub(crate) fn pending_count(conn: &Connection) -> Result<usize> {
-    visit_pending(conn, usize::MAX, false, |_| Ok(()))
+    visit_pending(conn, false, |_| Ok(()))
 }
 
 fn visit_pending(
     conn: &Connection,
-    budget: usize,
-    with_content: bool,
+    with_lengths: bool,
     mut visit: impl FnMut(&Row<'_>) -> SqlResult<()>,
 ) -> Result<usize> {
     let embedded: HashSet<i64> = {
-        let mut stmt = conn.prepare("SELECT DISTINCT chunk_id FROM vec_chunks")?;
+        let mut stmt = conn.prepare("SELECT chunk_id FROM vec_chunks")?;
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         rows.collect::<StdResult<_, _>>()?
     };
-    let sql = if with_content {
-        "SELECT id, content, generation FROM qa_chunks ORDER BY timestamp DESC NULLS LAST"
+    let sql = if with_lengths {
+        "SELECT id, generation, length(CAST(content AS BLOB)) FROM qa_chunks"
     } else {
         "SELECT id FROM qa_chunks"
     };
     let mut stmt = conn.prepare(sql)?;
     let mut rows = stmt.query([])?;
     let mut count = 0;
-    while count < budget {
-        let Some(row) = rows.next()? else {
-            break;
-        };
+    while let Some(row) = rows.next()? {
         if !embedded.contains(&row.get::<_, i64>(0)?) {
             visit(row)?;
             count += 1;
@@ -328,7 +470,7 @@ impl MockEmbedder {
     }
 
     /// A mock that fails any batch containing `text` (all-or-nothing, matching
-    /// `embed_chunks`'s batch semantics). T-001 uses it to poison one batch.
+    /// the pipeline's batch semantics). T-001 uses it to poison one batch.
     pub(crate) fn failing_on_text(text: &str) -> Self {
         Self {
             call_count: AtomicUsize::new(0),
@@ -400,7 +542,7 @@ impl Embed for MockEmbedder {
         ])?)
     }
 
-    /// Explicit impl of the production dispatch target: `embed_chunks` calls this
+    /// Explicit impl of the production dispatch target: `embed_page` calls this
     /// method, so the poison check lives here (all-or-nothing per batch), not in
     /// the per-item delegate. Being explicit also survives rurico revisions where
     /// the trait's default body is removed (required at rurico HEAD).

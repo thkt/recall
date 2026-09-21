@@ -5,44 +5,6 @@ use crate::db::{open_db, seed_chunk, seed_session, setup_test_db};
 use crate::index_observer::recording;
 
 #[test]
-fn test_embed_recent_chunks_budget_zero() {
-    let (_dir, mut conn) = setup_test_db();
-    let embedder = MockEmbedder::new();
-    let result = embed_recent_chunks(&mut conn, &embedder, 0, None).unwrap();
-    assert_eq!(result.embedded, 0);
-    assert_eq!(result.failed_count, 0);
-}
-
-#[test]
-fn embed_chunks_reports_committed_progress() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    for i in 0..3 {
-        seed_chunk(&conn, i + 1, &format!("content {i}"));
-    }
-
-    let embedder = MockEmbedder::new();
-    let chunks = pending_chunks(&conn, usize::MAX).unwrap();
-
-    let calls = Mutex::new(Vec::new());
-    let result = embed_chunks(
-        &mut conn,
-        &embedder,
-        &chunks,
-        Some(&|done, total| {
-            calls.lock().unwrap().push((done, total));
-        }),
-        &EmbedOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(result.embedded, 3);
-    let calls = calls.into_inner().unwrap();
-    assert!(!calls.is_empty());
-    assert_eq!(calls.last().unwrap(), &(3, 3));
-}
-
-#[test]
 fn replaying_the_same_generation_replaces_vectors_without_duplicates() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
@@ -92,7 +54,7 @@ fn seed_chunks(conn: &Connection, count: usize, content: impl Fn(i64) -> String)
 
 // T-007 (FR-002, FR-004): when every batch fails, the embed run is non-fatal and
 // fully retryable. Given 1 pending chunk and failing_after(0) (every batch
-// fails), embed_recent_chunks returns Ok (the index does not abort), counts the
+// fails), the production pending pipeline returns Ok (the index does not abort), counts the
 // whole batch as failed, and leaves no vec row so the next index retries it.
 // (Updated from the old T-009: stopped_at_error.is_some() → failed_count > 0.)
 // Perspective: error (the all-fail path) + boundary (failed_count == every chunk).
@@ -102,7 +64,14 @@ fn all_batches_failing_is_non_fatal_and_retryable() {
     seed_chunks(&conn, 1, |_| "pending content".to_owned());
 
     let embedder = MockEmbedder::failing_after(0);
-    let result = embed_recent_chunks(&mut conn, &embedder, 10, None).unwrap();
+    let result = embed_pending_observed(
+        &mut conn,
+        &embedder,
+        None,
+        &EmbedOptions::default(),
+        &Observer::default(),
+    )
+    .unwrap();
 
     assert_eq!(result.embedded, 0, "every batch failed, so nothing embeds");
     assert_eq!(
@@ -128,24 +97,22 @@ fn all_batches_failing_is_non_fatal_and_retryable() {
 #[test]
 fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     let (_dir, mut conn) = setup_test_db();
-    seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
-    seed_chunk(&conn, 129, "x");
+    seed_chunks(&conn, 1024, |id| format!("content_{id:04}"));
+    seed_chunk(&conn, 1025, "x");
 
     // Shortest text sorts into the first batch; the second batch still commits.
     let poisoned = MockEmbedder::failing_on_text("x");
     let (observer, lines) = recording();
-    let pending = pending_chunks(&conn, 129).unwrap();
-    let first = embed_chunks_observed(
+    let first = embed_pending_observed(
         &mut conn,
         &poisoned,
-        &pending,
         None,
         &EmbedOptions::default(),
         &observer,
     )
     .unwrap();
     let counts = observer.snapshot()["counts"].clone();
-    assert_eq!(counts["chunks_saved"], 1);
+    assert_eq!(counts["chunks_saved"], 897);
     assert_eq!(counts["chunks_failed"], 128);
     assert_eq!(counts["chunks_remaining_snapshot"], 128);
     assert_eq!(counts["chunks_unattempted"], 0);
@@ -162,11 +129,11 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
             .iter()
             .filter(|line| line.contains("embedding_db_save: committed"))
             .count(),
-        1
+        8
     );
     assert_eq!(
-        first.embedded, 1,
-        "precondition: only batch 2 embeds on run 1"
+        first.embedded, 897,
+        "later batches and the next page still commit"
     );
 
     assert_eq!(first.failed_count, 128);
@@ -180,11 +147,21 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     let stored: i64 = conn
         .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(stored, 1, "a failed batch must not partially commit");
-    assert_eq!(pending_chunks(&conn, 129).unwrap().len(), 128);
+    assert_eq!(stored, 897, "a failed batch must not partially commit");
+    assert_eq!(pending_chunks(&conn, usize::MAX).unwrap().len(), 128);
 
+    assert_eq!(counts["pending_pages"], 2);
+    assert_eq!(counts["inference_chunks"], 1025);
+    assert_eq!(counts["inference_batches"], 9);
     let healthy = MockEmbedder::new();
-    let second = embed_recent_chunks(&mut conn, &healthy, 129, None).unwrap();
+    let second = embed_pending_observed(
+        &mut conn,
+        &healthy,
+        None,
+        &EmbedOptions::default(),
+        &Observer::default(),
+    )
+    .unwrap();
     assert_eq!(
         second.embedded, 128,
         "the previously failed batch embeds on the retry run"
@@ -199,37 +176,6 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
         )
         .unwrap();
     assert_eq!(pending, 0, "no chunk is left behind after the retry");
-}
-
-// #138: budget truncation must keep the newest chunks. With 3 pending chunks
-// at distinct timestamps and budget 1, the embedded row is the one with the
-// newest timestamp (ORDER BY timestamp DESC NULLS LAST). Pins the selection
-// order across the one-pass rewrite of the pending query.
-// Perspective: boundary (budget < pending).
-#[test]
-fn test_embed_recent_chunks_budget_prefers_newest_chunk() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    for (id, ts) in [(1_i64, 100_i64), (2, 300), (3, 200)] {
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-                 VALUES (?1, 's1', ?2, ?3)",
-            rusqlite::params![id, format!("content_{id}"), ts],
-        )
-        .unwrap();
-    }
-
-    let embedder = MockEmbedder::new();
-    let result = embed_recent_chunks(&mut conn, &embedder, 1, None).unwrap();
-
-    assert_eq!(result.embedded, 1, "budget 1 embeds exactly one chunk");
-    let embedded_id: i64 = conn
-        .query_row("SELECT chunk_id FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        embedded_id, 2,
-        "budget 1 must pick the chunk with the newest timestamp (ts=300)"
-    );
 }
 
 /// Interrupt after vectors have been computed but before embed_chunks can save.
@@ -520,11 +466,11 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
 }
 
 #[test]
-fn later_database_save_failure_preserves_prior_commits_and_retries_only_remaining_chunks() {
-    // Fail the second INSERT of batch 2, after batch 1 committed and one
-    // vector in batch 2 was staged. This exercises rollback, not only BEGIN.
-    struct InvalidSecondBatch(AtomicUsize);
-    impl Embed for InvalidSecondBatch {
+fn later_page_database_save_failure_preserves_other_batches_and_retries_only_failed_chunks() {
+    // Fail the second INSERT of page 2, after all eight page-1 batches committed and one
+    // vector in that failing batch was staged. This exercises rollback, not only BEGIN.
+    struct InvalidLaterBatch(AtomicUsize);
+    impl Embed for InvalidLaterBatch {
         fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
             MockEmbedder::new().embed_query(text)
         }
@@ -538,7 +484,7 @@ fn later_database_save_failure_preserves_prior_commits_and_retries_only_remainin
             texts: &[&str],
         ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
             let mut vectors = MockEmbedder::new().embed_documents_batch(texts)?;
-            if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 8 {
                 vectors[1] = ChunkedEmbedding::try_new(vec![vec![0.0; 1]])?;
             }
             Ok(vectors)
@@ -550,10 +496,7 @@ fn later_database_save_failure_preserves_prior_commits_and_retries_only_remainin
     }
 
     let (dir, mut conn) = setup_test_db();
-    seed_chunks(&conn, 257, |id| format!("private input {id:03}"));
-    let mut pending = pending_chunks(&conn, usize::MAX).unwrap();
-    // Equal-length inputs retain this order in the stable length sort.
-    pending.sort_by_key(|chunk| chunk.id);
+    seed_chunks(&conn, 1153, |id| format!("private input {id:04}"));
     let reader = open_db(&dir.path().join("test.db")).unwrap();
     let saved_ids = || {
         reader
@@ -564,79 +507,89 @@ fn later_database_save_failure_preserves_prior_commits_and_retries_only_remainin
             .collect::<SqlResult<Vec<_>>>()
             .unwrap()
     };
-    let embedder = InvalidSecondBatch(AtomicUsize::new(0));
+    let embedder = InvalidLaterBatch(AtomicUsize::new(0));
     let (observer, lines) = recording();
     let commits = Mutex::new(Vec::new());
-    let error = embed_chunks_observed(
+    let error = embed_pending_observed(
         &mut conn,
         &embedder,
-        &pending,
         Some(&|done, total| {
-            assert_eq!(saved_ids(), (1..=128).collect::<Vec<_>>());
+            let mut expected: Vec<i64> = (1..=i64::try_from(done.min(1024)).unwrap()).collect();
+            if done == 1025 {
+                expected.push(1153);
+            }
+            assert_eq!(saved_ids(), expected);
             commits.lock().unwrap().push((done, total));
         }),
         &EmbedOptions::default(),
         &observer,
     )
     .err()
-    .expect("the second batch must fail to save");
+    .expect("the second page must fail to save");
     assert!(
         error.to_string().contains("Dimension mismatch"),
         "must reach the failing vector INSERT: {error}"
     );
-    assert_eq!(embedder.0.load(Ordering::SeqCst), 2);
-    assert_eq!(*commits.lock().unwrap(), vec![(128, 257)]);
-    assert_eq!(saved_ids(), (1..=128).collect::<Vec<_>>());
+    assert_eq!(embedder.0.load(Ordering::SeqCst), 10);
+    assert_eq!(
+        *commits.lock().unwrap(),
+        (1..=8)
+            .map(|batch| (batch * 128, 1153))
+            .chain([(1025, 1153)])
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(saved_ids(), (1..=1024).chain([1153]).collect::<Vec<_>>());
     let counts = observer.snapshot()["counts"].clone();
-    assert_eq!(counts["chunks_pending_snapshot"], 257);
-    assert_eq!(counts["chunks_saved"], 128);
+    assert_eq!(counts["chunks_pending_snapshot"], 1153);
+    assert_eq!(counts["chunks_saved"], 1025);
     assert_eq!(counts["chunks_save_failed"], 128);
     assert_eq!(counts["chunks_failed"], 0);
     assert_eq!(counts["chunks_stale"], 0);
-    assert_eq!(counts["chunks_unattempted"], 1);
-    assert_eq!(counts["chunks_remaining_snapshot"], 129);
+    assert_eq!(counts["chunks_unattempted"], 0);
+    assert_eq!(counts["chunks_remaining_snapshot"], 128);
     assert_eq!(
         lines
             .borrow()
             .iter()
             .filter(|line| line.contains("embedding_db_save: committed"))
             .count(),
-        1
+        9
     );
     assert!(
         lines
             .borrow()
             .iter()
-            .any(|line| line.contains("embedding_db_save: unfinished"))
+            .any(|line| line.contains("embedding_db_save: failed; batch rolled back"))
     );
     let first_counts: serde_json::Value = serde_json::from_str(
-        lines.borrow()[0]
-            .strip_prefix("index: embedding counts: ")
+        lines
+            .borrow()
+            .iter()
+            .find_map(|line| line.strip_prefix("index: embedding counts: "))
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(first_counts["chunks_unattempted"], 257);
+    assert_eq!(first_counts["chunks_unattempted"], 1153);
     assert_eq!(first_counts["chunks_saved"], 0);
 
     let remaining = pending_chunks(&reader, usize::MAX).unwrap();
     let mut remaining_ids: Vec<_> = remaining.iter().map(|chunk| chunk.id).collect();
     remaining_ids.sort_unstable();
-    assert_eq!(remaining_ids, (129..=257).collect::<Vec<_>>());
+    assert_eq!(remaining_ids, (1025..=1152).collect::<Vec<_>>());
     // Reuse the real pending gate on restart; saved chunks must not be retried.
     let (resumed, _) = recording();
-    let result = embed_chunks_observed(
+    let result = embed_pending_observed(
         &mut conn,
         &MockEmbedder::new(),
-        &remaining,
         None,
         &EmbedOptions::default(),
         &resumed,
     )
     .unwrap();
-    assert_eq!(result.embedded, 129);
-    assert_eq!(resumed.snapshot()["counts"]["chunks_pending_snapshot"], 129);
+    assert_eq!(result.embedded, 128);
+    assert_eq!(resumed.snapshot()["counts"]["chunks_pending_snapshot"], 128);
     assert_eq!(resumed.snapshot()["counts"]["chunks_remaining_snapshot"], 0);
-    assert_eq!(saved_ids(), (1..=257).collect::<Vec<_>>());
+    assert_eq!(saved_ids(), (1..=1153).collect::<Vec<_>>());
     assert_eq!(pending_count(&reader).unwrap(), 0);
     assert_vectors_match_current_content(&reader);
 }
@@ -676,7 +629,7 @@ fn failed_database_save_is_counted_without_claiming_a_commit() {
         lines
             .borrow()
             .iter()
-            .any(|line| line.contains("embedding_db_save: unfinished"))
+            .any(|line| line.contains("embedding_db_save: failed; batch rolled back"))
     );
     conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
     assert_eq!(
@@ -686,4 +639,118 @@ fn failed_database_save_is_counted_without_claiming_a_commit() {
         1
     );
     assert_eq!(pending_count(&conn).unwrap(), 0);
+}
+
+#[test]
+fn byte_bounded_pages_preserve_unicode_nuls_and_an_oversized_chunk() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    // Descending lengths force the real length bucketing to change ID order.
+    seed_chunk(&conn, 1, &"c".repeat(PENDING_PAGE_BYTES + 1));
+    seed_chunk(&conn, 2, &"b".repeat(PENDING_PAGE_BYTES / 2));
+    seed_chunk(&conn, 3, &"a".repeat(PENDING_PAGE_BYTES / 2 - 3));
+    // Four UTF-8 bytes: counting characters (or stopping at NUL) would wrongly
+    // admit chunk 2 into the first page, whose bodies would exceed 8 MiB by one.
+    seed_chunk(&conn, 4, "é\0x");
+    let observer = Observer::default();
+    let pages = Mutex::new(Vec::new());
+    let result = embed_pending_observed(
+        &mut conn,
+        &MockEmbedder::new(),
+        Some(&|done, total| {
+            let counts = observer.snapshot()["counts"].clone();
+            pages.lock().unwrap().push((
+                done,
+                total,
+                counts["pending_body_bytes_peak"].as_u64().unwrap(),
+            ));
+        }),
+        &EmbedOptions::default(),
+        &observer,
+    )
+    .unwrap();
+    assert_eq!(result.embedded, 4);
+    assert_eq!(
+        *pages.lock().unwrap(),
+        vec![(2, 4, 4_194_305), (3, 4, 4_194_305), (4, 4, 8_388_609)]
+    );
+    assert_eq!(observer.snapshot()["counts"]["pending_pages"], 3);
+    assert_eq!(observer.snapshot()["counts"]["inference_batches"], 3);
+    assert_eq!(pending_count(&conn).unwrap(), 0);
+    assert_vectors_match_current_content(&conn);
+}
+
+#[test]
+fn later_pages_reject_replaced_and_deleted_generations_without_loading_new_bodies() {
+    let (dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 1027, |id| format!("input {id:04}"));
+    let mut other = open_db(&dir.path().join("test.db")).unwrap();
+    let observer = Observer::default();
+    let other = Mutex::new(&mut other);
+    let result = embed_pending_observed(
+        &mut conn,
+        &MockEmbedder::new(),
+        Some(&|done, total| {
+            assert_eq!(total, 1027);
+            if done != 128 {
+                return;
+            }
+            let mut writer = other.lock().unwrap();
+            writer
+                .execute("DELETE FROM qa_chunks WHERE id IN (1025, 1027)", [])
+                .unwrap();
+            writer
+                .execute(
+                    "UPDATE qa_chunks SET content = ?1 WHERE id = 1026",
+                    [&"x".repeat(PENDING_PAGE_BYTES + 1)],
+                )
+                .unwrap();
+            seed_chunk(&writer, 1027, "input 1027");
+            seed_chunk(&writer, 1028, "new input");
+            let current: Vec<_> = pending_chunks(&writer, usize::MAX)
+                .unwrap()
+                .into_iter()
+                .filter(|chunk| chunk.id == 1027)
+                .collect();
+            embed_chunks(
+                &mut writer,
+                &MockEmbedder::new(),
+                &current,
+                None,
+                &EmbedOptions::default(),
+            )
+            .unwrap();
+        }),
+        &EmbedOptions::default(),
+        &observer,
+    )
+    .unwrap();
+    assert_eq!(result.embedded, 1024);
+    let counts = observer.snapshot()["counts"].clone();
+    assert_eq!(counts["chunks_pending_snapshot"], 1027);
+    assert_eq!(counts["chunks_stale"], 3);
+    assert_eq!(counts["chunks_unattempted"], 0);
+    assert_eq!(counts["chunks_remaining_snapshot"], 3);
+    assert_eq!(counts["inference_chunks"], 1024);
+    assert_eq!(counts["pending_body_bytes_peak"], 10_240);
+    assert_eq!(pending_count(&conn).unwrap(), 2);
+    let resumed = embed_pending_observed(
+        &mut conn,
+        &MockEmbedder::new(),
+        None,
+        &EmbedOptions::default(),
+        &Observer::default(),
+    )
+    .unwrap();
+    assert_eq!(resumed.embedded, 2);
+    assert_eq!(pending_count(&conn).unwrap(), 0);
+    let (rows, distinct): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT chunk_id) FROM vec_chunks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, distinct), (1027, 1027));
+    assert_vectors_match_current_content(&conn);
 }

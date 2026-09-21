@@ -1,0 +1,628 @@
+{
+  "measured_date": "2026-09-21",
+  "base_commit": "0fe2f4bfc0608ba3745e2b887c78775ad6f85f6f",
+  "candidate_inputs_fingerprint": "054d03d9e8526f9ba047b7aab9b9bbb8617e7698963a73552eda8ffe229c87e0",
+  "conditions": {
+    "baseline-short": {
+      "binary_sha256": "b503299fff19cfacc64712516a5ca33dd4ed0467c850d49d561aade42bae01df",
+      "script_sha256": "6f9ff1f0adbc199dfa79dd5fc4e8f690dac59e1ea07063b4f6866251e25343d3",
+      "shape": "short",
+      "pairs": 2048,
+      "sessions": 128,
+      "corpus_sha256": "44a12a73f2bc5195135eeaee42ac3814774da69b234713165227c562e1ceaa7f",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "hardware": "Apple M3 / Mac15,3 / 24 GB RAM",
+      "model": "cl-nagoya/ruri-v3-310m",
+      "revision": "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3",
+      "settings": "default token budget and forward pause; separate process; non-TTY; offline cached model",
+      "uncontrolled": "filesystem/GPU caches, background load, power state"
+    },
+    "candidate-short": {
+      "binary_sha256": "a981efb31c34324b75c57cbf146e66a2ef43b96cf098fa562a5059fb9904091e",
+      "script_sha256": "6f9ff1f0adbc199dfa79dd5fc4e8f690dac59e1ea07063b4f6866251e25343d3",
+      "shape": "short",
+      "pairs": 2048,
+      "sessions": 128,
+      "corpus_sha256": "44a12a73f2bc5195135eeaee42ac3814774da69b234713165227c562e1ceaa7f",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "hardware": "Apple M3 / Mac15,3 / 24 GB RAM",
+      "model": "cl-nagoya/ruri-v3-310m",
+      "revision": "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3",
+      "settings": "default token budget and forward pause; separate process; non-TTY; offline cached model",
+      "uncontrolled": "filesystem/GPU caches, background load, power state"
+    },
+    "baseline-mixed": {
+      "binary_sha256": "b503299fff19cfacc64712516a5ca33dd4ed0467c850d49d561aade42bae01df",
+      "script_sha256": "6f9ff1f0adbc199dfa79dd5fc4e8f690dac59e1ea07063b4f6866251e25343d3",
+      "shape": "mixed",
+      "pairs": 2048,
+      "sessions": 128,
+      "corpus_sha256": "dd53ad2a51a35e3bc4d7e2d44cc143c1f71336e2e0ef1c07e3005c40917f931d",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "hardware": "Apple M3 / Mac15,3 / 24 GB RAM",
+      "model": "cl-nagoya/ruri-v3-310m",
+      "revision": "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3",
+      "settings": "default token budget and forward pause; separate process; non-TTY; offline cached model",
+      "uncontrolled": "filesystem/GPU caches, background load, power state"
+    },
+    "candidate-mixed": {
+      "binary_sha256": "a981efb31c34324b75c57cbf146e66a2ef43b96cf098fa562a5059fb9904091e",
+      "script_sha256": "6f9ff1f0adbc199dfa79dd5fc4e8f690dac59e1ea07063b4f6866251e25343d3",
+      "shape": "mixed",
+      "pairs": 2048,
+      "sessions": 128,
+      "corpus_sha256": "dd53ad2a51a35e3bc4d7e2d44cc143c1f71336e2e0ef1c07e3005c40917f931d",
+      "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+      "hardware": "Apple M3 / Mac15,3 / 24 GB RAM",
+      "model": "cl-nagoya/ruri-v3-310m",
+      "revision": "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3",
+      "settings": "default token budget and forward pause; separate process; non-TTY; offline cached model",
+      "uncontrolled": "filesystem/GPU caches, background load, power state"
+    }
+  },
+  "results": [
+    {
+      "shape": "short",
+      "version": "baseline",
+      "case": "initial",
+      "exit_code": 0,
+      "wall_seconds": 95.1714835419989,
+      "max_rss_bytes": 1541767168,
+      "held_body_bytes": 270164,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 0,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048
+      },
+      "seconds": {
+        "inference": 92.364324917,
+        "pending_extraction": 0.000424792,
+        "total": 94.696270292
+      }
+    },
+    {
+      "shape": "short",
+      "version": "baseline",
+      "case": "rebuild",
+      "exit_code": 0,
+      "wall_seconds": 85.26598066699808,
+      "max_rss_bytes": 1545043968,
+      "held_body_bytes": 270164,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 0,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048
+      },
+      "seconds": {
+        "inference": 82.50494162300001,
+        "pending_extraction": 0.000476792,
+        "total": 85.203183417
+      }
+    },
+    {
+      "shape": "short",
+      "version": "baseline",
+      "case": "interrupted",
+      "exit_code": -15,
+      "wall_seconds": 6.673337458996684,
+      "max_rss_bytes": 1546305536,
+      "held_body_bytes": 270164,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 128,
+        "embedded_chunks": 128,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 253616,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 1920,
+        "chunks_saved": 128,
+        "inference_batches": 1,
+        "inference_chunks": 128
+      },
+      "seconds": {}
+    },
+    {
+      "shape": "short",
+      "version": "baseline",
+      "case": "resume",
+      "exit_code": 0,
+      "wall_seconds": 83.19460991698725,
+      "max_rss_bytes": 1545650176,
+      "held_body_bytes": 253616,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 0,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 1920,
+        "inference_batches": 15,
+        "inference_chunks": 1920
+      },
+      "seconds": {
+        "inference": 81.549993085,
+        "pending_extraction": 0.000768917,
+        "total": 83.113648666
+      }
+    },
+    {
+      "shape": "short",
+      "version": "candidate",
+      "case": "initial",
+      "exit_code": 0,
+      "wall_seconds": 91.41417833299784,
+      "max_rss_bytes": 1547583488,
+      "held_body_bytes": 136192,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 0,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048,
+        "pending_body_bytes_peak": 136192,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 2
+      },
+      "seconds": {
+        "inference": 88.77043791700001,
+        "pending_extraction": 0.0022390830000000002,
+        "total": 90.921836583
+      }
+    },
+    {
+      "shape": "short",
+      "version": "candidate",
+      "case": "rebuild",
+      "exit_code": 0,
+      "wall_seconds": 84.45515745799639,
+      "max_rss_bytes": 1549189120,
+      "held_body_bytes": 136192,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 0,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048,
+        "pending_body_bytes_peak": 136192,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 2
+      },
+      "seconds": {
+        "inference": 81.40948920700001,
+        "pending_extraction": 0.002262251,
+        "total": 84.412289
+      }
+    },
+    {
+      "shape": "short",
+      "version": "candidate",
+      "case": "interrupted",
+      "exit_code": -15,
+      "wall_seconds": 6.204054832996917,
+      "max_rss_bytes": 1545633792,
+      "held_body_bytes": 133972,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 128,
+        "embedded_chunks": 128,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 253616,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 1920,
+        "chunks_saved": 128,
+        "inference_batches": 1,
+        "inference_chunks": 128,
+        "pending_body_bytes_peak": 133972,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 1
+      },
+      "seconds": {}
+    },
+    {
+      "shape": "short",
+      "version": "candidate",
+      "case": "resume",
+      "exit_code": 0,
+      "wall_seconds": 78.98454554199998,
+      "max_rss_bytes": 1548238848,
+      "held_body_bytes": 134448,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 270164,
+        "largest_chunk_bytes": 133,
+        "pending_body_bytes": 0,
+        "body_sha256": "09e0a17688d72dd6ac890048a48601f73f563d6f8d9c998503a23cc8a2586b8b",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 1920,
+        "inference_batches": 15,
+        "inference_chunks": 1920,
+        "pending_body_bytes_peak": 134448,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 2
+      },
+      "seconds": {
+        "inference": 77.54223737699999,
+        "pending_extraction": 0.002223083,
+        "total": 78.942496
+      }
+    },
+    {
+      "shape": "mixed",
+      "version": "baseline",
+      "case": "initial",
+      "exit_code": 0,
+      "wall_seconds": 187.0664581250021,
+      "max_rss_bytes": 1547567104,
+      "held_body_bytes": 829268,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 0,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048
+      },
+      "seconds": {
+        "inference": 185.053400499,
+        "pending_extraction": 0.000649792,
+        "total": 187.002457166
+      }
+    },
+    {
+      "shape": "mixed",
+      "version": "baseline",
+      "case": "rebuild",
+      "exit_code": 0,
+      "wall_seconds": 177.10187829200004,
+      "max_rss_bytes": 1588166656,
+      "held_body_bytes": 829268,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 0,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048
+      },
+      "seconds": {
+        "inference": 174.090428917,
+        "pending_extraction": 0.000601667,
+        "total": 177.054929583
+      }
+    },
+    {
+      "shape": "mixed",
+      "version": "baseline",
+      "case": "interrupted",
+      "exit_code": -15,
+      "wall_seconds": 6.261937666989979,
+      "max_rss_bytes": 1548402688,
+      "held_body_bytes": 829268,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 128,
+        "embedded_chunks": 128,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 812664,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 1920,
+        "chunks_saved": 128,
+        "inference_batches": 1,
+        "inference_chunks": 128
+      },
+      "seconds": {}
+    },
+    {
+      "shape": "mixed",
+      "version": "baseline",
+      "case": "resume",
+      "exit_code": 0,
+      "wall_seconds": 264.3893262909987,
+      "max_rss_bytes": 1588166656,
+      "held_body_bytes": 812664,
+      "held_body_basis": "complete pending payload from database and baseline all-body selection",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 0,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 1920,
+        "inference_batches": 15,
+        "inference_chunks": 1920
+      },
+      "seconds": {
+        "inference": 261.708272123,
+        "pending_extraction": 0.000903375,
+        "total": 264.160683334
+      }
+    },
+    {
+      "shape": "mixed",
+      "version": "candidate",
+      "case": "initial",
+      "exit_code": 0,
+      "wall_seconds": 174.29468408301182,
+      "max_rss_bytes": 1588592640,
+      "held_body_bytes": 694740,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 0,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048,
+        "pending_body_bytes_peak": 694740,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 2
+      },
+      "seconds": {
+        "inference": 169.918863291,
+        "pending_extraction": 0.0037744579999999996,
+        "total": 174.21067475
+      }
+    },
+    {
+      "shape": "mixed",
+      "version": "candidate",
+      "case": "rebuild",
+      "exit_code": 0,
+      "wall_seconds": 171.82607499998994,
+      "max_rss_bytes": 1589313536,
+      "held_body_bytes": 694740,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 0,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 2048,
+        "inference_batches": 16,
+        "inference_chunks": 2048,
+        "pending_body_bytes_peak": 694740,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 2
+      },
+      "seconds": {
+        "inference": 169.128630295,
+        "pending_extraction": 0.002766417,
+        "total": 171.723972
+      }
+    },
+    {
+      "shape": "mixed",
+      "version": "candidate",
+      "case": "interrupted",
+      "exit_code": -15,
+      "wall_seconds": 5.302789749999647,
+      "max_rss_bytes": 1546731520,
+      "held_body_bytes": 134528,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 128,
+        "embedded_chunks": 128,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 812664,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 1920,
+        "chunks_saved": 128,
+        "inference_batches": 1,
+        "inference_chunks": 128,
+        "pending_body_bytes_peak": 134528,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 1
+      },
+      "seconds": {}
+    },
+    {
+      "shape": "mixed",
+      "version": "candidate",
+      "case": "resume",
+      "exit_code": 0,
+      "wall_seconds": 161.47709837499133,
+      "max_rss_bytes": 1588314112,
+      "held_body_bytes": 677716,
+      "held_body_basis": "observed page payload peak",
+      "database": {
+        "sessions": 128,
+        "messages": 4096,
+        "chunks": 2048,
+        "vectors": 2048,
+        "embedded_chunks": 2048,
+        "body_bytes": 829268,
+        "largest_chunk_bytes": 3349,
+        "pending_body_bytes": 0,
+        "body_sha256": "3bffa031fb0447bda3c8fd282d92a9c1e3a3044dd0b8ac7f3625215760bc246f",
+        "source_links_valid": true
+      },
+      "counts": {
+        "chunks_remaining_snapshot": 0,
+        "chunks_saved": 1920,
+        "inference_batches": 15,
+        "inference_chunks": 1920,
+        "pending_body_bytes_peak": 677716,
+        "pending_metadata_bytes": 49152,
+        "pending_page_chunks_peak": 1024,
+        "pending_pages": 2
+      },
+      "seconds": {
+        "inference": 159.56526954100002,
+        "pending_extraction": 0.004438042999999999,
+        "total": 161.445241958
+      }
+    }
+  ],
+  "all_body_and_source_link_comparisons_passed": true,
+  "limitations": [
+    "One cycle per shape/version; caches, background load and power state uncontrolled.",
+    "Baseline mixed resume overlapped the earlier failed full check; not an isolated speed comparison.",
+    "Corpus crosses the 1024-count boundary, but not the 8 MiB byte boundary.",
+    "Vector payload bytes and search quality were not compared in this host benchmark.",
+    "Maximum RSS includes model/runtime; body metrics exclude identity metadata and temporary allocations."
+  ],
+  "candidate_commit": "4975b2e16c0181b18d1df9b61c5dc1ddb1c8dd5b",
+  "full_check": {
+    "command": [
+      "sh",
+      "-ec",
+      "cargo fmt -- --check\ncargo nextest run --profile ci --locked\ncargo clippy --locked --all-targets --all-features -- -D warnings"
+    ],
+    "exit_code": 0,
+    "wall_seconds": 58.16995310783386,
+    "note": "Same full check, profile, concurrency and sources. No concurrent parent benchmark. Host permission allows existing hdiutil disk-image fixtures."
+  }
+}

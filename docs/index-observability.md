@@ -23,7 +23,7 @@
 | `chunk_reconciliation` | 再利用対象の会話の旧チャンク取得・新チャンク生成・照合・rowid更新・不要vector削除・再利用件数取得。`parse_fts` と `fts_transaction` に含まれる。対象なしは0 |
 | `chunking` | 未完了セッション選択、本文取得、チャンク作成、DB書込み、段階全体のcommit |
 | `legacy_backfill` | 既存チャンクのrowidリンクと旧セッションの編集先パス再読込み、解析診断の取得/表示 |
-| `pending_extraction` | 埋め込み未処理の一回の抽出。モデル利用時は本文も取得。利用不可時はIDだけで件数を取得 |
+| `pending_extraction` | 埋め込み未処理のID・世代・byte長の一回の照合とソート、および各ページの本文取得の累積。利用不可時はIDだけで件数を取得 |
 | `inference` | 全バッチの推論時間の累積。tokenize、分割、指定したforward pauseを含む |
 | `embedding_db_save` | 全バッチの保存時間の累積。writer lock待ち、世代/本文照合、書込み、commitを含む |
 
@@ -38,10 +38,10 @@
 - `files_remaining`：列挙済みで処理結果が未確定のファイル数。通常終了では上記5分類の和が `files_discovered`。SQL失敗で途中終了した場合には未処理分が残る。`files_updated_committed` はFTS transactionのcommit後だけ更新する。未commitの更新を保存済みと扱わない。
 - `sessions_stored`：FTS処理後の保存済みセッション総数。root保護や以前のデータも含む。
 - `sessions_chunk_pending`：今回のチャンク化対象セッション数。`sessions_chunked_committed` は段階全体のcommit済みセッション数、`sessions_chunked_empty` はそのうち0チャンクで正常完了した数、`chunks_created_committed` は作成したチャンク数。空完了は内数であり、足し合わせない。`sessions_chunk_remaining` はこの段階でまだcommitしていない対象数。途中表示の `processed` / `unprocessed` は作業量であり、commit前は `committed=0` のまま。
-- `chunks_pending_snapshot`：抽出時点の未処理チャンク数。`chunks_saved` / `chunks_failed` / `chunks_stale` / `chunks_save_failed` / `chunks_unattempted` は、その集合の相互排他的な分類。順に、この実行でcommit、推論失敗、世代等が変わり保存を破棄、保存失敗したバッチ、まだ推論が完了していないもの。保存失敗時はバッチ全体を `save_failed` とし、そのバッチの世代差分は確定しない。モデル不使用では全件が `unattempted` となる。
-- `chunks_remaining_snapshot = chunks_pending_snapshot - chunks_saved`。失敗・破棄・未試行を含む。並行するindexによる削除・再保存・新規追加を追跡する現在のDB総数ではない。再開時は新たに一回抽出し直す。バッチごとに累積件数をstderrへ通知する。
+- `chunks_pending_snapshot`：ID一覧を確定した時点の未処理チャンク数。`chunks_saved` / `chunks_failed` / `chunks_stale` / `chunks_save_failed` / `chunks_unattempted` は、その集合の相互排他的な分類。順に、この実行でcommit、推論失敗、本文取得前または保存前に世代等が変わり破棄、保存失敗したバッチ、まだ推論が完了していないもの。保存失敗時はバッチ全体を `save_failed` とし、そのバッチの世代差分は確定しない。モデル不使用では全件が `unattempted` となる。
+- `chunks_remaining_snapshot = chunks_pending_snapshot - chunks_saved`。失敗・破棄・未試行を含む。並行するindexによる削除・再保存・新規追加を追跡する現在のDB総数ではない。再開時はID一覧を新たに一回照合し直す。バッチごとに累積件数をstderrへ通知する。
 
-観測のためtransactionを分割しない。新規チャンクの途中失敗はチャンク段階全体をrollbackする。既存会話の照合失敗はFTS transaction全体をrollbackする。埋め込みの推論失敗は後続バッチを継続し、保存失敗はコマンドを失敗させるが、それより前のバッチcommitは残る。root未読や永続する解析診断の件数はこれらの今回処理数とは別に確認する。
+観測のためtransactionを分割しない。新規チャンクの途中失敗はチャンク段階全体をrollbackする。既存会話の照合失敗はFTS transaction全体をrollbackする。埋め込みの推論失敗と保存失敗は後続バッチを継続する。保存失敗したバッチはrollbackし、全ページ処理後に最初の保存エラーを返してコマンドを失敗させる。成功したバッチのcommitは前後とも残る。本文取得自体のSQL失敗はその場で停止し、未取得分は未試行に残る。root未読や永続する解析診断の件数はこれらの今回処理数とは別に確認する。
 
 ## 4ケースの実モデル計測
 
@@ -53,7 +53,7 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-
   --conditions 'commit、チップ、RAM、OS、Rust/Metal版、電源/GPU負荷、cold/warm条件'
 ```
 
-スクリプトは私的ログを参照しない合成512会話で初回、無変更、1会話への1往復追記を実行する。別の新規DBを途中のバッチcommit通知後にSIGTERMで止め、同じDBで再開する。入力・DB・stderr・JSONと各ケースの実時間を指定先へ残す。中断が間に合わなかった場合やモデルが使えない場合は失敗し、有効な4ケース測定として扱わない。必要なら会話数を増やし、新しい保存先でやり直す。合成負荷と実際の長い会話の費用は同一視しない。RSSはこのスクリプトでは測定しない。
+スクリプトは私的ログを参照しない合成512会話で初回、無変更、1会話への1往復追記を実行する。別の新規DBを途中のバッチcommit通知後にSIGTERMで止め、同じDBで再開する。入力・DB・stderr・JSONと各ケースの実時間を指定先へ残す。中断が間に合わなかった場合やモデルが使えない場合は失敗し、有効な4ケース測定として扱わない。必要なら会話数を増やし、新しい保存先でやり直す。合成負荷と実際の長い会話の費用は同一視しない。最大RSSも各子processの `wait4` rusageからbytes単位で保存する。macOSのbytesとLinuxのKiBを区別し、前のコマンドの最大値を混ぜない。
 
 各プロセスはモデルを再ロードする。初回DB作成をcold model / cold filesystemと呼ばない。キャッシュを意図的に制御した場合だけ条件と操作を記録し、制御できない場合は未制御と記す。token budget / pauseは既定値に固定している。異なる設定を評価する場合は、同じ入力と双方の条件を揃えて別の比較にする。
 
@@ -103,3 +103,50 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-
 PRの測定記録にはハードウェア・モデル・件数・変更量、推論入力数とバッチ回数、再利用数、段階時間とwall、保存データの一致、ページ容量を示す。双方を同じ入力・設定で交互順に繰り返し、無変更の追加費用と追記の削減を分ける。中断の1試行成功を一般的な競合保証にせず、stubのbyte一致を実モデルのfloat値一致や検索品質の証明にしない。[#324の既存測定](../research/index-observability-measurements.md) は今回の性能結果ではない。実モデル計測・設定済みfull check・CIと独立評価はホストで実施し、この手順の追加だけで費用に見合うことを確認済みとはしない。
 
 引継ぎ時の[#325実測記録](../research/index-reuse-measurements.md)は、上記の512ファイルの手順とは別に、ホスト用scriptで合成1会話256往復へ1往復を追記した結果である。測定版・入力fingerprint・保存内容の照合結果・未測定範囲は同記録を参照し、提出版との差分を確認して再利用する。過去の実測を提出版のfull checkやCIの成功へ読み替えない。
+
+
+## 未処理本文の有限ページと比較計測
+
+[Issue #326](https://github.com/thkt/recall/issues/326) の対象は、埋め込み待ち本文の取得から処理までの保持量である。モデル、tokenizer、SQLite cache、FTS取込み、会話のチャンク化・再利用照合のmemoryを含むprocess全体の上限ではない。
+
+モデル利用時は、短いread transaction内でvec0のchunk IDを一度走査してHashSetへ入れ、qa_chunksを一度走査して未処理のID・世代・UTF-8 byte長だけを保存する。本文やtimestampのSQLソートはしない。byte長はNULを含む本文でも正しく数える。metadataをbyte長・IDの順に並べ、transactionと埋め込み済みID集合を解放してから本文を取得する。ID・世代を条件に主キー検索するため、ページごとの全表走査や相関NOT EXISTSを追加しない。
+
+本文の取得単位は最大1,024チャンクかつ8 MiB。1件だけで8 MiBを超える場合は単独ページとし、切り捨てずモデルへ渡す。したがって保持する本文のbyte長の合計は `max(8 MiB, snapshot内の最大単一チャンク)` 以下となる。通常のチャンク生成は16,000 bytesで分割するが、旧DB等の長い単一チャンクも処理する。文字列やVecの管理領域・allocatorの余白、モデル内部のtoken化・分割結果・出力vectorはこの合計に含まない。ページを処理し終えて解放してから次を取得し、先読みqueueは持たない。
+
+その他の主なmemoryは、照合中の埋め込み済みID集合 O(E)、未処理一覧 O(P)、1ページ分の本文オブジェクト、最大128入力のモデル出力である。Eは埋め込み済みの異なるchunk ID数、Pはsnapshotの未処理数である。64-bit環境の一覧要素はID・世代・長さで24 bytes、Vecのcapacity分を確保する。HashSetの余白、SQLiteの一行の評価用memoryは別途必要となる。全件照合 O(V + Q)、metadataのソート O(P log P)、本文の主キー検索 O(P log Q) が残る（Vはvector行数、Qはchunk行数）。既存の保存時のvec0 IN-deleteはバッチにつき1回の走査のままであり、全処理を線形と保証するものではない。
+
+ページの内部も最大128件ずつ推論する。snapshot全体の長さ順を維持するので、timestamp順の局所ページだけで長短が混ざることを避ける。byte上限によるページ末尾では128件未満のバッチが増える可能性がある。`--token-budget` と `--forward-pause-ms` は各呼出しへ従来どおり転送し、forwardの分割とpauseはruricoが行う。取得単位はGPUのtoken budgetとは別である。
+
+有限のID一覧を一方向へ進むため、推論・保存が失敗したページを同じ実行で取り直さない。本文取得時にも世代を照合し、変更・削除済みの行は本文をロードせず `chunks_stale` に数える。取得後の競合は #319 の保存transaction内の本文・世代照合で拒否する。同じ世代の並行保存では検証済みIDだけを置換し、重複vectorを作らない。snapshot後の新規ID・新世代は次のindex対象となる。失敗・破棄・未試行と保存数はページをまたいで累積する。
+
+追加した観測値は次の意味を持つ。モデル利用不可時は出さない。
+
+- `pending_body_bytes_peak`：同時保持したページ本文のbyte長の合計の最大値。RSSやheap全体の測定ではない。
+- `pending_page_chunks_peak`：同時保持したページ本文の最大件数。
+- `pending_metadata_bytes`：未処理一覧のcapacity × 要素サイズ。照合用HashSetを含まない。
+- `pending_pages`：取得したページ数。全件が世代不一致で本文0件のページも数える。
+
+取得方式の比較では、毎ページpending照合を繰り返す方式は #138 の利点を失うため採らない。ID keysetだけのページ取得はmetadataを減らせる一方、長さの近い入力を全体からまとめる現在の推論効率を変える。今回のmetadata一覧方式は O(P) の小さい一覧を残してその長さ順を保つ選択である。1,024件・8 MiBは実装上の比較対象値であり、実測済みの最適値や人が合意した性能SLOではない。今回の実測と制約は[本文保持量の比較記録](../research/bounded-pending-measurements.md)に記す。
+
+### 追加比較の手順
+
+以下は入力長や反復数を広げる場合の手順であり、上の比較記録で全条件を実行したという意味ではない。
+
+変更前は引継ぎ開始版 `0fe2f4bfc0608ba3745e2b887c78775ad6f85f6f`、変更版は提出差分を含む同一性確認済みbinaryを使う。両版を同じrelease・モデルrevision・設定でビルドし、上記の入力hash記録と環境条件の記録を適用する。短文、長短混在、長文をそれぞれ同じ合成入力で比較する。各版を交互順で繰り返し、回数・全試行・中央値・範囲を残す。既存 #324/#325 の時間・RSSは今回の値へ転用しない。
+
+```sh
+python3 scripts/measure-index.py /path/to/before /path/to/new-before-results \
+  --sessions 2048 --body-profile mixed --all-body-baseline \
+  --model 'モデルID・固定revision・artifact識別値' \
+  --conditions '開始commit、チップ、RAM、OS、Rust/Metal版、ビルド条件、電源/GPU負荷、cache条件'
+python3 scripts/measure-index.py /path/to/after /path/to/new-after-results \
+  --sessions 2048 --body-profile mixed --verify-bounded-pending \
+  --model '同じモデルID・固定revision・artifact識別値' \
+  --conditions '変更版の識別値と同じ比較条件'
+```
+
+`--body-profile short` は各roleに短文1回、`long` は64回、`mixed` は往復番号ごとに短文と64回の長文を交互に置く。short / longにも同じコマンドを実行する。これは実際の会話長やtoken分布を代表するとの主張ではない。旧版にも段階通知があるので `--baseline` は付けない。初回、無変更、追記、rebuild、中断、再開を記録する。単一チャンクの例外・世代競合・失敗注入はstubテストで確認する。
+
+各ケースの最大RSS、保持本文量、未処理抽出時間、推論時間、totalとwall、完了件数・残件、推論バッチ数を前後で示す。前版の本文保持量は観測キーがないため、固定合成データのchunk byte長とpending snapshot件数から導出する。初回/rebuildでは全件、再開では長さ順に保存済みのprefixを除いたsuffixの合計である。同じ長さのtie順は合計に影響しない。この導出は、指定前版が全件取得・全体の長さ順に処理し、他writerがなく推論・保存失敗もない本scriptの条件だけで成り立つ。allocationやRSSの実測値とは区別する。変更版はページの観測値を使う。
+
+スクリプトは保存本文・source対応のhash、完了数、残件を照合し、上限超過や中断不成立・モデル不使用を拒否する。前後のbody hash・件数も比較し、ページ化で処理を省いた結果を改善と扱わない。RSSは前段やモデルのpeakを含むため、本文保持量が減ってもRSS改善を断定しない。条件と比較値はPRの証拠へ保存し、私的本文は公開しない。実モデル比較、設定済みfull check・CI、変更文書を含む独立評価はホストで実施する。この手順やstub成功だけでそれらを完了したとは扱わない。
