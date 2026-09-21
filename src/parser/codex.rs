@@ -102,6 +102,11 @@ fn process_codex_entry(
 }
 
 pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
+    Ok(parse_codex_session_including_empty(path)?.filter(|p| !p.messages.is_empty()))
+}
+
+/// Retain successful empty reads so an indexer can acknowledge a truncation.
+pub(super) fn parse_codex_session_including_empty(path: &Path) -> Result<Option<ParseResult>> {
     let Some(initial_session_id) = session_id_from_path(path) else {
         return Ok(None);
     };
@@ -120,10 +125,6 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         process_codex_entry(entry, entry_type, &mut state)
     })?;
-
-    if messages.is_empty() {
-        return Ok(None);
-    }
 
     let slug = match (&date_slug, &uuid_short) {
         (Some(d), Some(u)) => format!("{d}-{u}"),

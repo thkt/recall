@@ -172,7 +172,7 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 ~/.codex/sessions/**/*.jsonl   ─┘
 ```
 
-**インデックス** — `recall index` でセッションディレクトリをスキャン、JSONLを解析し、全文検索インデックスとQ&Aチャンクを構築し、新規チャンクをembeddingします。差分更新で、全セッションファイルを走査しつつ、前回インデックス以降に更新されたファイルのみを再解析します。
+**インデックス** — `recall index` でセッションディレクトリをスキャン、JSONLを解析し、全文検索インデックスとQ&Aチャンクを構築し、新規チャンクをembeddingします。差分更新では全セッションファイルを走査し、保存済みサイズが一致し、mtime差が1ms未満の場合だけ本文の再解析を省きます。mtimeを保持した追記・切詰めもサイズ差で検出します。読取り中に更新印が変わったファイルは次回のindexで再読取りします。サイズ未保存の旧インデックスは一度再読取りし、embeddingが利用できない間は既存embeddingを持つ会話の更新を保留します。同じサイズでmtimeも同じ（または差が1ms未満）の内容差し替えは検出できません。その場合は、動作するモデルを用意して `recall rebuild` で更新してください。更新判定のための全件ハッシュ計算は行いません。
 
 **検索** — `recall search` は構築済みインデックスを読むだけで、インデックスは作成しません。事前に `recall index` でリフレッシュするか、[Hook](#hook) を登録してセッション終了時に自動インデックスしてください。空のインデックスを検索すると `No sessions indexed. Run recall index first.` を表示します。
 
@@ -186,7 +186,7 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 src/
 ├── main.rs       CLIサブコマンド（index, search, show, status）
 ├── parser/       Claude Code / Codex の JSONL パーサー
-├── indexer.rs    mtime追跡によるインクリメンタルインデクサー + チャンク生成
+├── indexer.rs    mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
 ├── hybrid.rs     RRF 統合 + recency boost
 ├── embedder.rs   index時embeddingのオーケストレーション（チャンクをruricoでバッチ処理）
