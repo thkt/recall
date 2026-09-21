@@ -86,10 +86,16 @@ fn test_uuid_short_extraction() {
 }
 
 #[test]
-fn test_codex_empty_messages_returns_none() {
+fn codex_empty_messages_are_retained_for_diagnostics() {
     let tmp = write_jsonl(&[
         r#"{"timestamp":"2026-01-17T16:39:33Z","type":"session_meta","payload":{"id":"abc","cwd":"/proj"}}"#,
         r#"{"timestamp":"2026-01-17T16:40:00Z","type":"event_msg","payload":{}}"#,
     ]);
-    assert!(parse_codex_session(tmp.path()).unwrap().is_none());
+    assert!(
+        parse_codex_session(tmp.path())
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty()
+    );
 }

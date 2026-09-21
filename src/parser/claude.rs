@@ -86,12 +86,8 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
     Some(Message { role, text })
 }
 
+/// Retain empty reads and their diagnostics for ingestion and path backfill.
 pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
-    Ok(parse_claude_session_including_empty(path)?.filter(|p| !p.messages.is_empty()))
-}
-
-/// Retain successful empty reads so an indexer can acknowledge a truncation.
-pub(super) fn parse_claude_session_including_empty(path: &Path) -> Result<Option<ParseResult>> {
     let Some(session_id) = session_id_from_path(path) else {
         return Ok(None);
     };
@@ -103,7 +99,7 @@ pub(super) fn parse_claude_session_including_empty(path: &Path) -> Result<Option
         scanned_files: Vec::new(),
     };
 
-    let (messages, skipped_lines) =
+    let (messages, diagnostics) =
         parse_jsonl_entries(path, |entry| process_claude_entry(entry, &mut state))?;
 
     if state.slug.is_empty() {
@@ -121,7 +117,7 @@ pub(super) fn parse_claude_session_including_empty(path: &Path) -> Result<Option
         },
         messages,
         scanned_files: state.scanned_files,
-        skipped_lines,
+        diagnostics,
     }))
 }
 

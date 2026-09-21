@@ -67,12 +67,18 @@ fn test_claude_slug_fallback_to_session_id() {
 }
 
 #[test]
-fn test_claude_empty_messages_returns_none() {
+fn claude_empty_messages_are_retained_for_diagnostics() {
     let tmp = write_jsonl(&[
         r#"{"type":"progress","data":{"type":"hook_progress"}}"#,
         r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#,
     ]);
-    assert!(parse_claude_session(tmp.path()).unwrap().is_none());
+    assert!(
+        parse_claude_session(tmp.path())
+            .unwrap()
+            .unwrap()
+            .messages
+            .is_empty()
+    );
 }
 
 // U-002 dedupe: a write-target path repeated across tool_use blocks — within one

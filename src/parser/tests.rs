@@ -147,3 +147,42 @@ fn test_source_from_db_unknown_returns_none() {
     assert_eq!(Source::from_db(""), None);
     assert_eq!(Source::from_db("Claude"), None);
 }
+
+#[test]
+fn jsonl_diagnostics_distinguish_corruption_from_possible_incomplete_tails() {
+    use std::fs;
+
+    // Each boundary can otherwise misdirect the user to wait for a writer
+    // instead of repairing corruption, or flag a valid excluded event as loss.
+    let cases: &[(&[u8], [i64; 3])] = &[
+        (b"{\"type\":\"progress\"}\n \t\r\n", [0, 0, 0]),
+        (b"{\"type\":\"progress\"}", [0, 0, 0]),
+        (b"{\"type\":", [0, 0, 1]),
+        (b"{\"type\":\n", [1, 0, 0]),
+        (b"{broken", [1, 0, 0]),
+        (b"\xff\n", [0, 1, 0]),
+        (b"\xff", [0, 1, 0]),
+        (b"{\"text\":\"\xe3\x81", [0, 0, 1]),
+        (b"{\"text\":\"\xe3\x81\n", [0, 1, 0]),
+    ];
+    for (input, expected) in cases {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), input).unwrap();
+        for source in [Source::Claude, Source::Codex] {
+            let parsed = parse_session_including_empty(file.path(), source)
+                .unwrap()
+                .unwrap();
+            assert!(parsed.messages.is_empty());
+            let d = parsed.diagnostics;
+            assert_eq!(
+                [
+                    d.invalid_json_lines,
+                    d.invalid_utf8_lines,
+                    d.incomplete_tail_lines
+                ],
+                *expected,
+                "{source}: {input:?}"
+            );
+        }
+    }
+}

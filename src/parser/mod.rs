@@ -89,7 +89,23 @@ pub struct ParseResult {
     /// tool_use blocks (Edit / Write / MultiEdit / NotebookEdit). Never routed
     /// into `messages` / `qa_chunks`; the indexer persists them to `session_files`.
     pub scanned_files: Vec<String>,
-    pub skipped_lines: usize,
+    pub diagnostics: LineDiagnostics,
+}
+
+/// Counts only malformed input; valid excluded events and blank lines are not errors.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LineDiagnostics {
+    pub invalid_json_lines: i64,
+    pub invalid_utf8_lines: i64,
+    /// Unterminated last line with a JSON EOF or truncated UTF-8 sequence.
+    /// This is evidence of a possible write in progress, not proof of one.
+    pub incomplete_tail_lines: i64,
+}
+
+impl LineDiagnostics {
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 pub(crate) fn parse_session_including_empty(
@@ -97,8 +113,8 @@ pub(crate) fn parse_session_including_empty(
     source: Source,
 ) -> Result<Option<ParseResult>> {
     match source {
-        Source::Claude => claude::parse_claude_session_including_empty(path),
-        Source::Codex => codex::parse_codex_session_including_empty(path),
+        Source::Claude => parse_claude_session(path),
+        Source::Codex => parse_codex_session(path),
     }
 }
 
@@ -290,24 +306,36 @@ pub(super) fn parse_iso_timestamp(val: &Value) -> Option<i64> {
 pub(super) fn parse_jsonl_entries(
     path: &Path,
     mut process: impl FnMut(&Value) -> Option<Message>,
-) -> Result<(Vec<Message>, usize)> {
+) -> Result<(Vec<Message>, LineDiagnostics)> {
     use std::fs::File;
-    use std::io::{BufRead, BufReader, ErrorKind};
+    use std::io::{BufRead, BufReader};
+    use std::str;
 
-    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
+    let file = File::open(path).context("Failed to open session file")?;
+    let mut reader = BufReader::new(file);
     let mut messages = Vec::new();
-    let mut skipped_lines = 0;
+    let mut diagnostics = LineDiagnostics::default();
+    let mut bytes = Vec::new();
 
-    for line_result in reader.lines() {
-        let raw_line = match line_result {
+    loop {
+        bytes.clear();
+        if reader
+            .read_until(b'\n', &mut bytes)
+            .context("Failed to read session file")?
+            == 0
+        {
+            break;
+        }
+        let terminated = bytes.last() == Some(&b'\n');
+        let raw_line = match str::from_utf8(&bytes) {
             Ok(line) => line,
-            Err(e) if e.kind() == ErrorKind::InvalidData => {
-                skipped_lines += 1;
-                continue;
-            }
             Err(e) => {
-                return Err(e).with_context(|| format!("I/O error reading {}", path.display()));
+                if !terminated && e.error_len().is_none() {
+                    diagnostics.incomplete_tail_lines += 1;
+                } else {
+                    diagnostics.invalid_utf8_lines += 1;
+                }
+                continue;
             }
         };
         let line = raw_line.trim();
@@ -316,8 +344,12 @@ pub(super) fn parse_jsonl_entries(
         }
         let entry: Value = match serde_json::from_str(line) {
             Ok(v) => v,
-            Err(_) => {
-                skipped_lines += 1;
+            Err(e) => {
+                if !terminated && e.is_eof() {
+                    diagnostics.incomplete_tail_lines += 1;
+                } else {
+                    diagnostics.invalid_json_lines += 1;
+                }
                 continue;
             }
         };
@@ -326,7 +358,7 @@ pub(super) fn parse_jsonl_entries(
         }
     }
 
-    Ok((messages, skipped_lines))
+    Ok((messages, diagnostics))
 }
 
 pub(super) fn session_id_from_path(path: &Path) -> Option<String> {

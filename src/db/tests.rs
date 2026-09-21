@@ -1176,3 +1176,49 @@ fn generation_upgrade_preserves_embeddings_and_reopen_keeps_generation_identity(
         "re-open must not reset the counter"
     );
 }
+
+#[test]
+fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    seed_session(&conn, "s");
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('s', 'user', 'kept')",
+        [],
+    )
+    .unwrap();
+    conn.execute_batch(
+        "UPDATE sessions SET mtime = 123, file_size = 42; DROP TABLE parse_diagnostics;",
+    )
+    .unwrap();
+    drop(conn);
+    let conn = open_db(tmp.path()).unwrap();
+    let stamp: (Option<f64>, i64) = conn
+        .query_row("SELECT mtime, file_size FROM sessions", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(stamp, (None, 42));
+    let text: String = conn
+        .query_row("SELECT text FROM messages", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(text, "kept");
+    conn.execute("UPDATE sessions SET mtime = 456", []).unwrap();
+    conn.execute("INSERT INTO parse_diagnostics (file_path, source, invalid_json_lines) VALUES ('/s.jsonl', 'claude', 2)", []).unwrap();
+    drop(conn);
+    let conn = open_db(tmp.path()).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT mtime FROM sessions", [], |r| r.get::<_, f64>(0))
+            .unwrap(),
+        456.0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT invalid_json_lines FROM parse_diagnostics",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+}

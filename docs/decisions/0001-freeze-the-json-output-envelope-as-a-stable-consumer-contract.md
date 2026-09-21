@@ -57,6 +57,25 @@ The no-model state is reported on two different axes by design, and this asymmet
 
 A contributor who tries to make all three commands agree on `degraded` for the no-model case would either wrongly mark `doctor`/`status` unhealthy or wrongly hide search's lost-coverage signal. The divergence is the contract.
 
+### Index parsing diagnostics
+
+[Issue #323](https://github.com/thkt/recall/issues/323) authorizes an additive index/rebuild payload extension while preserving the outer envelope and stdout contract. The envelope remains exactly `data`, `degraded`, and `notes`; successful partial indexing exits 0 and writes one JSON envelope to stdout. Human progress and warnings remain on stderr. The existing `embedded`, `failed_count`, `skipped_roots`, and `preserved_embedded` payload fields retain their meanings.
+
+`data.parse_diagnostics` is always an array (empty when no parsing loss is known). Each entry describes one file's unresolved observation:
+
+| Field | Meaning |
+| --- | --- |
+| `file_path` | Display path, control characters removed and capped at 240 Unicode characters; may be truncated or collide, so it is not a unique machine identifier |
+| `source` | Existing `claude` or `codex` token |
+| `invalid_json_lines` | Count of malformed JSON lines, excluding possible incomplete tails |
+| `invalid_utf8_lines` | Count of invalid UTF-8 lines, excluding possible incomplete tails |
+| `incomplete_tail_lines` | 0 or 1: unterminated final line with JSON EOF or truncated UTF-8; possible write in progress, not proof of an active writer |
+| `read_error` | Boolean: a file open/read/metadata failure or unsupported non-UTF-8 path prevented ingestion; count true entries for affected files |
+
+Internal persistence and cleanup distinguish the original path bytes, including non-UTF-8 names; collisions in the display path do not merge file counts or clear another file's diagnostics. Valid excluded events and blank lines do not contribute. Diagnostics contain neither conversation content nor raw parser errors. Any entry adds actionable notes and makes `degraded` true, independently of the existing embedding and root reasons. Counts persist across freshness skips; they are not per-run totals. A failed read retains prior line counts until a successful observation replaces them. See the [index operating instructions](../../README.md#index) for repair, append, retry, migration, and clearing conditions.
+
+Repository consumers are the CLI output builder and its unit/integration contract tests. The payload-key golden includes `parse_diagnostics`; the real CLI test checks the outer key set and the populated diagnostic shape. External consumers must accept this additional data field; no external consumer execution is claimed here.
+
 ### Reassessment Triggers
 
 - A v2 JSON schema is introduced (then version the envelope explicitly)
