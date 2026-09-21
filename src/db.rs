@@ -282,6 +282,8 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         );",
     )?;
 
+    migrate_parse_diagnostics_if_needed(conn)?;
+
     migrate_fts_if_needed(conn)?;
     migrate_vec_chunks_if_needed(conn)?;
     migrate_qa_chunks_if_needed(conn)?;
@@ -346,6 +348,32 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     migrate_chunks_indexed_if_needed(conn)?;
 
+    Ok(())
+}
+
+fn migrate_parse_diagnostics_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_def(&tx, "parse_diagnostics")?.is_some() {
+        tx.commit()?;
+        return Ok(());
+    }
+    // File-scoped rather than session-scoped: even a file with no usable
+    // messages can have unresolved loss. CREATE also upgrades older indexes.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS parse_diagnostics (
+            file_path TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            invalid_json_lines INTEGER NOT NULL DEFAULT 0,
+            invalid_utf8_lines INTEGER NOT NULL DEFAULT 0,
+            incomplete_tail_lines INTEGER NOT NULL DEFAULT 0,
+            read_error INTEGER NOT NULL DEFAULT 0
+        );",
+    )?;
+
+    // Older runs recorded no line-loss state. Re-read once to establish it;
+    // embedded sessions still use the ordinary preserve-until-model gate.
+    tx.execute("UPDATE sessions SET mtime = NULL", [])?;
+    tx.commit()?;
     Ok(())
 }
 

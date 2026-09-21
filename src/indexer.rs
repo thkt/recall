@@ -1,3 +1,9 @@
+mod diagnostics;
+
+pub use diagnostics::FileParseDiagnostics;
+pub(crate) use diagnostics::load_parse_diagnostics;
+use diagnostics::{cleanup_parse_diagnostics, save_parse_diagnostics, save_read_error};
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::ffi::OsString;
@@ -13,10 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::chunker;
 use crate::classify::classify_first_turn;
-use crate::parser::{
-    Message, ParseResult, Role, Source, parse_claude_session, parse_codex_session,
-    parse_session_including_empty,
-};
+use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
 struct SessionEntry {
     session_id: String,
@@ -29,8 +32,7 @@ struct SessionEntry {
 
 pub struct IndexStats {
     pub indexed: usize,
-    pub parse_errors: usize,
-    pub first_error: Option<String>,
+    pub parse_diagnostics: Vec<FileParseDiagnostics>,
     pub total_sessions: usize,
     pub elapsed_secs: f64,
     /// Sources whose root was not scanned this run yet still hold sessions in
@@ -100,27 +102,18 @@ impl SkippedReason {
     }
 }
 
-impl IndexStats {
-    pub fn parse_error_detail(&self) -> Option<String> {
-        self.first_error
-            .as_ref()
-            .map(|err| format!("Failed to parse {} files — {err}", self.parse_errors))
-    }
-}
-
 enum IndexOutcome {
     Indexed,
     Unchanged,
     /// A re-index was due, but the session already has embeddings and the model
     /// is absent this run, so its rows were left untouched to protect them (#215).
     Preserved(String),
-    ParseError(String),
 }
 
 struct IndexContext<'a> {
     tx: &'a Transaction<'a>,
     existing: &'a HashMap<String, SessionEntry>,
-    /// Force re-index: `check_freshness` must not skip an mtime-unchanged file,
+    /// Force re-index: `is_unchanged` must not skip an mtime-unchanged file,
     /// so every present file is re-parsed and its chunks/embeddings rebuilt.
     force: bool,
     /// Session ids that already hold embeddings, populated only when the model is
@@ -251,14 +244,6 @@ fn upsert_session(
         ],
     )?;
 
-    if parsed.skipped_lines > 0 {
-        debug!(
-            skipped_lines = parsed.skipped_lines,
-            path = fpath_str,
-            "skipped lines during parse"
-        );
-    }
-
     let mut msg_stmt = ctx
         .tx
         .prepare_cached("INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)")?;
@@ -277,31 +262,25 @@ fn upsert_session(
     Ok(())
 }
 
-fn check_freshness(ctx: &IndexContext, fpath: &Path) -> Option<(String, FileStamp)> {
-    let fpath_str = match fpath.to_str() {
-        Some(s) => s.to_owned(),
-        None => {
-            debug!(path = %fpath.display(), "skipping non-UTF-8 path");
-            return None;
-        }
-    };
-
-    let stamp = resolve_file_stamp(fpath)?;
-
-    // Epsilon 0.001s tolerates filesystem mtime rounding (HFS+ 1s, ext4 nano→f64).
-    // Force bypasses the skip so a `rebuild` re-parses every present file even
-    // when its mtime is unchanged.
+fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result<bool> {
+    // A previous failed read must be retried even if metadata was restored.
+    // Line-loss diagnostics survive a freshness skip in their own table.
     if !ctx.force
         && let Some(new_mt) = stamp.mtime_secs()
-        && let Some(entry) = ctx.existing.get(&fpath_str)
+        && let Some(entry) = ctx.existing.get(fpath_str)
         && let Some(old_mt) = entry.mtime
         && entry.file_size == Some(stamp.size)
         && (old_mt - new_mt).abs() < 0.001
+        && !ctx.tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM parse_diagnostics WHERE file_path = ? AND read_error = 1)",
+            [fpath_str],
+            |row| row.get::<_, bool>(0),
+        )?
     {
-        return None;
+        return Ok(true);
     }
 
-    Some((fpath_str, stamp))
+    Ok(false)
 }
 
 fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<IndexOutcome> {
@@ -314,15 +293,19 @@ fn index_file_with_parser(
     source: &Source,
     parse: impl FnOnce(&Path, Source) -> Result<Option<ParseResult>>,
 ) -> Result<IndexOutcome> {
-    let Some((fpath_str, before)) = check_freshness(ctx, fpath) else {
+    let (Some(fpath_str), Some(before)) = (fpath.to_str(), resolve_file_stamp(fpath)) else {
+        save_read_error(ctx.tx, fpath, *source)?;
         return Ok(IndexOutcome::Unchanged);
     };
+    if is_unchanged(ctx, fpath_str, before)? {
+        return Ok(IndexOutcome::Unchanged);
+    }
 
     // Without embedding, preserve this path's stored session and stamp so a later
     // run can retry. Upsert would delete vectors we cannot regenerate. Check the
     // cached ID before parsing: the file may now resolve to a different ID.
     if let Some(embedded) = &ctx.embedded_sessions
-        && let Some(entry) = ctx.existing.get(&fpath_str)
+        && let Some(entry) = ctx.existing.get(fpath_str)
         && embedded.contains(&entry.session_id)
     {
         return Ok(IndexOutcome::Preserved(entry.session_id.clone()));
@@ -331,23 +314,23 @@ fn index_file_with_parser(
     let mut parsed = match parse(fpath, *source) {
         Ok(Some(p)) => p,
         Ok(None) => return Ok(IndexOutcome::Unchanged),
-        Err(e) => {
-            warn!(path = %fpath.display(), error = %e, "parse failed");
-            return Ok(IndexOutcome::ParseError(format!(
-                "{}: {e}",
-                fpath.display()
-            )));
+        Err(_) => {
+            // Never include parser errors or conversation bytes in diagnostics.
+            save_read_error(ctx.tx, fpath, *source)?;
+            return Ok(IndexOutcome::Unchanged);
         }
     };
+
+    save_parse_diagnostics(ctx.tx, fpath_str, *source, parsed.diagnostics)?;
 
     if parsed.messages.is_empty() {
         // A complete empty/metadata-only read can replace a known body. Keep
         // its identity and stamp so subsequent unchanged runs skip parsing.
         // Malformed input is not proof of an empty session; leave it pending.
-        let Some(entry) = ctx.existing.get(&fpath_str) else {
+        let Some(entry) = ctx.existing.get(fpath_str) else {
             return Ok(IndexOutcome::Unchanged);
         };
-        if parsed.skipped_lines > 0 {
+        if !parsed.diagnostics.is_empty() {
             return Ok(IndexOutcome::Unchanged);
         }
         parsed.metadata.session_id.clone_from(&entry.session_id);
@@ -365,7 +348,7 @@ fn index_file_with_parser(
     // If a writer appended while parsing (even with restored mtime), NULL
     // markers force a retry. Never acknowledge a post-read size for an old body.
     let stable_stamp = (resolve_file_stamp(fpath) == Some(before)).then_some(before);
-    upsert_session(ctx, &fpath_str, stable_stamp, &parsed)?;
+    upsert_session(ctx, fpath_str, stable_stamp, &parsed)?;
     Ok(IndexOutcome::Indexed)
 }
 
@@ -437,8 +420,6 @@ fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {
 
 struct IndexTotals {
     indexed: usize,
-    parse_errors: usize,
-    first_error: Option<String>,
     preserved_embedded: usize,
     /// IDs whose updates were deferred this run, including replacements at a
     /// new path. Cleanup must not undo the ingestion decision to preserve them.
@@ -447,8 +428,6 @@ struct IndexTotals {
 
 fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexTotals> {
     let mut indexed = 0;
-    let mut parse_errors = 0;
-    let mut first_error = None;
     let mut preserved_embedded = 0;
     let mut preserved_sessions = HashSet::new();
 
@@ -460,19 +439,11 @@ fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexT
                 preserved_embedded += 1;
                 preserved_sessions.insert(session_id);
             }
-            IndexOutcome::ParseError(msg) => {
-                parse_errors += 1;
-                if first_error.is_none() {
-                    first_error = Some(msg);
-                }
-            }
         }
     }
 
     Ok(IndexTotals {
         indexed,
-        parse_errors,
-        first_error,
         preserved_embedded,
         preserved_sessions,
     })
@@ -501,7 +472,7 @@ pub(crate) fn index_from_dirs(
 ) -> Result<IndexStats> {
     let start = Instant::now();
 
-    // Always full-scan: file-level mtime/size checks in check_freshness keep indexing
+    // Always full-scan: file-level mtime/size checks in is_unchanged keep indexing
     // incremental. A directory-mtime skip optimization here used to miss new files
     // added to existing deep dirs (Codex Y/M/D, Claude subagents) — #52 / #70.
     //
@@ -546,6 +517,7 @@ pub(crate) fn index_from_dirs(
         &scan.scanned,
         &totals.preserved_sessions,
     )?;
+    let parse_diagnostics = cleanup_parse_diagnostics(&tx, &source_paths, &scan.scanned)?;
     tx.commit().context("Failed to commit transaction")?;
 
     finalize_fts(conn, totals.indexed, opts.force)?;
@@ -557,8 +529,7 @@ pub(crate) fn index_from_dirs(
 
     Ok(IndexStats {
         indexed: totals.indexed,
-        parse_errors: totals.parse_errors,
-        first_error: totals.first_error,
+        parse_diagnostics,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
         skipped_roots: summarize_skipped_roots(&existing, &source_paths, &scan.skipped),
@@ -1030,15 +1001,6 @@ pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     Ok(backfilled)
 }
 
-/// Nonempty-session parsing for path backfill. Ingestion separately retains
-/// empty reads so a known session can acknowledge a truncation.
-fn parse_session(fpath: &Path, source: Source) -> Result<Option<ParseResult>> {
-    match source {
-        Source::Claude => parse_claude_session(fpath),
-        Source::Codex => parse_codex_session(fpath),
-    }
-}
-
 /// Outcome of re-reading one session's JSONL for path extraction.
 enum RereadOutcome {
     /// A terminal read: parsed paths, a clean-but-empty (zero-touch) session,
@@ -1053,21 +1015,23 @@ enum RereadOutcome {
 /// Re-read the write-target paths from one session's JSONL for path extraction
 /// only. Malformed lines are skipped by the parsers themselves, so an `Err`
 /// from the parse is an I/O failure, not a content problem.
-fn reread_scanned_files(fpath: &Path, source: &str) -> RereadOutcome {
-    let result = match Source::from_db(source) {
-        Some(source) => parse_session(fpath, source),
-        None => return RereadOutcome::Paths(Vec::new()),
+fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<RereadOutcome> {
+    let Some(source) = Source::from_db(source) else {
+        return Ok(RereadOutcome::Paths(Vec::new()));
     };
-    match result {
-        Ok(Some(parsed)) => RereadOutcome::Paths(parsed.scanned_files),
-        Ok(None) => RereadOutcome::Paths(Vec::new()),
-        Err(e) => {
-            warn!(
-                error = %e,
-                path = %fpath.display(),
-                "backfill: session JSONL unreadable; left unmarked for retry on the next index"
-            );
-            RereadOutcome::Unavailable
+    match parse_session_including_empty(fpath, source) {
+        Ok(Some(parsed)) => {
+            // A path-only backfill cannot certify the stored conversation body
+            // as complete. A clean path-only read must not clear older loss.
+            if !parsed.diagnostics.is_empty() {
+                save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
+            }
+            Ok(RereadOutcome::Paths(parsed.scanned_files))
+        }
+        Ok(None) => Ok(RereadOutcome::Paths(Vec::new())),
+        Err(_) => {
+            save_read_error(tx, fpath, source)?;
+            Ok(RereadOutcome::Unavailable)
         }
     }
 }
@@ -1117,7 +1081,7 @@ pub(crate) fn backfill_session_files(
         if let Some(cb) = on_progress {
             cb(done + 1, total);
         }
-        let scanned = match reread_scanned_files(Path::new(file_path), source) {
+        let scanned = match reread_scanned_files(&tx, Path::new(file_path), source)? {
             RereadOutcome::Paths(paths) => paths,
             RereadOutcome::Unavailable => continue,
         };

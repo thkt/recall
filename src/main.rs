@@ -441,9 +441,9 @@ fn index_and_report(
 /// `degraded_note` is `Some` when the embedder could not load (model-less): the
 /// index still completes FTS-only. `embedded`/`failed_count`/`first_error` report
 /// the embed pass: `failed_count > 0` means some batches failed but the index is
-/// complete and those chunks stay pending for the next run. The two degradation
+/// queryable and those chunks stay pending for the next run. These two embedding
 /// reasons are mutually exclusive (a model-less run skips embedding, so
-/// `failed_count == 0`).
+/// `failed_count == 0`); parsing and root diagnostics can coexist with either.
 #[derive(Default)]
 struct IndexOutcome {
     degraded_note: Option<String>,
@@ -460,18 +460,15 @@ struct IndexOutcome {
     /// that semantic search for those sessions stayed intact instead of being
     /// silently rebuilt-then-degraded.
     preserved_embedded: usize,
+    parse_diagnostics: Vec<indexer::FileParseDiagnostics>,
 }
 
-/// Build the `--json` envelope for an index run from its [`IndexOutcome`],
-/// mirroring [`search_degraded_state`]: both degradation reasons — a model-less
-/// load (`degraded_note`) and an embed batch failure (`failed_count`) — become
-/// `notes`, `degraded` co-varies (true iff `notes` is non-empty), and
-/// `{ embedded, failed_count }` is the data so an agent reads the magnitude, not
-/// just a boolean.
 /// Cap on the `first_error` portion of the embed-stop note (chars, not bytes, so
 /// truncation never splits a UTF-8 boundary).
 const EMBED_ERROR_NOTE_MAX_CHARS: usize = 120;
 
+/// Combine embedding, source-root, and persistent parsing diagnostics without
+/// changing the outer envelope. `degraded` is true exactly when notes are present.
 fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     debug_assert!(
         outcome.degraded_note.is_none() || outcome.failed_count == 0,
@@ -506,6 +503,12 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     if let Some(note) = preserved_embedded_note(outcome.preserved_embedded) {
         notes.push(note);
     }
+    notes.extend(
+        outcome
+            .parse_diagnostics
+            .iter()
+            .flat_map(indexer::FileParseDiagnostics::notes),
+    );
     let degraded = !notes.is_empty();
     let skipped_roots: Vec<_> = outcome
         .skipped_roots
@@ -518,7 +521,22 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
             })
         })
         .collect();
+    let parse_diagnostics: Vec<_> = outcome
+        .parse_diagnostics
+        .iter()
+        .map(|diagnostic| {
+            serde_json::json!({
+                "file_path": diagnostic.display_path(),
+                "source": diagnostic.source.as_str(),
+                "invalid_json_lines": diagnostic.lines.invalid_json_lines,
+                "invalid_utf8_lines": diagnostic.lines.invalid_utf8_lines,
+                "incomplete_tail_lines": diagnostic.lines.incomplete_tail_lines,
+                "read_error": diagnostic.read_error,
+            })
+        })
+        .collect();
     let data = serde_json::json!({
+        "parse_diagnostics": parse_diagnostics,
         "embedded": outcome.embedded,
         "failed_count": outcome.failed_count,
         "skipped_roots": skipped_roots,
@@ -530,7 +548,7 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
 /// Index pipeline with an injected embedder loader. Runs FTS indexing + chunking,
 /// then embeds every pending chunk via the loaded embedder so `recall search`
 /// reads a complete index without embedding on the search path. A model-less
-/// loader (`Err`) skips embedding but keeps the FTS index complete, returning a
+/// loader (`Err`) skips embedding but keeps the parsed FTS content, returning a
 /// degraded note. `load_embedder` is a seam: tests inject a `MockEmbedder` or a
 /// degraded `Err`, production passes [`try_load_embedder_cached`]. Source dirs
 /// arrive via `opts` so tests control them without `set_var`.
@@ -604,10 +622,16 @@ where
             "Indexed {} sessions in {:.1}s",
             stats.indexed, stats.elapsed_secs
         )
+    } else if !stats.parse_diagnostics.is_empty() {
+        format!(
+            "{} sessions stored; {} file(s) with unresolved parsing diagnostics",
+            stats.total_sessions,
+            stats.parse_diagnostics.len()
+        )
     } else {
         format!("{} sessions up to date", stats.total_sessions)
     };
-    sp.finish_with_detail(&main_msg, stats.parse_error_detail().as_deref());
+    sp.finish(&main_msg);
     for skipped in &stats.skipped_roots {
         warning(
             &skipped
@@ -640,6 +664,14 @@ where
     };
     let scanned_backfilled =
         indexer::backfill_session_files(&mut conn, Some(&on_backfill_progress))?;
+    // Include observations made by legacy path backfill as well as ingestion.
+    let parse_diagnostics = indexer::load_parse_diagnostics(&conn)?;
+    for note in parse_diagnostics
+        .iter()
+        .flat_map(indexer::FileParseDiagnostics::notes)
+    {
+        warning(&note);
+    }
     if scanned_backfilled > 0 {
         debug!(
             sessions = scanned_backfilled,
@@ -678,12 +710,14 @@ where
                 first_error: result.first_error,
                 skipped_roots,
                 preserved_embedded,
+                parse_diagnostics,
             })
         }
         Err(reason) => Ok(IndexOutcome {
             degraded_note: search_degraded_note(reason),
             skipped_roots,
             preserved_embedded,
+            parse_diagnostics,
             ..IndexOutcome::default()
         }),
     }
@@ -714,7 +748,7 @@ fn embed_all_pending(
     )?;
     sp.finish(&format!("Embedded {} chunks", result.embedded));
     // A mid-run batch failure is non-fatal: chunks already embedded are committed,
-    // the rest stay pending, and the FTS index is complete and queryable. The next
+    // the rest stay pending, and the parsed FTS content stays queryable. The next
     // `recall index` retries the remaining pending via the pending gate, so we
     // warn rather than fail. The stop is also surfaced in the index `--json`
     // envelope via `failed_count` (index_command_output).
@@ -5198,7 +5232,7 @@ mod tests {
         let src = tempfile::TempDir::new().unwrap();
         let claude_dir = src.path().join("claude");
         let (_, codex_dir) = absent_source_dirs(src.path());
-        write_backfill_session(
+        let partial = write_backfill_session(
             &claude_dir,
             "a.jsonl",
             "session a probe",
@@ -5211,6 +5245,10 @@ mod tests {
             Some("/proj/marker_b.rs"),
         );
 
+        // Partial input must also survive the loaded-model outcome branch.
+        let body = fs::read_to_string(&partial).unwrap();
+        fs::write(&partial, format!("{body}\ninvalid JSON\n")).unwrap();
+
         let db_dir = tempfile::TempDir::new().unwrap();
         let db_path = db_dir.path().join("recall.db");
         let opts = indexer::IndexOptions {
@@ -5221,10 +5259,17 @@ mod tests {
 
         // given: an indexed + embedded DB, then reset its path-backfill state,
         // leaving the body and freshness stamps intact.
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        assert_eq!(
+            index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
+            1
+        );
         let before = {
             let conn = open_or_create_db(&db_path).unwrap();
             reset_to_legacy_state(&conn);
+            // Model an old partial body with no recorded diagnostics. Only the
+            // path backfill reads this unchanged file during the next command.
+            conn.execute("DELETE FROM parse_diagnostics", []).unwrap();
             assert!(
                 !collect_i64(&conn, "SELECT chunk_id FROM vec_chunks").is_empty(),
                 "precondition: the legacy DB must hold embeddings, or the invariant is vacuous"
@@ -5233,7 +5278,11 @@ mod tests {
         };
 
         // when: recall index runs again over the mtime-unchanged source.
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+        assert_eq!(
+            index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
+            1
+        );
 
         let conn = open_or_create_db(&db_path).unwrap();
         // then: the searchable body and embeddings are stable across the backfill.
@@ -6135,6 +6184,7 @@ mod tests {
             first_error: Some("batch: mock failure".to_owned()),
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         }
     }
 
@@ -6148,6 +6198,7 @@ mod tests {
             first_error: None,
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         }
     }
 
@@ -6161,6 +6212,7 @@ mod tests {
             first_error: None,
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         }
     }
 
@@ -6276,6 +6328,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons() {
+        for mut outcome in [
+            success_outcome(),
+            model_absent_outcome(),
+            embed_stop_outcome(),
+        ] {
+            let existing_notes = index_command_output(&outcome).notes;
+            outcome
+                .parse_diagnostics
+                .push(indexer::FileParseDiagnostics {
+                    file_path: format!("/logs/\x1b[31mfile\n\t{}", "界".repeat(300)).into(),
+                    source: parser::Source::Claude,
+                    lines: parser::LineDiagnostics {
+                        invalid_json_lines: 2,
+                        invalid_utf8_lines: 1,
+                        incomplete_tail_lines: 1,
+                    },
+                    read_error: true,
+                });
+            let without_root = index_command_output(&outcome);
+            assert!(without_root.degraded);
+            assert_eq!(without_root.notes.len(), existing_notes.len() + 3);
+            outcome.skipped_roots.push(indexer::SkippedRoot {
+                source: parser::Source::Codex,
+                preserved_sessions: 1,
+                reason: indexer::SkippedReason::MissingRoot,
+            });
+            let out = index_command_output(&outcome);
+            assert!(out.degraded);
+            for note in existing_notes {
+                assert!(out.notes.contains(&note));
+            }
+            assert!(out.notes.iter().any(|n| n.contains("root unavailable")));
+            let d = &out.data["parse_diagnostics"][0];
+            let path = d["file_path"].as_str().unwrap();
+            assert_eq!(path.chars().count(), 240);
+            assert!(path.starts_with("/logs/file"));
+            assert!(!path.chars().any(char::is_control));
+            assert_eq!(d["invalid_json_lines"], 2);
+            assert_eq!(d["invalid_utf8_lines"], 1);
+            assert_eq!(d["incomplete_tail_lines"], 1);
+            assert_eq!(d["read_error"], true);
+            for note in &out.notes {
+                assert!(!note.chars().any(char::is_control));
+                assert!(note.chars().count() < 500);
+            }
+        }
+    }
+
     // T-009 (FR-006): the embed-stop note sanitizes and bounds first_error — control
     // chars are stripped (matching every other envelope-bound string) and the error
     // is capped so a verbose MLX error cannot bloat the note. The retry guidance
@@ -6291,6 +6393,7 @@ mod tests {
             first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
             skipped_roots: Vec::new(),
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         };
 
         let out = index_command_output(&outcome);
@@ -6332,6 +6435,7 @@ mod tests {
                 reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         };
 
         let out = index_command_output(&outcome);
@@ -6384,6 +6488,7 @@ mod tests {
                 reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         };
 
         let out = index_command_output(&outcome);
@@ -6744,6 +6849,7 @@ mod tests {
                 reason: indexer::SkippedReason::IncompleteEnumeration,
             }],
             preserved_embedded: 0,
+            parse_diagnostics: Vec::new(),
         };
 
         let out = index_command_output(&outcome);
@@ -6753,6 +6859,7 @@ mod tests {
             [
                 "embedded",
                 "failed_count",
+                "parse_diagnostics",
                 "preserved_embedded",
                 "skipped_roots"
             ],

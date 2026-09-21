@@ -1130,3 +1130,139 @@ fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
 fn integration_canary_は非_root_で_green_root_では_panic_で赤化する() {
     root_skip::assert_root_canary();
 }
+
+#[test]
+fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
+    let dir = TempDir::new().unwrap();
+    let claude = dir.path().join("claude");
+    let codex = dir.path().join("codex");
+    fs::create_dir(&claude).unwrap();
+    fs::create_dir(&codex).unwrap();
+    let path = claude.join("partial.jsonl");
+    let good = b"{\"type\":\"user\",\"message\":\"secret-conversation-body\"}\n";
+    let mut contents = good.to_vec();
+    contents
+        .extend_from_slice(b"{broken-secret-body\n\xff\n{\"type\":\"progress\"}\n{\"message\":");
+    fs::write(&path, contents).unwrap();
+    fs::write(codex.join("ignored.jsonl"), "{\"type\":\"event_msg\"}\n").unwrap();
+    let run = |args: &[&str]| {
+        recall(dir.path())
+            .env("HF_HOME", dir.path().join("empty-cache"))
+            .env("RECALL_CLAUDE_DIR", &claude)
+            .env("RECALL_CODEX_DIR", &codex)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // Repeated index and force rebuild must all report the same unresolved loss.
+    for command in ["index", "index", "rebuild"] {
+        let out = run(&[command, "--json"]);
+        assert_eq!(out.status.code(), Some(0));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["data", "degraded", "notes"]);
+        assert_eq!(v["degraded"], true);
+        let diagnostics = v["data"]["parse_diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "excluded Codex events are not loss");
+        assert_eq!(
+            diagnostics[0],
+            serde_json::json!({
+                "file_path": path.to_str().unwrap(), "source": "claude",
+                "invalid_json_lines": 1, "invalid_utf8_lines": 1,
+                "incomplete_tail_lines": 1, "read_error": false,
+            })
+        );
+        let notes = v["notes"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("recall model download"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("repair the source"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("next append"))
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("secret-"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("secret-"));
+    }
+    let out = run(&["index"]);
+    assert_eq!(out.status.code(), Some(0));
+    let human = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(human.contains("1 invalid JSON") && human.contains("1 invalid UTF-8"));
+    assert!(human.contains("1 incomplete final line") && human.contains("next append"));
+    assert!(!human.contains("secret-"));
+    // Repairing the source clears all line loss and makes the replacement searchable.
+    fs::write(
+        &path,
+        [
+            good.as_slice(),
+            b"{\"type\":\"assistant\",\"message\":\"repaired-answer\"}\n",
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let out = run(&["index", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
+    assert_eq!(
+        v["degraded"], true,
+        "model absence still degrades the repaired index"
+    );
+    let out = run(&["show", "partial", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(body.contains("secret-conversation-body") && body.contains("repaired-answer"));
+}
+
+#[cfg(unix)]
+#[test]
+fn index_reports_real_file_read_failure_then_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let claude = dir.path().join("claude");
+    fs::create_dir(&claude).unwrap();
+    let path = claude.join("unreadable.jsonl");
+    fs::write(
+        &path,
+        "{\"type\":\"user\",\"message\":\"readable-again\"}\n",
+    )
+    .unwrap();
+    let run = || {
+        recall(dir.path())
+            .env("HF_HOME", dir.path().join("empty-cache"))
+            .env("RECALL_CLAUDE_DIR", &claude)
+            .args(["index", "--json"])
+            .output()
+            .unwrap()
+    };
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["parse_diagnostics"][0]["read_error"], true);
+    assert_eq!(v["degraded"], true);
+    assert!(
+        v["notes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("check file access"))
+    );
+    let out = run();
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
+}

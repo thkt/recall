@@ -101,12 +101,8 @@ fn process_codex_entry(
     }
 }
 
+/// Retain empty reads and their diagnostics for ingestion and path backfill.
 pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
-    Ok(parse_codex_session_including_empty(path)?.filter(|p| !p.messages.is_empty()))
-}
-
-/// Retain successful empty reads so an indexer can acknowledge a truncation.
-pub(super) fn parse_codex_session_including_empty(path: &Path) -> Result<Option<ParseResult>> {
     let Some(initial_session_id) = session_id_from_path(path) else {
         return Ok(None);
     };
@@ -121,7 +117,7 @@ pub(super) fn parse_codex_session_including_empty(path: &Path) -> Result<Option<
     let date_slug = extract_date_from_path(&path_str);
     let uuid_short = extract_uuid_short(&state.session_id);
 
-    let (messages, skipped_lines) = parse_jsonl_entries(path, |entry| {
+    let (messages, diagnostics) = parse_jsonl_entries(path, |entry| {
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         process_codex_entry(entry, entry_type, &mut state)
     })?;
@@ -145,7 +141,7 @@ pub(super) fn parse_codex_session_including_empty(path: &Path) -> Result<Option<
         messages,
         // Codex rollouts carry no Claude Code write-tool metadata (contract U-002).
         scanned_files: Vec::new(),
-        skipped_lines,
+        diagnostics,
     }))
 }
 

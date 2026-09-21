@@ -1370,7 +1370,14 @@ fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
                 fs::set_permissions(&fresh, permissions).unwrap();
                 let stats = stats.unwrap();
                 assert_eq!(stats.indexed, 0);
-                assert_eq!(stats.parse_errors, usize::from(unreadable));
+                assert_eq!(
+                    stats
+                        .parse_diagnostics
+                        .iter()
+                        .filter(|d| d.read_error)
+                        .count(),
+                    usize::from(unreadable)
+                );
                 assert_eq!(
                     stats.total_sessions, 1,
                     "exactly the Claude orphan is deleted"
@@ -1698,7 +1705,10 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
         let original = dir_a.join("collision.jsonl");
         fs::write(
             &original,
-            r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            concat!(
+                r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+                "\ninvalid JSON\n",
+            ),
         )
         .unwrap();
         let codex_dir = tmp.path().join("codex");
@@ -1750,7 +1760,9 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
             assert_eq!(stats.indexed, 0);
             assert_eq!(stats.preserved_embedded, 1);
             assert_eq!(stats.total_sessions, 1);
-            assert_eq!(stats.parse_errors, 0);
+            assert_eq!(stats.parse_diagnostics.len(), 1);
+            assert_eq!(stats.parse_diagnostics[0].file_path, original);
+            assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
             assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
             assert_eq!(snapshot(&conn), before);
         }
@@ -1760,6 +1772,9 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
         let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
         assert_eq!(stats.indexed, 1);
         assert_eq!(stats.preserved_embedded, 0);
+        // A still-present corrupt file remains reportable; a moved file no
+        // longer backs retained content once its replacement is ingested.
+        assert_eq!(stats.parse_diagnostics.len(), usize::from(!remove_original));
         assert_eq!(stats.total_sessions, 1);
         assert_eq!(
             collect_strings(&conn, "SELECT file_path FROM sessions"),
@@ -1780,6 +1795,13 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
             collect_strings(&conn, "SELECT content FROM qa_chunks"),
             ["replacement question"]
         );
+        fs::remove_file(&replacement).unwrap();
+        if !remove_original {
+            fs::remove_file(&original).unwrap();
+        }
+        let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+        assert_eq!(stats.total_sessions, 0);
+        assert!(stats.parse_diagnostics.is_empty());
     }
 }
 
@@ -2569,6 +2591,10 @@ fn 読めない_jsonl_のセッションはマーカーを立てず次回に再�
         "an unreadable JSONL yields no session_files rows"
     );
 
+    let diagnostics = load_parse_diagnostics(&conn).unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].read_error);
+
     // and: a second backfill sees the same unmarked session again (retry path).
     let retried = backfill_session_files(&mut conn, None).unwrap();
     assert_eq!(
@@ -2794,5 +2820,231 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
         plan.iter()
             .any(|line| line.contains("VIRTUAL TABLE INDEX") && line.contains('=')),
         "expected FTS rowid equality lookup: {plan:?}"
+    );
+}
+
+#[test]
+fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repaired() {
+    let (db_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude");
+    let codex_dir = tmp.path().join("codex");
+    fs::create_dir(&claude_dir).unwrap();
+    let path = claude_dir.join("partial.jsonl");
+    let valid = "{\"type\":\"user\",\"message\":\"retained question\"}\n";
+    fs::write(&path, format!("{valid}{{broken\n")).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    index_chunks(&mut conn, None).unwrap();
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    let chunks = collect_strings(
+        &conn,
+        "SELECT json_array(id, content, generation) FROM qa_chunks",
+    );
+    let vectors = collect_strings(&conn, "SELECT hex(embedding) FROM vec_chunks");
+    // Persistence across connection lifetimes and a real freshness skip.
+    drop(conn);
+    let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.indexed, 0);
+    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, content, generation) FROM qa_chunks"
+        ),
+        chunks
+    );
+
+    fs::write(&path, valid).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!(stats.preserved_embedded, 1);
+    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT hex(embedding) FROM vec_chunks"),
+        vectors
+    );
+
+    let hidden = tmp.path().join("hidden");
+    fs::rename(&claude_dir, &hidden).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.skipped_roots.len(), 1);
+    assert_eq!(stats.parse_diagnostics.len(), 1);
+    fs::rename(&hidden, &claude_dir).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert!(stats.parse_diagnostics.is_empty());
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["retained question"]
+    );
+
+    // A file with only an incomplete tail has no session yet. A later append
+    // completes the message and resolves its diagnostic without a rebuild.
+    let tail = claude_dir.join("tail.jsonl");
+    fs::write(
+        &tail,
+        "{\"type\":\"user\",\"message\":\"completed by append",
+    )
+    .unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.parse_diagnostics[0].lines.incomplete_tail_lines, 1);
+    assert_eq!(stats.total_sessions, 1);
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(&tail).unwrap();
+        file.write_all(b"\"}\n").unwrap();
+    }
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert!(stats.parse_diagnostics.is_empty());
+    assert_eq!(stats.total_sessions, 2);
+    assert!(
+        collect_strings(&conn, "SELECT text FROM messages")
+            .contains(&"completed by append".to_owned())
+    );
+    fs::remove_file(tail).unwrap();
+
+    // Files without a session still report loss; confirmed deletion clears it.
+    let empty = claude_dir.join("no-messages.jsonl");
+    fs::write(&empty, "invalid\n").unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.parse_diagnostics.len(), 1);
+    assert_eq!(stats.total_sessions, 1);
+    fs::remove_file(empty).unwrap();
+    assert!(
+        index_from_dirs(&mut conn, &opts, true)
+            .unwrap()
+            .parse_diagnostics
+            .is_empty()
+    );
+}
+
+#[test]
+fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadata() {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("s.jsonl");
+    fs::write(&path, "{\"type\":\"user\",\"message\":\"kept\"}\ninvalid\n").unwrap();
+    let missing = tmp.path().join("no-codex");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: tmp.path(),
+        codex_dir: &missing,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    let existing = load_existing_sessions(&conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    let ctx = IndexContext {
+        tx: &tx,
+        existing: &existing,
+        force: true,
+        embedded_sessions: None,
+    };
+    // Deterministic read failure after discovery, including for privileged hosts.
+    index_file_with_parser(&ctx, &path, &Source::Claude, |_, _| {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private content must not escape",
+        )
+        .into())
+    })
+    .unwrap();
+    tx.commit().unwrap();
+    let d = load_parse_diagnostics(&conn).unwrap();
+    assert!(d[0].read_error);
+    assert_eq!(d[0].lines.invalid_json_lines, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["kept"]
+    );
+    // The original metadata still matches, but a read error must force retry.
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert!(!stats.parse_diagnostics[0].read_error);
+    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resolved() {
+    use std::os::unix::ffi::OsStringExt;
+
+    // Not every filesystem permits these names. Supply the collector's list at
+    // the ingestion boundary; parsing, persistence and cleanup are production
+    // code, and the valid UTF-8 path below is a real file.
+    fn observe(conn: &mut Connection, paths: &[PathBuf]) -> Vec<FileParseDiagnostics> {
+        let existing = load_existing_sessions(conn).unwrap();
+        let tx = conn.transaction().unwrap();
+        let ctx = IndexContext {
+            tx: &tx,
+            existing: &existing,
+            force: false,
+            embedded_sessions: None,
+        };
+        let sources: Vec<_> = paths.iter().cloned().map(|p| (p, Source::Claude)).collect();
+        index_all(&ctx, &sources).unwrap();
+        let source_paths = paths.iter().map(PathBuf::as_path).collect();
+        let diagnostics =
+            cleanup_parse_diagnostics(&tx, &source_paths, &HashSet::from([Source::Claude]))
+                .unwrap();
+        tx.commit().unwrap();
+        diagnostics
+    }
+
+    let (db_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let paths = [
+        tmp.path()
+            .join(OsString::from_vec(b"bad-\xff.jsonl".to_vec())),
+        tmp.path()
+            .join(OsString::from_vec(b"bad-\xfe.jsonl".to_vec())),
+        tmp.path().join("bad-\u{fffd}.jsonl"),
+    ];
+    fs::write(&paths[2], "invalid JSON\n").unwrap();
+    let diagnostics = observe(&mut conn, &paths);
+    assert_eq!(diagnostics.len(), 3);
+    assert_eq!(diagnostics.iter().filter(|d| d.read_error).count(), 2);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| { d.display_path() == paths[2].to_str().unwrap() })
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|d| d.lines.invalid_json_lines)
+            .sum::<i64>(),
+        1
+    );
+
+    // Reload real persisted keys, then clear only the valid UTF-8 file's loss.
+    drop(conn);
+    let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
+    fs::write(&paths[2], "{\"type\":\"user\",\"message\":\"readable\"}\n").unwrap();
+    for _ in 0..2 {
+        let diagnostics = observe(&mut conn, &paths);
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().all(|d| d.read_error));
+        let reported: HashSet<_> = diagnostics.iter().map(|d| &d.file_path).collect();
+        assert_eq!(reported, HashSet::from([&paths[0], &paths[1]]));
+    }
+    // Cleanup must compare exact paths too: the colliding display name still
+    // exists, but only the deleted file's diagnostic should disappear.
+    let diagnostics = observe(&mut conn, &paths[1..]);
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].file_path, paths[1]);
+    assert!(diagnostics[0].read_error);
+    let diagnostics = observe(&mut conn, &paths[2..]);
+    assert!(diagnostics.is_empty());
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["readable"]
     );
 }
