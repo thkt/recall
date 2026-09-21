@@ -61,6 +61,8 @@ impl Observer {
 
     pub(crate) fn start_embedding(&self, pending: usize) {
         self.count("chunks_pending_snapshot", pending);
+        self.count("inference_batches", 0);
+        self.count("inference_chunks", 0);
         self.count("chunks_saved", 0);
         self.count("chunks_failed", 0);
         self.count("chunks_stale", 0);

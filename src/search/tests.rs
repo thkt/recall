@@ -1220,7 +1220,7 @@ fn test_search_limit_zero_returns_empty() {
 
 #[test]
 fn test_index_then_search_roundtrip() {
-    use crate::indexer::{IndexOptions, index_from_dirs};
+    use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
 
     let (_dir, mut conn) = setup_test_db();
     let tmp = tempfile::TempDir::new().unwrap();
@@ -1292,6 +1292,10 @@ fn test_index_then_search_roundtrip() {
         results.is_empty(),
         "algorithm lives in beta; alpha filter should exclude it"
     );
+
+    // Finish the CLI's chunking stage before checking the unchanged fast path.
+    // Parsed-only sessions have no confirmed rules version and must be reread.
+    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 2);
 
     let stats2 = index_from_dirs(
         &mut conn,

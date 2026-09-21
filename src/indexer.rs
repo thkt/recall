@@ -18,9 +18,21 @@ use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info, warn};
 
 use crate::chunker;
+
 use crate::classify::classify_first_turn;
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
+
+// Completion also identifies the parser/chunker/embedding contract. Version 1
+// is the existing #320 pipeline: Ruri v3 310m, pinned snapshot
+// 18b60fb8c2b9df296fb4212bb7d23ef94e579cd3 (rurico 7b2b256).
+// Bump for parser semantics, grouping/splitting, model/tokenizer/pooling changes.
+// A mismatch forces a reread and disables reuse; unavailable models still defer.
+// chunks_indexed: -version = parsed at that version, awaiting chunking;
+// +version = completed at that version; NULL = pending with unknown parser;
+// 0 = chunked with an unknown/outdated parser, still requiring a source reread.
+// Chunking alone must never certify an unknown parser, even during a root outage.
+const INDEX_RULES_VERSION: i64 = 1;
 
 struct SessionEntry {
     session_id: String,
@@ -29,6 +41,7 @@ struct SessionEntry {
     source: Option<Source>,
     mtime: Option<f64>,
     file_size: Option<u64>,
+    rules_version: Option<i64>,
 }
 
 pub struct IndexStats {
@@ -103,8 +116,17 @@ impl SkippedReason {
     }
 }
 
+#[derive(Default)]
+struct ReuseStats {
+    matched: usize,
+    embedded: usize,
+    created: usize,
+    removed: usize,
+    seconds: f64,
+}
+
 enum IndexOutcome {
-    Indexed,
+    Indexed(ReuseStats),
     Unchanged,
     Empty,
     Failed,
@@ -123,7 +145,7 @@ struct IndexContext<'a> {
     /// absent this run (#215). `Some` activates preserve-in-place: a re-index of
     /// a session in this set is skipped so its chunks/embeddings survive instead
     /// of being deleted before an embed gate that cannot rebuild them. `None`
-    /// (model present) leaves the normal delete-and-reindex path unchanged.
+    /// (model present) allows reconciliation or intentional regeneration.
     embedded_sessions: Option<HashSet<String>>,
 }
 
@@ -193,24 +215,35 @@ fn upsert_session(
     ctx: &IndexContext,
     fpath_str: &str,
     stamp: Option<FileStamp>,
-    parsed: &ParseResult,
-) -> Result<()> {
+    parsed: ParseResult,
+) -> Result<ReuseStats> {
     let cached = ctx.existing.get(fpath_str);
-
-    if let Some(entry) = cached {
+    let session_id = &parsed.metadata.session_id;
+    // Consult the live transaction, also for renamed files with the same ID.
+    let reuse = !ctx.force
+        && ctx.tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND chunks_indexed = ?2 AND EXISTS(SELECT 1 FROM qa_chunks WHERE session_id = ?1))",
+            rusqlite::params![session_id, INDEX_RULES_VERSION],
+            |r| r.get::<_, bool>(0),
+        )?;
+    if let Some(entry) = cached
+        && entry.session_id != *session_id
+    {
         ctx.tx.execute(
             "DELETE FROM sessions WHERE session_id = ?",
             [&entry.session_id],
         )?;
         delete_session_dependents(ctx.tx, &entry.session_id)?;
     }
-
-    // New session_id differs from cached — clean up all dependent data under the new ID
-    // (e.g. left over from a renamed file that previously used it).
-    let same_session_id =
-        matches!(cached, Some(entry) if entry.session_id == parsed.metadata.session_id);
-    if !same_session_id {
-        delete_session_dependents(ctx.tx, &parsed.metadata.session_id)?;
+    if reuse {
+        ctx.tx
+            .execute("DELETE FROM messages WHERE session_id = ?", [session_id])?;
+        ctx.tx.execute(
+            "DELETE FROM session_files WHERE session_id = ?",
+            [session_id],
+        )?;
+    } else {
+        delete_session_dependents(ctx.tx, session_id)?;
     }
 
     // Classify from the first user turn so `recall search` can exclude automated
@@ -226,13 +259,14 @@ fn upsert_session(
     )
     .as_str();
 
-    // INSERT OR REPLACE omits chunks_indexed: any newly parsed body is pending,
-    // even when this id previously completed with zero chunks.
+    // Persist parser provenance with the body, before the separate chunk pass.
+    // Reconciliation completes it in this transaction; new/empty/invalidated
+    // sessions keep the negative version until the batched chunk pass commits.
     // files_scanned = 1 marks that scanned-file extraction ran for this session,
     // distinct from NULL (never recorded). Set on every upsert, so the re-parse
     // path — where the DELETE FROM sessions above drops the marker — re-raises it.
     ctx.tx.execute(
-        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned, file_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT OR REPLACE INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type, files_scanned, file_size, chunks_indexed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         rusqlite::params![
             parsed.metadata.session_id,
             parsed.metadata.source.as_str(),
@@ -244,25 +278,121 @@ fn upsert_session(
             session_type,
             1,
             stamp.and_then(|s| i64::try_from(s.size).ok()),
+            -INDEX_RULES_VERSION,
         ],
     )?;
 
     let mut msg_stmt = ctx
         .tx
         .prepare_cached("INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)")?;
-    for msg in &parsed.messages {
+    let mut messages = Vec::new();
+    for msg in parsed.messages {
         msg_stmt.execute(rusqlite::params![
             parsed.metadata.session_id,
             msg.role.as_str(),
             msg.text
         ])?;
+        if reuse {
+            messages.push((ctx.tx.last_insert_rowid(), msg));
+        }
     }
+    let stats = if reuse {
+        // With the model unavailable, both stored and parsed IDs have passed
+        // the protection set under this same writer lock. No vectors can have
+        // appeared since that read; do not scan vec0 again for each session.
+        reconcile_chunks(
+            ctx.tx,
+            session_id,
+            &messages,
+            parsed.metadata.timestamp,
+            ctx.embedded_sessions.is_some(),
+        )?
+    } else {
+        ReuseStats::default()
+    };
 
     // Persist the session's write-target paths (precondition upheld by the
     // session_files DELETE above).
     insert_session_files(ctx.tx, &parsed.metadata.session_id, &parsed.scanned_files)?;
 
-    Ok(())
+    Ok(stats)
+}
+
+/// Reconcile under the same writer lock as the message replacement. Exact text
+/// is the embedding input; duplicate texts consume separate stored IDs. No hash
+/// ledger or vector copies are needed. Range updates do not change generation,
+/// so an in-flight result remains valid only for a genuinely unchanged input.
+fn reconcile_chunks(
+    tx: &Transaction,
+    session_id: &str,
+    messages: &[(i64, Message)],
+    timestamp: Option<i64>,
+    known_unembedded: bool,
+) -> Result<ReuseStats> {
+    let start = Instant::now();
+    let embedded: HashSet<i64> = if known_unembedded {
+        HashSet::new()
+    } else {
+        let mut stmt = tx.prepare_cached("SELECT DISTINCT chunk_id FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)")?;
+        stmt.query_map([session_id], |r| r.get(0))?
+            .collect::<StdResult<_, _>>()?
+    };
+    let mut stored: HashMap<String, Vec<i64>> = HashMap::new();
+    {
+        let mut stmt = tx.prepare_cached(
+            "SELECT id, content FROM qa_chunks WHERE session_id = ? ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([session_id], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, content) = row?;
+            stored.entry(content).or_default().push(id);
+        }
+    }
+    // Prefer an already embedded occurrence when identical inputs straddle a
+    // failed batch. Truncation must not discard a usable vector in favor of a
+    // pending duplicate. Stable sort preserves ascending pop order within ties.
+    for ids in stored.values_mut() {
+        ids.sort_by_key(|id| embedded.contains(id));
+    }
+    // NULL is transaction-local scratch for unmatched rows. Every new chunk has
+    // a source range, including split chunks. Rollback restores the old links.
+    tx.execute(
+        "UPDATE qa_chunks SET src_rowid_lo = NULL, src_rowid_hi = NULL WHERE session_id = ?",
+        [session_id],
+    )?;
+    let mut stats = ReuseStats::default();
+    for chunk in chunker::chunk_messages(session_id, messages, timestamp) {
+        if let Some(id) = stored.get_mut(&chunk.content).and_then(Vec::pop) {
+            tx.execute("UPDATE qa_chunks SET timestamp = ?1, src_rowid_lo = ?2, src_rowid_hi = ?3 WHERE id = ?4",
+                rusqlite::params![timestamp, chunk.src_rowid_lo, chunk.src_rowid_hi, id])?;
+            stats.matched += 1;
+            stats.embedded += usize::from(embedded.contains(&id));
+        } else {
+            tx.execute("INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![session_id, chunk.content, timestamp, chunk.src_rowid_lo, chunk.src_rowid_hi])?;
+            stats.created += 1;
+        }
+    }
+    // The embedded set is still current under this writer lock. Only scan vec0
+    // for deletion when an unmatched input actually has a vector.
+    if stored.values().any(|ids| !ids.is_empty()) {
+        if stored.values().flatten().any(|id| embedded.contains(id)) {
+            tx.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ? AND src_rowid_lo IS NULL)", [session_id])?;
+        }
+        stats.removed = tx.execute(
+            "DELETE FROM qa_chunks WHERE session_id = ? AND src_rowid_lo IS NULL",
+            [session_id],
+        )?;
+    }
+
+    tx.execute(
+        "UPDATE sessions SET chunks_indexed = ?1 WHERE session_id = ?2",
+        rusqlite::params![INDEX_RULES_VERSION, session_id],
+    )?;
+    stats.seconds = start.elapsed().as_secs_f64();
+    Ok(stats)
 }
 
 fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result<bool> {
@@ -272,6 +402,7 @@ fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result
         && let Some(new_mt) = stamp.mtime_secs()
         && let Some(entry) = ctx.existing.get(fpath_str)
         && let Some(old_mt) = entry.mtime
+        && entry.rules_version == Some(INDEX_RULES_VERSION)
         && entry.file_size == Some(stamp.size)
         && (old_mt - new_mt).abs() < 0.001
         && !ctx.tx.prepare_cached(
@@ -349,8 +480,12 @@ fn index_file_with_parser(
     // If a writer appended while parsing (even with restored mtime), NULL
     // markers force a retry. Never acknowledge a post-read size for an old body.
     let stable_stamp = (resolve_file_stamp(fpath) == Some(before)).then_some(before);
-    upsert_session(ctx, fpath_str, stable_stamp, &parsed)?;
-    Ok(IndexOutcome::Indexed)
+    Ok(IndexOutcome::Indexed(upsert_session(
+        ctx,
+        fpath_str,
+        stable_stamp,
+        parsed,
+    )?))
 }
 
 /// Priority: `RECALL_CLAUDE_DIR` > `CLAUDE_CONFIG_DIR/projects` > `~/.claude/projects`
@@ -421,6 +556,7 @@ fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {
 
 struct IndexTotals {
     indexed: usize,
+    reuse: ReuseStats,
     preserved_embedded: usize,
     /// IDs whose updates were deferred this run, including replacements at a
     /// new path. Cleanup must not undo the ingestion decision to preserve them.
@@ -437,6 +573,7 @@ fn index_all(
     let mut empty = 0;
     let mut failed = 0;
     let mut indexed = 0;
+    let mut reuse = ReuseStats::default();
     let mut preserved_embedded = 0;
     let mut preserved_sessions = HashSet::new();
 
@@ -447,7 +584,14 @@ fn index_all(
             observer.add_seconds("parse", start.elapsed().as_secs_f64());
             parsed
         })? {
-            IndexOutcome::Indexed => indexed += 1,
+            IndexOutcome::Indexed(stats) => {
+                indexed += 1;
+                reuse.matched += stats.matched;
+                reuse.embedded += stats.embedded;
+                reuse.created += stats.created;
+                reuse.removed += stats.removed;
+                reuse.seconds += stats.seconds;
+            }
             IndexOutcome::Unchanged => unchanged += 1,
             IndexOutcome::Empty => empty += 1,
             IndexOutcome::Failed => failed += 1,
@@ -476,6 +620,7 @@ fn index_all(
     }
     Ok(IndexTotals {
         indexed,
+        reuse,
         preserved_embedded,
         preserved_sessions,
     })
@@ -513,7 +658,14 @@ pub(crate) fn index_from_dirs_observed(
     observer: &Observer,
 ) -> Result<IndexStats> {
     let start = Instant::now();
-    let preparation = observer.stage("index_prepare");
+
+    // Enumeration and the deletion candidates must share the writer lock. If
+    // another index saves a new file after our scan but before our DB snapshot,
+    // cleanup would mistake that live session for an orphan.
+    let fts = observer.stage("fts_transaction");
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("Failed to begin transaction")?;
 
     // Always full-scan: file-level mtime/size checks in is_unchanged keep indexing
     // incremental. A directory-mtime skip optimization here used to miss new files
@@ -525,16 +677,6 @@ pub(crate) fn index_from_dirs_observed(
     // were deleted, destroying the index on a transient root outage (#177). Force
     // instead re-indexes every present file (mtime skip bypassed via `ctx.force`)
     // while cleanup removes only rows whose scanned root confirms their absence.
-    let existing = load_existing_sessions(conn)?;
-    // Compute the embedded-session set before the transaction borrows conn, only
-    // when the model is absent — when present the normal re-index path applies and
-    // the (potentially large) set is never built (#215).
-    let embedded_sessions = if embed_capable {
-        None
-    } else {
-        Some(embedded_session_ids(conn)?)
-    };
-    preparation.finish("complete");
     let enumeration = observer.stage("enumeration");
     let scan = collect_sources(opts);
     observer.count("files_discovered", scan.sources.len());
@@ -546,8 +688,18 @@ pub(crate) fn index_from_dirs_observed(
 
     info!(count = sources.len(), "Found source files");
 
-    let fts = observer.stage("fts_transaction");
-    let tx = conn.transaction().context("Failed to begin transaction")?;
+    let preparation = observer.stage("index_prepare");
+    let existing = load_existing_sessions(&tx)?;
+    // Read freshness and model-unavailable protection under the writer lock.
+    // Otherwise another index could commit new vectors after this snapshot and
+    // a model-unavailable run could erase them using an obsolete preserve set.
+    let embedded_sessions = if embed_capable {
+        None
+    } else {
+        Some(embedded_session_ids(&tx)?)
+    };
+    preparation.finish("complete");
+
     tx.execute(
         "INSERT INTO messages(messages, rank) VALUES('automerge', 0)",
         [],
@@ -571,6 +723,11 @@ pub(crate) fn index_from_dirs_observed(
     tx.commit().context("Failed to commit transaction")?;
 
     observer.count("files_updated_committed", totals.indexed);
+    observer.count("chunks_matched_committed", totals.reuse.matched);
+    observer.count("embeddings_reused_committed", totals.reuse.embedded);
+    observer.count("chunks_reconciled_created_committed", totals.reuse.created);
+    observer.count("chunks_removed_committed", totals.reuse.removed);
+    observer.add_seconds("chunk_reconciliation", totals.reuse.seconds);
     fts.finish("committed");
     observer.add_seconds(
         "fts_excluding_parse",
@@ -667,8 +824,9 @@ fn summarize_skipped_roots(
 }
 
 fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEntry>> {
-    let mut stmt =
-        conn.prepare("SELECT file_path, session_id, source, mtime, file_size FROM sessions")?;
+    let mut stmt = conn.prepare(
+        "SELECT file_path, session_id, source, mtime, file_size, chunks_indexed FROM sessions",
+    )?;
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -676,11 +834,12 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEn
             row.get::<_, String>(2)?,
             row.get::<_, Option<f64>>(3)?,
             row.get::<_, Option<i64>>(4)?,
+            row.get::<_, Option<i64>>(5)?,
         ))
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (fp, sid, src, mt, size) = row?;
+        let (fp, sid, src, mt, size, rules_version) = row?;
         map.insert(
             fp,
             SessionEntry {
@@ -688,6 +847,7 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEn
                 source: Source::from_db(&src),
                 mtime: mt,
                 file_size: size.and_then(|size| u64::try_from(size).ok()),
+                rules_version,
             },
         );
     }
@@ -823,7 +983,7 @@ const STAGE_CHUNK_MESSAGES: &str =
     "INSERT INTO chunk_message_rows (session_id, message_rowid, text_bytes)
      SELECT m.session_id, m.rowid, length(CAST(m.text AS BLOB))
      FROM messages m CROSS JOIN sessions s ON s.session_id = m.session_id
-     WHERE s.chunks_indexed IS NULL";
+     WHERE s.chunks_indexed IS NULL OR s.chunks_indexed < 0";
 const READ_CHUNK_BATCH: &str = "SELECT r.session_id, m.rowid, m.role, m.text
      FROM chunk_message_rows r CROSS JOIN messages m ON m.rowid = r.message_rowid
      WHERE r.session_id >= ?1 AND r.session_id <= ?2
@@ -866,7 +1026,7 @@ pub(crate) fn index_chunks_observed(
     observer.count("chunks_created_committed", 0);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let pending: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE chunks_indexed IS NULL)",
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE chunks_indexed IS NULL OR chunks_indexed < 0)",
         [],
         |row| row.get(0),
     )?;
@@ -891,7 +1051,7 @@ pub(crate) fn index_chunks_observed(
         let mut stmt = tx.prepare(
             "SELECT s.session_id, s.timestamp, COALESCE(SUM(r.text_bytes), 0)
              FROM sessions s LEFT JOIN chunk_message_rows r ON r.session_id = s.session_id
-             WHERE s.chunks_indexed IS NULL
+             WHERE s.chunks_indexed IS NULL OR s.chunks_indexed < 0
              GROUP BY s.session_id ORDER BY s.session_id",
         )?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
@@ -947,8 +1107,10 @@ pub(crate) fn index_chunks_observed(
                 stats.chunks_created += 1;
             }
             tx.execute(
-                "UPDATE sessions SET chunks_indexed = 1 WHERE session_id = ?",
-                [session_id],
+                // A preserved legacy body may be chunked while its root is
+                // unavailable, but it must still be reread when the root returns.
+                "UPDATE sessions SET chunks_indexed = CASE WHEN chunks_indexed = -?1 THEN ?1 ELSE 0 END WHERE session_id = ?2",
+                rusqlite::params![INDEX_RULES_VERSION, session_id],
             )?;
             stats.sessions_chunked += 1;
             stage.progress(stats.sessions_chunked, total, 0);

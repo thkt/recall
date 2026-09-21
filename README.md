@@ -108,7 +108,9 @@ Diagnostics persist across runs, including mtime/size skips, deferred embedded u
 
 Index and rebuild announce each stage on stderr in both terminals and redirected output, including model load/probe and pending extraction. Progress before a transaction commits is labeled uncommitted; embedding counts describe committed batches and distinguish inference failure, save failure, stale results, and unattempted work. `--json` adds numeric timings and counts under `data.observations`, preserving the outer envelope. Remaining embedding counts refer to the selected snapshot, not a continuously refreshed database total. See [measurement definitions and the host four-case procedure](docs/index-observability.md) for overlapping timers, empty completion, interruption, and comparison conditions.
 
-Chunk generation records completion even for zero Q&A pairs, so unchanged sessions need no further body retrieval or chunking. Re-parsing a changed session clears completion. Chunks and completion commit together; failures or interruptions leave the pass pending. Upgrades preserve existing chunks and embeddings and process previously empty sessions once.
+Chunk generation records completion even for zero Q&A pairs, so unchanged sessions need no further body retrieval or chunking. When a completed session with chunks is re-parsed, index compares the newly derived chunks by exact content within that session. Matching chunks keep their IDs, generations and embeddings; source message rowid ranges and timestamps are updated with the messages in the same transaction. Appending an assistant response re-derives the final Q&A group. Only new or changed chunks need inference; a content-preserving mtime update keeps all embeddings. Truncation and replacement remove unmatched chunks and vectors, while retaining any exact matches, including duplicate content as separate occurrences.
+
+An interrupted or failed message/chunk transaction rolls back together. After it commits, reusable vectors remain searchable and missing embeddings are pending; inference or save failures can be retried with `recall index`. Existing snapshot counts and notes identify unfinished embedding work. New sessions, previously empty sessions, and invalidated sessions use the batched chunk pass, which commits chunks and completion together. `rebuild` intentionally bypasses reuse. Reuse requires the same recorded pipeline version (parser, chunk rules and pinned embedding model); see [invalidation and measurement details](docs/index-observability.md#チャンク再利用の条件と追記計測). Model absence/probe failure still defers updates to embedded sessions.
 
 When embedding is unavailable, updates to embedded sessions wait until it is available again. Their stored content, chunks, embeddings, and edited-file records are preserved, including when a parsed replacement containing messages at a different path uses the same session ID and the old file has been deleted. Such deferred updates are excluded from orphan cleanup for that run; deleted logs without such a replacement remain subject to the cleanup rules above.
 
@@ -213,7 +215,7 @@ src/
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
 ├── embedder.rs   Index-time embedding orchestration (batches chunks via rurico)
-├── chunker.rs    Q&A pair chunker with size splitting + SHA256 change detection
+├── chunker.rs    Q&A pair chunker with size splitting (exact-content reuse in indexer)
 ├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
 └── date.rs       Civil calendar date utilities
 ```
