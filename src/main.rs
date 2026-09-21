@@ -482,7 +482,7 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     }
     if outcome.failed_count > 0 {
         // first_error is always Some when failed_count > 0 (both are set in
-        // embed_chunks' Err arm together); the fallback is defensive only. Like
+        // embed_page's inference error arm together); the fallback is defensive only. Like
         // every other envelope-bound string the error is control-char-stripped,
         // and capped so a verbose MLX error cannot bloat the note.
         let raw = outcome.first_error.as_deref().unwrap_or("unknown error");
@@ -729,24 +729,11 @@ where
     // (FR-004a/004b). The model-absent run also preserved any embedded sessions it
     // would otherwise have re-indexed (#215); that count rides along either arm.
     let preserved_embedded = stats.preserved_embedded;
-    let extraction = observer.stage("pending_extraction");
-    let pending = if embed_capable {
-        embedder::pending_chunks(&conn, usize::MAX)?
-    } else {
-        Vec::new()
-    };
-    let pending_total = if embed_capable {
-        pending.len()
-    } else {
-        embedder::pending_count(&conn)?
-    };
-    extraction.finish("complete");
     let outcome: Result<IndexOutcome> = match load_result {
         Ok(embedder) => {
-            let result = embedder::embed_chunks_observed(
+            let result = embedder::embed_pending_observed(
                 &mut conn,
                 embedder.as_ref(),
-                &pending,
                 None,
                 &embed_options,
                 observer,
@@ -764,6 +751,9 @@ where
             })
         }
         Err(reason) => {
+            let extraction = observer.stage("pending_extraction");
+            let pending_total = embedder::pending_count(&conn)?;
+            extraction.finish("complete");
             observer.start_embedding(pending_total);
             Ok(IndexOutcome {
                 degraded_note: search_degraded_note(reason),
@@ -780,23 +770,20 @@ where
     Ok(outcome)
 }
 
-/// Embed every chunk absent from `vec_chunks`. Incremental by the one-pass
-/// pending gate (`embedder::pending_chunks`), so a re-index embeds only new
-/// chunks; a `rebuild` re-embeds every present session because it re-parses each
-/// one and replaces its chunks, leaving them pending. The pending list is
-/// collected once and fed straight to
-/// `embed_chunks` — a separate COUNT would re-scan vec_chunks (#138).
+/// Test adapter for the production finite-page pipeline.
 #[cfg(test)]
 fn embed_all_pending(
     conn: &mut Connection,
     embedder: &dyn Embed,
     options: &embedder::EmbedOptions,
 ) -> Result<embedder::EmbedResult> {
-    let pending = embedder::pending_chunks(conn, usize::MAX)?;
-    if pending.is_empty() {
-        return Ok(embedder::EmbedResult::default());
-    }
-    let result = embedder::embed_chunks(conn, embedder, &pending, None, options)?;
+    let result = embedder::embed_pending_observed(
+        conn,
+        embedder,
+        None,
+        options,
+        &index_observer::Observer::default(),
+    )?;
     // A mid-run batch failure is non-fatal: chunks already embedded are committed,
     // the rest stay pending, and the parsed FTS content stays queryable. The next
     // `recall index` retries the remaining pending via the pending gate, so we
