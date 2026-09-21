@@ -5,6 +5,7 @@ use super::*;
 use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use crate::index_observer::recording;
+use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
 
 /// Collect a single-TEXT-column query into a Vec, replacing the verbose
@@ -41,6 +42,7 @@ fn test_index_from_dirs_indexes_and_skips() {
     .unwrap();
     assert_eq!(stats.indexed, 1);
     assert_eq!(stats.total_sessions, 1);
+    index_chunks(&mut conn, None).unwrap();
 
     let stats2 = index_from_dirs(
         &mut conn,
@@ -338,7 +340,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
             parsed
         })
         .unwrap();
-        assert!(matches!(outcome, IndexOutcome::Indexed));
+        assert!(matches!(outcome, IndexOutcome::Indexed(_)));
         if order == 2 {
             append();
         }
@@ -366,6 +368,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
             collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
             ["original question", "appended answer"]
         );
+        index_chunks(&mut conn, None).unwrap();
         let existing = load_existing_sessions(&conn).unwrap();
         let tx = conn.transaction().unwrap();
         let ctx = IndexContext {
@@ -518,6 +521,7 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
     )
     .unwrap();
     assert_eq!(stats1.indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
 
     // New session added into the SAME existing day dir. The parent `2026/` mtime
     // does not change, so the old dirs_changed_since optimization skipped the scan
@@ -1686,7 +1690,7 @@ fn test_session_id_collision_cleans_old_messages() {
         )
         .unwrap();
     assert_eq!(msg_count, 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
     assert_eq!(
         collect_strings(&conn, "SELECT content FROM qa_chunks"),
         ["from dir b"]
@@ -1785,13 +1789,13 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
             collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
             ["replacement question"]
         );
-        for table in ["qa_chunks", "vec_chunks", "session_files"] {
+        for table in ["vec_chunks", "session_files"] {
             let count: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .unwrap();
             assert_eq!(count, 0, "old {table} must be removed on replacement");
         }
-        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
+        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
         assert_eq!(
             collect_strings(&conn, "SELECT content FROM qa_chunks"),
             ["replacement question"]
@@ -3150,8 +3154,8 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
         assert_eq!(counts["files_unchanged"], usize::from(pass == 1));
         assert_eq!(counts["files_deferred"], usize::from(pass == 2));
         assert_eq!(counts["files_remaining"], 0);
+        index_chunks(&mut conn, None).unwrap();
         if pass == 1 {
-            index_chunks(&mut conn, None).unwrap();
             embed_recent_chunks(&mut conn, &MockEmbedder::new(), usize::MAX, None).unwrap();
             fs::write(
                 source.path().join("good.jsonl"),
@@ -3160,4 +3164,451 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
             .unwrap();
         }
     }
+
+    // With another session's vectors protected, a completed but unembedded
+    // conversation can still reconcile. Its matched chunk is not a reused
+    // embedding, and the protected session's bytes must remain untouched.
+    let protected = chunk_vectors(&conn);
+    assert_eq!(protected.len(), 1);
+    let unembedded = source.path().join("unembedded.jsonl");
+    write_reuse_conversation(&unembedded, &[("user", "pending question")]);
+    index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    let before = collect_strings(
+        &conn,
+        "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded'",
+    );
+    write_reuse_conversation(
+        &unembedded,
+        &[("user", "pending question"), ("user", "appended question")],
+    );
+    let observer = Observer::default();
+    let stats = index_from_dirs_observed(&mut conn, &opts, false, &observer).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(stats.preserved_embedded, 1);
+    let counts = observer.snapshot()["counts"].clone();
+    assert_eq!(counts["chunks_matched_committed"], 1);
+    assert_eq!(counts["embeddings_reused_committed"], 0);
+    assert_eq!(counts["chunks_reconciled_created_committed"], 1);
+    assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
+    assert_eq!(chunk_vectors(&conn), protected);
+    let after = collect_strings(
+        &conn,
+        "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded' ORDER BY id",
+    );
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[..1], before);
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT text FROM messages WHERE session_id = 'unembedded' ORDER BY rowid"
+        ),
+        ["pending question", "appended question"]
+    );
+}
+
+// The lifecycle checks inference inputs and persistent vectors, rather than
+// merely counting chunks. A fresh rebuild is the oracle for final saved data.
+fn write_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
+    let text = messages
+        .iter()
+        .map(|(role, text)| {
+            serde_json::json!({"type": role, "message": {"role": role, "content": text}})
+                .to_string()
+                + "\n"
+        })
+        .collect::<String>();
+    fs::write(path, text).unwrap();
+}
+
+fn chunk_vectors(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT json_array(c.content, v.sub_idx, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.content, v.sub_idx, hex(v.embedding)",
+    )
+}
+
+#[test]
+fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
+    use rusqlite::{Error as SqliteError, ErrorCode};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    // The observer controls the interleaving without sleeps or a test-only
+    // indexing path. A second index either saves before cleanup, or gets BUSY
+    // and retries after the first writer commits. Both must preserve its work.
+    for embed_capable in [true, false] {
+        let (db_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let absent = root.join("absent");
+        let opts = IndexOptions {
+            force: false,
+            claude_dir: &root,
+            codex_dir: &absent,
+        };
+        let writer = open_db(&db_dir.path().join("test.db")).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let writer = RefCell::new(writer);
+        let writer_root = root.clone();
+        let saved = Rc::new(RefCell::new(None));
+        let writer_saved = Rc::clone(&saved);
+        let index_new = Rc::new(move || -> Result<()> {
+            let mut writer = writer.borrow_mut();
+            let absent = writer_root.join("absent");
+            let opts = IndexOptions {
+                force: false,
+                claude_dir: &writer_root,
+                codex_dir: &absent,
+            };
+            index_from_dirs(&mut writer, &opts, true)?;
+            index_chunks(&mut writer, None)?;
+            assert_eq!(
+                embed_recent_chunks(&mut writer, &MockEmbedder::new(), 100, None)?.embedded,
+                1
+            );
+            *writer_saved.borrow_mut() = Some(chunk_vectors(&writer));
+            Ok(())
+        });
+        let attempted = Rc::new(Cell::new(false));
+        let observer_attempted = Rc::clone(&attempted);
+        let observer_index = Rc::clone(&index_new);
+        let path = root.join("new.jsonl");
+        let observer = Observer::with_reporter(move |line| {
+            if line.starts_with("index: enumeration: complete") {
+                assert!(!observer_attempted.replace(true));
+                write_reuse_conversation(
+                    &path,
+                    &[("user", "new question"), ("assistant", "new answer")],
+                );
+                if let Err(error) = observer_index() {
+                    assert_eq!(
+                        error
+                            .downcast_ref::<SqliteError>()
+                            .and_then(SqliteError::sqlite_error_code),
+                        Some(ErrorCode::DatabaseBusy),
+                        "only writer contention permits a retry: {error:#}"
+                    );
+                }
+            }
+        });
+
+        index_from_dirs_observed(&mut conn, &opts, embed_capable, &observer).unwrap();
+        assert!(attempted.get());
+        if saved.borrow().is_none() {
+            index_new().unwrap();
+        }
+        assert_eq!(
+            collect_strings(&conn, "SELECT session_id FROM sessions"),
+            ["new"]
+        );
+        assert_eq!(
+            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+            ["new question", "new answer"]
+        );
+        assert_eq!(chunk_vectors(&conn).len(), 1);
+        assert_eq!(chunk_vectors(&conn), *saved.borrow().as_ref().unwrap());
+    }
+}
+
+#[test]
+fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
+    let original = [
+        ("user", "duplicate"),
+        ("assistant", "same answer"),
+        ("user", "duplicate"),
+        ("assistant", "same answer"),
+        ("user", "tail question"),
+        ("assistant", "tail answer"),
+    ];
+    for scenario in [
+        "append",
+        "assistant",
+        "mtime",
+        "truncate",
+        "partial-duplicate",
+        "replace",
+        "rules",
+        "pending-rules",
+        "pending-old-rules",
+        "pending-current-rules",
+        "rebuild",
+    ] {
+        let (_db_dir, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("claude");
+        fs::create_dir(&root).unwrap();
+        let path = root.join("reuse.jsonl");
+        let absent = tmp.path().join("absent");
+        let mut opts = IndexOptions {
+            force: false,
+            claude_dir: &root,
+            codex_dir: &absent,
+        };
+        write_reuse_conversation(&path, &original);
+        index_from_dirs(&mut conn, &opts, true).unwrap();
+        if scenario == "pending-current-rules" {
+            // FTS committed with the current parser before interruption. A new
+            // connection must be able to finish chunking during a root outage.
+            let offline = tmp.path().join("offline");
+            fs::rename(&root, &offline).unwrap();
+            let mut resumed = open_db(&_db_dir.path().join("test.db")).unwrap();
+            assert_eq!(
+                index_from_dirs(&mut resumed, &opts, true).unwrap().indexed,
+                0
+            );
+            assert_eq!(
+                index_chunks(&mut resumed, None).unwrap().sessions_chunked,
+                1
+            );
+            fs::rename(&offline, &root).unwrap();
+            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+        }
+        index_chunks(&mut conn, None).unwrap();
+        let model = MockEmbedder::new();
+        assert_eq!(
+            embed_recent_chunks(&mut conn, &model, 100, None)
+                .unwrap()
+                .embedded,
+            3
+        );
+        if scenario == "partial-duplicate" {
+            conn.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id = (SELECT min(id) FROM qa_chunks)",
+                [],
+            )
+            .unwrap();
+        }
+        let before = collect_strings(
+            &conn,
+            "SELECT json_array(c.id, c.generation, c.content, v.rowid, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id",
+        );
+        // Force new message rowids to differ, as happens when another session
+        // has been indexed after this one. Old rowid links must not survive.
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('other', 'user', 'unrelated')",
+            [],
+        )
+        .unwrap();
+        let mut changed = original.to_vec();
+        let (reused, inferred) = match scenario {
+            "append" => {
+                changed.extend([
+                    ("user", "appended question"),
+                    ("assistant", "appended answer"),
+                ]);
+                (3, 1)
+            }
+            "assistant" => {
+                changed.push(("assistant", "continuation needle"));
+                (2, 1)
+            }
+            "mtime" | "pending-current-rules" => (3, 0),
+            "truncate" | "partial-duplicate" => {
+                changed.truncate(2);
+                (1, 0)
+            }
+            "replace" => {
+                changed = vec![
+                    ("user", "tail question"),
+                    ("assistant", "tail answer"),
+                    ("user", "replacement needle"),
+                ];
+                (1, 1)
+            }
+            "rules" => {
+                conn.execute("UPDATE sessions SET chunks_indexed = 99", [])
+                    .unwrap();
+                (0, 3)
+            }
+            "pending-rules" | "pending-old-rules" => {
+                // An older parser committed FTS, then stopped before chunking.
+                // The file stamp still matches, but its parsing rules are unknown.
+                conn.execute_batch("DELETE FROM vec_chunks; DELETE FROM qa_chunks; UPDATE sessions SET chunks_indexed = NULL; UPDATE messages SET text = 'obsolete parser output' WHERE session_id = 'reuse';").unwrap();
+                if scenario == "pending-old-rules" {
+                    conn.execute("UPDATE sessions SET chunks_indexed = -99", [])
+                        .unwrap();
+                }
+                // Chunking a preserved body while its source root is absent
+                // cannot certify the parser version. Restore the same file,
+                // including its mtime and size, before the normal index below.
+                let stamp = resolve_file_stamp(&path);
+                let offline = tmp.path().join("offline");
+                fs::rename(&root, &offline).unwrap();
+                let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+                assert_eq!(stats.indexed, 0);
+                assert_eq!(stats.total_sessions, 1);
+                assert_eq!(stats.skipped_roots[0].preserved_sessions, 1);
+                assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 1);
+                // A second absent-root run must not duplicate chunks.
+                assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
+                embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+                fs::rename(&offline, &root).unwrap();
+                assert!(resolve_file_stamp(&path) == stamp);
+                (0, 3)
+            }
+            "rebuild" => {
+                opts.force = true;
+                (0, 3)
+            }
+            _ => unreachable!(),
+        };
+        if !matches!(scenario, "rules" | "pending-rules" | "pending-old-rules") {
+            write_reuse_conversation(&path, &changed);
+            conn.execute("UPDATE sessions SET mtime = 0", []).unwrap();
+        }
+        let observer = Observer::default();
+        assert_eq!(
+            index_from_dirs_observed(&mut conn, &opts, true, &observer)
+                .unwrap()
+                .indexed,
+            1,
+            "{scenario}"
+        );
+        assert_eq!(
+            observer.snapshot()["counts"]["embeddings_reused_committed"],
+            reused,
+            "{scenario}"
+        );
+        index_chunks(&mut conn, None).unwrap();
+        let retained = collect_strings(
+            &conn,
+            "SELECT json_array(c.id, c.generation, c.content, v.rowid, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id",
+        );
+        assert_eq!(retained.len(), reused as usize, "{scenario}");
+        assert!(
+            retained.iter().all(|row| before.contains(row)),
+            "{scenario}: reused vectors changed"
+        );
+        assert_eq!(
+            embed_recent_chunks(&mut conn, &model, 100, None)
+                .unwrap()
+                .embedded,
+            inferred as usize
+        );
+        assert_eq!(
+            model.calls(),
+            3 + inferred as usize,
+            "{scenario}: redundant inference"
+        );
+        let tx = conn.transaction().unwrap();
+        let messages = read_session_messages(&tx, "reuse").unwrap();
+        let mut expected: Vec<_> = chunker::chunk_messages("reuse", &messages, None)
+            .into_iter()
+            .map(|c| (c.content, c.src_rowid_lo, c.src_rowid_hi))
+            .collect();
+        let mut actual: Vec<(String, i64, i64)> = tx
+            .prepare("SELECT content, src_rowid_lo, src_rowid_hi FROM qa_chunks")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "{scenario}: incorrect source rowid mapping"
+        );
+        tx.commit().unwrap();
+        if scenario == "assistant" {
+            let results = search(&conn, "continuation", &SearchOptions::default()).unwrap();
+            assert_eq!(results.len(), 1);
+            assert!(results[0].excerpt.contains("continuation needle"));
+            assert!(results[0].chunk_id.is_some());
+        }
+        let expected_vectors = chunk_vectors(&conn);
+        opts.force = true;
+        index_from_dirs(&mut conn, &opts, true).unwrap();
+        index_chunks(&mut conn, None).unwrap();
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+        assert_eq!(
+            chunk_vectors(&conn),
+            expected_vectors,
+            "{scenario}: differs from rebuild"
+        );
+    }
+}
+
+#[test]
+fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resume() {
+    use crate::embedder::{EmbedOptions, embed_chunks, pending_chunks};
+    let (db_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("reuse.jsonl");
+    let absent = tmp.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: tmp.path(),
+        codex_dir: &absent,
+    };
+    let mut messages = vec![
+        ("user", "stable"),
+        ("assistant", "answer"),
+        ("user", "tail"),
+    ];
+    write_reuse_conversation(&path, &messages);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    // One vector committed, with an outstanding snapshot for both chunks.
+    let old_pending = pending_chunks(&conn, 100).unwrap();
+    let stable = conn
+        .query_row(
+            "SELECT id FROM qa_chunks WHERE content = 'stable\nanswer'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap();
+    let bytes = f32_as_bytes(&MockEmbedder::deterministic_vector("stable\nanswer")).to_vec();
+    conn.execute(
+        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (?1, 0, ?2)",
+        rusqlite::params![stable, bytes],
+    )
+    .unwrap();
+    let before = chunk_vectors(&conn);
+    messages.push(("assistant", "new tail"));
+    write_reuse_conversation(&path, &messages);
+    conn.execute_batch("CREATE TEMP TRIGGER fail_reconcile BEFORE UPDATE OF chunks_indexed ON sessions BEGIN SELECT RAISE(ABORT, 'reconciliation failed'); END;").unwrap();
+    assert!(index_from_dirs(&mut conn, &opts, true).is_err());
+    assert_eq!(chunk_vectors(&conn), before);
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["stable", "answer", "tail"]
+    );
+    conn.execute_batch("DROP TRIGGER fail_reconcile;").unwrap();
+    // Simulate a different index finishing its FTS work while the old worker
+    // still holds inference inputs, using an independent SQLite connection.
+    let mut writer = open_db(&db_dir.path().join("test.db")).unwrap();
+    index_from_dirs(&mut writer, &opts, true).unwrap();
+    assert_eq!(chunk_vectors(&conn), before);
+    let stale = embed_chunks(
+        &mut conn,
+        &MockEmbedder::new(),
+        &old_pending,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(stale.embedded, 1, "only the unchanged input can save");
+    assert_eq!(chunk_vectors(&conn), before);
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::failing_after(0), 100, None)
+            .unwrap()
+            .failed_count,
+        1
+    );
+    assert_eq!(chunk_vectors(&conn), before);
+    drop(conn);
+    drop(writer);
+    let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+    let model = MockEmbedder::new();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &model, 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    assert_eq!(model.calls(), 1);
+    assert_eq!(chunk_vectors(&conn).len(), 2);
 }

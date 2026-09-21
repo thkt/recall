@@ -99,6 +99,9 @@ fn slow_loader_is_announced_before_work_and_run_counts_distinguish_changes() {
         assert_eq!(counts["files_unchanged"], unchanged);
         assert_eq!(counts["files_remaining"], 0);
         assert_eq!(counts["chunks_remaining_snapshot"], 0);
+        assert_eq!(counts["inference_chunks"], updated);
+        assert_eq!(counts["inference_batches"], updated);
+        assert_eq!(counts["embeddings_reused_committed"], usize::from(run == 2));
         let lines = lines.borrow();
         let position = |text: &str| lines.iter().position(|line| line.contains(text)).unwrap();
         assert!(position("fts_transaction: committed") < position("chunking: started"));

@@ -106,11 +106,13 @@ pub(crate) fn embed_chunks_observed(
     let mut stale = 0;
     let mut attempted = 0;
 
-    for batch_idx in sorted.chunks(EMBED_BATCH_SIZE) {
+    for (batch_number, batch_idx) in sorted.chunks(EMBED_BATCH_SIZE).enumerate() {
         let texts: Vec<&str> = batch_idx
             .iter()
             .map(|&i| chunks[i].content.as_str())
             .collect();
+        observer.count("inference_batches", batch_number + 1);
+        observer.count("inference_chunks", attempted + batch_idx.len());
         let inference = observer.stage("inference");
         let result = embedder.embed_documents_batch_with_options(&texts, options);
         inference.finish(if result.is_ok() {
@@ -342,9 +344,12 @@ impl MockEmbedder {
         Self::new()
     }
 
-    /// The `EmbedOptions` forwarded by the most recent
-    /// `embed_documents_batch_with_options` call, or `None` if that entry point
-    /// was never invoked.
+    /// Query/document inference attempts, including failures.
+    pub(crate) fn calls(&self) -> usize {
+        self.call_count.load(Ordering::SeqCst)
+    }
+
+    /// The options from the most recent batch call, or None before any call.
     pub(crate) fn captured_options(&self) -> Option<EmbedOptions> {
         *self.captured_options.lock().unwrap()
     }
@@ -378,21 +383,17 @@ impl MockEmbedder {
 #[cfg(test)]
 impl Embed for MockEmbedder {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        if let Some(limit) = self.fail_after {
-            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if count >= limit {
-                return Err(Self::inference_error("mock failure".to_owned()));
-            }
+        let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if self.fail_after.is_some_and(|limit| count >= limit) {
+            return Err(Self::inference_error("mock failure".to_owned()));
         }
         Ok(Self::deterministic_vector(text))
     }
 
     fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-        if let Some(limit) = self.fail_after {
-            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
-            if count >= limit {
-                return Err(Self::inference_error("mock failure".to_owned()));
-            }
+        let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+        if self.fail_after.is_some_and(|limit| count >= limit) {
+            return Err(Self::inference_error("mock failure".to_owned()));
         }
         Ok(ChunkedEmbedding::try_new(vec![
             Self::deterministic_vector(text),

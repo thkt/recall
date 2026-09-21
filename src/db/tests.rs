@@ -107,14 +107,23 @@ fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
             .unwrap();
         assert_eq!(id, 1);
         assert_eq!(embedding, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]));
+        // Migration preserves the known legacy completion for s1. The other
+        // bodies have no parser provenance: chunking them (including the empty
+        // result) must leave them requiring a source reread, also after reopen.
+        let markers: Vec<(String, i64)> = conn
+            .prepare("SELECT session_id, chunks_indexed FROM sessions ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM sessions WHERE chunks_indexed = 1",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            3
+            markers,
+            [
+                ("empty".to_owned(), 0),
+                ("pending".to_owned(), 0),
+                ("s1".to_owned(), 1),
+            ]
         );
     }
 }
