@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::chunker;
 use crate::classify::classify_first_turn;
+use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
 struct SessionEntry {
@@ -105,6 +106,8 @@ impl SkippedReason {
 enum IndexOutcome {
     Indexed,
     Unchanged,
+    Empty,
+    Failed,
     /// A re-index was due, but the session already has embeddings and the model
     /// is absent this run, so its rows were left untouched to protect them (#215).
     Preserved(String),
@@ -281,10 +284,6 @@ fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result
     Ok(false)
 }
 
-fn index_file(ctx: &IndexContext, fpath: &Path, source: &Source) -> Result<IndexOutcome> {
-    index_file_with_parser(ctx, fpath, source, parse_session_including_empty)
-}
-
 fn index_file_with_parser(
     ctx: &IndexContext,
     fpath: &Path,
@@ -293,7 +292,7 @@ fn index_file_with_parser(
 ) -> Result<IndexOutcome> {
     let (Some(fpath_str), Some(before)) = (fpath.to_str(), resolve_file_stamp(fpath)) else {
         save_read_error(ctx.tx, fpath, *source)?;
-        return Ok(IndexOutcome::Unchanged);
+        return Ok(IndexOutcome::Failed);
     };
     if is_unchanged(ctx, fpath_str, before)? {
         return Ok(IndexOutcome::Unchanged);
@@ -311,11 +310,11 @@ fn index_file_with_parser(
 
     let mut parsed = match parse(fpath, *source) {
         Ok(Some(p)) => p,
-        Ok(None) => return Ok(IndexOutcome::Unchanged),
+        Ok(None) => return Ok(IndexOutcome::Empty),
         Err(_) => {
             // Never include parser errors or conversation bytes in diagnostics.
             save_read_error(ctx.tx, fpath, *source)?;
-            return Ok(IndexOutcome::Unchanged);
+            return Ok(IndexOutcome::Failed);
         }
     };
 
@@ -326,10 +325,14 @@ fn index_file_with_parser(
         // its identity and stamp so subsequent unchanged runs skip parsing.
         // Malformed input is not proof of an empty session; leave it pending.
         let Some(entry) = ctx.existing.get(fpath_str) else {
-            return Ok(IndexOutcome::Unchanged);
+            return Ok(if parsed.diagnostics.is_empty() {
+                IndexOutcome::Empty
+            } else {
+                IndexOutcome::Failed
+            });
         };
         if !parsed.diagnostics.is_empty() {
-            return Ok(IndexOutcome::Unchanged);
+            return Ok(IndexOutcome::Failed);
         }
         parsed.metadata.session_id.clone_from(&entry.session_id);
     }
@@ -424,22 +427,53 @@ struct IndexTotals {
     preserved_sessions: HashSet<String>,
 }
 
-fn index_all(ctx: &IndexContext, sources: &[(PathBuf, Source)]) -> Result<IndexTotals> {
+fn index_all(
+    ctx: &IndexContext,
+    sources: &[(PathBuf, Source)],
+    observer: &Observer,
+) -> Result<IndexTotals> {
+    let stage = observer.stage("parse_fts");
+    let mut unchanged = 0;
+    let mut empty = 0;
+    let mut failed = 0;
     let mut indexed = 0;
     let mut preserved_embedded = 0;
     let mut preserved_sessions = HashSet::new();
 
-    for (fpath, source) in sources {
-        match index_file(ctx, fpath, source)? {
+    for (position, (fpath, source)) in sources.iter().enumerate() {
+        match index_file_with_parser(ctx, fpath, source, |path, source| {
+            let start = Instant::now();
+            let parsed = parse_session_including_empty(path, source);
+            observer.add_seconds("parse", start.elapsed().as_secs_f64());
+            parsed
+        })? {
             IndexOutcome::Indexed => indexed += 1,
-            IndexOutcome::Unchanged => {}
+            IndexOutcome::Unchanged => unchanged += 1,
+            IndexOutcome::Empty => empty += 1,
+            IndexOutcome::Failed => failed += 1,
             IndexOutcome::Preserved(session_id) => {
                 preserved_embedded += 1;
                 preserved_sessions.insert(session_id);
             }
         }
+        observer.count("files_remaining", sources.len() - position - 1);
+        observer.count("files_updated", indexed);
+        observer.count("files_unchanged", unchanged);
+        observer.count("files_empty", empty);
+        observer.count("files_failed", failed);
+        observer.count("files_deferred", preserved_embedded);
+        stage.progress(position + 1, sources.len(), 0);
     }
 
+    // Results in this transaction have not been committed yet.
+    stage.finish("processed; awaiting FTS transaction commit");
+    if sources.is_empty() {
+        observer.count("files_updated", 0);
+        observer.count("files_unchanged", 0);
+        observer.count("files_empty", 0);
+        observer.count("files_failed", 0);
+        observer.count("files_deferred", 0);
+    }
     Ok(IndexTotals {
         indexed,
         preserved_embedded,
@@ -463,12 +497,23 @@ fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()
 /// than re-indexed (#215), since the embed gate downstream cannot rebuild what a
 /// re-index would delete. The caller loads the embedder once and passes the
 /// result here so the model is not probed twice.
+#[cfg(test)]
 pub(crate) fn index_from_dirs(
     conn: &mut Connection,
     opts: &IndexOptions,
     embed_capable: bool,
 ) -> Result<IndexStats> {
+    index_from_dirs_observed(conn, opts, embed_capable, &Observer::default())
+}
+
+pub(crate) fn index_from_dirs_observed(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+    embed_capable: bool,
+    observer: &Observer,
+) -> Result<IndexStats> {
     let start = Instant::now();
+    let preparation = observer.stage("index_prepare");
 
     // Always full-scan: file-level mtime/size checks in is_unchanged keep indexing
     // incremental. A directory-mtime skip optimization here used to miss new files
@@ -489,12 +534,19 @@ pub(crate) fn index_from_dirs(
     } else {
         Some(embedded_session_ids(conn)?)
     };
+    preparation.finish("complete");
+    let enumeration = observer.stage("enumeration");
     let scan = collect_sources(opts);
+    observer.count("files_discovered", scan.sources.len());
+    observer.count("files_remaining", scan.sources.len());
+    observer.count("files_updated_committed", 0);
+    enumeration.finish("complete; unavailable roots reported separately");
     let sources = &scan.sources;
     let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
 
     info!(count = sources.len(), "Found source files");
 
+    let fts = observer.stage("fts_transaction");
     let tx = conn.transaction().context("Failed to begin transaction")?;
     tx.execute(
         "INSERT INTO messages(messages, rank) VALUES('automerge', 0)",
@@ -507,7 +559,7 @@ pub(crate) fn index_from_dirs(
         force: opts.force,
         embedded_sessions,
     };
-    let totals = index_all(&ctx, sources)?;
+    let totals = index_all(&ctx, sources, observer)?;
     cleanup_orphans(
         &tx,
         &existing,
@@ -518,7 +570,15 @@ pub(crate) fn index_from_dirs(
     let parse_diagnostics = cleanup_parse_diagnostics(&tx, &source_paths, &scan.scanned)?;
     tx.commit().context("Failed to commit transaction")?;
 
+    observer.count("files_updated_committed", totals.indexed);
+    fts.finish("committed");
+    observer.add_seconds(
+        "fts_excluding_parse",
+        (observer.seconds("fts_transaction") - observer.seconds("parse")).max(0.0),
+    );
+    let optimize = observer.stage("fts_finalize");
     finalize_fts(conn, totals.indexed, opts.force)?;
+    optimize.finish("complete");
 
     let total_sessions = {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
@@ -788,10 +848,22 @@ fn chunk_batch_len(sessions: &[PendingChunkSession]) -> usize {
 /// Progress reports staged sessions, before commit (#121). Error or callback panic
 /// rolls back chunks AND completion markers. An immediate transaction keeps the
 /// pending selection and bodies in the same snapshot and excludes other writers.
+#[cfg(test)]
 pub(crate) fn index_chunks(
     conn: &mut Connection,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<ChunkStats> {
+    index_chunks_observed(conn, on_progress, &Observer::default())
+}
+
+pub(crate) fn index_chunks_observed(
+    conn: &mut Connection,
+    on_progress: Option<&dyn Fn(usize, usize)>,
+    observer: &Observer,
+) -> Result<ChunkStats> {
+    let stage = observer.stage("chunking");
+    observer.count("sessions_chunked_committed", 0);
+    observer.count("chunks_created_committed", 0);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let pending: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sessions WHERE chunks_indexed IS NULL)",
@@ -799,6 +871,10 @@ pub(crate) fn index_chunks(
         |row| row.get(0),
     )?;
     if !pending {
+        observer.count("sessions_chunk_pending", 0);
+        observer.count("sessions_chunk_remaining", 0);
+        observer.count("sessions_chunked_empty", 0);
+        stage.finish("no pending sessions");
         return Ok(ChunkStats::default());
     }
 
@@ -822,6 +898,9 @@ pub(crate) fn index_chunks(
         rows.collect::<StdResult<_, _>>()?
     };
     let total = sessions.len();
+    observer.count("sessions_chunk_pending", total);
+    observer.count("sessions_chunk_remaining", total);
+    let mut empty = 0;
     info!(count = total, "Chunking sessions");
 
     let mut stats = ChunkStats {
@@ -855,6 +934,9 @@ pub(crate) fn index_chunks(
         for (session_id, timestamp, _) in batch {
             let body = messages.remove(session_id).unwrap_or_default();
             let chunks = chunker::chunk_messages(session_id, &body, *timestamp);
+            if chunks.is_empty() {
+                empty += 1;
+            }
             for chunk in &chunks {
                 tx.execute(
                     "INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
@@ -869,6 +951,7 @@ pub(crate) fn index_chunks(
                 [session_id],
             )?;
             stats.sessions_chunked += 1;
+            stage.progress(stats.sessions_chunked, total, 0);
             if let Some(cb) = on_progress {
                 cb(stats.sessions_chunked, total);
             }
@@ -877,6 +960,11 @@ pub(crate) fn index_chunks(
     }
     tx.execute_batch("DROP TABLE chunk_message_rows;")?;
     tx.commit()?;
+    observer.count("sessions_chunk_remaining", 0);
+    observer.count("sessions_chunked_committed", stats.sessions_chunked);
+    observer.count("sessions_chunked_empty", empty);
+    observer.count("chunks_created_committed", stats.chunks_created);
+    stage.finish("committed");
     debug!(
         sessions = stats.sessions_chunked,
         batches = stats.message_batches,

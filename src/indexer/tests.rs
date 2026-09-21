@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime};
 use super::*;
 use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
+use crate::index_observer::recording;
 use tempfile::TempDir;
 
 /// Collect a single-TEXT-column query into a Vec, replacing the verbose
@@ -2660,6 +2661,7 @@ fn chunk_completion_rolls_back_with_chunks_and_retries() {
         seed_session(&conn, "empty");
         seed_session(&conn, "s1");
         seed_message(&conn, "user", "question");
+        let (observer, lines) = recording();
         if !interrupt {
             conn.execute_batch(
                 "CREATE TEMP TRIGGER fail_completion BEFORE UPDATE OF chunks_indexed ON sessions
@@ -2667,18 +2669,21 @@ fn chunk_completion_rolls_back_with_chunks_and_retries() {
                  BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
             )
             .unwrap();
-            let error = index_chunks(&mut conn, None).err().unwrap();
+            let error = index_chunks_observed(&mut conn, None, &observer)
+                .err()
+                .unwrap();
             assert!(error.to_string().contains("injected completion failure"));
         } else {
             assert!(
                 catch_unwind(AssertUnwindSafe(|| {
-                    index_chunks(
+                    index_chunks_observed(
                         &mut conn,
                         Some(&|done, _| {
                             if done == 2 {
                                 panic!("injected interruption");
                             }
                         }),
+                        &observer,
                     )
                     .unwrap();
                 }))
@@ -2698,6 +2703,22 @@ fn chunk_completion_rolls_back_with_chunks_and_retries() {
             )
             .unwrap(),
             0
+        );
+        assert_eq!(
+            observer.snapshot()["counts"]["sessions_chunked_committed"],
+            0
+        );
+        assert!(
+            lines
+                .borrow()
+                .iter()
+                .any(|line| line.contains("chunking: unfinished"))
+        );
+        assert!(
+            !lines
+                .borrow()
+                .iter()
+                .any(|line| line.contains("chunking: committed"))
         );
         conn.execute_batch("DROP TRIGGER IF EXISTS fail_completion;")
             .unwrap();
@@ -2988,7 +3009,7 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
             embedded_sessions: None,
         };
         let sources: Vec<_> = paths.iter().cloned().map(|p| (p, Source::Claude)).collect();
-        index_all(&ctx, &sources).unwrap();
+        index_all(&ctx, &sources, &Observer::default()).unwrap();
         let source_paths = paths.iter().map(PathBuf::as_path).collect();
         let diagnostics =
             cleanup_parse_diagnostics(&tx, &source_paths, &HashSet::from([Source::Claude]))
@@ -3047,4 +3068,96 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         collect_strings(&conn, "SELECT text FROM messages"),
         ["readable"]
     );
+}
+
+#[test]
+fn failed_fts_transaction_never_reports_saved_files() {
+    let (_dir, mut conn) = setup_test_db();
+    let source = TempDir::new().unwrap();
+    fs::write(
+        source.path().join("s.jsonl"),
+        r#"{"type":"user","message":{"role":"user","content":"question"}}"#,
+    )
+    .unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_session BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'injected FTS failure'); END;").unwrap();
+    let (observer, lines) = recording();
+    let absent = source.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: source.path(),
+        codex_dir: &absent,
+    };
+    let error = index_from_dirs_observed(&mut conn, &opts, true, &observer)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("injected FTS failure"));
+    assert_eq!(observer.snapshot()["counts"]["files_updated_committed"], 0);
+    assert!(collect_strings(&conn, "SELECT session_id FROM sessions").is_empty());
+    assert!(
+        !lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("fts_transaction: committed"))
+    );
+    assert!(
+        lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("fts_transaction: unfinished"))
+    );
+    conn.execute_batch("DROP TRIGGER fail_session;").unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+}
+
+#[test]
+fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
+    let (_dir, mut conn) = setup_test_db();
+    let source = TempDir::new().unwrap();
+    let body = r#"{"type":"user","message":{"role":"user","content":"question"}}"#;
+    let absent = source.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: source.path(),
+        codex_dir: &absent,
+    };
+    let observer = Observer::default();
+    index_from_dirs_observed(&mut conn, &opts, true, &observer).unwrap();
+    let counts = observer.snapshot()["counts"].clone();
+    for key in [
+        "files_discovered",
+        "files_updated",
+        "files_unchanged",
+        "files_empty",
+        "files_failed",
+        "files_deferred",
+        "files_remaining",
+        "files_updated_committed",
+    ] {
+        assert_eq!(counts[key], 0, "empty source: {key}");
+    }
+
+    fs::write(source.path().join("good.jsonl"), body).unwrap();
+    fs::write(source.path().join("empty.jsonl"), "\n").unwrap();
+    fs::write(source.path().join("broken.jsonl"), "{broken}\n").unwrap();
+    for pass in 0..3 {
+        let observer = Observer::default();
+        index_from_dirs_observed(&mut conn, &opts, pass != 2, &observer).unwrap();
+        let counts = observer.snapshot()["counts"].clone();
+        assert_eq!(counts["files_discovered"], 3);
+        assert_eq!(counts["files_empty"], 1);
+        assert_eq!(counts["files_failed"], 1);
+        assert_eq!(counts["files_updated"], usize::from(pass == 0));
+        assert_eq!(counts["files_unchanged"], usize::from(pass == 1));
+        assert_eq!(counts["files_deferred"], usize::from(pass == 2));
+        assert_eq!(counts["files_remaining"], 0);
+        if pass == 1 {
+            index_chunks(&mut conn, None).unwrap();
+            embed_recent_chunks(&mut conn, &MockEmbedder::new(), usize::MAX, None).unwrap();
+            fs::write(
+                source.path().join("good.jsonl"),
+                format!("{body}\n{body}\n"),
+            )
+            .unwrap();
+        }
+    }
 }

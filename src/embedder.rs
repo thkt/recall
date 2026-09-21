@@ -10,8 +10,10 @@ use anyhow::Result;
 use rurico::embed::Embed;
 #[cfg(test)]
 use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, Result as SqlResult, Row, TransactionBehavior};
 use tracing::warn;
+
+use crate::index_observer::Observer;
 
 /// Per-call knobs for the index/rebuild embed pass, threaded from the
 /// `--token-budget` / `--forward-pause-ms` CLI flags down to rurico's
@@ -66,6 +68,7 @@ pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
     bytemuck::cast_slice(v)
 }
 
+#[cfg(test)]
 pub(crate) fn embed_chunks(
     conn: &mut Connection,
     embedder: &dyn Embed,
@@ -73,9 +76,25 @@ pub(crate) fn embed_chunks(
     on_progress: Option<&dyn Fn(usize, usize)>,
     options: &EmbedOptions,
 ) -> Result<EmbedResult> {
-    if chunks.is_empty() {
-        return Ok(EmbedResult::default());
-    }
+    embed_chunks_observed(
+        conn,
+        embedder,
+        chunks,
+        on_progress,
+        options,
+        &Observer::default(),
+    )
+}
+
+pub(crate) fn embed_chunks_observed(
+    conn: &mut Connection,
+    embedder: &dyn Embed,
+    chunks: &[PendingChunk],
+    on_progress: Option<&dyn Fn(usize, usize)>,
+    options: &EmbedOptions,
+    observer: &Observer,
+) -> Result<EmbedResult> {
+    observer.start_embedding(chunks.len());
 
     let mut sorted: Vec<usize> = (0..chunks.len()).collect();
     sorted.sort_by_key(|&i| chunks[i].content.len());
@@ -84,72 +103,108 @@ pub(crate) fn embed_chunks(
     let mut embedded = 0;
     let mut failed_count = 0;
     let mut first_error = None;
+    let mut stale = 0;
+    let mut attempted = 0;
 
     for batch_idx in sorted.chunks(EMBED_BATCH_SIZE) {
         let texts: Vec<&str> = batch_idx
             .iter()
             .map(|&i| chunks[i].content.as_str())
             .collect();
-        match embedder.embed_documents_batch_with_options(&texts, options) {
+        let inference = observer.stage("inference");
+        let result = embedder.embed_documents_batch_with_options(&texts, options);
+        inference.finish(if result.is_ok() {
+            "complete; not saved"
+        } else {
+            "failed; not saved"
+        });
+        attempted += batch_idx.len();
+        observer.count("chunks_unattempted", total - attempted);
+        match result {
             Ok(embeddings) => {
                 // Acquire the writer lock BEFORE reading the current generations:
                 // no writer can replace a checked row before this batch commits.
                 // Inference itself never holds the lock.
-                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                let mut current = Vec::new();
-                {
-                    let mut check = tx.prepare_cached(
-                        "SELECT EXISTS(SELECT 1 FROM qa_chunks \
+                let save = observer.stage("embedding_db_save");
+                let saved: Result<usize> = (|| {
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let mut current = Vec::new();
+                    {
+                        let mut check = tx.prepare_cached(
+                            "SELECT EXISTS(SELECT 1 FROM qa_chunks \
                          WHERE id = ?1 AND content = ?2 AND generation = ?3)",
-                    )?;
-                    for (chunked, &i) in embeddings.iter().zip(batch_idx) {
-                        let chunk = &chunks[i];
-                        if check.query_row(
-                            rusqlite::params![chunk.id, chunk.content, chunk.generation],
-                            |row| row.get::<_, bool>(0),
-                        )? {
-                            current.push((chunked, chunk.id));
+                        )?;
+                        for (chunked, &i) in embeddings.iter().zip(batch_idx) {
+                            let chunk = &chunks[i];
+                            if check.query_row(
+                                rusqlite::params![chunk.id, chunk.content, chunk.generation],
+                                |row| row.get::<_, bool>(0),
+                            )? {
+                                current.push((chunked, chunk.id));
+                            }
                         }
                     }
-                }
-                if current.is_empty() {
-                    continue;
-                }
-                // Delete only validated IDs, preserving another worker's current
-                // vectors when our result is stale. Keep one IN-delete per batch:
-                // vec0's +chunk_id is unindexed, so per-chunk deletes are O(batch × N).
-                let placeholders = anon_placeholders(current.len());
-                tx.execute(
-                    &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
-                    rusqlite::params_from_iter(current.iter().map(|(_, id)| id)),
-                )?;
-                for (chunked, id) in &current {
-                    for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
-                        let embedding_bytes = f32_as_bytes(sub_emb);
-                        tx.execute(
-                            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
-                             VALUES (?1, ?2, ?3)",
-                            rusqlite::params![embedding_bytes, id, sub_idx as i64],
-                        )?;
+                    if current.is_empty() {
+                        return Ok(0);
                     }
-                }
-                tx.commit()?;
-                embedded += current.len();
-                if let Some(cb) = &on_progress {
+                    // Delete only validated IDs, preserving another worker's current
+                    // vectors when our result is stale. Keep one IN-delete per batch:
+                    // vec0's +chunk_id is unindexed, so per-chunk deletes are O(batch × N).
+                    let placeholders = anon_placeholders(current.len());
+                    tx.execute(
+                        &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
+                        rusqlite::params_from_iter(current.iter().map(|(_, id)| id)),
+                    )?;
+                    for (chunked, id) in &current {
+                        for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
+                            let embedding_bytes = f32_as_bytes(sub_emb);
+                            tx.execute(
+                                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
+                             VALUES (?1, ?2, ?3)",
+                                rusqlite::params![embedding_bytes, id, sub_idx as i64],
+                            )?;
+                        }
+                    }
+                    tx.commit()?;
+                    Ok(current.len())
+                })();
+                let saved = match saved {
+                    Ok(saved) => saved,
+                    Err(error) => {
+                        observer.count("chunks_save_failed", batch_idx.len());
+                        observer.embedding_progress();
+                        return Err(error);
+                    }
+                };
+                stale += batch_idx.len() - saved;
+                embedded += saved;
+                observer.count("chunks_stale", stale);
+                observer.count("chunks_saved", embedded);
+                observer.count("chunks_remaining_snapshot", total - embedded);
+                save.finish(if saved == 0 {
+                    "no current results to save"
+                } else {
+                    "committed"
+                });
+                if saved > 0
+                    && let Some(cb) = &on_progress
+                {
                     cb(embedded, total);
                 }
             }
-            Err(e) => {
+            Err(_) => {
                 // Skip the failed batch and keep going: a poison chunk fails its
                 // whole ≤128-batch (all-or-nothing) but must not block the rest of
                 // the backlog. The chunks stay pending (no tx committed here) for
                 // the next index to retry via the pending gate.
                 failed_count += batch_idx.len();
+                observer.count("chunks_failed", failed_count);
                 if first_error.is_none() {
-                    first_error = Some(format!("batch: {e}"));
+                    first_error = Some("batch inference failed".to_owned());
                 }
             }
         }
+        observer.embedding_progress();
     }
 
     Ok(EmbedResult {
@@ -170,39 +225,56 @@ pub(crate) fn pending_chunks(conn: &Connection, budget: usize) -> Result<Vec<Pen
         return Ok(Vec::new());
     }
 
+    let mut missing = Vec::new();
+    visit_pending(conn, budget, true, |row| {
+        missing.push(PendingChunk {
+            id: row.get(0)?,
+            content: row.get(1)?,
+            generation: row.get(2)?,
+        });
+        Ok(())
+    })?;
+    Ok(missing)
+}
+
+/// Same single-pass selection without loading bodies when inference is unavailable.
+pub(crate) fn pending_count(conn: &Connection) -> Result<usize> {
+    visit_pending(conn, usize::MAX, false, |_| Ok(()))
+}
+
+fn visit_pending(
+    conn: &Connection,
+    budget: usize,
+    with_content: bool,
+    mut visit: impl FnMut(&Row<'_>) -> SqlResult<()>,
+) -> Result<usize> {
     let embedded: HashSet<i64> = {
         let mut stmt = conn.prepare("SELECT DISTINCT chunk_id FROM vec_chunks")?;
         let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
         rows.collect::<StdResult<_, _>>()?
     };
-
-    let mut stmt = conn.prepare(
-        "SELECT c.id, c.content, c.generation FROM qa_chunks c \
-         ORDER BY c.timestamp DESC NULLS LAST",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        let id: i64 = row.get(0)?;
-        if embedded.contains(&id) {
-            // Skip without decoding content; sqlite materializes only the
-            // columns a row actually reads.
-            return Ok(None);
+    let sql = if with_content {
+        "SELECT id, content, generation FROM qa_chunks ORDER BY timestamp DESC NULLS LAST"
+    } else {
+        "SELECT id FROM qa_chunks"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0;
+    while count < budget {
+        let Some(row) = rows.next()? else {
+            break;
+        };
+        if !embedded.contains(&row.get::<_, i64>(0)?) {
+            visit(row)?;
+            count += 1;
         }
-        Ok(Some(PendingChunk {
-            id,
-            content: row.get(1)?,
-            generation: row.get(2)?,
-        }))
-    })?;
-    let missing = rows
-        .filter_map(StdResult::transpose)
-        .take(budget)
-        .collect::<StdResult<_, _>>()?;
-    Ok(missing)
+    }
+    Ok(count)
 }
 
-/// Test-only composition of the production pair (`pending_chunks` →
-/// `embed_chunks`); `embed_all_pending` (main.rs) calls the pair directly so
-/// the empty-pending case can skip the Spinner.
+/// Test-only composition of pending selection and embedding, using the same
+/// observed implementation as production with a silent reporter.
 #[cfg(test)]
 pub(crate) fn embed_recent_chunks(
     conn: &mut Connection,

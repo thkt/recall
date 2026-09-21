@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use super::*;
 use crate::db::{open_db, seed_chunk, seed_session, setup_test_db};
+use crate::index_observer::recording;
 
 #[test]
 fn test_embed_recent_chunks_budget_zero() {
@@ -96,7 +97,7 @@ fn seed_chunks(conn: &Connection, count: usize, content: impl Fn(i64) -> String)
 // (Updated from the old T-009: stopped_at_error.is_some() → failed_count > 0.)
 // Perspective: error (the all-fail path) + boundary (failed_count == every chunk).
 #[test]
-fn test_embed_recent_chunks_all_batches_fail_is_non_fatal_and_retryable() {
+fn all_batches_failing_is_non_fatal_and_retryable() {
     let (_dir, mut conn) = setup_test_db();
     seed_chunks(&conn, 1, |_| "pending content".to_owned());
 
@@ -110,7 +111,7 @@ fn test_embed_recent_chunks_all_batches_fail_is_non_fatal_and_retryable() {
     );
     let err = result.first_error.as_deref().unwrap_or_default();
     assert!(
-        err.contains("mock failure"),
+        err == "batch inference failed",
         "the all-fail run still records the first batch error, got: {err:?}"
     );
     let vec_count: i64 = conn
@@ -132,7 +133,37 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
 
     // Shortest text sorts into the first batch; the second batch still commits.
     let poisoned = MockEmbedder::failing_on_text("x");
-    let first = embed_recent_chunks(&mut conn, &poisoned, 129, None).unwrap();
+    let (observer, lines) = recording();
+    let pending = pending_chunks(&conn, 129).unwrap();
+    let first = embed_chunks_observed(
+        &mut conn,
+        &poisoned,
+        &pending,
+        None,
+        &EmbedOptions::default(),
+        &observer,
+    )
+    .unwrap();
+    let counts = observer.snapshot()["counts"].clone();
+    assert_eq!(counts["chunks_saved"], 1);
+    assert_eq!(counts["chunks_failed"], 128);
+    assert_eq!(counts["chunks_remaining_snapshot"], 128);
+    assert_eq!(counts["chunks_unattempted"], 0);
+    assert_eq!(counts["chunks_stale"], 0);
+    assert!(
+        !lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("poison text"))
+    );
+    assert_eq!(
+        lines
+            .borrow()
+            .iter()
+            .filter(|line| line.contains("embedding_db_save: committed"))
+            .count(),
+        1
+    );
     assert_eq!(
         first.embedded, 1,
         "precondition: only batch 2 embeds on run 1"
@@ -144,7 +175,7 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
             .first_error
             .as_deref()
             .unwrap()
-            .contains("poison text: x")
+            .eq("batch inference failed")
     );
     let stored: i64 = conn
         .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
@@ -305,12 +336,14 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
     });
     let progress = Mutex::new(Vec::new());
     let chunks = pending_chunks(&conn, 10).unwrap();
-    let result = embed_chunks(
+    let observer = Observer::default();
+    let result = embed_chunks_observed(
         &mut conn,
         &embedder,
         &chunks,
         Some(&|done, total| progress.lock().unwrap().push((done, total))),
         &EmbedOptions::default(),
+        &observer,
     )
     .unwrap();
     assert_eq!(result.embedded, 1, "only the unchanged chunk is a success");
@@ -319,6 +352,14 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
         "stale work is not an inference failure"
     );
     assert_eq!(*progress.lock().unwrap(), vec![(1, 7)]);
+    let counts = observer.snapshot()["counts"].clone();
+    assert_eq!(counts["chunks_pending_snapshot"], 7);
+    assert_eq!(counts["chunks_saved"], 1);
+    assert_eq!(counts["chunks_stale"], 6);
+    assert_eq!(counts["chunks_failed"], 0);
+    assert_eq!(counts["chunks_save_failed"], 0);
+    assert_eq!(counts["chunks_unattempted"], 0);
+    assert_eq!(counts["chunks_remaining_snapshot"], 6);
     let preserved = conn
         .query_row(
             "SELECT rowid, embedding FROM vec_chunks WHERE chunk_id = 7",
@@ -335,6 +376,7 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
         .collect();
     pending.sort_unstable();
     assert_eq!(pending, vec![2, 4, 5, 6]);
+    assert_eq!(pending_count(&conn).unwrap(), 4);
     let retry = embed_recent_chunks(&mut conn, &MockEmbedder::new(), 10, None).unwrap();
     assert_eq!(retry.embedded, 4);
     assert!(pending_chunks(&conn, 10).unwrap().is_empty());
@@ -475,4 +517,173 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
     assert_eq!(count, 1);
     assert!(pending_chunks(&conn, 10).unwrap().is_empty());
     assert_vectors_match_current_content(&conn);
+}
+
+#[test]
+fn later_database_save_failure_preserves_prior_commits_and_retries_only_remaining_chunks() {
+    // Fail the second INSERT of batch 2, after batch 1 committed and one
+    // vector in batch 2 was staged. This exercises rollback, not only BEGIN.
+    struct InvalidSecondBatch(AtomicUsize);
+    impl Embed for InvalidSecondBatch {
+        fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+            MockEmbedder::new().embed_query(text)
+        }
+
+        fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+            MockEmbedder::new().embed_document(text)
+        }
+
+        fn embed_documents_batch(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+            let mut vectors = MockEmbedder::new().embed_documents_batch(texts)?;
+            if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
+                vectors[1] = ChunkedEmbedding::try_new(vec![vec![0.0; 1]])?;
+            }
+            Ok(vectors)
+        }
+
+        fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
+            MockEmbedder::new().embed_text(text, prefix)
+        }
+    }
+
+    let (dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 257, |id| format!("private input {id:03}"));
+    let mut pending = pending_chunks(&conn, usize::MAX).unwrap();
+    // Equal-length inputs retain this order in the stable length sort.
+    pending.sort_by_key(|chunk| chunk.id);
+    let reader = open_db(&dir.path().join("test.db")).unwrap();
+    let saved_ids = || {
+        reader
+            .prepare("SELECT chunk_id FROM vec_chunks ORDER BY chunk_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<SqlResult<Vec<_>>>()
+            .unwrap()
+    };
+    let embedder = InvalidSecondBatch(AtomicUsize::new(0));
+    let (observer, lines) = recording();
+    let commits = Mutex::new(Vec::new());
+    let error = embed_chunks_observed(
+        &mut conn,
+        &embedder,
+        &pending,
+        Some(&|done, total| {
+            assert_eq!(saved_ids(), (1..=128).collect::<Vec<_>>());
+            commits.lock().unwrap().push((done, total));
+        }),
+        &EmbedOptions::default(),
+        &observer,
+    )
+    .err()
+    .expect("the second batch must fail to save");
+    assert!(
+        error.to_string().contains("Dimension mismatch"),
+        "must reach the failing vector INSERT: {error}"
+    );
+    assert_eq!(embedder.0.load(Ordering::SeqCst), 2);
+    assert_eq!(*commits.lock().unwrap(), vec![(128, 257)]);
+    assert_eq!(saved_ids(), (1..=128).collect::<Vec<_>>());
+    let counts = observer.snapshot()["counts"].clone();
+    assert_eq!(counts["chunks_pending_snapshot"], 257);
+    assert_eq!(counts["chunks_saved"], 128);
+    assert_eq!(counts["chunks_save_failed"], 128);
+    assert_eq!(counts["chunks_failed"], 0);
+    assert_eq!(counts["chunks_stale"], 0);
+    assert_eq!(counts["chunks_unattempted"], 1);
+    assert_eq!(counts["chunks_remaining_snapshot"], 129);
+    assert_eq!(
+        lines
+            .borrow()
+            .iter()
+            .filter(|line| line.contains("embedding_db_save: committed"))
+            .count(),
+        1
+    );
+    assert!(
+        lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("embedding_db_save: unfinished"))
+    );
+    let first_counts: serde_json::Value = serde_json::from_str(
+        lines.borrow()[0]
+            .strip_prefix("index: embedding counts: ")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first_counts["chunks_unattempted"], 257);
+    assert_eq!(first_counts["chunks_saved"], 0);
+
+    let remaining = pending_chunks(&reader, usize::MAX).unwrap();
+    let mut remaining_ids: Vec<_> = remaining.iter().map(|chunk| chunk.id).collect();
+    remaining_ids.sort_unstable();
+    assert_eq!(remaining_ids, (129..=257).collect::<Vec<_>>());
+    // Reuse the real pending gate on restart; saved chunks must not be retried.
+    let (resumed, _) = recording();
+    let result = embed_chunks_observed(
+        &mut conn,
+        &MockEmbedder::new(),
+        &remaining,
+        None,
+        &EmbedOptions::default(),
+        &resumed,
+    )
+    .unwrap();
+    assert_eq!(result.embedded, 129);
+    assert_eq!(resumed.snapshot()["counts"]["chunks_pending_snapshot"], 129);
+    assert_eq!(resumed.snapshot()["counts"]["chunks_remaining_snapshot"], 0);
+    assert_eq!(saved_ids(), (1..=257).collect::<Vec<_>>());
+    assert_eq!(pending_count(&reader).unwrap(), 0);
+    assert_vectors_match_current_content(&reader);
+}
+
+#[test]
+fn failed_database_save_is_counted_without_claiming_a_commit() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 1, |_| "private input".to_owned());
+    let pending = pending_chunks(&conn, 1).unwrap();
+    // Keep BEGIN failure coverage as well as the later INSERT/rollback case.
+    conn.execute_batch("PRAGMA query_only = ON;").unwrap();
+    let (observer, lines) = recording();
+    assert!(
+        embed_chunks_observed(
+            &mut conn,
+            &MockEmbedder::new(),
+            &pending,
+            None,
+            &EmbedOptions::default(),
+            &observer
+        )
+        .is_err()
+    );
+    let counts = observer.snapshot()["counts"].clone();
+    assert_eq!(counts["chunks_saved"], 0);
+    assert_eq!(counts["chunks_save_failed"], 1);
+    assert_eq!(counts["chunks_failed"], 0);
+    assert_eq!(counts["chunks_unattempted"], 0);
+    assert_eq!(counts["chunks_remaining_snapshot"], 1);
+    assert!(
+        !lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("embedding_db_save: committed"))
+    );
+    assert!(
+        lines
+            .borrow()
+            .iter()
+            .any(|line| line.contains("embedding_db_save: unfinished"))
+    );
+    conn.execute_batch("PRAGMA query_only = OFF;").unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 1, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    assert_eq!(pending_count(&conn).unwrap(), 0);
 }

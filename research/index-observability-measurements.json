@@ -1,0 +1,838 @@
+{
+  "conditions": {
+    "binary_sha256": "20c62a9c1e1498aadcf8110cea839514f635b3def7df025601ef6554069b8694",
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "model": "cl-nagoya/ruri-v3-310m; cached snapshot 18b60fb8c2b9df296fb4212bb7d23ef94e579cd3",
+    "conditions": "base ef814f3 plus Issue 324 repair candidate; Mac15,3 Apple M3 24 GB; macOS 27.0; Rust 1.98.1; release with clang 21 runtime linked; cached model files; new process per run; GPU/filesystem caches uncontrolled; non-TTY",
+    "sessions": 512,
+    "data": "synthetic, one user/assistant pair per file; one pair appended to one file",
+    "cache": "each invocation is a new process; filesystem/model-cache state is operator-supplied",
+    "options": "default token budget and forward pause; inherited overrides removed"
+  },
+  "base_binary_sha256": "f981984c373fbc29ceabf1e0ee96747d78c8ea0b05c3d4fc713d46e632d63253",
+  "source_inputs_sha256": {
+    "src/hybrid.rs": "783cb08fa68654206bb83c72a128f80babb6895f5e386b9dd6e1513b0eb99304",
+    "src/classify.rs": "73f804db328596c2e3e608820c9ccbc02cf49630637c542530aece6d28d386c1",
+    "src/error.rs": "8d9cc2e71c1365d8d789f567f8a1534a98ba599edff661a979c2692b12a8fc8b",
+    "src/chunker.rs": "f54728ab49660b57334873d1348a8be6009b70cca17308521a886993c4b8dcfa",
+    "src/db.rs": "5680c7e655ad3ce95469a61a98937b2b48ed34519ea027d9cbb80f963397a497",
+    "src/date.rs": "3223ed6433ba97cf57c64789a281b25e26707d4ed896834627f507c55ab8e792",
+    "src/envelope.rs": "5e3b31e1ba54e4ea4487471e41939f598610a2b3aeca38fdcb30a54635b4d680",
+    "src/output.rs": "029605234cf905736ff47cba2b96ac9c4641e97fdb51dfab403f7f8ef5560525",
+    "src/ansi.rs": "37a186ae12bcbca9e94e8fad155fbe828d139ef31f5f9280f4a95a7061e3ad7f",
+    "src/main.rs": "032e1531e52122a4814bd9a18ef62dc7c1524bdee9f2797b220ae567b3f11f1f",
+    "src/index_observer.rs": "9936dcf8304e80c7095cb17da3c683ca81e946e941d632f576470d04c6684290",
+    "src/indexer.rs": "565ff713ce77d45b9ae9b208c9ea996972da23a02a43d8ab3d2bffd4078aa6ac",
+    "src/embedder.rs": "2951114fb2fdbedf8611f1225841060c88cb1c2874b0ce0ee95e98c7fbd7f42d",
+    "src/search.rs": "a6395afb8ede530dba7d4f5e36c31d10600d42c7e39cae8e4b02834b2eb0a0c8",
+    "src/classify/tests.rs": "687d156554306e533eb89300bde0a52bc09dca32690e3ea44a0a790152231924",
+    "src/ansi/tests.rs": "048f1f07d41f88bf9d6afedd8e096e054ad4c46c44719b020260f91448b12288",
+    "src/date/tests.rs": "241e4e8e8b9577cafadfad7f9c4245ea16af4276109a9a6f4c74a4c1ee805001",
+    "src/output/tests.rs": "3af1dc1bd66823283d555d3e26c916c6d5755a70ca3996390125edbbf4e20665",
+    "src/embedder/tests.rs": "f27cd07941aee27f3f234d10993604c63171b0e3593a8eb3acf4e4b8d1536ace",
+    "src/parser/claude.rs": "4773b8ee0458ae7d75678d40a7a1d3d45422f2f0a21d423d6da062f30bae9781",
+    "src/parser/codex.rs": "86b2951920aa345d84b1273c6582d6430a6d0087502e0f9b79b9171da9f5607b",
+    "src/parser/mod.rs": "774bc02850db6d62f84dfcbd7eb7ac13218b274a77d47d1ac950a1c10412a4af",
+    "src/parser/tests.rs": "cb03a149d08bde4686b2a90bb70c69f814152127c4b70689a2840150e8e7ffe1",
+    "src/search/tests.rs": "abbd5e0ceba20187734a23f9a05d60292897e961fb0b42be7bb32a6f50c83fd8",
+    "src/envelope/tests.rs": "c9e1e762cc9b65543c477debe1ce50b57b264560a946084e54549c4f53f8cf4f",
+    "src/index_observer/tests.rs": "5c25e5283ea01c1b3607e560ca04df5a316cd26cef878193a6cdd5b63663ebae",
+    "src/db/tests.rs": "2d96f03fbd2aad853d2cc068ae93e28f5becd0cf595de2975514ccfe41b3182a",
+    "src/chunker/tests.rs": "fa7f36c2f641ff07726fd03c9dc19f1f0fdc96aa3ccbecee938297888d285f6c",
+    "src/error/tests.rs": "c0b5adb5731b500062a7f31e5c75dbd328a1184bcaddb32fb31c674b4da254a4",
+    "src/indexer/diagnostics.rs": "1cdf12be60d87e2779c16480602319d73843c49a05d127ef390d226c61ed13a0",
+    "src/indexer/tests.rs": "15fb244b16301253204c852ff7fea22de8bcbd0c03f336481a5017c176c3f236",
+    "src/hybrid/tests.rs": "0e106e188af52a6df096d110a3d63b88383a63b51a1061699b373b2288f894d8",
+    "src/parser/claude/tests.rs": "ff14d9de400f2dbc15631baf285a9c04cc555f081a9b67e984c6b950dc79ebd0",
+    "src/parser/codex/tests.rs": "db4166ddbf5506e0c09f33a87c9c0ff1ec727d102371020a3d9065452100ccbe",
+    "Cargo.toml": "9727b2dd0f0b5fd4331134a57f03de290571adc72c7c9cd9ccd9c3c63ca31690",
+    "Cargo.lock": "622e24542f670c0e05530c9306796d48298983dde74b04fe17ac308fa8f29715"
+  },
+  "cases": {
+    "base": [
+      {
+        "case": "initial",
+        "wall_seconds": 28.346962583003915,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": null,
+        "data": {
+          "embedded": 512,
+          "failed_count": 0,
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      },
+      {
+        "case": "unchanged",
+        "wall_seconds": 1.2380884169979254,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": null,
+        "data": {
+          "embedded": 0,
+          "failed_count": 0,
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      },
+      {
+        "case": "append-one",
+        "wall_seconds": 1.15436800000316,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": null,
+        "data": {
+          "embedded": 2,
+          "failed_count": 0,
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      }
+    ],
+    "new": [
+      {
+        "case": "initial",
+        "wall_seconds": 18.567140958999516,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": {
+          "chunks_created_committed": 512,
+          "chunks_failed": 0,
+          "chunks_pending_snapshot": 512,
+          "chunks_remaining_snapshot": 0,
+          "chunks_save_failed": 0,
+          "chunks_saved": 512,
+          "chunks_stale": 0,
+          "chunks_unattempted": 0,
+          "files_deferred": 0,
+          "files_discovered": 512,
+          "files_empty": 0,
+          "files_failed": 0,
+          "files_remaining": 0,
+          "files_unchanged": 0,
+          "files_updated": 512,
+          "files_updated_committed": 512,
+          "sessions_chunk_pending": 512,
+          "sessions_chunk_remaining": 0,
+          "sessions_chunked_committed": 512,
+          "sessions_chunked_empty": 0,
+          "sessions_stored": 512
+        },
+        "data": {
+          "embedded": 512,
+          "failed_count": 0,
+          "observations": {
+            "counts": {
+              "chunks_created_committed": 512,
+              "chunks_failed": 0,
+              "chunks_pending_snapshot": 512,
+              "chunks_remaining_snapshot": 0,
+              "chunks_save_failed": 0,
+              "chunks_saved": 512,
+              "chunks_stale": 0,
+              "chunks_unattempted": 0,
+              "files_deferred": 0,
+              "files_discovered": 512,
+              "files_empty": 0,
+              "files_failed": 0,
+              "files_remaining": 0,
+              "files_unchanged": 0,
+              "files_updated": 512,
+              "files_updated_committed": 512,
+              "sessions_chunk_pending": 512,
+              "sessions_chunk_remaining": 0,
+              "sessions_chunked_committed": 512,
+              "sessions_chunked_empty": 0,
+              "sessions_stored": 512
+            },
+            "seconds": {
+              "chunking": 0.006027583,
+              "database_open": 0.002738083,
+              "embedding_db_save": 0.038985625,
+              "enumeration": 0.000488875,
+              "fts_excluding_parse": 0.059768816999999995,
+              "fts_finalize": 0.001765625,
+              "fts_transaction": 0.070768584,
+              "index_prepare": 7.875e-05,
+              "inference": 17.077429626,
+              "legacy_backfill": 6.4e-05,
+              "model_load_probe": 1.070604708,
+              "parse": 0.010999767,
+              "parse_fts": 0.0688585,
+              "pending_extraction": 0.00014425,
+              "total": 18.296865584
+            }
+          },
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      },
+      {
+        "case": "unchanged",
+        "wall_seconds": 0.6896501250012079,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": {
+          "chunks_created_committed": 0,
+          "chunks_failed": 0,
+          "chunks_pending_snapshot": 0,
+          "chunks_remaining_snapshot": 0,
+          "chunks_save_failed": 0,
+          "chunks_saved": 0,
+          "chunks_stale": 0,
+          "chunks_unattempted": 0,
+          "files_deferred": 0,
+          "files_discovered": 512,
+          "files_empty": 0,
+          "files_failed": 0,
+          "files_remaining": 0,
+          "files_unchanged": 512,
+          "files_updated": 0,
+          "files_updated_committed": 0,
+          "sessions_chunk_pending": 0,
+          "sessions_chunk_remaining": 0,
+          "sessions_chunked_committed": 0,
+          "sessions_chunked_empty": 0,
+          "sessions_stored": 512
+        },
+        "data": {
+          "embedded": 0,
+          "failed_count": 0,
+          "observations": {
+            "counts": {
+              "chunks_created_committed": 0,
+              "chunks_failed": 0,
+              "chunks_pending_snapshot": 0,
+              "chunks_remaining_snapshot": 0,
+              "chunks_save_failed": 0,
+              "chunks_saved": 0,
+              "chunks_stale": 0,
+              "chunks_unattempted": 0,
+              "files_deferred": 0,
+              "files_discovered": 512,
+              "files_empty": 0,
+              "files_failed": 0,
+              "files_remaining": 0,
+              "files_unchanged": 512,
+              "files_updated": 0,
+              "files_updated_committed": 0,
+              "sessions_chunk_pending": 0,
+              "sessions_chunk_remaining": 0,
+              "sessions_chunked_committed": 0,
+              "sessions_chunked_empty": 0,
+              "sessions_stored": 512
+            },
+            "seconds": {
+              "chunking": 3.6208e-05,
+              "database_open": 0.00082125,
+              "enumeration": 0.000670083,
+              "fts_excluding_parse": 0.001640833,
+              "fts_finalize": 3.8333e-05,
+              "fts_transaction": 0.001640833,
+              "index_prepare": 0.000290709,
+              "legacy_backfill": 9.2625e-05,
+              "model_load_probe": 0.644707708,
+              "parse_fts": 0.0012115,
+              "pending_extraction": 0.000869209,
+              "total": 0.657880666
+            }
+          },
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      },
+      {
+        "case": "append-one",
+        "wall_seconds": 0.7578352499986067,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": {
+          "chunks_created_committed": 2,
+          "chunks_failed": 0,
+          "chunks_pending_snapshot": 2,
+          "chunks_remaining_snapshot": 0,
+          "chunks_save_failed": 0,
+          "chunks_saved": 2,
+          "chunks_stale": 0,
+          "chunks_unattempted": 0,
+          "files_deferred": 0,
+          "files_discovered": 512,
+          "files_empty": 0,
+          "files_failed": 0,
+          "files_remaining": 0,
+          "files_unchanged": 511,
+          "files_updated": 1,
+          "files_updated_committed": 1,
+          "sessions_chunk_pending": 1,
+          "sessions_chunk_remaining": 0,
+          "sessions_chunked_committed": 1,
+          "sessions_chunked_empty": 0,
+          "sessions_stored": 512
+        },
+        "data": {
+          "embedded": 2,
+          "failed_count": 0,
+          "observations": {
+            "counts": {
+              "chunks_created_committed": 2,
+              "chunks_failed": 0,
+              "chunks_pending_snapshot": 2,
+              "chunks_remaining_snapshot": 0,
+              "chunks_save_failed": 0,
+              "chunks_saved": 2,
+              "chunks_stale": 0,
+              "chunks_unattempted": 0,
+              "files_deferred": 0,
+              "files_discovered": 512,
+              "files_empty": 0,
+              "files_failed": 0,
+              "files_remaining": 0,
+              "files_unchanged": 511,
+              "files_updated": 1,
+              "files_updated_committed": 1,
+              "sessions_chunk_pending": 1,
+              "sessions_chunk_remaining": 0,
+              "sessions_chunked_committed": 1,
+              "sessions_chunked_empty": 0,
+              "sessions_stored": 512
+            },
+            "seconds": {
+              "chunking": 0.000640792,
+              "database_open": 0.000699,
+              "embedding_db_save": 0.001329458,
+              "enumeration": 0.000399541,
+              "fts_excluding_parse": 0.003453042,
+              "fts_finalize": 3.7791e-05,
+              "fts_transaction": 0.003503,
+              "index_prepare": 0.000269542,
+              "inference": 0.068394542,
+              "legacy_backfill": 8.0417e-05,
+              "model_load_probe": 0.641267792,
+              "parse": 4.9958e-05,
+              "parse_fts": 0.002384291,
+              "pending_extraction": 0.000797833,
+              "total": 0.728942625
+            }
+          },
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      },
+      {
+        "case": "interrupted",
+        "wall_seconds": 5.042429708002601,
+        "exit_code": -15,
+        "interruption_requested": true,
+        "last_reported_counts": {
+          "chunks_created_committed": 513,
+          "chunks_failed": 0,
+          "chunks_pending_snapshot": 513,
+          "chunks_remaining_snapshot": 385,
+          "chunks_save_failed": 0,
+          "chunks_saved": 128,
+          "chunks_stale": 0,
+          "chunks_unattempted": 385,
+          "files_deferred": 0,
+          "files_discovered": 512,
+          "files_empty": 0,
+          "files_failed": 0,
+          "files_remaining": 0,
+          "files_unchanged": 0,
+          "files_updated": 512,
+          "files_updated_committed": 512,
+          "sessions_chunk_pending": 512,
+          "sessions_chunk_remaining": 0,
+          "sessions_chunked_committed": 512,
+          "sessions_chunked_empty": 0,
+          "sessions_stored": 512
+        }
+      },
+      {
+        "case": "resume",
+        "wall_seconds": 15.863138041997445,
+        "exit_code": 0,
+        "interruption_requested": false,
+        "last_reported_counts": {
+          "chunks_created_committed": 0,
+          "chunks_failed": 0,
+          "chunks_pending_snapshot": 385,
+          "chunks_remaining_snapshot": 0,
+          "chunks_save_failed": 0,
+          "chunks_saved": 385,
+          "chunks_stale": 0,
+          "chunks_unattempted": 0,
+          "files_deferred": 0,
+          "files_discovered": 512,
+          "files_empty": 0,
+          "files_failed": 0,
+          "files_remaining": 0,
+          "files_unchanged": 512,
+          "files_updated": 0,
+          "files_updated_committed": 0,
+          "sessions_chunk_pending": 0,
+          "sessions_chunk_remaining": 0,
+          "sessions_chunked_committed": 0,
+          "sessions_chunked_empty": 0,
+          "sessions_stored": 512
+        },
+        "data": {
+          "embedded": 385,
+          "failed_count": 0,
+          "observations": {
+            "counts": {
+              "chunks_created_committed": 0,
+              "chunks_failed": 0,
+              "chunks_pending_snapshot": 385,
+              "chunks_remaining_snapshot": 0,
+              "chunks_save_failed": 0,
+              "chunks_saved": 385,
+              "chunks_stale": 0,
+              "chunks_unattempted": 0,
+              "files_deferred": 0,
+              "files_discovered": 512,
+              "files_empty": 0,
+              "files_failed": 0,
+              "files_remaining": 0,
+              "files_unchanged": 512,
+              "files_updated": 0,
+              "files_updated_committed": 0,
+              "sessions_chunk_pending": 0,
+              "sessions_chunk_remaining": 0,
+              "sessions_chunked_committed": 0,
+              "sessions_chunked_empty": 0,
+              "sessions_stored": 512
+            },
+            "seconds": {
+              "chunking": 3.7709e-05,
+              "database_open": 0.011761417,
+              "embedding_db_save": 0.018207166,
+              "enumeration": 0.000400833,
+              "fts_excluding_parse": 0.005132833,
+              "fts_finalize": 6.1834e-05,
+              "fts_transaction": 0.005132833,
+              "index_prepare": 0.000274,
+              "inference": 14.990293166999999,
+              "legacy_backfill": 8.3083e-05,
+              "model_load_probe": 0.778185958,
+              "parse_fts": 0.001081125,
+              "pending_extraction": 0.0003115,
+              "total": 15.822259375
+            }
+          },
+          "parse_diagnostics": [],
+          "preserved_embedded": 0,
+          "skipped_roots": []
+        },
+        "degraded": false
+      }
+    ]
+  },
+  "database_validation": [
+    {
+      "version": "base",
+      "counts": {
+        "sessions": 512,
+        "messages_content": 1026,
+        "qa_chunks": 513,
+        "vec_chunks_rowids": 513
+      },
+      "body_sha256": "4f3a07206aa0d6941986944afba804a8c11e74e678c4e77e42c6b59137bd8022"
+    },
+    {
+      "version": "new",
+      "counts": {
+        "sessions": 512,
+        "messages_content": 1026,
+        "qa_chunks": 513,
+        "vec_chunks_rowids": 513
+      },
+      "body_sha256": "4f3a07206aa0d6941986944afba804a8c11e74e678c4e77e42c6b59137bd8022"
+    },
+    {
+      "version": "resumed",
+      "counts": {
+        "sessions": 512,
+        "messages_content": 1026,
+        "qa_chunks": 513,
+        "vec_chunks_rowids": 513
+      },
+      "body_sha256": "4f3a07206aa0d6941986944afba804a8c11e74e678c4e77e42c6b59137bd8022"
+    }
+  ],
+  "overhead_model_present": {
+    "summary": {
+      "base": {
+        "runs": 11,
+        "median_ms": 869.8210000002291,
+        "min_ms": 803.3533749985509,
+        "max_ms": 1114.5993329992052
+      },
+      "new": {
+        "runs": 11,
+        "median_ms": 879.4624579968513,
+        "min_ms": 740.6733340030769,
+        "max_ms": 1062.1280830018804
+      }
+    },
+    "trials": [
+      {
+        "trial": 0,
+        "version": "base",
+        "seconds": 1.1145993329992052
+      },
+      {
+        "trial": 0,
+        "version": "new",
+        "seconds": 0.7406733340030769
+      },
+      {
+        "trial": 1,
+        "version": "new",
+        "seconds": 0.8250104170001578
+      },
+      {
+        "trial": 1,
+        "version": "base",
+        "seconds": 0.8108828750046086
+      },
+      {
+        "trial": 2,
+        "version": "base",
+        "seconds": 0.8033533749985509
+      },
+      {
+        "trial": 2,
+        "version": "new",
+        "seconds": 0.8131419159981306
+      },
+      {
+        "trial": 3,
+        "version": "new",
+        "seconds": 0.7970503750038915
+      },
+      {
+        "trial": 3,
+        "version": "base",
+        "seconds": 0.8236502919971826
+      },
+      {
+        "trial": 4,
+        "version": "base",
+        "seconds": 1.0445684170044842
+      },
+      {
+        "trial": 4,
+        "version": "new",
+        "seconds": 0.8434515839981032
+      },
+      {
+        "trial": 5,
+        "version": "new",
+        "seconds": 1.0621280830018804
+      },
+      {
+        "trial": 5,
+        "version": "base",
+        "seconds": 0.9514131670002826
+      },
+      {
+        "trial": 6,
+        "version": "base",
+        "seconds": 0.8698210000002291
+      },
+      {
+        "trial": 6,
+        "version": "new",
+        "seconds": 0.8800866669989773
+      },
+      {
+        "trial": 7,
+        "version": "new",
+        "seconds": 0.8878455000012764
+      },
+      {
+        "trial": 7,
+        "version": "base",
+        "seconds": 0.8566078750009183
+      },
+      {
+        "trial": 8,
+        "version": "base",
+        "seconds": 0.9275992089969805
+      },
+      {
+        "trial": 8,
+        "version": "new",
+        "seconds": 0.9891807909953059
+      },
+      {
+        "trial": 9,
+        "version": "new",
+        "seconds": 0.885105334004038
+      },
+      {
+        "trial": 9,
+        "version": "base",
+        "seconds": 0.9797148750003544
+      },
+      {
+        "trial": 10,
+        "version": "base",
+        "seconds": 0.8683158339990769
+      },
+      {
+        "trial": 10,
+        "version": "new",
+        "seconds": 0.8794624579968513
+      }
+    ]
+  },
+  "overhead_model_absent": {
+    "summary": {
+      "before": {
+        "base": {
+          "counts": {
+            "sessions": 10000,
+            "messages": 20005,
+            "qa_chunks": 10005
+          },
+          "body_sha256": "acc13d5696e0e2ecf84ba09ee115f6274b15cefeaf4ca4f1b0db0fca2b221e5d"
+        },
+        "new": {
+          "counts": {
+            "sessions": 10000,
+            "messages": 20005,
+            "qa_chunks": 10005
+          },
+          "body_sha256": "acc13d5696e0e2ecf84ba09ee115f6274b15cefeaf4ca4f1b0db0fca2b221e5d"
+        }
+      },
+      "after": {
+        "base": {
+          "counts": {
+            "sessions": 10000,
+            "messages": 20005,
+            "qa_chunks": 10005
+          },
+          "body_sha256": "acc13d5696e0e2ecf84ba09ee115f6274b15cefeaf4ca4f1b0db0fca2b221e5d"
+        },
+        "new": {
+          "counts": {
+            "sessions": 10000,
+            "messages": 20005,
+            "qa_chunks": 10005
+          },
+          "body_sha256": "acc13d5696e0e2ecf84ba09ee115f6274b15cefeaf4ca4f1b0db0fca2b221e5d"
+        }
+      },
+      "base": {
+        "median_ms": 47.1172910038149,
+        "min_ms": 46.46133299684152,
+        "max_ms": 48.397040998679586,
+        "median_max_rss_bytes": 21528576,
+        "binary_sha256": "f981984c373fbc29ceabf1e0ee96747d78c8ea0b05c3d4fc713d46e632d63253",
+        "runs": 11
+      },
+      "new": {
+        "median_ms": 48.531291002291255,
+        "min_ms": 47.16516699409112,
+        "max_ms": 58.226000001013745,
+        "median_max_rss_bytes": 21577728,
+        "binary_sha256": "20c62a9c1e1498aadcf8110cea839514f635b3def7df025601ef6554069b8694",
+        "runs": 11
+      }
+    },
+    "trials": [
+      {
+        "version": "base",
+        "phase": "warmup",
+        "trial": 0,
+        "seconds": 0.05146899999817833,
+        "max_rss_bytes": 21626880
+      },
+      {
+        "version": "new",
+        "phase": "warmup",
+        "trial": 0,
+        "seconds": 0.06738541700178757,
+        "max_rss_bytes": 21626880
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 0,
+        "seconds": 0.04682787499768892,
+        "max_rss_bytes": 21512192
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 0,
+        "seconds": 0.058226000001013745,
+        "max_rss_bytes": 21561344
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 1,
+        "seconds": 0.04778387500118697,
+        "max_rss_bytes": 21692416
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 1,
+        "seconds": 0.047095875001105014,
+        "max_rss_bytes": 21561344
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 2,
+        "seconds": 0.046479666998493485,
+        "max_rss_bytes": 21495808
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 2,
+        "seconds": 0.04788304199610138,
+        "max_rss_bytes": 21594112
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 3,
+        "seconds": 0.04734466700028861,
+        "max_rss_bytes": 21659648
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 3,
+        "seconds": 0.047258167003747076,
+        "max_rss_bytes": 21495808
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 4,
+        "seconds": 0.047906166000757366,
+        "max_rss_bytes": 21004288
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 4,
+        "seconds": 0.04866141600359697,
+        "max_rss_bytes": 21692416
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 5,
+        "seconds": 0.048550207997323014,
+        "max_rss_bytes": 21544960
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 5,
+        "seconds": 0.0471172910038149,
+        "max_rss_bytes": 21544960
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 6,
+        "seconds": 0.04669837500114227,
+        "max_rss_bytes": 21577728
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 6,
+        "seconds": 0.048531291002291255,
+        "max_rss_bytes": 21577728
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 7,
+        "seconds": 0.04929204200016102,
+        "max_rss_bytes": 21544960
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 7,
+        "seconds": 0.048397040998679586,
+        "max_rss_bytes": 21528576
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 8,
+        "seconds": 0.04646133299684152,
+        "max_rss_bytes": 21544960
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 8,
+        "seconds": 0.04716516699409112,
+        "max_rss_bytes": 21544960
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 9,
+        "seconds": 0.0473087909995229,
+        "max_rss_bytes": 21512192
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 9,
+        "seconds": 0.04783258400129853,
+        "max_rss_bytes": 21528576
+      },
+      {
+        "version": "base",
+        "phase": "unchanged",
+        "trial": 10,
+        "seconds": 0.047200167005939875,
+        "max_rss_bytes": 21577728
+      },
+      {
+        "version": "new",
+        "phase": "unchanged",
+        "trial": 10,
+        "seconds": 0.050166832996183075,
+        "max_rss_bytes": 21577728
+      }
+    ]
+  },
+  "tty": {
+    "pty": true,
+    "stdout": "one JSON envelope; degraded false; embedded zero",
+    "stderr": "stage starts visible on PTY; commit counts present",
+    "initial_checker_exit": 1,
+    "checker_failure": "Extra spinner-frame assertion was unrelated to the requested stage visibility; recorded output satisfies stage/stdout contract.",
+    "source_inputs_unchanged": true
+  }
+}
