@@ -271,11 +271,9 @@ fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result
         && let Some(old_mt) = entry.mtime
         && entry.file_size == Some(stamp.size)
         && (old_mt - new_mt).abs() < 0.001
-        && !ctx.tx.query_row(
+        && !ctx.tx.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM parse_diagnostics WHERE file_path = ? AND read_error = 1)",
-            [fpath_str],
-            |row| row.get::<_, bool>(0),
-        )?
+        )?.query_row([fpath_str], |row| row.get::<_, bool>(0))?
     {
         return Ok(true);
     }
