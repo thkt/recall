@@ -20,17 +20,18 @@ pub(super) fn is_uuid(s: &str) -> bool {
         })
 }
 
-/// Only the observed <parent UUID>/subagents/agent-<nonempty ID>.jsonl layout.
-pub(super) fn claude_parent(path: &Path) -> Option<&str> {
-    if path.extension()?.to_str()? != "jsonl"
-        || path
-            .file_stem()?
-            .to_str()?
-            .strip_prefix("agent-")?
-            .is_empty()
-    {
+pub(super) fn claude_agent_id(path: &Path) -> Option<&str> {
+    if path.extension()?.to_str()? != "jsonl" {
         return None;
     }
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("agent-")
+        .filter(|id| !id.is_empty())
+}
+
+/// Check the <parent UUID>/subagents directory after `claude_agent_id` validates the filename.
+pub(super) fn claude_parent(path: &Path) -> Option<&str> {
     let dir = path.parent()?;
     if dir.file_name()?.to_str()? != "subagents" {
         return None;

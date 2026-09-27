@@ -157,6 +157,8 @@ recall classify --dry-run   # 変更内容のみ表示し書き込まない
 1. 既知の生成元の出自があれば `automated`。Claude はユーザー／アシスタントのメッセージにある真偽値 `isSidechain: true`、または `<親 UUID>/subagents/agent-<ID>.jsonl` という限定された配置を使います。Codex は `session_meta.payload.thread_source` の `subagent`、`guardian_review`、`memory_consolidation`、または既知の `source` 形式（`subagent` の `review`、`compact`、`memory_consolidation`、構造化された `thread_spawn`、旧形式の `subagent.other: guardian`、`internal` の `guardian`／`memory_consolidation`）を使います。`thread_spawn` には親 UUID と整数の depth が必要です。一方のフィールドが未知の feature でも、もう一方に既知の根拠があれば採用します。
 2. それ以外は、既存の先頭ユーザー発話の prefix 判定を使います。一致しない場合やユーザー発話がない場合は `interactive` です。文中の言及、引用されたマーカー、エージェント名、`exec`／`vscode`、未知の feature／`other` 名だけでは自動生成の根拠にしません。
 
+Claude のメッセージの `sessionId` は、ファイルの会話 ID または上記の限定配置の親 UUID と照合します。限定配置の外にある `agent-<空でないID>.jsonl` では、各ユーザー／アシスタントレコード（旧形式の `human` や role だけのレコードも含む）が非 meta であり、トップレベルに真偽値 `isSidechain: true`、ファイル名の `<ID>` に完全一致する文字列 `agentId`、同一の有効な UUID の `sessionId` を持つ場合に限り、親の `sessionId` を許容します。別 agent、フィールドの欠落・不正、矛盾する親 ID、文字列の `"true"`、本文に引用したメタデータ、ファイル名だけではこの例外を認めません。限定配置の親 UUID との矛盾も許容しません。保存 ID は `agent-<ID>` のままで、親会話との統合規則は変わりません。この[旧形式の採用条件](https://github.com/thkt/recall/issues/340)は初回索引と `classify --all` の両方に適用します。
+
 automated は通常検索から除外され、`--include-automated` で含められます。分類によって本文を削除したり、索引対象を除外したり、埋め込み処理量を減らしたりはしません。[判定根拠と形式の限界](docs/research/session-provenance-classification.md)も参照してください。
 
 メタデータだけのログを再索引する際、レコードから得た会話 ID が保存済み ID と異なる場合は、既存会話を変更せず再試行対象に残します。同一 ID のメタデータは分類の更新に使い、会話レコードのない空ログは従来の空本文の索引処理に従います。
