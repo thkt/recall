@@ -54,9 +54,9 @@ use super::Metrics;
     code = replace_once(code, "use crate::parser::{self, Source};", "use baseline_parser::{self as parser, Source};")
     start = code.index("// Baseline is installed")
     end = code.index("struct Corpus", start)
-    code = code[:start] + """#[path = "baseline_parser/mod.rs"]
+    code = code[:start] + """#[path = "__BASELINE_PARSER__"]
 mod baseline_parser;
-#[path = "baseline.rs"]
+#[path = "__BASELINE__"]
 mod baseline;
 
 fn legacy(conn: &mut Connection, mut read: impl FnMut(&str, &str, &str) -> Result<bool, &'static str>, metrics: &RefCell<Metrics>) {
@@ -70,6 +70,8 @@ fn legacy(conn: &mut Connection, mut read: impl FnMut(&str, &str, &str) -> Resul
 }
 
 """ + code[end:]
+    code = code.replace("__BASELINE_PARSER__", str(dest / "src/classify/baseline_parser/mod.rs"))
+    code = code.replace("__BASELINE__", str(dest / "src/classify/baseline.rs"))
     bench.write_text(code)
     return {"start_commit": BASELINE, "baseline_main_sha256": hashlib.sha256(main.encode()).hexdigest()}
 
@@ -88,7 +90,7 @@ def main():
                           for name in current_sources}
         provenance = install_baseline(root, dest)
         command = ["cargo", "test", "--release", "--locked", "--bin", "recall",
-                   "classify::benchmark::synthetic_classification_measurement", "--", "--ignored", "--nocapture"]
+                   "classify::benchmark::tests::synthetic_classification_measurement", "--", "--ignored", "--nocapture"]
         print(json.dumps({"environment": {"platform": platform.platform(),
               "rustc": subprocess.check_output(["rustc", "--version"]).decode().strip(),
               "os_cache": "warm, no cache eviction", "source": "deterministic synthetic enumeration only",
