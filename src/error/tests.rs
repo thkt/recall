@@ -196,6 +196,13 @@ fn to_error_envelope_marks_internal_and_data_non_retryable() {
         !data.error.retryable,
         "a malformed-input error must not be retryable"
     );
+    assert!(
+        data.error
+            .next_step
+            .as_deref()
+            .is_some_and(|hint| hint.contains("query")),
+        "malformed queries must retain query repair guidance"
+    );
 }
 
 // T-ERR006: error_envelope falls back to classify() for an untyped anyhow
