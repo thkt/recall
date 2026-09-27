@@ -2,7 +2,7 @@
 name = "recall"
 version = "0.13.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.98.1"
 description = "Full-text search CLI for past Claude Code and Codex sessions"
 license = "MIT"
 repository = "https://github.com/thkt/recall"
