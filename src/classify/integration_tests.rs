@@ -324,6 +324,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
         if id == "agent-example" {
             assert_eq!(
                 crate::read_classification_origin(
+                    fs::File::open(&path).unwrap(),
                     path.to_str().unwrap(),
                     "claude",
                     "11111111-1111-4111-8111-111111111111"
@@ -490,7 +491,9 @@ fn reclassification_retains_unverifiable_labels_and_falls_back_only_for_null_row
         }
         let path = path.to_str().unwrap();
         assert_eq!(
-            crate::read_classification_origin(path, source, id),
+            crate::open_classification_file(path)
+                .1
+                .and_then(|file| crate::read_classification_origin(file, path, source, id)),
             Err(reason)
         );
         conn.execute("INSERT INTO sessions (session_id, source, file_path, session_type) VALUES (?1, ?2, ?3, 'automated')", rusqlite::params![id, source, path]).unwrap();
@@ -528,43 +531,40 @@ fn reclassification_retains_unverifiable_labels_and_falls_back_only_for_null_row
 }
 
 #[test]
-fn reclassification_reserves_the_writer_before_reading_source_files() {
+fn reclassification_retries_after_a_writer_commits_during_source_read() {
     use crate::db::open_db;
-    use rusqlite::ErrorCode;
     use std::time::Duration;
 
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("index.db");
     let mut conn = open_db(&path).unwrap();
+    let log = root.path().join("s.jsonl");
+    fs::write(&log, r#"{"type":"user","message":"question"}"#).unwrap();
     conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path) VALUES ('s', 'claude', '/s')",
+        "INSERT INTO sessions (session_id, source, file_path) VALUES ('s', 'claude', ?1)",
+        [log.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('s', 'user', 'human question')",
         [],
     )
     .unwrap();
     let other = open_db(&path).unwrap();
     other.busy_timeout(Duration::ZERO).unwrap();
     let mut reads = 0;
-    crate::reclassify_sessions_with(&mut conn, true, false, |_, _, _| {
+    let outcomes = crate::reclassify_sessions_with(&mut conn, true, false, |_, _, _, _| {
         reads += 1;
-        let error = other
-            .execute(
-                "UPDATE sessions SET session_type = 'interactive' WHERE session_id = 's'",
-                [],
-            )
-            .unwrap_err();
-        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
-        Ok(true)
-    })
-    .unwrap();
-    assert_eq!(reads, 1);
+        if reads == 1 {
+            // This synchronous commit must finish while the reader is paused here.
+            other.execute("UPDATE messages SET text = '<command-message>run</command-message>' WHERE session_id = 's'", []).unwrap();
+        }
+        Ok(false)
+    }).unwrap();
+    assert_eq!(reads, 2);
+    assert_eq!(outcomes.len(), 1);
     assert_eq!(
         strings(&conn, "SELECT session_type FROM sessions"),
         ["automated"]
     );
-    other
-        .execute(
-            "UPDATE sessions SET session_type = 'interactive' WHERE session_id = 's'",
-            [],
-        )
-        .unwrap();
 }

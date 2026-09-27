@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::provenance::{SessionOrigin, codex_automated};
+use super::provenance::CodexOrigin;
 
 use super::{
     Message, ParseResult, Role, SessionData, Source, extract_text, parse_iso_timestamp,
@@ -44,9 +44,6 @@ fn extract_cwd_from_content(content: Option<&Value>) -> Option<String> {
 }
 
 struct CodexParseState {
-    origin: SessionOrigin,
-    metadata_id: Option<String>,
-    session_id: String,
     project: String,
     earliest_ts: Option<i64>,
 }
@@ -65,18 +62,6 @@ fn process_codex_entry(
     match entry_type {
         "session_meta" => {
             let payload = entry.get("payload").unwrap_or(&Value::Null);
-            if let Some(id) = payload.get("id").and_then(Value::as_str)
-                && !id.is_empty()
-            {
-                state.origin.has_records = true;
-                state.origin.automated |= codex_automated(payload);
-                state.origin.identity_conflict |=
-                    state.metadata_id.as_deref().is_some_and(|prev| prev != id);
-                state.metadata_id = Some(id.to_owned());
-                if state.session_id.starts_with("rollout-") {
-                    state.session_id = id.to_owned();
-                }
-            }
             if state.project.is_empty()
                 && let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str())
                 && !cwd.is_empty()
@@ -87,10 +72,6 @@ fn process_codex_entry(
         }
         "response_item" => {
             let payload = entry.get("payload").unwrap_or(&Value::Null);
-            state.origin.has_records |= matches!(
-                payload.get("role").and_then(Value::as_str),
-                Some("user" | "assistant")
-            );
             extract_codex_message(payload)
         }
         "event_msg" | "turn_context" => None,
@@ -105,7 +86,6 @@ fn process_codex_entry(
                 Some("user" | "assistant") => {}
                 _ => return None,
             }
-            state.origin.has_records = true;
             if state.project.is_empty()
                 && let Some(cwd) = extract_cwd_from_content(entry.get("content"))
             {
@@ -122,39 +102,34 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
         return Ok(None);
     };
 
+    let mut origin = CodexOrigin::new(initial_session_id);
     let mut state = CodexParseState {
-        origin: SessionOrigin::default(),
-        metadata_id: None,
-        session_id: initial_session_id,
         project: String::new(),
         earliest_ts: None,
     };
 
     let path_str = path.to_string_lossy();
     let date_slug = extract_date_from_path(&path_str);
-    let uuid_short = extract_uuid_short(&state.session_id);
+    let uuid_short = extract_uuid_short(&origin.session_id);
 
     let (messages, diagnostics) = parse_jsonl_entries(path, |entry| {
+        origin.observe(entry);
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
         process_codex_entry(entry, entry_type, &mut state)
     })?;
 
-    state.origin.identity_conflict |= state
-        .metadata_id
-        .as_deref()
-        .is_some_and(|id| id != state.session_id);
-    state.origin.automated &= !state.origin.identity_conflict;
+    let (session_id, origin) = origin.finish();
 
     let slug = match (&date_slug, &uuid_short) {
         (Some(d), Some(u)) => format!("{d}-{u}"),
         (Some(d), None) => d.clone(),
         (None, Some(u)) => u.clone(),
-        (None, None) => state.session_id.chars().take(8).collect(),
+        (None, None) => session_id.chars().take(8).collect(),
     };
 
     Ok(Some(ParseResult {
         metadata: SessionData {
-            session_id: state.session_id,
+            session_id,
             source: Source::Codex,
             file_path: path_str.into_owned(),
             project: state.project,
@@ -165,7 +140,7 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
         // Codex rollouts carry no Claude Code write-tool metadata (contract U-002).
         scanned_files: Vec::new(),
         diagnostics,
-        origin: state.origin,
+        origin,
     }))
 }
 

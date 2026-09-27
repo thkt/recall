@@ -173,6 +173,7 @@ fn jsonl_diagnostics_distinguish_corruption_from_possible_incomplete_tails() {
                 .unwrap()
                 .unwrap();
             assert!(parsed.messages.is_empty());
+            assert_classification_matches(file.path(), source, &parsed);
             let d = parsed.diagnostics;
             assert_eq!(
                 [
@@ -182,6 +183,50 @@ fn jsonl_diagnostics_distinguish_corruption_from_possible_incomplete_tails() {
                 ],
                 *expected,
                 "{source}: {input:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn classification_visits_identity_and_diagnostics_after_automated_evidence() {
+    use std::fs;
+    for source in [Source::Claude, Source::Codex] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("sample.jsonl");
+        let (first, conflicting) = match source {
+            Source::Claude => (
+                r#"{"type":"user","sessionId":"sample","isSidechain":true,"message":"question"}"#,
+                r#"{"role":"assistant","sessionId":"other"}"#,
+            ),
+            Source::Codex => (
+                r#"{"type":"session_meta","payload":{"id":"sample","source":{"internal":"guardian"}}}"#,
+                r#"{"type":"session_meta","payload":{"id":"other"}}"#,
+            ),
+        };
+        for (tail, conflict, diagnostics) in [
+            (conflicting.as_bytes(), true, [0, 0, 0]),
+            (b"{bad\n".as_slice(), false, [1, 0, 0]),
+            (b"\xff\n".as_slice(), false, [0, 1, 0]),
+            (b"{\"type\":".as_slice(), false, [0, 0, 1]),
+        ] {
+            let mut input = format!("{first}\n").into_bytes();
+            input.extend_from_slice(tail);
+            fs::write(&path, input).unwrap();
+            let full = parse_session_including_empty(&path, source)
+                .unwrap()
+                .unwrap();
+            assert_classification_matches(&path, source, &full);
+            assert_eq!(full.origin.identity_conflict, conflict);
+            assert_eq!(full.origin.automated, !conflict);
+            let d = full.diagnostics;
+            assert_eq!(
+                [
+                    d.invalid_json_lines,
+                    d.invalid_utf8_lines,
+                    d.incomplete_tail_lines
+                ],
+                diagnostics
             );
         }
     }

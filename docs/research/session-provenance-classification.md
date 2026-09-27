@@ -95,3 +95,8 @@ R1-1 の原因は、空本文の再索引で保存済みIDへ戻す際に、別I
 [索引の回帰テスト](../../src/indexer/tests.rs)を1件追加し、同一ID／別IDと既存の2種類のラベルを区別して、再索引直後・明示再分類後・反復時の保存結果を確認する。既存のパーサー単体テストと初回索引の結合テストが通っても、保存IDへの復元をまたぐ誤分類は検出できなかったため追加した。同一IDの対照は、修復によって正当な出自まで無視する退行を防ぐ。実パーサーとSQLiteを使い、モデル取得・固定sleep・私的ログは不要。既存の空本文処理、Codexの解析、再分類と合成検索の検証はそれぞれ異なる境界を守るため維持し、削除・統合による検出条件の喪失はない。
 
 修復前は、別IDへの差替えで期待する `interactive` が `automated` になることを回帰テストで再現した。修復後の `cargo nextest run --offline --locked --profile ci -E 'test(metadata_only_reindex_applies_provenance_only_to_the_matching_session) | test(size_changes_reindex_with_equal_or_submillisecond_mtime) | test(parser::codex::tests) | test(classify::integration_tests)'` は13件成功した（他462件は選択外）。その後、回帰テストの分類確認を再分類の前後に分け、同テストだけを再実行して成功した（0.096秒、1回の観測）。対象Rustファイルの `rustfmt --check --edition 2024` と `git diff --check` も成功した。今回の環境では製品テストを実行できたが、上記の過去のビルド停止記録を置き換える結果ではない。ホスト記録の473件成功・1件スキップも修復前の結果であり、今回の全検証成功とは扱わない。設定済みの全検証とCIはホストに残し、captureは引き続き不要。実ログ全体の精度、大規模DBの待ち時間、速度改善は未検証のままである。
+
+
+## Issue #342 による再分類方式の変更
+
+上記の Issue #327 実装時の writer 予約と未測定事項は、その時点の記録として残す。後続の [Issue #342](https://github.com/thkt/recall/issues/342) では、ログの読取り・分類を予約の外へ移し、検証した集合を一括適用する。DB 全体の commit とファイル状態の変化で全候補を破棄し、初回＋最大2回の再試行とする。旧形式の出自・ID 検証は全文パーサーと分類専用読取りで共有する。現行の操作と保証の限界は [README](../../README.ja.md#分類classify)、比較条件・結果・未確認事項は [#342 の既存報告](issue-342-scope.md) に記載する。過去の件数や私的ログの観測を、今回の性能・並行制御の証拠へ転用しない。

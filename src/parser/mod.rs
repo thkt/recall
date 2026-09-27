@@ -6,6 +6,7 @@ pub use claude::parse_claude_session;
 pub use codex::parse_codex_session;
 
 use std::fmt;
+use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -118,6 +119,44 @@ pub(crate) fn parse_session_including_empty(
         Source::Claude => parse_claude_session(path),
         Source::Codex => parse_codex_session(path),
     }
+}
+
+/// Classification needs no message bodies, tool targets, or display metadata.
+/// Still visit every JSONL record: later identity conflicts and diagnostics matter.
+pub(crate) struct ClassificationRead {
+    pub session_id: String,
+    pub origin: provenance::SessionOrigin,
+    pub diagnostics: LineDiagnostics,
+}
+
+pub(crate) fn parse_classification(
+    file: File,
+    path: &Path,
+    source: Source,
+) -> Result<Option<ClassificationRead>> {
+    use provenance::{ClaudeOrigin, CodexOrigin};
+    let Some(session_id) = session_id_from_path(path) else {
+        return Ok(None);
+    };
+    let (session_id, origin, diagnostics) = match source {
+        Source::Claude => {
+            let mut origin = ClaudeOrigin::new(path, &session_id);
+            let diagnostics = scan_jsonl_reader(file, |entry| origin.observe(entry))?;
+            let origin = origin.finish();
+            (session_id, origin, diagnostics)
+        }
+        Source::Codex => {
+            let mut origin = CodexOrigin::new(session_id);
+            let diagnostics = scan_jsonl_reader(file, |entry| origin.observe(entry))?;
+            let (session_id, origin) = origin.finish();
+            (session_id, origin, diagnostics)
+        }
+    };
+    Ok(Some(ClassificationRead {
+        session_id,
+        origin,
+        diagnostics,
+    }))
 }
 
 const TEXT_BLOCK_TYPES: &[&str] = &["text", "input_text", "output_text"];
@@ -309,13 +348,25 @@ pub(super) fn parse_jsonl_entries(
     path: &Path,
     mut process: impl FnMut(&Value) -> Option<Message>,
 ) -> Result<(Vec<Message>, LineDiagnostics)> {
-    use std::fs::File;
+    let mut messages = Vec::new();
+    let diagnostics = scan_jsonl_entries(path, |entry| {
+        if let Some(message) = process(entry) {
+            messages.push(message);
+        }
+    })?;
+    Ok((messages, diagnostics))
+}
+
+fn scan_jsonl_entries(path: &Path, process: impl FnMut(&Value)) -> Result<LineDiagnostics> {
+    let file = File::open(path).context("Failed to open session file")?;
+    scan_jsonl_reader(file, process)
+}
+
+fn scan_jsonl_reader(file: File, mut process: impl FnMut(&Value)) -> Result<LineDiagnostics> {
     use std::io::{BufRead, BufReader};
     use std::str;
 
-    let file = File::open(path).context("Failed to open session file")?;
     let mut reader = BufReader::new(file);
-    let mut messages = Vec::new();
     let mut diagnostics = LineDiagnostics::default();
     let mut bytes = Vec::new();
 
@@ -355,12 +406,10 @@ pub(super) fn parse_jsonl_entries(
                 continue;
             }
         };
-        if let Some(msg) = process(&entry) {
-            messages.push(msg);
-        }
+        process(&entry);
     }
 
-    Ok((messages, diagnostics))
+    Ok(diagnostics)
 }
 
 pub(super) fn session_id_from_path(path: &Path) -> Option<String> {
@@ -391,3 +440,13 @@ pub(super) fn write_test_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn assert_classification_matches(path: &Path, source: Source, full: &ParseResult) {
+    let classification = parse_classification(File::open(path).unwrap(), path, source)
+        .unwrap()
+        .unwrap();
+    assert_eq!(classification.session_id, full.metadata.session_id);
+    assert_eq!(classification.origin, full.origin);
+    assert_eq!(classification.diagnostics, full.diagnostics);
+}

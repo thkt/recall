@@ -16,13 +16,13 @@ mod search;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
-use std::fs::{OpenOptions, create_dir_all, metadata};
+use std::fs::{File, OpenOptions, Permissions, create_dir_all, metadata};
 use std::io::{self, ErrorKind, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use amici::cli::exit_code::codes;
 use amici::cli::{done, exit_error, info as cli_info, try_expand_shorthand, warning};
@@ -2215,16 +2215,41 @@ struct ClassifyOutcome {
     excerpt: String,
 }
 
-/// Re-read provenance only from the stored source/path and matching identity.
-/// Failure is distinct from a readable session with unknown provenance.
+/// Re-read provenance only. The caller checks availability and file freshness.
 fn read_classification_origin(
+    file: File,
     path: &str,
     source: &str,
     session_id: &str,
 ) -> Result<bool, &'static str> {
     let source = Source::from_db(source).ok_or("unknown source")?;
-    let path = Path::new(path);
-    let stat = || {
+    let parsed = parser::parse_classification(file, Path::new(path), source)
+        .map_err(|_| "read failure")?
+        .ok_or("invalid format")?;
+    if parsed.session_id != session_id || parsed.origin.identity_conflict {
+        return Err("session ID mismatch");
+    }
+    if !parsed.diagnostics.is_empty() || !parsed.origin.has_records {
+        return Err("invalid format");
+    }
+    Ok(parsed.origin.automated)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ClassificationFileState {
+    stamp: Result<(u64, SystemTime, Permissions), &'static str>,
+    access: Result<(), &'static str>,
+}
+
+/// Include accessibility, even for an unavailable source: a recovered log must
+/// invalidate an old fallback. No log contents are read by the final check.
+fn classification_file_state(path: &str) -> ClassificationFileState {
+    open_classification_file(path).0
+}
+
+/// Reuse the accessibility probe for scanning at the same read boundary.
+fn open_classification_file(path: &str) -> (ClassificationFileState, Result<File, &'static str>) {
+    let stamp = (|| {
         let meta = metadata(path).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 "missing file"
@@ -2235,27 +2260,31 @@ fn read_classification_origin(
         if !meta.is_file() {
             return Err("not a regular file");
         }
-        Ok((meta.len(), meta.modified().map_err(|_| "read failure")?))
+        Ok((
+            meta.len(),
+            meta.modified().map_err(|_| "read failure")?,
+            meta.permissions(),
+        ))
+    })();
+    let file = match &stamp {
+        Ok(_) => File::open(path).map_err(|_| "read failure"),
+        Err(reason) => Err(*reason),
     };
-    let before = stat()?;
-    let parsed = parser::parse_session_including_empty(path, source)
-        .map_err(|_| "read failure")?
-        .ok_or("invalid format")?;
-    if stat()? != before {
-        return Err("file changed during read");
-    }
-    if parsed.metadata.session_id != session_id || parsed.origin.identity_conflict {
-        return Err("session ID mismatch");
-    }
-    if !parsed.diagnostics.is_empty() || !parsed.origin.has_records {
-        return Err("invalid format");
-    }
-    Ok(parsed.origin.automated)
+    let access = file.as_ref().map(|_| ()).map_err(|reason| *reason);
+    (ClassificationFileState { stamp, access }, file)
 }
 
-/// Explicit classification changes only session_type. Hold a writer reservation
-/// before taking the snapshot, so indexing cannot replace rows during file reads.
-/// Dry runs use a read transaction and never acquire a writer reservation.
+#[derive(Clone, Copy)]
+enum ClassifyPhase {
+    Snapshot,
+    Prepared,
+    WriterWaiting,
+    WriterAcquired,
+    WriterReleased,
+    Updated,
+    Retry,
+}
+
 fn reclassify_sessions(
     conn: &mut Connection,
     all: bool,
@@ -2268,18 +2297,30 @@ fn reclassify_sessions_with(
     conn: &mut Connection,
     all: bool,
     dry_run: bool,
-    mut read_origin: impl FnMut(&str, &str, &str) -> Result<bool, &'static str>,
+    read_origin: impl FnMut(File, &str, &str, &str) -> Result<bool, &'static str>,
 ) -> Result<Vec<ClassifyOutcome>> {
-    use rusqlite::TransactionBehavior;
+    reclassify_sessions_observed(conn, all, dry_run, read_origin, |_| {})
+}
+
+/// Observe transaction boundaries directly in deterministic tests/measurements.
+/// The production observer is a no-op, eliminated by monomorphization.
+fn reclassify_sessions_observed(
+    conn: &mut Connection,
+    all: bool,
+    dry_run: bool,
+    mut read_origin: impl FnMut(File, &str, &str, &str) -> Result<bool, &'static str>,
+    mut observe: impl FnMut(ClassifyPhase),
+) -> Result<Vec<ClassifyOutcome>> {
+    use rusqlite::{ErrorCode, TransactionBehavior};
     use std::collections::BTreeMap;
 
-    let tx = conn.transaction_with_behavior(if dry_run {
-        TransactionBehavior::Deferred
-    } else {
-        TransactionBehavior::Immediate
-    })?;
-    let outcomes = {
-        let mut stmt = tx.prepare(
+    for _ in 0..3 {
+        // Same connection, BEFORE the snapshot, with no own writes until apply.
+        // Other commits (including change-and-restore) invalidate all candidates.
+        let version: i64 = conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
+        let tx = conn.transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
             // SQLite's single MIN aggregate takes text from that minimum row.
             // Group once rather than scanning the FTS table for every session.
             "WITH first_turn AS (SELECT session_id, text, MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id) \
@@ -2298,25 +2339,45 @@ fn reclassify_sessions_with(
                 error.into()
             }
         })?;
-        let rows = stmt.query_map([all], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })?;
+            let rows = stmt.query_map([all], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })?;
+
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        tx.commit()?;
+        observe(ClassifyPhase::Snapshot);
+
         let mut outcomes = Vec::new();
+        let mut files = Vec::new();
         let mut unavailable = BTreeMap::<&str, usize>::new();
-        for row in rows {
-            let (session_id, source, path, previous, first_turn) = row?;
-            let origin = match read_origin(&path, &source, &session_id) {
+        let mut changed = false;
+        for (session_id, source, path, previous, first_turn) in rows {
+            let (before, file) = open_classification_file(&path);
+            let (origin, after) = match file {
+                Ok(file) => {
+                    let origin = read_origin(file, &path, &source, &session_id);
+                    let after = classification_file_state(&path);
+                    if before != after {
+                        changed = true;
+                    }
+                    (origin, after)
+                }
+                // No read occurred, so this boundary needs no second probe.
+                // The fresh check inside apply still detects recovered files.
+                Err(reason) => (Err(reason), before),
+            };
+            files.push((path, after));
+            let origin = match origin {
                 Ok(origin) => origin,
                 Err(reason) => {
                     *unavailable.entry(reason).or_default() += 1;
-                    // Do not erase an existing provenance-based classification
-                    // just because the source log is temporarily unavailable.
                     if previous.is_some() {
                         continue;
                     }
@@ -2334,22 +2395,56 @@ fn reclassify_sessions_with(
                 },
             });
         }
+        observe(ClassifyPhase::Prepared);
+        if changed {
+            observe(ClassifyPhase::Retry);
+            continue;
+        }
+        if !dry_run {
+            observe(ClassifyPhase::WriterWaiting);
+            let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+                Ok(tx) => tx,
+                Err(error) if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
+                    observe(ClassifyPhase::Retry);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            observe(ClassifyPhase::WriterAcquired);
+            // Include the final stat/open checks in writer hold time. Never
+            // reparse bodies while holding the reservation.
+            let current: i64 = tx.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
+            if current != version
+                || files
+                    .iter()
+                    .any(|(path, state)| classification_file_state(path) != *state)
+            {
+                tx.rollback()?;
+                observe(ClassifyPhase::WriterReleased);
+                observe(ClassifyPhase::Retry);
+                continue;
+            }
+            {
+                let mut update = tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1 AND session_type IS NOT ?2")?;
+                for o in &outcomes {
+                    update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
+                    observe(ClassifyPhase::Updated);
+                }
+            }
+            tx.commit()?;
+            observe(ClassifyPhase::WriterReleased);
+        }
+        // Only the accepted attempt contributes warnings or success counts.
         for (reason, count) in unavailable {
             eprintln!(
                 "warning: provenance unavailable ({reason}): {count} session(s); existing labels retained, unclassified rows use first-turn fallback"
             );
         }
-        outcomes
-    };
-    if !dry_run {
-        let mut update =
-            tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1")?;
-        for o in &outcomes {
-            update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
-        }
+        return Ok(outcomes);
     }
-    tx.commit()?;
-    Ok(outcomes)
+    Err(RecallError::TempFailure(
+        "classification inputs kept changing or the database writer remained busy after 3 attempts; no classification changes applied; rerun `recall classify` with the same options".to_owned()
+    ).into())
 }
 
 /// `recall classify`: tag existing sessions using source provenance, then the
