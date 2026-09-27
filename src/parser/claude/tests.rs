@@ -113,3 +113,80 @@ fn test_claude_is_meta_skipped() {
     assert_eq!(result.messages.len(), 1);
     assert_eq!(result.messages[0].text, "real message");
 }
+
+#[test]
+fn provenance_requires_boolean_message_metadata_or_the_exact_subagent_layout() {
+    use serde_json::json;
+    use std::fs;
+    let root = tempfile::tempdir().unwrap();
+    let parent = "01234567-89ab-cdef-0123-456789abcdef";
+    for (relative, record, expected) in [
+        (
+            "session.jsonl".to_owned(),
+            json!({"type":"user","isSidechain":true,"message":{"content":"help"}}),
+            true,
+        ),
+        (
+            "session.jsonl".to_owned(),
+            json!({"type":"assistant","isSidechain":true,"message":{"content":[]}}),
+            true,
+        ),
+        (
+            "session.jsonl".to_owned(),
+            json!({"type":"user","isSidechain":"true","message":{"content":"help"}}),
+            false,
+        ),
+        (
+            "session.jsonl".to_owned(),
+            json!({"type":"summary","isSidechain":true}),
+            false,
+        ),
+        (
+            "session.jsonl".to_owned(),
+            json!({"type":"user","agentId":"agent-a","message":{"content":"Explain {\"isSidechain\":true}"}}),
+            false,
+        ),
+        (
+            format!("{parent}/subagents/agent-a.jsonl"),
+            json!({"type":"user","sessionId":parent,"message":{"content":"help"}}),
+            true,
+        ),
+        (
+            format!("{parent}/subagents/agent-a.jsonl"),
+            json!({"type":"user","sessionId":"other","message":{"content":"help"}}),
+            false,
+        ),
+        (
+            "subagents/agent-a.jsonl".to_owned(),
+            json!({"type":"user"}),
+            false,
+        ),
+        (
+            "project/subagents/agent-a.jsonl".to_owned(),
+            json!({"type":"user"}),
+            false,
+        ),
+        ("agent-a.jsonl".to_owned(), json!({"type":"user"}), false),
+        (
+            format!("{parent}/subagents/session.jsonl"),
+            json!({"type":"user"}),
+            false,
+        ),
+        (
+            format!("{parent}/subagents/agent-.jsonl"),
+            json!({"type":"user"}),
+            false,
+        ),
+        (
+            "session.jsonl".to_owned(),
+            json!({"role":"user","sessionId":"unrelated","isSidechain":true,"content":"human question"}),
+            false,
+        ),
+    ] {
+        let path = root.path().join(&relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, record.to_string()).unwrap();
+        let parsed = parse_claude_session(&path).unwrap().unwrap();
+        assert_eq!(parsed.origin.automated, expected, "{relative}: {record}");
+    }
+}

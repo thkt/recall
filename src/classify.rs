@@ -1,12 +1,12 @@
-//! Session classification (#24): label a session interactive or automated from
-//! its first user turn, so `recall search` can exclude hook/script-generated
+//! Session classification (#24, #327): use positive source provenance, then the
+//! first user turn, so `recall search` can exclude hook/script-generated
 //! noise by default. Markers are programmatic prefixes intrinsic to the
 //! Claude/Codex ecosystem (slash-command wrappers, local-command I/O, synthetic
 //! actions, interrupt/continuation strings). A false positive would hide a real
 //! session from default search, so only prefixes a human is very unlikely to open
 //! a session with belong here. Matched literally — no regex/config dependency.
 
-/// Classification of a session, derived from its first user turn.
+/// Classification of a session, derived from source provenance and its first turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionType {
     /// Human-driven session. The default whenever no marker matches.
@@ -22,6 +22,16 @@ impl SessionType {
             SessionType::Interactive => "interactive",
             SessionType::Automated => "automated",
         }
+    }
+}
+
+/// Positive source provenance takes priority; unknown provenance retains the
+/// fail-open first-turn heuristic. Shared by ingestion and explicit reclassification.
+pub fn classify_session(first_turn: &str, automated_origin: bool) -> SessionType {
+    if automated_origin {
+        SessionType::Automated
+    } else {
+        classify_first_turn(first_turn)
     }
 }
 
@@ -63,3 +73,6 @@ pub fn classify_first_turn(first_turn: &str) -> SessionType {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod integration_tests;

@@ -305,6 +305,68 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
 }
 
 #[test]
+fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
+    for initial_type in ["interactive", "automated"] {
+        for replacement_id in ["session-a", "session-b"] {
+            let (_db_dir, mut conn) = setup_test_db();
+            let root = TempDir::new().unwrap();
+            let file = root.path().join("rollout-test.jsonl");
+            let absent = root.path().join("absent");
+            let opts = IndexOptions {
+                force: false,
+                claude_dir: &absent,
+                codex_dir: root.path(),
+            };
+            let initial = format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"session-a\",\"source\":\"exec\"}}}}\n{}",
+                r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
+            );
+            fs::write(&file, &initial).unwrap();
+            index_from_dirs(&mut conn, &opts, true).unwrap();
+            index_chunks(&mut conn, None).unwrap();
+            conn.execute("UPDATE sessions SET session_type = ?", [initial_type])
+                .unwrap();
+            let replacement = format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{replacement_id}","source":{{"subagent":"review"}}}}}}"#,
+            );
+            assert_ne!(initial.len(), replacement.len(), "force a freshness miss");
+            fs::write(&file, replacement).unwrap();
+
+            let matches = replacement_id == "session-a";
+            for attempt in 0..2 {
+                let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+                index_chunks(&mut conn, None).unwrap();
+                assert_eq!(
+                    collect_strings(&conn, "SELECT session_id FROM sessions"),
+                    ["session-a"]
+                );
+                assert_eq!(
+                    collect_strings(&conn, "SELECT session_type FROM sessions"),
+                    [if matches { "automated" } else { initial_type }],
+                    "replacement {replacement_id}, initial {initial_type}, attempt {attempt}"
+                );
+                assert_eq!(stats.indexed, usize::from(matches && attempt == 0));
+                assert_eq!(
+                    collect_strings(&conn, "SELECT text FROM messages"),
+                    if matches {
+                        vec![]
+                    } else {
+                        vec!["original question"]
+                    },
+                    "another session's metadata cannot establish that this body is empty"
+                );
+                crate::reclassify_sessions(&mut conn, true, false).unwrap();
+                assert_eq!(
+                    collect_strings(&conn, "SELECT session_type FROM sessions"),
+                    [if matches { "automated" } else { initial_type }],
+                    "explicit reclassification must agree with indexing"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
     // Append after the first stat, after EOF, or after the final stat. The last
     // order must keep the old stamp; the other orders must leave a pending mark.

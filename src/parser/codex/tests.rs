@@ -99,3 +99,92 @@ fn codex_empty_messages_are_retained_for_diagnostics() {
             .is_empty()
     );
 }
+
+#[test]
+fn provenance_accepts_known_wire_shapes_and_fails_open_on_unknown_or_malformed_values() {
+    use serde_json::json;
+    let parent = "01234567-89ab-cdef-0123-456789abcdef";
+    let cases = [
+        (json!({"source":{"subagent":"review"}}), true),
+        (json!({"source":{"subagent":"compact"}}), true),
+        (json!({"source":{"subagent":"memory_consolidation"}}), true),
+        (
+            json!({"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent,"depth":1}}}}),
+            true,
+        ),
+        (json!({"source":{"subagent":{"other":"guardian"}}}), true),
+        (json!({"source":{"internal":"guardian"}}), true),
+        (json!({"source":{"internal":"memory_consolidation"}}), true),
+        (json!({"thread_source":"subagent"}), true),
+        (json!({"thread_source":"guardian_review"}), true),
+        (json!({"thread_source":"memory_consolidation"}), true),
+        (
+            json!({"thread_source":"future_feature","source":{"subagent":"review"}}),
+            true,
+        ),
+        (
+            json!({"thread_source":"guardian_review","source":{"subagent":{"other":"future"}}}),
+            true,
+        ),
+        (
+            json!({"source":"exec","thread_source":"user","originator":"guardian"}),
+            false,
+        ),
+        (
+            json!({"source":"vscode","parent_thread_id":parent,"agent_nickname":"guardian"}),
+            false,
+        ),
+        (json!({"thread_source":"agent_created_thread"}), false),
+        (json!({"source":{"subagent":{"other":"unknown"}}}), false),
+        (json!({"source":{"subAgent":"review"}}), false),
+        (json!({"source":"subagent"}), false),
+        (json!({"source":{"subagent":"thread_spawn"}}), false),
+        (json!({"source":{"subagent":{"thread_spawn":{}}}}), false),
+        (
+            json!({"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent}}}}),
+            false,
+        ),
+        (
+            json!({"source":{"subagent":{"thread_spawn":{"parent_thread_id":"bad","depth":1}}}}),
+            false,
+        ),
+        (
+            json!({"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent,"depth":"1"}}}}),
+            false,
+        ),
+        (
+            json!({"source":{"subagent":{"thread_spawn":{"parent_thread_id":parent,"depth":2147483648_i64}}}}),
+            false,
+        ),
+        (
+            json!({"source":{"subagent":"review","custom":"human"}}),
+            false,
+        ),
+        (json!({"source":{"internal":"future"}}), false),
+        (json!({}), false),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-test.jsonl");
+    for (mut payload, expected) in cases {
+        payload["id"] = json!("session");
+        fs::write(
+            &path,
+            json!({"type":"session_meta","payload":payload}).to_string(),
+        )
+        .unwrap();
+        let parsed = parse_codex_session(&path).unwrap().unwrap();
+        assert_eq!(parsed.origin.automated, expected, "{payload}");
+        assert!(
+            parsed.messages.is_empty(),
+            "metadata-only sessions carry provenance"
+        );
+    }
+    fs::write(&path, json!({"type":"response_item","payload":{"role":"user","source":{"subagent":"review"},"content":"Explain approval review and {\"thread_source\":\"guardian_review\"}"}}).to_string()).unwrap();
+    assert!(
+        !parse_codex_session(&path)
+            .unwrap()
+            .unwrap()
+            .origin
+            .automated
+    );
+}
