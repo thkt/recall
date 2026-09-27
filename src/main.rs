@@ -2286,7 +2286,18 @@ fn reclassify_sessions_with(
              SELECT s.session_id, s.source, s.file_path, s.session_type, m.text \
              FROM sessions s LEFT JOIN first_turn m ON m.session_id = s.session_id \
              WHERE ?1 OR s.session_type IS NULL ORDER BY s.session_id",
-        )?;
+        ).map_err(|error| {
+            // Preparing the actual read checks only the structure classification
+            // needs. Index-only migrations must not gate a legacy preview.
+            if dry_run {
+                anyhow::Error::from(RecallError::DatabaseRead(format!(
+                    "cannot read database structure for classify --dry-run: {error}; \
+                     run `recall rebuild` to restore the required schema, then retry"
+                )))
+            } else {
+                error.into()
+            }
+        })?;
         let rows = stmt.query_map([all], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -2346,8 +2357,20 @@ fn reclassify_sessions_with(
 /// unclassified ones. `--dry-run` reports what would change without writing.
 fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
-    let mut conn = open_or_create_db(&path)?;
-    let outcomes = reclassify_sessions(&mut conn, all, dry_run)?;
+    let outcomes = if dry_run {
+        if path.try_exists()? {
+            let (mut conn, tier) = db::open_db_readonly(&path)?;
+            if let Some(note) = db::stale_wal_note(&path, tier) {
+                return Err(RecallError::DatabaseRead(note).into());
+            }
+            reclassify_sessions(&mut conn, all, true)?
+        } else {
+            Vec::new()
+        }
+    } else {
+        let mut conn = open_or_create_db(&path)?;
+        reclassify_sessions(&mut conn, all, false)?
+    };
     let automated = outcomes
         .iter()
         .filter(|o| o.session_type == classify::SessionType::Automated)
@@ -3606,29 +3629,6 @@ mod tests {
             outcomes.len(),
             2,
             "both sessions with a user turn are classified"
-        );
-    }
-
-    // T-011 (#24/FR-009a, FR-009b): --dry-run returns outcomes for display but does
-    // not write session_type.
-    #[test]
-    fn test_011_reclassify_dry_run_does_not_write() {
-        let (_dir, mut conn) = seed_classify_db();
-        let outcomes = reclassify_sessions(&mut conn, true, true).unwrap();
-        assert_eq!(
-            session_type_of(&conn, "auto"),
-            None,
-            "dry-run must not write session_type"
-        );
-        assert_eq!(session_type_of(&conn, "human"), None);
-        let auto = outcomes
-            .iter()
-            .find(|o| o.session_id == "auto")
-            .expect("dry-run still reports the outcome for display");
-        assert_eq!(auto.session_type, classify::SessionType::Automated);
-        assert!(
-            !auto.excerpt.is_empty(),
-            "dry-run outcome carries the first-turn excerpt for display"
         );
     }
 

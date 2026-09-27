@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -6,9 +8,11 @@ use serde_json::{Value, json};
 use super::{SessionType, classify_first_turn};
 use crate::db::setup_test_db;
 use crate::embedder::{MockEmbedder, embed_recent_chunks};
+use crate::envelope::render_json_error;
+use crate::error::error_envelope;
 use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
-use crate::reclassify_sessions;
 use crate::search::{SearchOptions, search};
+use crate::{reclassify_sessions, run_classify};
 
 fn strings(conn: &Connection, sql: &str) -> Vec<String> {
     conn.prepare(sql)
@@ -36,9 +40,151 @@ fn bodies_and_vectors(conn: &Connection) -> Vec<Vec<String>> {
     ].iter().map(|sql| strings(conn, sql)).collect()
 }
 
+// SHM holds SQLite's reader coordination, not persistent index contents.
+fn persistent_files(path: &Path) -> Vec<Option<(Vec<u8>, fs::Permissions)>> {
+    [path.to_path_buf(), path.with_extension("db-wal")]
+        .iter()
+        .map(|p| match fs::read(p) {
+            Ok(bytes) => Some((bytes, fs::metadata(p).unwrap().permissions())),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => panic!("cannot snapshot {}: {error}", p.display()),
+        })
+        .collect()
+}
+
+#[test]
+fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recall.db");
+    let conn = Connection::open(&path).unwrap();
+    // Shape predating parse_diagnostics and the index-only columns. The
+    // pre-fix command migrated even when the only row was already classified.
+    conn.execute_batch(
+        "CREATE TABLE sessions (
+            session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
+            project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT
+         );
+         CREATE VIRTUAL TABLE messages USING fts5(session_id UNINDEXED, role, text, tokenize='trigram');
+         INSERT INTO sessions VALUES ('synthetic', 'claude', '/missing-synthetic.jsonl', '/p', 's', 0, 123, 'interactive');
+         INSERT INTO messages VALUES ('synthetic', 'user', '<command-message>run</command-message>');",
+    ).unwrap();
+    let schema = strings(
+        &conn,
+        "SELECT coalesce(sql, name) FROM sqlite_master ORDER BY name",
+    );
+    drop(conn);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let before = persistent_files(&path);
+    for all in [false, true] {
+        let out = run_classify(all, true, &Some(path.clone())).unwrap();
+        assert_eq!(out.data["classified"], 0);
+        assert!(
+            persistent_files(&path) == before,
+            "DB/WAL contents and permissions changed"
+        );
+    }
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        strings(
+            &conn,
+            "SELECT coalesce(sql, name) FROM sqlite_master ORDER BY name"
+        ),
+        schema
+    );
+    assert_eq!(
+        strings(
+            &conn,
+            "SELECT json_array(mtime, session_type) FROM sessions"
+        ),
+        ["[123.0,\"interactive\"]"]
+    );
+    conn.execute("UPDATE sessions SET session_type = NULL", [])
+        .unwrap();
+    drop(conn);
+    let before = persistent_files(&path);
+    for all in [false, true] {
+        let out = run_classify(all, true, &Some(path.clone())).unwrap();
+        assert_eq!(
+            out.data,
+            json!({"classified":1,"automated":1,"interactive":0,"dry_run":true})
+        );
+        assert!(
+            out.markdown
+                .contains("synthetic [automated] <command-message>")
+        );
+        assert!(
+            persistent_files(&path) == before,
+            "DB/WAL contents and permissions changed"
+        );
+    }
+    let applied = run_classify(false, false, &Some(path.clone())).unwrap();
+    assert_eq!(applied.data["automated"], 1);
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(
+        strings(
+            &conn,
+            "SELECT json_array(mtime, session_type) FROM sessions"
+        ),
+        ["[null,\"automated\"]"]
+    );
+    assert_eq!(
+        strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name = 'parse_diagnostics'"
+        ),
+        ["parse_diagnostics"]
+    );
+    assert_eq!(
+        strings(&conn, "SELECT text FROM messages"),
+        ["<command-message>run</command-message>"]
+    );
+}
+
+#[test]
+fn classify_preview_rejects_missing_read_structure_without_writes() {
+    for ddl in [
+        "",
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT, session_type TEXT)",
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT); CREATE TABLE messages (session_id TEXT, role TEXT, text TEXT)",
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT, session_type TEXT); CREATE TABLE messages (session_id TEXT, role TEXT)",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(ddl).unwrap();
+        drop(conn);
+        let before = persistent_files(&path);
+        for all in [false, true] {
+            let error = run_classify(all, true, &Some(path.clone())).unwrap_err();
+            let envelope = error_envelope(&error);
+            let rendered = render_json_error(&envelope);
+            let payload: Value = serde_json::from_str(&rendered).unwrap();
+            assert_eq!(payload["error"]["code"], "DATA_ERROR");
+            assert_eq!(payload["error"]["retryable"], false);
+            assert!(payload["error"].get("next_step").is_none(), "{rendered}");
+            let message = payload["error"]["message"].as_str().unwrap();
+            assert!(message.contains("classify --dry-run"), "{message}");
+            assert!(message.contains("recall rebuild"), "{message}");
+            assert!(message.contains("no such"), "{message}");
+            assert!(
+                persistent_files(&path) == before,
+                "DB/WAL contents and permissions changed"
+            );
+        }
+    }
+}
+
 #[test]
 fn provenance_classification_removes_synthetic_contamination_without_human_omissions() {
-    let (_db_dir, mut conn) = setup_test_db();
+    let (db_dir, mut conn) = setup_test_db();
+    // Keep all corpus rows in the WAL: ignoring committed frames would return
+    // zero classifications from the checkpointed, empty schema.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
     let root = tempfile::tempdir().unwrap();
     let claude = root.path().join("claude");
     let codex = root.path().join("codex");
@@ -205,14 +351,20 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
         })
         .count();
     assert_eq!(baseline_mixing, 6);
-    let planned = reclassify_sessions(&mut conn, true, true).unwrap();
-    assert_eq!(
-        planned
-            .iter()
-            .filter(|o| o.session_type == SessionType::Automated)
-            .count(),
-        6
-    );
+    let path = db_dir.path().join("test.db");
+    let files = persistent_files(&path);
+    assert!(!files[1].as_ref().unwrap().0.is_empty(), "live WAL fixture");
+    for (all, count) in [(false, 0), (true, 12)] {
+        let planned = run_classify(all, true, &Some(path.clone())).unwrap();
+        assert_eq!(planned.data["classified"], count);
+        assert_eq!(planned.data["automated"], if all { 6 } else { 0 });
+        assert!(!planned.degraded);
+        assert!(
+            persistent_files(&path) == files,
+            "DB/WAL contents and permissions changed"
+        );
+        assert_eq!(bodies_and_vectors(&conn), before);
+    }
     assert_eq!(labels(&conn), old_labels, "dry run must not write");
     assert!(
         reclassify_sessions(&mut conn, false, false)

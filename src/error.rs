@@ -31,7 +31,7 @@ use crate::envelope::{ErrorEnvelope, ErrorPayload};
 pub(crate) enum ErrorCode {
     /// Command used wrong: missing query, unresolved or ambiguous id, no index.
     UsageError,
-    /// Malformed input data: an unparseable search query.
+    /// Unusable input data, such as a search query or database snapshot.
     DataError,
     /// Invariant violation or programmer error.
     Internal,
@@ -67,6 +67,10 @@ pub(crate) enum RecallError {
     /// User-supplied data was malformed (maps to `DATA_ERROR`, 65).
     #[error("{0}")]
     DataError(String),
+    /// A database snapshot cannot be previewed (maps to `DATA_ERROR`, 65).
+    /// The message carries the specific remedy; query syntax advice does not apply.
+    #[error("{0}")]
+    DatabaseRead(String),
     /// Invariant violation or permanent environment fault, e.g. the MLX backend
     /// is missing on non-Apple-Silicon hardware (maps to `INTERNAL`, 70).
     #[error("{0}")]
@@ -80,7 +84,7 @@ impl RecallError {
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             Self::Usage(_) => ErrorCode::UsageError,
-            Self::DataError(_) => ErrorCode::DataError,
+            Self::DataError(_) | Self::DatabaseRead(_) => ErrorCode::DataError,
             Self::Internal(_) => ErrorCode::Internal,
             Self::TempFailure(_) => ErrorCode::TempFailure,
         }
@@ -114,7 +118,7 @@ impl RecallError {
             Self::TempFailure(_) => {
                 Some("Retry the command; the failure may be transient.".to_owned())
             }
-            Self::Internal(_) => None,
+            Self::Internal(_) | Self::DatabaseRead(_) => None,
         };
         ErrorEnvelope {
             error: ErrorPayload {
