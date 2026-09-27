@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
-use super::provenance::{SessionOrigin, claude_parent};
+use super::provenance::{SessionOrigin, claude_agent_id, claude_parent, is_uuid};
 
 use super::{
     Message, ParseResult, Role, SessionData, Source, extract_text, extract_tool_use_path,
@@ -98,7 +98,10 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
         return Ok(None);
     };
 
-    let parent = claude_parent(path);
+    let agent_id = claude_agent_id(path);
+    let parent = agent_id.and_then(|_| claude_parent(path));
+    let mut legacy_identity_matches = parent.is_none() && agent_id.is_some();
+    let mut legacy_parent = None;
     let mut state = ClaudeParseState {
         origin: SessionOrigin {
             automated: parent.is_some(),
@@ -112,18 +115,33 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
 
     let (messages, diagnostics) = parse_jsonl_entries(path, |entry| {
         let message = process_claude_entry(entry, &mut state);
-        if (matches!(
+        if matches!(
             entry.get("type").and_then(Value::as_str),
             Some("user" | "human" | "assistant")
         ) || matches!(
             entry.get("role").and_then(Value::as_str),
             Some("user" | "assistant")
-        )) && let Some(id) = entry.get("sessionId").and_then(Value::as_str)
-        {
-            state.origin.identity_conflict |= id != session_id && Some(id) != parent;
+        ) {
+            let id = entry.get("sessionId").and_then(Value::as_str);
+            if let Some(id) = id {
+                state.origin.identity_conflict |= id != session_id && Some(id) != parent;
+            }
+            // Outside the canonical layout, every message must attest to this
+            // agent and the same UUID parent. One good line cannot authenticate
+            // a mixed or incomplete transcript, nor override a directory parent.
+            legacy_identity_matches = legacy_identity_matches
+                && entry.get("isMeta").and_then(Value::as_bool) != Some(true)
+                && entry.get("isSidechain").and_then(Value::as_bool) == Some(true)
+                && entry.get("agentId").and_then(Value::as_str) == agent_id
+                && id.is_some_and(is_uuid);
+            if legacy_identity_matches && let Some(id) = id {
+                let expected = legacy_parent.get_or_insert_with(|| id.to_owned());
+                legacy_identity_matches &= expected == id;
+            }
         }
         message
     })?;
+    state.origin.identity_conflict &= !legacy_identity_matches;
     state.origin.automated &= !state.origin.identity_conflict;
 
     if state.slug.is_empty() {

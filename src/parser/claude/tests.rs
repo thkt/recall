@@ -190,3 +190,109 @@ fn provenance_requires_boolean_message_metadata_or_the_exact_subagent_layout() {
         assert_eq!(parsed.origin.automated, expected, "{relative}: {record}");
     }
 }
+
+#[test]
+fn legacy_agent_provenance_matches_the_filename_and_one_parent() {
+    use serde_json::json;
+    use std::fs;
+
+    let root = tempfile::tempdir().unwrap();
+    let user = json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}});
+    let mut assistant = user.clone();
+    assistant.as_object_mut().unwrap().remove("type");
+    assistant["role"] = json!("assistant");
+    assistant["message"]["content"] = json!("The sample looks correct.");
+    for (relative, contents, count) in [
+        ("agent-example.jsonl", user.to_string(), 1),
+        (
+            "project/subagents/agent-example.jsonl",
+            format!("{user}\n{assistant}\n"),
+            2,
+        ),
+    ] {
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, contents).unwrap();
+        let parsed = parse_claude_session(&path).unwrap().unwrap();
+        assert!(parsed.origin.automated, "{relative}");
+        assert!(!parsed.origin.identity_conflict);
+        assert_eq!(parsed.metadata.session_id, "agent-example");
+        assert_eq!(parsed.messages.len(), count);
+    }
+}
+
+#[test]
+fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
+    use serde_json::json;
+    use std::fs;
+
+    let root = tempfile::tempdir().unwrap();
+    let valid = json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}});
+    let mut invalid_records = Vec::new();
+    for (field, values) in [
+        (
+            "agentId",
+            vec![json!("other"), json!(""), json!(42), Value::Null],
+        ),
+        (
+            "sessionId",
+            vec![
+                json!("22222222-2222-4222-8222-222222222222"),
+                json!("invalid"),
+                json!(""),
+                json!(42),
+                Value::Null,
+            ],
+        ),
+        (
+            "isSidechain",
+            vec![json!("true"), json!(false), Value::Null],
+        ),
+    ] {
+        for value in values {
+            let mut record = valid.clone();
+            if value.is_null() {
+                record.as_object_mut().unwrap().remove(field);
+            } else {
+                record[field] = value;
+            }
+            invalid_records.push(record);
+        }
+    }
+    let mut meta = valid.clone();
+    meta["isMeta"] = json!(true);
+    invalid_records.push(meta);
+    invalid_records.push(json!({"type":"user","message":{"content":valid.to_string()}}));
+    let path = root.path().join("agent-example.jsonl");
+    for invalid in invalid_records {
+        // Both orders must reject the whole exception, including role-only logs.
+        let mut role_only = invalid.clone();
+        role_only.as_object_mut().unwrap().remove("type");
+        role_only["role"] = json!("assistant");
+        for records in [
+            format!("{valid}\n{invalid}"),
+            format!("{role_only}\n{valid}"),
+        ] {
+            fs::write(&path, &records).unwrap();
+            let parsed = parse_claude_session(&path).unwrap().unwrap();
+            assert!(!parsed.origin.automated, "{records}");
+            assert!(parsed.origin.identity_conflict, "{records}");
+        }
+    }
+    // A matching record cannot grant the exception to a different filename,
+    // an empty agent suffix, a non-jsonl file, or a conflicting canonical parent.
+    for relative in [
+        "agent-other.jsonl",
+        "agent-.jsonl",
+        "session.jsonl",
+        "agent-example.txt",
+        "22222222-2222-4222-8222-222222222222/subagents/agent-example.jsonl",
+    ] {
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, valid.to_string()).unwrap();
+        let parsed = parse_claude_session(&path).unwrap().unwrap();
+        assert!(!parsed.origin.automated, "{relative}");
+        assert!(parsed.origin.identity_conflict, "{relative}");
+    }
+}

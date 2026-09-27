@@ -11,7 +11,7 @@ use crate::embedder::{MockEmbedder, embed_recent_chunks};
 use crate::envelope::render_json_error;
 use crate::error::error_envelope;
 use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
-use crate::search::{SearchOptions, search};
+use crate::search::{SearchOptions, search, search_with_embedder};
 use crate::{reclassify_sessions, run_classify};
 
 fn strings(conn: &Connection, sql: &str) -> Vec<String> {
@@ -189,9 +189,9 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
     let claude = root.path().join("claude");
     let codex = root.path().join("codex");
     let parent = "01234567-89ab-cdef-0123-456789abcdef";
-    // Public synthetic corpus: six known automated and six human/unknown cases.
+    // Public synthetic corpus: seven known automated and seven human/unknown cases.
     // The label is independently specified here, not derived from the classifier.
-    let cases: [(&str, &str, Value, &str, bool); 12] = [
+    let cases: [(&str, &str, Value, &str, bool); 14] = [
         (
             "claude",
             "side",
@@ -205,6 +205,20 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             json!({"sessionId":parent}),
             "authentication help",
             true,
+        ),
+        (
+            "claude",
+            "agent-example",
+            json!({"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true}),
+            "Review this sample authentication module.",
+            true,
+        ),
+        (
+            "claude",
+            "agent-mismatch",
+            json!({"sessionId":parent,"agentId":"other","isSidechain":true}),
+            "Review this sample authentication module.",
+            false,
         ),
         (
             "codex",
@@ -307,13 +321,24 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             path
         };
         assert!(path.is_file());
+        if id == "agent-example" {
+            assert_eq!(
+                crate::read_classification_origin(
+                    path.to_str().unwrap(),
+                    "claude",
+                    "11111111-1111-4111-8111-111111111111"
+                ),
+                Err("session ID mismatch"),
+                "the agent's provenance must not be borrowed by a stored parent row"
+            );
+        }
     }
     let opts = IndexOptions {
         force: false,
         claude_dir: &claude,
         codex_dir: &codex,
     };
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 12);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 14);
     index_chunks(&mut conn, None).unwrap();
     embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
     let expected = labels(&conn);
@@ -350,14 +375,14 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             *automated && classify_first_turn(text) == SessionType::Interactive
         })
         .count();
-    assert_eq!(baseline_mixing, 6);
+    assert_eq!(baseline_mixing, 7);
     let path = db_dir.path().join("test.db");
     let files = persistent_files(&path);
     assert!(!files[1].as_ref().unwrap().0.is_empty(), "live WAL fixture");
-    for (all, count) in [(false, 0), (true, 12)] {
+    for (all, count) in [(false, 0), (true, 13)] {
         let planned = run_classify(all, true, &Some(path.clone())).unwrap();
         assert_eq!(planned.data["classified"], count);
-        assert_eq!(planned.data["automated"], if all { 6 } else { 0 });
+        assert_eq!(planned.data["automated"], if all { 7 } else { 0 });
         assert!(!planned.degraded);
         assert!(
             persistent_files(&path) == files,
@@ -374,7 +399,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
     for _ in 0..2 {
         assert_eq!(
             reclassify_sessions(&mut conn, true, false).unwrap().len(),
-            12
+            13, // The conflicting agent retains its existing label.
         );
         assert_eq!(labels(&conn), expected);
         assert_eq!(bodies_and_vectors(&conn), before);
@@ -396,8 +421,8 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
     };
     let ordinary = ids(false);
     let inclusive = ids(true);
-    assert_eq!(ordinary.len(), 6);
-    assert_eq!(inclusive.len(), 12);
+    assert_eq!(ordinary.len(), 7);
+    assert_eq!(inclusive.len(), 14);
     for (_, id, _, _, automated) in cases {
         assert_eq!(
             ordinary.iter().any(|found| found == id),
@@ -408,6 +433,36 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             inclusive.iter().any(|found| found == id),
             "include-automated: {id}"
         );
+    }
+    // No FTS hits: the new agent's exclusion and opt-in must also work through
+    // the shared vector filter. Reuse the real mock vectors already saved above.
+    let query = "unmatchedvectorquery";
+    assert!(
+        search(&conn, query, &SearchOptions::default())
+            .unwrap()
+            .is_empty()
+    );
+    for include_automated in [false, true] {
+        let outcome = search_with_embedder(
+            &conn,
+            query,
+            &SearchOptions {
+                limit: 100,
+                include_automated,
+                ..Default::default()
+            },
+            Some(&MockEmbedder::new()),
+        )
+        .unwrap();
+        assert!(!outcome.vec_degraded);
+        let ids: Vec<_> = outcome
+            .results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert_eq!(ids.contains(&"agent-example"), include_automated);
+        assert!(ids.contains(&"agent-mismatch"));
+        assert!(ids.contains(&"human"));
     }
 }
 
