@@ -51,12 +51,14 @@ The class-to-code table, the serde string tokens, and the retryable rule are pin
 | ---- | ------------ | ----------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------ |
 | 0    | (none)       | Ok                      | success                                                                                               | ADR-0066 G2              |
 | 64   | USAGE_ERROR  | bad invocation          | `RecallError::Usage` (missing query, unresolved/ambiguous id, no index)                               | error.rs:64-66, 82       |
-| 65   | DATA_ERROR   | malformed input         | `RecallError::DataError`; `SanitizeError::EmptyInput` / `NoSearchableTerms`                           | error.rs:67-69, 169      |
+| 65   | DATA_ERROR   | malformed input         | `RecallError::DataError`; `RecallError::DatabaseRead` (unreadable preview structure or WAL); `SanitizeError::EmptyInput` / `NoSearchableTerms` | [error.rs](../../src/error.rs) (`error_code`, `classify`) |
 | 70   | INTERNAL     | invariant violation     | `RecallError::Internal`; `SanitizeError::InvalidVocabTable`; `ModelDownloadError::BackendUnavailable` | error.rs:70-73, 168, 188 |
 | 73   | CANT_CREAT   | output-create failure   | absent: DB / IO failures map to `IoError`, no distinct create path                                    | error.rs:10-12           |
 | 74   | IO_ERROR     | sqlite / IO failure     | raw `io::Error` / `rusqlite::Error`; `SanitizeError::VocabLookupFailed`                               | error.rs:167, 172-175    |
 | 75   | TEMP_FAILURE | retryable transient     | `RecallError::TempFailure`; `ModelDownloadError::DownloadFailed` / `ProbeFailed` (retry may succeed)  | error.rs:74-76, 185-186  |
 | 104  | UNKNOWN      | unclassified (fallback) | unmapped anyhow error; signals a path to promote to a typed variant                                   | error.rs:42-43, 176      |
+
+The 2026-09-27 `classify --dry-run` repair adds `DatabaseRead` to the existing 65 / `DATA_ERROR` route. It remains non-retryable and carries recovery guidance in `message`, omitting the query-specific `next_step`. `DataError` retains its query guidance. This table maintenance follows the variant-update rule above; the Confirmation section records the verification available when this ADR was adopted.
 
 ### Routing Invariants
 

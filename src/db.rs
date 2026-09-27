@@ -34,8 +34,9 @@ pub enum SchemaState {
     Stale,
 }
 
-/// Open the index read-only, never writing (no WAL/`-shm` sidecars, no schema
-/// creation). This is the read-command counterpart to [`open_db`]; the write
+/// Open the index without changing persistent DB/WAL contents or schema.
+/// SQLite may create sidecars and update `-shm` for reader coordination in a
+/// writable directory. This is the read-command counterpart to [`open_db`]; the write
 /// path is left untouched (SOW NFR-001). The failed-open diagnosis path may
 /// create and remove a transient `.recall-write-probe-<pid>` file in the DB's
 /// parent directory (see [`dir_write_probe_fails`]); the DB itself stays untouched.
@@ -236,7 +237,8 @@ pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
     if tier != OpenTier::Immutable {
         return None;
     }
-    const PREFIX: &str = "read-only open cannot see uncommitted changes in the write-ahead log; ";
+    const PREFIX: &str =
+        "read-only open cannot see uncheckpointed changes in the write-ahead log; ";
     match fs::metadata(wal_path(path)) {
         Ok(m) if m.len() > 0 => Some(if dir_is_unwritable(path) {
             format!(

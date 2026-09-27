@@ -872,6 +872,36 @@ fn classify_reports_and_dry_run_previews() {
     assert!(out.contains("classified"), "classify output: {out}");
 }
 
+#[test]
+fn classify_preview_of_missing_database_keeps_the_path_absent() {
+    let dir = TempDir::new().unwrap();
+    for path in [
+        dir.path().join("recall.db"),
+        dir.path().join("absent/nested/recall.db"),
+    ] {
+        for all in [false, true] {
+            let mut cmd = recall(dir.path());
+            cmd.arg("--db-path")
+                .arg(&path)
+                .args(["classify", "--dry-run", "--json"]);
+            if all {
+                cmd.arg("--all");
+            }
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+            let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                envelope,
+                serde_json::json!({
+                    "data": {"classified":0,"automated":0,"interactive":0,"dry_run":true},
+                    "degraded": false, "notes": []
+                })
+            );
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+}
+
 // T-CLI025 (#24 audit/N): a default search surfaces a note that automated sessions
 // are excluded, so an AI-agent consumer can discover --include-automated.
 #[test]
@@ -1006,11 +1036,19 @@ fn read_commands_work_in_readonly_directory() {
         .arg("status")
         .output()
         .expect("spawn recall binary");
+    let classify_out = recall(dir.path())
+        .args(["classify", "--all", "--dry-run"])
+        .output()
+        .expect("spawn recall binary");
 
     // Restore before any assertion can panic: a read-only dir breaks TempDir drop.
     set_mode(0o755);
 
-    for (name, out) in [("search", &search_out), ("status", &status_out)] {
+    for (name, out) in [
+        ("search", &search_out),
+        ("status", &status_out),
+        ("classify", &classify_out),
+    ] {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             !stderr.contains("Error code 14"),
@@ -1084,9 +1122,28 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
         .into_iter()
         .map(|(name, out)| (name, out.expect("spawn recall binary")))
         .collect();
+    let classify_out = recall(dir.path())
+        .args(["classify", "--all", "--dry-run", "--json"])
+        .output()
+        .expect("spawn recall binary");
 
     // Restore before any assertion can panic: a read-only dir breaks TempDir drop.
     set_mode(0o755);
+
+    // A preview must not present counts from a snapshot that omits the WAL.
+    assert_eq!(
+        classify_out.status.code(),
+        Some(65),
+        "{}",
+        String::from_utf8_lossy(&classify_out.stderr)
+    );
+    assert!(classify_out.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&classify_out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "DATA_ERROR");
+    assert_eq!(error["error"]["retryable"], false);
+    assert!(error["error"].get("next_step").is_none(), "{error}");
+    let message = error["error"]["message"].as_str().unwrap();
+    root_skip::assert_copy_based_remedy(message, "classify");
 
     for (name, out) in &outputs {
         let stdout = String::from_utf8_lossy(&out.stdout);

@@ -175,7 +175,13 @@ Automated sessions are excluded from ordinary search; `--include-automated` incl
 
 When reindexing a metadata-only log, records resolving to a different session ID leave the stored session unchanged and pending retry. Metadata for the same ID can update its classification; an empty log without session records still follows the existing empty-body indexing behavior.
 
-For an existing index, preview with `recall classify --all --dry-run`, then apply with `recall classify --all`. This reads original logs using each row's stored source/path and updates only classification, without regenerating embeddings. A missing/unreadable/changing/invalid log or an identity mismatch retains an existing label; an unclassified row instead uses its stored first turn. Warnings summarize these conditions. A readable log with unknown provenance uses the first-turn fallback even with `--all`; known provenance also works without a user turn. Repeating the operation is stable for unchanged inputs. The write transaction blocks other index writers while logs are read; schedule this operation between indexing runs on large archives. Search/show remain read-only.
+For an existing index, preview with `recall classify --all --dry-run`, then apply with `recall classify --all`. Both dry-run modes open the DB read-only: they do not create the DB or parent directories, migrate the schema, or change stored data or existing file permissions. A missing DB returns zero classifications in the usual JSON envelope when `--json` is set.
+
+Older schemas can be previewed if `sessions` has `session_id`, `source`, `file_path`, and `session_type`, and `messages` has `session_id`, `role`, `text`, and `rowid`; index-only columns and `parse_diagnostics` are not required. Missing read structures produce an error with rebuild guidance, without writing. Applying without `--dry-run` still performs any required migrations.
+
+Committed WAL changes are read through SQLite's normal read-only connection; SQLite may use shared memory (`-shm`) to coordinate readers. If the read-only-directory fallback cannot read a nonempty WAL, preview stops with guidance to copy the DB and its sidecars to a writable location.
+
+Classification reads original logs using each row's stored source/path. On a current schema, applying changes only classification, without regenerating embeddings. A missing/unreadable/changing/invalid log or an identity mismatch retains an existing label; an unclassified row instead uses its stored first turn. Warnings summarize these conditions. A readable log with unknown provenance uses the first-turn fallback even with `--all`; known provenance also works without a user turn. Repeating the operation is stable for unchanged inputs. When applying, the write transaction blocks other index writers while logs are read; schedule this operation between indexing runs on large archives. Search/show remain read-only.
 
 ### Doctor
 
