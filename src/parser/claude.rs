@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::Value;
 
+use super::provenance::{SessionOrigin, claude_parent};
+
 use super::{
     Message, ParseResult, Role, SessionData, Source, extract_text, extract_tool_use_path,
     is_valid_scanned_path, parse_iso_timestamp, parse_jsonl_entries, session_id_from_path,
@@ -10,6 +12,7 @@ use super::{
 };
 
 struct ClaudeParseState {
+    origin: SessionOrigin,
     project: String,
     slug: String,
     earliest_ts: Option<i64>,
@@ -60,6 +63,9 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
         return None;
     };
 
+    state.origin.has_records = true;
+    state.origin.automated |= entry.get("isSidechain").and_then(Value::as_bool) == Some(true);
+
     let msg_content = match entry.get("message") {
         Some(Value::Object(msg)) => msg.get("content"),
         Some(Value::String(_)) => entry.get("message"),
@@ -92,15 +98,33 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
         return Ok(None);
     };
 
+    let parent = claude_parent(path);
     let mut state = ClaudeParseState {
+        origin: SessionOrigin {
+            automated: parent.is_some(),
+            ..Default::default()
+        },
         project: String::new(),
         slug: String::new(),
         earliest_ts: None,
         scanned_files: Vec::new(),
     };
 
-    let (messages, diagnostics) =
-        parse_jsonl_entries(path, |entry| process_claude_entry(entry, &mut state))?;
+    let (messages, diagnostics) = parse_jsonl_entries(path, |entry| {
+        let message = process_claude_entry(entry, &mut state);
+        if (matches!(
+            entry.get("type").and_then(Value::as_str),
+            Some("user" | "human" | "assistant")
+        ) || matches!(
+            entry.get("role").and_then(Value::as_str),
+            Some("user" | "assistant")
+        )) && let Some(id) = entry.get("sessionId").and_then(Value::as_str)
+        {
+            state.origin.identity_conflict |= id != session_id && Some(id) != parent;
+        }
+        message
+    })?;
+    state.origin.automated &= !state.origin.identity_conflict;
 
     if state.slug.is_empty() {
         state.slug = session_id.chars().take(12).collect();
@@ -118,6 +142,7 @@ pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
         messages,
         scanned_files: state.scanned_files,
         diagnostics,
+        origin: state.origin,
     }))
 }
 

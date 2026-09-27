@@ -16,7 +16,7 @@ mod search;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
-use std::fs::{OpenOptions, create_dir_all};
+use std::fs::{OpenOptions, create_dir_all, metadata};
 use std::io::{self, ErrorKind, Write};
 use std::num::ParseIntError;
 use std::path::{Path, PathBuf};
@@ -144,7 +144,7 @@ enum Command {
         #[arg(long, default_value_t = DEFAULT_WINDOW)]
         window: i64,
     },
-    /// Classify existing sessions interactive/automated from their first user turn
+    /// Classify existing sessions from source provenance and their first user turn
     Classify {
         /// Re-classify every session (default: only unclassified)
         #[arg(long)]
@@ -2215,73 +2215,134 @@ struct ClassifyOutcome {
     excerpt: String,
 }
 
-/// Re-classify existing sessions from their first user turn and update
-/// `session_type`. With `all`, every session that has a user turn is re-evaluated;
-/// otherwise only those still unclassified (NULL). When `dry_run`, nothing is
-/// written — the caller displays the returned outcomes. Sessions without a user
-/// turn are left untouched (NULL = interactive).
+/// Re-read provenance only from the stored source/path and matching identity.
+/// Failure is distinct from a readable session with unknown provenance.
+fn read_classification_origin(
+    path: &str,
+    source: &str,
+    session_id: &str,
+) -> Result<bool, &'static str> {
+    let source = Source::from_db(source).ok_or("unknown source")?;
+    let path = Path::new(path);
+    let stat = || {
+        let meta = metadata(path).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                "missing file"
+            } else {
+                "read failure"
+            }
+        })?;
+        if !meta.is_file() {
+            return Err("not a regular file");
+        }
+        Ok((meta.len(), meta.modified().map_err(|_| "read failure")?))
+    };
+    let before = stat()?;
+    let parsed = parser::parse_session_including_empty(path, source)
+        .map_err(|_| "read failure")?
+        .ok_or("invalid format")?;
+    if stat()? != before {
+        return Err("file changed during read");
+    }
+    if parsed.metadata.session_id != session_id || parsed.origin.identity_conflict {
+        return Err("session ID mismatch");
+    }
+    if !parsed.diagnostics.is_empty() || !parsed.origin.has_records {
+        return Err("invalid format");
+    }
+    Ok(parsed.origin.automated)
+}
+
+/// Explicit classification changes only session_type. Hold a writer reservation
+/// before taking the snapshot, so indexing cannot replace rows during file reads.
+/// Dry runs use a read transaction and never acquire a writer reservation.
 fn reclassify_sessions(
     conn: &mut Connection,
     all: bool,
     dry_run: bool,
 ) -> Result<Vec<ClassifyOutcome>> {
-    // First user turn per session: the lowest-rowid user message (document order,
-    // AS-003). Without `all`, restrict to still-unclassified sessions.
-    let base = "SELECT m.session_id, m.text FROM messages m \
-        WHERE m.rowid IN (SELECT MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id)";
-    let sql = if all {
-        base.to_owned()
-    } else {
-        format!(
-            "{base} AND m.session_id IN (SELECT session_id FROM sessions WHERE session_type IS NULL)"
-        )
-    };
+    reclassify_sessions_with(conn, all, dry_run, read_classification_origin)
+}
 
+fn reclassify_sessions_with(
+    conn: &mut Connection,
+    all: bool,
+    dry_run: bool,
+    mut read_origin: impl FnMut(&str, &str, &str) -> Result<bool, &'static str>,
+) -> Result<Vec<ClassifyOutcome>> {
+    use rusqlite::TransactionBehavior;
+    use std::collections::BTreeMap;
+
+    let tx = conn.transaction_with_behavior(if dry_run {
+        TransactionBehavior::Deferred
+    } else {
+        TransactionBehavior::Immediate
+    })?;
     let outcomes = {
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        let mut stmt = tx.prepare(
+            // SQLite's single MIN aggregate takes text from that minimum row.
+            // Group once rather than scanning the FTS table for every session.
+            "WITH first_turn AS (SELECT session_id, text, MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id) \
+             SELECT s.session_id, s.source, s.file_path, s.session_type, m.text \
+             FROM sessions s LEFT JOIN first_turn m ON m.session_id = s.session_id \
+             WHERE ?1 OR s.session_type IS NULL ORDER BY s.session_id",
+        )?;
+        let rows = stmt.query_map([all], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
         })?;
         let mut outcomes = Vec::new();
+        let mut unavailable = BTreeMap::<&str, usize>::new();
         for row in rows {
-            let (session_id, first_turn) = row?;
-            let session_type = classify::classify_first_turn(&first_turn);
-            // The excerpt is for --dry-run display only; skip the allocation on the
-            // write path where it is never read.
-            let excerpt = if dry_run {
-                first_turn.trim_start().chars().take(80).collect()
-            } else {
-                String::new()
+            let (session_id, source, path, previous, first_turn) = row?;
+            let origin = match read_origin(&path, &source, &session_id) {
+                Ok(origin) => origin,
+                Err(reason) => {
+                    *unavailable.entry(reason).or_default() += 1;
+                    // Do not erase an existing provenance-based classification
+                    // just because the source log is temporarily unavailable.
+                    if previous.is_some() {
+                        continue;
+                    }
+                    false
+                }
             };
+            let first_turn = first_turn.as_deref().unwrap_or("");
             outcomes.push(ClassifyOutcome {
                 session_id,
-                session_type,
-                excerpt,
+                session_type: classify::classify_session(first_turn, origin),
+                excerpt: if dry_run {
+                    first_turn.trim_start().chars().take(80).collect()
+                } else {
+                    String::new()
+                },
             });
+        }
+        for (reason, count) in unavailable {
+            eprintln!(
+                "warning: provenance unavailable ({reason}): {count} session(s); existing labels retained, unclassified rows use first-turn fallback"
+            );
         }
         outcomes
     };
-
     if !dry_run {
-        // One transaction for the whole batch: a single commit instead of one per
-        // row, and all-or-nothing so an interrupted run leaves session_type
-        // unchanged and is cleanly re-runnable.
-        let tx = conn.transaction()?;
-        {
-            let mut update =
-                tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1")?;
-            for o in &outcomes {
-                update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
-            }
+        let mut update =
+            tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1")?;
+        for o in &outcomes {
+            update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
         }
-        tx.commit()?;
     }
-
+    tx.commit()?;
     Ok(outcomes)
 }
 
-/// `recall classify`: tag existing sessions interactive/automated from their first
-/// user turn (#24 Phase 3). `--all` re-classifies every session; otherwise only
+/// `recall classify`: tag existing sessions using source provenance, then the
+/// stored first user turn (#327). `--all` re-classifies every session; otherwise only
 /// unclassified ones. `--dry-run` reports what would change without writing.
 fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;

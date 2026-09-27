@@ -39,3 +39,17 @@ fn test_human_and_empty_turn_is_interactive() {
         );
     }
 }
+
+#[test]
+fn quoted_and_mid_sentence_markers_do_not_hide_human_turns() {
+    for marker in AUTOMATED_MARKERS {
+        for turn in [
+            format!("Explain {marker} in this log"),
+            format!("`{marker}` is printed; why?"),
+            format!("\"{marker}\" is printed; why?"),
+            format!("```text\n{marker}\n```\nWhat does this mean?"),
+        ] {
+            assert_eq!(classify_session(&turn, false), SessionType::Interactive);
+        }
+    }
+}

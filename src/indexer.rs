@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::chunker;
 
-use crate::classify::classify_first_turn;
+use crate::classify::classify_session;
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
@@ -246,16 +246,15 @@ fn upsert_session(
         delete_session_dependents(ctx.tx, session_id)?;
     }
 
-    // Classify from the first user turn so `recall search` can exclude automated
-    // sessions by default (#24). Done at ingest from the already-parsed messages —
-    // no extra read. No user turn → interactive (never hidden by default).
-    let session_type = classify_first_turn(
+    // Use provenance collected during parsing; no second file read (#327).
+    let session_type = classify_session(
         parsed
             .messages
             .iter()
             .find(|m| matches!(m.role, Role::User))
             .map(|m| m.text.as_str())
             .unwrap_or(""),
+        parsed.origin.automated,
     )
     .as_str();
 
@@ -463,6 +462,12 @@ fn index_file_with_parser(
             });
         };
         if !parsed.diagnostics.is_empty() {
+            return Ok(IndexOutcome::Failed);
+        }
+        // Records for another identity cannot prove this session is empty or
+        // supply its provenance. Preserve the row and leave the file pending.
+        // A genuinely empty read has no identity evidence and still clears it.
+        if parsed.origin.has_records && parsed.metadata.session_id != entry.session_id {
             return Ok(IndexOutcome::Failed);
         }
         parsed.metadata.session_id.clone_from(&entry.session_id);

@@ -152,7 +152,16 @@ recall classify --all       # 全セッションを再分類
 recall classify --dry-run   # 変更内容のみ表示し書き込まない
 ```
 
-各セッションは最初のユーザー発話から interactive または automated に分類されます。automated（hook/script/agent生成）セッションは検索からデフォルトで除外され、`--include-automated` で含められます。
+索引時と明示的な再分類では、次の優先順を使います。
+
+1. 既知の生成元の出自があれば `automated`。Claude はユーザー／アシスタントのメッセージにある真偽値 `isSidechain: true`、または `<親 UUID>/subagents/agent-<ID>.jsonl` という限定された配置を使います。Codex は `session_meta.payload.thread_source` の `subagent`、`guardian_review`、`memory_consolidation`、または既知の `source` 形式（`subagent` の `review`、`compact`、`memory_consolidation`、構造化された `thread_spawn`、旧形式の `subagent.other: guardian`、`internal` の `guardian`／`memory_consolidation`）を使います。`thread_spawn` には親 UUID と整数の depth が必要です。一方のフィールドが未知の feature でも、もう一方に既知の根拠があれば採用します。
+2. それ以外は、既存の先頭ユーザー発話の prefix 判定を使います。一致しない場合やユーザー発話がない場合は `interactive` です。文中の言及、引用されたマーカー、エージェント名、`exec`／`vscode`、未知の feature／`other` 名だけでは自動生成の根拠にしません。
+
+automated は通常検索から除外され、`--include-automated` で含められます。分類によって本文を削除したり、索引対象を除外したり、埋め込み処理量を減らしたりはしません。[判定根拠と形式の限界](docs/research/session-provenance-classification.md)も参照してください。
+
+メタデータだけのログを再索引する際、レコードから得た会話 ID が保存済み ID と異なる場合は、既存会話を変更せず再試行対象に残します。同一 ID のメタデータは分類の更新に使い、会話レコードのない空ログは従来の空本文の索引処理に従います。
+
+既存 DB には `recall classify --all --dry-run` で確認してから `recall classify --all` で適用します。保存済みの source とパスから元ログを読み、埋め込みを再生成せず分類だけを更新します。ログの欠落・読取り失敗・読取り中の変更・不正形式・ID 不一致では既存分類を保持し、未分類行だけは保存済み先頭文で判定します。これらは理由別の件数を警告します。正常に読める未知の出自は `--all` でも先頭文判定へ戻り、既知の出自はユーザー発話がなくても使えます。同じ入力への反復適用で結果は変わりません。書込みトランザクション中はログ読取りの間も他の索引更新を待たせるため、大きなアーカイブでは索引処理と時間を分けて実行してください。search/show は読取り専用のままです。
 
 ### Doctor
 

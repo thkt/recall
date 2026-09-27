@@ -1,5 +1,6 @@
 mod claude;
 mod codex;
+mod provenance;
 
 pub use claude::parse_claude_session;
 pub use codex::parse_codex_session;
@@ -90,6 +91,7 @@ pub struct ParseResult {
     /// into `messages` / `qa_chunks`; the indexer persists them to `session_files`.
     pub scanned_files: Vec<String>,
     pub diagnostics: LineDiagnostics,
+    pub origin: provenance::SessionOrigin,
 }
 
 /// Counts only malformed input; valid excluded events and blank lines are not errors.

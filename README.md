@@ -164,7 +164,16 @@ recall classify --all       # re-classify every session
 recall classify --dry-run   # report what would change without writing
 ```
 
-Each session is classified interactive or automated from its first user turn. Automated sessions (hook/script/agent-generated) are excluded from search by default; pass `--include-automated` to include them.
+Classification uses the following priority at indexing and during explicit reclassification:
+
+1. Known source provenance → `automated`. Claude: boolean `isSidechain: true` on a user/assistant message, or the exact `<parent UUID>/subagents/agent-<ID>.jsonl` layout. Codex: `session_meta.payload.thread_source` equal to `subagent`, `guardian_review`, or `memory_consolidation`; or known `source` variants (`subagent`: `review`, `compact`, `memory_consolidation`, structured `thread_spawn`; legacy `subagent.other: guardian`; `internal`: `guardian` or `memory_consolidation`). A `thread_spawn` requires a UUID parent and an integer depth. Either known Codex field suffices even if the other contains an unknown feature.
+2. Otherwise, apply the existing first-user-turn prefix markers. Unmatched or absent user turns are `interactive`. Mentions in the middle of text, quoted markers, agent names, `exec`/`vscode`, and unknown feature/`other` names alone do not establish automated provenance.
+
+Automated sessions are excluded from ordinary search; `--include-automated` includes them. Classification does not delete messages, exclude files from indexing, or reduce embedding work. See the [provenance evidence and format limits](docs/research/session-provenance-classification.md).
+
+When reindexing a metadata-only log, records resolving to a different session ID leave the stored session unchanged and pending retry. Metadata for the same ID can update its classification; an empty log without session records still follows the existing empty-body indexing behavior.
+
+For an existing index, preview with `recall classify --all --dry-run`, then apply with `recall classify --all`. This reads original logs using each row's stored source/path and updates only classification, without regenerating embeddings. A missing/unreadable/changing/invalid log or an identity mismatch retains an existing label; an unclassified row instead uses its stored first turn. Warnings summarize these conditions. A readable log with unknown provenance uses the first-turn fallback even with `--all`; known provenance also works without a user turn. Repeating the operation is stable for unchanged inputs. The write transaction blocks other index writers while logs are read; schedule this operation between indexing runs on large archives. Search/show remain read-only.
 
 ### Doctor
 
