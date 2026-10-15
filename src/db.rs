@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
 
-use amici::migration::notify_schema_change;
+use crate::embedding::EMBEDDING_DIMS;
+use crate::runtime::notify_schema_change;
+use crate::storage::ensure_sqlite_vec;
 use anyhow::Result;
-use rurico::embed::EMBEDDING_DIMS;
-use rurico::storage::ensure_sqlite_vec;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tracing::warn;
 

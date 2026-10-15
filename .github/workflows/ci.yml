@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -40,10 +41,10 @@ jobs:
           tool: cargo-nextest
 
       - name: Test
-        run: cargo nextest run --profile ci
+        run: cargo nextest run --profile ci --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   coverage:
     # Diff coverage gate: fail when coverage of the lines this PR adds or
@@ -51,8 +52,7 @@ jobs:
     # branches) cannot merge untested. No overall-percent floor (which would
     # flag existing unreachable code); no base-vs-PR double measurement.
     # Rationale: ported from yomu (Issue #223), THRESHOLDS.md "Coverage".
-    # Runs on macos like the test job: the rurico dependency pulls mlx-sys
-    # (MLX FFI), which needs BLAS + Apple silicon and cannot build on Linux.
+    # Runs on macos like the test job: the pinned Gemma backend uses llama.cpp/Metal on Apple silicon.
     # Mirrors the test job's default feature set so coverage matches what
     # the tests exercise.
     runs-on: macos-latest
@@ -65,6 +65,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
           fetch-depth: 0
 
       - name: Install Rust
@@ -81,8 +82,36 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Generate lcov coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+      - name: Measure standard tests
+        run: |
+          # --no-report accumulates profiles across the following invocations.
+          # Clear restored artifacts first so only this head's tests count.
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --locked --no-report
+
+      - name: Stage checksum-pinned public Gemma artifacts
+        run: |
+          target/llvm-cov-target/debug/recall model manifest > "$RUNNER_TEMP/gemma-manifest.json"
+          python3 scripts/fetch-gemma-test-artifacts.py \
+            "$RUNNER_TEMP/gemma-manifest.json" "$RUNNER_TEMP/gemma-public-model"
+
+      - name: Measure public model inference contracts
+        env:
+          RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
+          RECALL_MODEL_DIR: ${{ runner.temp }}/gemma-public-model
+        run: |
+          cargo llvm-cov --locked --no-report --bin recall -- \
+            --ignored public_model_contract --test-threads=1
+
+      - name: Measure public model CLI and probe contracts
+        env:
+          RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
+        run: |
+          cargo llvm-cov --locked --no-report --test gemma_cli -- \
+            --ignored public_model_cli_contract --test-threads=1 --nocapture
+
+      - name: Generate combined lcov coverage
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Test coverage filter script
         run: |
@@ -120,6 +149,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install cargo-deny and cargo-audit
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17

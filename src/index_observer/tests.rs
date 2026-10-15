@@ -50,7 +50,7 @@ fn slow_loader_is_announced_before_work_and_run_counts_distinguish_changes() {
                     );
                 } else if line.contains("chunking:") {
                     assert_eq!(
-                        count("SELECT count(*) FROM sessions WHERE chunks_indexed = 1"),
+                        count("SELECT count(*) FROM sessions WHERE chunks_indexed = 2"),
                         1
                     );
                     assert!(count("SELECT count(*) FROM qa_chunks") > 0);

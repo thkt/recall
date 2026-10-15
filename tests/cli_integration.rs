@@ -3,7 +3,7 @@
 //! error-classification glue that unit tests cannot reach in-process.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
@@ -26,6 +26,8 @@ mod root_skip;
 fn recall(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_recall"));
     cmd.env("RECALL_DB", dir.join("recall.db"))
+        .env("RECALL_MODEL_DIR", dir.join("no-model"))
+        .env_remove("RECALL_MODEL_MANIFEST")
         .env("RECALL_CLAUDE_DIR", dir.join("no-claude"))
         .env("RECALL_CODEX_DIR", dir.join("no-codex"))
         .env_remove("CLAUDE_CODE_SESSION_ID");
@@ -587,89 +589,23 @@ fn status_json_without_index_reports_zero_counts() {
     );
 }
 
-/// Populate an HF Hub cache under `hf_home` with valid DEFAULT-model artifacts so
-/// `cached_artifacts(ModelId::DEFAULT)` verifies as ready. Builds the
-/// `hub/models--{slug}/refs/{revision}` → `snapshots/{hash}/` layout
-/// `hf_hub::Cache::from_env` expects (root is `$HF_HOME/hub`). The fixtures mirror
-/// rurico's `test_support` (VALID_CONFIG_JSON / MINIMAL_TOKENIZER_JSON /
-/// FAKE_BACKBONE_KEY), which is `pub(crate)` and so unreachable from here.
-fn setup_cached_default_model(hf_home: &Path) {
-    // ruri-v3-310m is ModelId::DEFAULT; the revision keys the refs file name.
-    let repo_slug = "cl-nagoya--ruri-v3-310m";
-    let revision = "18b60fb8c2b9df296fb4212bb7d23ef94e579cd3";
-    // hf-hub 1.0 resolves a 40-hex commit-hash revision directly to
-    // `snapshots/{revision}` (skipping `refs/`), so the snapshot dir must be
-    // named after the revision itself for the staged cache to resolve.
-    let commit = revision;
-    let repo_dir = hf_home.join("hub").join(format!("models--{repo_slug}"));
-    let refs_dir = repo_dir.join("refs");
-    fs::create_dir_all(&refs_dir).unwrap();
-    fs::write(refs_dir.join(revision), commit).unwrap();
-    let snapshot = repo_dir.join("snapshots").join(commit);
-    fs::create_dir_all(&snapshot).unwrap();
-
-    // config.json must parse as a valid ModernBERT Config (artifacts.rs verify_config).
-    let config = r#"{
-        "vocab_size": 1000,
-        "hidden_size": 768,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 12,
-        "intermediate_size": 3072,
-        "max_position_embeddings": 512,
-        "layer_norm_eps": 1e-5,
-        "pad_token_id": 0,
-        "global_attn_every_n_layers": 3,
-        "global_rope_theta": 160000.0,
-        "local_attention": 128,
-        "local_rope_theta": 10000.0
-    }"#;
-    fs::write(snapshot.join("config.json"), config).unwrap();
-
-    // Minimal BPE tokenizer accepted by tokenizers 0.22+ (verify_tokenizer).
-    let tokenizer = r#"{
-        "version": "1.0",
-        "model": {"type": "BPE", "vocab": {}, "merges": []},
-        "added_tokens": [],
-        "normalizer": null,
-        "pre_tokenizer": null,
-        "post_processor": null,
-        "decoder": null,
-        "truncation": null,
-        "padding": null
-    }"#;
-    fs::write(snapshot.join("tokenizer.json"), tokenizer).unwrap();
-
-    // safetensors carrying one `layers.` backbone key (verify_embed_kind) and no
-    // reranker key, with one f32 of weight data.
-    fs::write(
-        snapshot.join("model.safetensors"),
-        fake_safetensors(&["layers.0.attn.Wo.weight"]),
-    )
-    .unwrap();
-}
-
-/// Structurally valid safetensors with the given tensor keys, each one f32 of
-/// data. Mirrors rurico `test_support::write_fake_safetensors`.
-fn fake_safetensors(keys: &[&str]) -> Vec<u8> {
-    let mut header = serde_json::Map::new();
-    header.insert("__metadata__".to_owned(), serde_json::json!({}));
-    let mut offset = 0usize;
-    for &key in keys {
-        let end = offset + 4;
-        header.insert(
-            key.to_owned(),
-            serde_json::json!({"dtype": "F32", "shape": [1], "data_offsets": [offset, end]}),
-        );
-        offset = end;
+/// An explicit fixture manifest verifies exact artifacts without claiming that
+/// synthetic bytes can pass the separate live model probe.
+fn setup_cached_default_model(root: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let output = recall(root).args(["model", "manifest"]).output().unwrap();
+    assert!(output.status.success());
+    let mut spec: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    for (name, key, bytes) in [
+        ("model.gguf", "model_sha256", b"fixture GGUF".as_slice()),
+        ("tokenizer.json", "tokenizer_sha256", b"{}".as_slice()),
+    ] {
+        fs::write(root.join(name), bytes).unwrap();
+        spec[key] = format!("{:x}", Sha256::digest(bytes)).into();
     }
-    let header_json = serde_json::to_vec(&header).unwrap();
-    let mut out = Vec::new();
-    out.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-    out.extend_from_slice(&header_json);
-    for _ in keys {
-        out.extend_from_slice(&0f32.to_le_bytes());
-    }
-    out
+    let path = root.join("manifest.json");
+    fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
+    path
 }
 
 // T-CLI020: `status --json` reports model_ready:true when the model artifacts are
@@ -682,9 +618,12 @@ fn fake_safetensors(keys: &[&str]) -> Vec<u8> {
 fn status_json_without_index_reports_model_ready_when_cached() {
     let dir = TempDir::new().unwrap();
     let hf_home = TempDir::new().unwrap();
-    setup_cached_default_model(hf_home.path());
+    let manifest = setup_cached_default_model(hf_home.path());
     let out = recall(dir.path())
         .env("HF_HOME", hf_home.path())
+        .env("RECALL_MODEL_DIR", hf_home.path())
+        .arg("--model-manifest")
+        .arg(manifest)
         .args(["status", "--json"])
         .output()
         .expect("spawn recall binary");

@@ -1,6 +1,6 @@
 use std::fs;
 
-use amici::testing::hybrid::assert_filter_symmetric;
+use crate::compat::assert_filter_symmetric;
 
 use super::*;
 use crate::db::{seed_session_file, setup_test_db};

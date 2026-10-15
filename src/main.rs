@@ -1,17 +1,23 @@
 mod ansi;
 mod chunker;
 mod classify;
+mod compat;
 mod date;
 mod db;
 mod embedder;
+mod embedding;
 mod envelope;
 mod error;
 mod hybrid;
 mod index_observer;
 mod indexer;
+mod model;
+mod native;
 mod output;
 mod parser;
+mod runtime;
 mod search;
+mod storage;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -24,19 +30,20 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use amici::cli::exit_code::codes;
-use amici::cli::{done, exit_error, info as cli_info, try_expand_shorthand, warning};
-use amici::logging::init_subscriber;
-use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
-use amici::model::{
-    EmbedderDegraded, degrade_with_warn, download_and_verify_model, record_degraded,
+use crate::compat::filter::escape_like;
+use crate::embedding::{EMBEDDING_DIMS, Embed};
+use crate::model::handle_probe_if_needed;
+use crate::model::{
+    DegradedReason, EmbedderDegraded, degrade_with_warn, download_and_verify_model,
+    record_degraded, try_load_embedder_default_logging,
 };
-use amici::storage::{collect_rows, filter::escape_like};
+use crate::model::{ModelId, cached_artifacts};
+use crate::runtime::{
+    codes, done, exit_error, info as cli_info, init_subscriber, try_expand_shorthand, warning,
+};
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand};
-use rurico::embed::{EMBEDDING_DIMS, Embed, ModelId, cached_artifacts};
-use rurico::handle_probe_if_needed;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, warn};
 
@@ -62,6 +69,10 @@ struct Cli {
     #[arg(long, env = "RECALL_DB", global = true)]
     db_path: Option<PathBuf>,
 
+    /// Pinned Gemma model manifest. Select an older saved manifest to roll back.
+    #[arg(long, env = "RECALL_MODEL_MANIFEST", global = true)]
+    model_manifest: Option<PathBuf>,
+
     /// Emit a machine-readable JSON envelope instead of human-readable text
     #[arg(long, global = true)]
     json: bool,
@@ -69,13 +80,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Parse and chunk new session logs (incremental). No model calls.
+    /// Parse, chunk, and embed new session logs (incremental).
     Index {
         #[command(flatten)]
         embed_flags: EmbedFlags,
     },
     /// Re-parse and re-embed every present session; a missing or unreadable
-    /// source root keeps its existing index. No model calls.
+    /// source root keeps its existing index.
     Rebuild {
         #[command(flatten)]
         embed_flags: EmbedFlags,
@@ -171,6 +182,8 @@ enum Command {
 enum ModelCommand {
     /// Download the embedding model and verify it loads.
     Download,
+    /// Print the selected pinned manifest for archiving, updates, or rollback.
+    Manifest,
 }
 
 /// Embed-pass tuning flags shared verbatim by `index` and `rebuild`
@@ -180,8 +193,8 @@ enum ModelCommand {
 struct EmbedFlags {
     /// Forward-pass token budget override; smaller values shorten each GPU
     /// forward so the host stays responsive during large embed runs. Clamped
-    /// down to 256_000 (never up) so it cannot exceed the embedder's own
-    /// OOM ceiling.
+    /// down to 256_000 (never up). Gemma packing is additionally capped at
+    /// 8192 tokens; one attention window remains atomic.
     #[arg(long, env = "RECALL_TOKEN_BUDGET", value_parser = parse_token_budget)]
     token_budget: Option<usize>,
 
@@ -227,7 +240,15 @@ fn open_or_create_db(path: &Path) -> Result<Connection> {
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).context("Failed to create database file"),
     }
-    db::open_db(path).context("Failed to open database")
+    // Check the identity read-only before schema creation or any WAL-mode change.
+    {
+        let (existing, _) = db::open_db_readonly(path)?;
+        model::check_index(&existing, model::selected())
+            .map_err(|e| RecallError::DatabaseRead(e.to_string()))?;
+    }
+    let mut conn = db::open_db(path).context("Failed to open database")?;
+    model::bind_index(&mut conn, model::selected())?;
+    Ok(conn)
 }
 
 fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
@@ -253,7 +274,11 @@ fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -
             .join(".local")
             .join("share"),
     };
-    Ok(data_home.join("recall").join("recall.db"))
+    Ok(data_home
+        .join("recall")
+        .join("indexes")
+        .join(model::selected().identity())
+        .join("recall.db"))
 }
 
 fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
@@ -618,17 +643,9 @@ where
     // present), and the same handle is reused for the embed step below so the
     // model loads at most once (#215). The seam's `FnOnce` bound makes the single
     // call structural.
-    // A loaded model can still fail the forward pass: the production load probe
-    // only constructs the model (rurico dispatch.rs `Embedder::new().map(|_| ())`)
-    // and runs no inference, so corrupt weights that error during real embedding
-    // pass load yet return load-Ok. Run one minimal `embed_document` probe so
-    // `embed_capable` reflects inference capability, not just load. On failure,
-    // demote to `ProbeFailed` so the preserve path runs instead of a destructive
-    // re-index the failing embed step cannot rebuild (#230, guarding #215's
-    // preserve). `degrade_with_warn` keeps the typed error in the structured warn
-    // before collapsing to the coarse reason (amici ADR-0009 house rule). The probe
-    // input is a non-degenerate string; an empty one would make pooling reject a
-    // healthy model's all-zero mask.
+    // The isolated probe checks query inference. Also probe document planning
+    // on the parent handle before allowing any embedded-session replacement.
+    // Failure preserves existing embeddings and pending work (#230 / #215).
     let loading = observer.stage("model_load_probe");
     let load_result = load_embedder().and_then(|embedder| {
         embedder
@@ -950,7 +967,20 @@ where
     // degraded:true on a complete file list (#249 honest-degraded contract).
     // A failed embedder load on the query path degrades search to FTS-only with
     // a reason-aware note for the `--json` channel; see search_degraded_state.
-    let (mut degraded, mut notes, embedder) = if query.is_some() {
+    let identity_error = if query.is_some() {
+        model::check_index(&conn, model::selected()).err()
+    } else {
+        None
+    };
+    let (mut degraded, mut notes, embedder) = if let Some(error) = identity_error {
+        (
+            true,
+            vec![format!(
+                "semantic search unavailable: {error}; results are text-only"
+            )],
+            None,
+        )
+    } else if query.is_some() {
         let embedder = load_embedder();
         let (degraded, notes) = search_degraded_state(&embedder);
         (degraded, notes, embedder.ok())
@@ -1066,7 +1096,7 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
     let mut msg_stmt =
         conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
     let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let messages: Vec<(String, String)> = collect_rows::<_, _, _, Error>(rows)?;
+    let messages: Vec<(String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Writes to an in-memory Vec are infallible; the pipe is only touched later
     // by the single emit_success -> emit_success_to write path.
@@ -1126,7 +1156,7 @@ fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::Sessio
             timestamp: row.get(5)?,
         })
     })?;
-    let matches: Vec<parser::SessionData> = collect_rows::<_, _, _, Error>(rows)?;
+    let matches: Vec<parser::SessionData> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     if matches.is_empty() {
         return Err(RecallError::Usage(format!("No session found matching '{session_id}'")).into());
@@ -1232,7 +1262,7 @@ fn render_windowed(
             row.get::<_, String>(2)?,
         ))
     })?;
-    let msgs: Vec<(i64, String, String)> = collect_rows::<_, _, _, Error>(rows)?;
+    let msgs: Vec<(i64, String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Body = messages whose rowid lands in [lo, hi]; neighbors are n positions to
     // each side of that body within the same-session list.
@@ -1441,10 +1471,18 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
 
     // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; the
     // reported counts may lag the writer, so mark the envelope degraded.
-    match db::stale_wal_note(&path, tier) {
-        Some(note) => Ok(CommandOutput::with_notes(markdown, data, true, vec![note])),
-        None => Ok(CommandOutput::ok(markdown, data)),
+    let mut notes: Vec<_> = db::stale_wal_note(&path, tier).into_iter().collect();
+    if let Err(error) = model::check_index(&conn, model::selected()) {
+        notes.push(format!(
+            "semantic search unavailable: {error}; results are text-only"
+        ));
     }
+    Ok(CommandOutput::with_notes(
+        markdown,
+        data,
+        !notes.is_empty(),
+        notes,
+    ))
 }
 
 /// One diagnostic check's result: a stable `name`, whether it passed, an optional
@@ -1501,6 +1539,8 @@ impl DoctorCheck {
 /// Remedy for a database that is corrupt, unopenable, or whose check query can't
 /// run: re-create the index from the JSONL sources (the data-loss tier).
 const CORRUPT_DB_REMEDY: &str = "remove the database file and run `recall index`";
+const MODEL_INDEX_REMEDY: &str =
+    "select the matching --model-manifest and index, or build this model in a separate --db-path";
 
 /// Run a DB-backed check, converting an error from the query itself into a
 /// degraded verdict instead of propagating. doctor exists to report on a broken
@@ -1853,6 +1893,16 @@ where
                         run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
                     ]
                 }
+                Err(e)
+                    if e.downcast_ref::<RecallError>()
+                        .is_some_and(|e| matches!(e, RecallError::DatabaseRead(_))) =>
+                {
+                    vec![DoctorCheck::fail(
+                        "integrity",
+                        e.to_string(),
+                        MODEL_INDEX_REMEDY,
+                    )]
+                }
                 Err(e) => open_failure_checks(e),
             }
         }
@@ -1889,8 +1939,17 @@ where
     // The model column comes last on every path (DB-free probe), so it runs even
     // when the DB failed to open. Under --fix it may re-fetch a degraded model
     // and re-probe; the recovery outcome rides alongside for the report.
-    let (model_check, model_recovery) =
+    let (mut model_check, model_recovery) =
         check_model_with_optional_recovery(fix, load_embedder, recover_model);
+    if let Ok((conn, _)) = db::open_db_readonly(&path)
+        && let Err(error) = model::check_index(&conn, model::selected())
+    {
+        model_check = DoctorCheck::fail(
+            "model",
+            error.to_string(),
+            "select the matching --model-manifest and index, or build this model in a separate --db-path",
+        );
+    }
     checks.push(model_check);
 
     let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
@@ -2544,6 +2603,8 @@ fn no_payload() -> CommandOutput {
 }
 
 fn run(cli: Cli) -> Result<CommandOutput> {
+    model::select(cli.model_manifest.as_deref())
+        .map_err(|e| RecallError::DatabaseRead(format!("invalid model manifest: {e}")))?;
     let default_filter = if cli.verbose {
         LOG_FILTER_VERBOSE
     } else {
@@ -2565,6 +2626,13 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         )
         .map(|o| index_command_output(&o)),
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
+        Some(Command::Model(ModelCommand::Manifest)) => {
+            let data = serde_json::to_value(model::selected())?;
+            Ok(CommandOutput::ok(
+                serde_json::to_string_pretty(&data)?,
+                data,
+            ))
+        }
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show {
             session_id,
@@ -2620,10 +2688,45 @@ mod tests {
     use std::assert_matches;
     use std::fs;
 
-    use rurico::embed::{ChunkedEmbedding, EmbedError};
+    use crate::embedding::{ChunkedEmbedding, EmbedError};
 
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn doctor_fix_model_mismatch_preserves_index_and_never_suggests_deletion() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = open_or_create_db(&path).unwrap();
+            conn.execute(
+                "UPDATE embedding_identity SET fingerprint='previous-model'",
+                [],
+            )
+            .unwrap();
+        }
+        let out = run_doctor_with(false, true, &Some(path.clone()), mock_loader, || {
+            panic!("model artifacts must not be replaced for an index identity mismatch")
+        })
+        .unwrap();
+        assert_eq!(out.data["healthy"], false);
+        assert!(out.degraded);
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("matching --model-manifest"))
+        );
+        assert!(out.notes.iter().all(|n| !n.contains("remove the database")));
+        let (conn, _) = db::open_db_readonly(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT fingerprint FROM embedding_identity", [], |r| r
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+            "previous-model"
+        );
+    }
 
     // ADR-0003 Confirmation: `create_db_file` creates the index DB with owner-only
     // 0o600 permission. 0o600 sets only owner bits, so no umask (including the common
@@ -2688,7 +2791,12 @@ mod tests {
 
         let path = resolve_default_db_path(None, Some(home)).unwrap();
 
-        assert_eq!(path, Path::new("/home/u/.local/share/recall/recall.db"));
+        assert_eq!(
+            path,
+            Path::new("/home/u/.local/share/recall/indexes")
+                .join(model::selected().identity())
+                .join("recall.db")
+        );
     }
 
     // An absolute XDG_DATA_HOME wins over the ~/.local/share fallback.
@@ -2698,7 +2806,12 @@ mod tests {
             resolve_default_db_path(Some(OsStr::new("/xdg/data")), Some(Path::new("/home/u")))
                 .unwrap();
 
-        assert_eq!(path, Path::new("/xdg/data/recall/recall.db"));
+        assert_eq!(
+            path,
+            Path::new("/xdg/data/recall/indexes")
+                .join(model::selected().identity())
+                .join("recall.db")
+        );
     }
 
     // A relative XDG_DATA_HOME is ignored per the XDG spec; fall back to home.
@@ -2710,7 +2823,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(path, Path::new("/home/u/.local/share/recall/recall.db"));
+        assert_eq!(
+            path,
+            Path::new("/home/u/.local/share/recall/indexes")
+                .join(model::selected().identity())
+                .join("recall.db")
+        );
     }
 
     // An explicit --db-path / RECALL_DB value passes through untouched.
@@ -2730,8 +2848,12 @@ mod tests {
         let path = resolve_db_path(&None).unwrap();
 
         assert!(
-            path.ends_with("recall/recall.db"),
-            "default path must end with recall/recall.db, got {path:?}"
+            path.ends_with(
+                Path::new("recall/indexes")
+                    .join(model::selected().identity())
+                    .join("recall.db")
+            ),
+            "default path must include the selected model identity, got {path:?}"
         );
     }
 

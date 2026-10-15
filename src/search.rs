@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use amici::storage::filter::{
+use crate::compat::filter::{
     append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
 };
-use amici::storage::{anon_placeholders, fts::clean_for_trigram};
+use crate::compat::{anon_placeholders, clean_for_trigram};
+use crate::embedding::Embed;
+use crate::storage::{QueryNormalizationConfig, SanitizeError, prepare_match_query};
 use anyhow::{Context, Result};
-use rurico::embed::Embed;
-use rurico::storage::{QueryNormalizationConfig, SanitizeError, prepare_match_query};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
