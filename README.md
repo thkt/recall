@@ -43,7 +43,7 @@ recall "authentication"
 brew install thkt/tap/recall
 # or: cargo install --path .
 
-# Download the embedding model once (~1.2 GB), then index your sessions
+# Download the embedding model once (~558 MB plus tokenizer), then index your sessions
 recall model download
 recall index
 
@@ -53,7 +53,7 @@ recall search "authentication"
 
 ## How search works
 
-recall indexes every session into keyword search (FTS5) and, in the same pass, embeds each chunk with a local AI model. Search blends both — **semantic search** finds sessions by meaning, not just keywords — and is read-only, so it returns instantly.
+recall indexes every session into keyword search (FTS5) and, in the same pass, embeds each chunk with a local AI model. Search blends both — **semantic search** finds sessions by meaning, not just keywords — and reads the index without embedding new documents.
 
 ```
 recall index:   Parse + FTS5 + embed every new chunk (needs the model)
@@ -61,7 +61,7 @@ recall search:  Hybrid ranking — FTS5 keyword + vector similarity (RRF), insta
 Over time:      More sessions indexed → broader semantic coverage
 ```
 
-No API keys. No data leaves your machine. The embedding model (Ruri v3) runs locally via MLX on Apple Silicon. Without the model, index still builds FTS5 and search falls back to keyword ranking.
+No API keys. No data leaves your machine. The embedding model (EmbeddingGemma 2 BF16) runs locally via llama.cpp/Metal on Apple Silicon. Without the model, index still builds FTS5 and search falls back to keyword ranking.
 
 ## Usage
 
@@ -114,7 +114,7 @@ An interrupted or failed message/chunk transaction rolls back together. After it
 
 When embedding is unavailable, updates to embedded sessions wait until it is available again. Their stored content, chunks, embeddings, and edited-file records are preserved, including when a parsed replacement containing messages at a different path uses the same session ID and the old file has been deleted. Such deferred updates are excluded from orphan cleanup for that run; deleted logs without such a replacement remain subject to the cleanup rules above.
 
-Embedding needs the model: run `recall model download` (~1.2 GB) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
+Embedding needs the model: run `recall model download` (~558 MB plus tokenizer) once. Without it, `recall index` builds FTS5 only and prints a note to download it; the next index after the model is present embeds the backlog.
 
 Overlapping `index` or `rebuild` runs save an embedding only if the chunk still has the same content and generation inside the save transaction. Results for updated, deleted, or replaced chunks are discarded without deleting another run's current vectors or increasing the embedded count. Any replacement still missing an embedding is eligible on the next `recall index`. This protects new writes when all overlapping runs use this guard; it does not detect previously stored content/vector mismatches. With a working model and available source logs, `recall rebuild` regenerates those embeddings.
 
@@ -130,18 +130,17 @@ recall index --token-budget 2048 --forward-pause-ms 700
 RECALL_TOKEN_BUDGET=2048 RECALL_FORWARD_PAUSE_MS=700 recall index
 ```
 
-`--token-budget` (`RECALL_TOKEN_BUDGET`) overrides the forward-pass token budget: smaller values split the work into shorter GPU forwards, so interactive processes get GPU time between them. Values above 256000 clamp down to 256000 (never up), keeping every forward under the embedder's own OOM ceiling. `--forward-pause-ms` (`RECALL_FORWARD_PAUSE_MS`) sleeps after each GPU forward pass, handing the freed GPU time to the desktop. The two combine: a small budget alone still runs forwards back-to-back, and a pause alone still leaves each forward long (up to minutes at the default budget), so responsiveness during a big backlog embed needs both, for example `--token-budget 2048 --forward-pause-ms 700`. Both flags trade embed throughput for responsiveness; leaving them unset preserves the default full-speed behavior.
+`--token-budget` (`RECALL_TOKEN_BUDGET`) controls packing of document windows into a forward pass; the Gemma backend caps actual packing at 8192 tokens and 32 sequences. A single bidirectional window remains atomic, so it may exceed a smaller requested packing budget. Documents are never silently shortened to satisfy it. `--forward-pause-ms` (`RECALL_FORWARD_PAUSE_MS`) pauses after each forward pass. The CLI retains its existing 256000 upper input clamp; values above the Gemma packing cap have the same effective packing budget.
 
-The index lives at `~/.local/share/recall/recall.db` by default (override with `--db-path` or the `RECALL_DB` env var; recall creates the parent directory on first run). Upgrading from a build that stored it at `~/.recall.db`? Move the old file before re-indexing, otherwise recall starts a fresh empty index at the new path and your past sessions stay invisible to search:
+The default index is `~/.local/share/recall/indexes/<manifest-sha256>/recall.db` (or under absolute `XDG_DATA_HOME`). `--db-path` / `RECALL_DB` overrides the location but never bypasses model identity checks. The old Ruri index is kept in place. Build a separate Gemma index; a nonempty legacy vector index without model identity is read with FTS-only degradation and refuses writes rather than being silently relabeled.
 
-```sh
-mkdir -p ~/.local/share/recall && mv ~/.recall.db ~/.local/share/recall/recall.db
-```
+See [independent validation, model updates and rollback](docs/gemma-model-updates.md). Archive `recall model manifest` with the matching artifacts and index; select a supported newer or older pinned manifest with `--model-manifest` / `RECALL_MODEL_MANIFEST`. Different manifests use different default index namespaces. Model downloads and model updates are explicit.
 
 ### Model
 
 ```sh
-recall model download   # download the embedding model and verify it loads
+recall model download   # download pinned artifacts and verify in an isolated probe
+recall model manifest   # save this manifest with its model and index for rollback
 ```
 
 ### Show
@@ -206,7 +205,7 @@ Add to `~/.claude/settings.json`:
 }
 ```
 
-`recall index` reads its sources from the environment and ignores the hook's stdin payload, so no extra wiring is needed. With the model present, the first fire is a one-time cold start — it embeds your whole backlog (~11 min for 28k chunks); later fires only handle new chunks. Without the model, fires stay FTS-only until you run `recall model download`. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
+`recall index` reads its sources from the environment and ignores the hook's stdin payload, so no extra wiring is needed. With the model present, the first fire is a one-time cold start — it embeds your whole backlog (time depends on corpus and hardware); later fires only handle new chunks. Without the model, fires stay FTS-only until you run `recall model download`. Codex has no SessionEnd hook; run `recall index` manually for Codex sessions.
 
 ## How it works
 
@@ -220,7 +219,7 @@ Add to `~/.claude/settings.json`:
 
 **Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
 
-**Embedding** — `recall index` embeds every new chunk (those without an embedding). Uses Ruri v3 (310M params) via mlx-rs with MLX acceleration on Apple Silicon. Batch inference (batch=128) with length-sorted padding minimization. Download the model once with `recall model download`; without it, index builds FTS5 only and search falls back to keyword ranking.
+**Embedding** — EmbeddingGemma 2 BF16 uses fixed artifact checksums and llama.cpp/Metal, projected 768-dimensional mean-pooled/L2-normalized embeddings. Queries start at a 512-token context and grow to 8192; over-limit queries preserve EOS. Documents use tokenizer-aligned windows of at most 8192 tokens with 2048-token overlap. Generation-checked saves and pending-page bounds remain unchanged. Without verified model artifacts, indexing builds FTS5 and search falls back to keyword ranking.
 
 **Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close.
 
@@ -233,24 +232,17 @@ src/
 ├── indexer.rs    Incremental indexer with mtime/size tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
-├── embedder.rs   Index-time embedding orchestration (batches chunks via rurico)
+├── embedder.rs   Index-time embedding orchestration (generation-checked chunk batches)
 ├── chunker.rs    Q&A pair chunker with size splitting (exact-content reuse in indexer)
 ├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
 └── date.rs       Civil calendar date utilities
 ```
 
-Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
+Single binary. SQLite, llama.cpp, and sqlite-vec are statically linked.
 
 ## Performance
 
-| Operation                       | Time                             |
-| ------------------------------- | -------------------------------- |
-| `recall index` (incremental)    | ~0.5s + embedding for new chunks |
-| `recall index` (first run, 28k) | ~11 min (embedding-dominated)    |
-| `recall rebuild` (28k)          | ~11 min (full re-embed)          |
-| `recall search`                 | instant (read-only)              |
-| Embedding throughput            | ~45 chunks/sec (M3 + MLX)        |
-| Initial model download          | ~1.2 GB                          |
+Gemma product latency and indexing throughput depend on corpus, hardware, checksum verification and the isolated probe. Earlier Ruri/MLX timings are not Gemma benchmarks. The pinned BF16 model is 557,950,176 bytes, plus its tokenizer. See the independent-validation report for measured conditions; no instant-search or throughput guarantee is made.
 
 ## Limitations
 
@@ -258,7 +250,7 @@ Single binary. SQLite, mlx-rs, and sqlite-vec are statically linked.
 | ------------------- | --------------------------------------------------------------------------- |
 | Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync      |
 | Text only           | Images, tool results, and binary content are not indexed                    |
-| Apple Silicon only  | Requires Apple Silicon. The MLX backend has no CPU/Linux fallback           |
+| Apple Silicon only  | Requires Apple Silicon. The supported model probe requires the GPU backend           |
 | Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations |
 
 ## Exit Codes
@@ -302,3 +294,5 @@ This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/rec
 ## License
 
 MIT
+
+Build from source with `git submodule update --init --recursive` followed by `cargo build --release --locked`. The evaluated llama.cpp backend is pinned; amici and rurico are not runtime or build dependencies.

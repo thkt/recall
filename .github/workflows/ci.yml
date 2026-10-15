@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
@@ -51,8 +52,7 @@ jobs:
     # branches) cannot merge untested. No overall-percent floor (which would
     # flag existing unreachable code); no base-vs-PR double measurement.
     # Rationale: ported from yomu (Issue #223), THRESHOLDS.md "Coverage".
-    # Runs on macos like the test job: the rurico dependency pulls mlx-sys
-    # (MLX FFI), which needs BLAS + Apple silicon and cannot build on Linux.
+    # Runs on macos like the test job: the pinned Gemma backend uses llama.cpp/Metal on Apple silicon.
     # Mirrors the test job's default feature set so coverage matches what
     # the tests exercise.
     runs-on: macos-latest
@@ -65,6 +65,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
           fetch-depth: 0
 
       - name: Install Rust
@@ -120,6 +121,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install cargo-deny and cargo-audit
         uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16

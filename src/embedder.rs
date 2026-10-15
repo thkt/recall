@@ -5,30 +5,22 @@ use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use amici::storage::anon_placeholders;
-use anyhow::Result;
-use rurico::embed::Embed;
+use crate::compat::anon_placeholders;
+use crate::embedding::Embed;
 #[cfg(test)]
-use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
+use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
+use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Row, TransactionBehavior};
 use tracing::warn;
 
 use crate::index_observer::Observer;
 
-/// Per-call knobs for the index/rebuild embed pass, threaded from the
-/// `--token-budget` / `--forward-pause-ms` CLI flags down to rurico's
-/// `Embed::embed_documents_batch_with_options`. `None`/`None` (`Default`)
-/// preserves the pre-flag behavior. rurico's `Embedder` applies `token_budget`
-/// to forward-pass sub-batch sizing and sleeps `forward_pause` after each
-/// forward pass (per-forward, not per-batch), so a small budget plus a pause
-/// yields the GPU to interactive processes during large runs.
-pub(crate) use rurico::embed::EmbedOptions;
+/// Per-forward packing and pause settings for the pinned Gemma encoder.
+/// A smaller budget reduces packing; a single document window remains atomic.
+pub(crate) use crate::embedding::EmbedOptions;
 
-/// Ceiling for `--token-budget` (index/rebuild CLI flag), matching rurico's
-/// `TOKEN_BUDGET` forward-pass ceiling (`docs/decisions/0009-...`). Values above
-/// this clamp down (never up) at clap parse time so an over-large flag cannot
-/// push a forward pass past the Metal OOM ceiling the const was chosen to avoid
-/// (rurico does not clamp; the caller owns this bound).
+/// Preserve the public CLI input clamp. The Gemma backend additionally caps
+/// actual packing at 8192 tokens; larger accepted inputs have that same effect.
 pub(crate) const TOKEN_BUDGET_CEILING: usize = 256_000;
 
 #[derive(Default)]
@@ -496,9 +488,7 @@ impl MockEmbedder {
         *self.captured_options.lock().unwrap()
     }
 
-    /// Constructs the error inline: rurico's `EmbedError::inference` helpers are
-    /// `pub(crate)`, and the enum's `#[non_exhaustive]` does not block downstream
-    /// construction of existing variants.
+    /// Construct an inference failure for the pipeline tests.
     fn inference_error(message: String) -> EmbedError {
         EmbedError::Inference {
             message,
@@ -537,15 +527,12 @@ impl Embed for MockEmbedder {
         if self.fail_after.is_some_and(|limit| count >= limit) {
             return Err(Self::inference_error("mock failure".to_owned()));
         }
-        Ok(ChunkedEmbedding::try_new(vec![
-            Self::deterministic_vector(text),
-        ])?)
+        ChunkedEmbedding::try_new(vec![Self::deterministic_vector(text)])
     }
 
     /// Explicit impl of the production dispatch target: `embed_page` calls this
     /// method, so the poison check lives here (all-or-nothing per batch), not in
-    /// the per-item delegate. Being explicit also survives rurico revisions where
-    /// the trait's default body is removed (required at rurico HEAD).
+    /// the per-item delegate.
     fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
         if let Some(poison) = self.fail_on_text.as_deref()
             && texts.contains(&poison)
@@ -560,9 +547,8 @@ impl Embed for MockEmbedder {
     }
 
     /// Records `options` into `captured_options` before delegating
-    /// (T-005/T-006), overriding rurico's ignore-and-delegate default so tests
-    /// can assert the CLI flags → `EmbedOptions` forwarding path. Does not
-    /// sleep: pause application is rurico `Embedder`'s responsibility.
+    /// (T-005/T-006), so tests can assert the CLI flags forwarding path.
+    /// Does not sleep: applying the pause belongs to the native encoder.
     fn embed_documents_batch_with_options(
         &self,
         texts: &[&str],

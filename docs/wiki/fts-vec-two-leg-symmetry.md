@@ -8,7 +8,7 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 
 1. フィルタ条件は `append_session_filter` 群(共有 helper)に追加し、FTS 候補クエリ・vec 検索・file-list の全経路が同じ helper を通ることを確認する
 2. 「フィルタ指定なしなら早期 return」等のガード条件も新しい軸に合わせて更新する
-3. `amici::testing::hybrid::assert_filter_symmetric` で vec-only 回帰テストを併設する(FTS 経路のみのテストで済ませない。既存フィルタ project / days / source には全て併設済み)
+3. `crate::compat::assert_filter_symmetric` で vec-only 回帰テストを併設する(FTS 経路のみのテストで済ませない。既存フィルタ project / days / source には全て併設済み)
 4. 候補数の倍率などの定数は共有 const に置き、FTS 側と vec 側で独立に再計算しない
 5. クエリ正規化を入れる場合は index 側と query 側の設定を同一インスタンスで揃える(片側だけ正規化すると match が空振る)
 

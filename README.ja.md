@@ -41,7 +41,7 @@ recall search "authentication"
 brew install thkt/tap/recall
 # or: cargo install --path .
 
-# モデルを一度ダウンロード（約1.2GB）してからインデックス作成
+# モデルを一度ダウンロード（約558MB＋tokenizer）してからインデックス作成
 recall model download
 recall index
 
@@ -59,7 +59,7 @@ recall search:  ハイブリッドランキング（FTS5 + ベクトル類似度
 継続:           indexを重ねるほどセマンティック検索のカバレッジ向上
 ```
 
-APIキー不要。データはマシンの外に出ません。embeddingモデル（Ruri v3）はApple Silicon上のMLXでローカル実行します。モデルがなくてもindexはFTS5を構築し、検索はキーワードランキングにフォールバックします。
+APIキー不要。データはマシンの外に出ません。embeddingモデル（EmbeddingGemma 2 BF16）はApple Silicon上のllama.cpp/Metalでローカル実行します。モデルがなくてもindexはFTS5を構築し、検索はキーワードランキングにフォールバックします。
 
 ## 使い方
 
@@ -110,17 +110,15 @@ recall rebuild          # 存在する全セッションを再解析・再embedd
 
 embeddingを持つ会話の更新は、embeddingが利用可能になるまで延期します。別パスの置換ファイルを解析してメッセージと同じセッションIDを確認できた場合は、旧ファイルが削除されていても、保存済み本文・チャンク・embedding・記録済み編集対象パスを保持します。こうした更新延期の対象は、その実行では上記の削除対象から除外します。この条件を満たす置換を確認できない削除済みログには、上記の削除条件が適用されます。
 
-embedding にはモデルが必要です。`recall model download`（約1.2GB）で一度取得してください。モデルがない場合 `recall index` はFTS5のみ構築し、ダウンロードを促す note を出します。モデル導入後の次回 index が backlog を embedding します。
+embedding にはモデルが必要です。`recall model download`（約558MB＋tokenizer）で一度取得してください。モデルがない場合 `recall index` はFTS5のみ構築し、ダウンロードを促す note を出します。モデル導入後の次回 index が backlog を embedding します。
 
 `index` や `rebuild` が同時に動く場合、保存 transaction 内でチャンクの本文と世代が推論前と一致した結果だけを保存します。更新・削除・置換されたチャンクの結果は破棄し、別の実行が保存した現在のベクトルを削除せず、埋め込み成功件数にも加算しません。置換後のチャンクが未処理なら、次の `recall index` で処理できます。この保護は、同時に動く全実行がこの照合を行う版である場合の新しい書込みに適用され、既に保存された本文とベクトルの不一致は検出しません。動作するモデルと読める元ログがあれば、`recall rebuild` で埋め込みを再生成できます。
 
 世代管理がないだけで他の読取り条件を満たす索引は、移行や rebuild をせずに `search`・`status`・`show` で参照できます。書込み用に開く際に、既存のチャンクと埋め込みを保持して世代管理を追加します。
 
-インデックスはデフォルトで `~/.local/share/recall/recall.db` に置かれます（`--db-path` または環境変数 `RECALL_DB` で上書き可能。親ディレクトリは初回実行時に作成します）。`~/.recall.db` に保存する旧ビルドからの移行時は、再 index の前に旧ファイルを移動してください。移動しないと recall は新パスに空のインデックスを作り直し、過去セッションが検索から不可視になります。
+既定の索引は `~/.local/share/recall/indexes/<manifest-sha256>/recall.db` です（絶対パスの `XDG_DATA_HOME` があればその配下）。`--db-path` / `RECALL_DB` で変更できますが、モデル識別の照合は省略しません。旧Ruri索引は保持し、Gemmaは別索引に構築してください。識別情報がない既存の非空ベクトル索引は、FTS-onlyのdegraded読取りとなり、暗黙の移行や書込みは拒否します。
 
-```sh
-mkdir -p ~/.local/share/recall && mv ~/.recall.db ~/.local/share/recall/recall.db
-```
+更新と切戻しは[独立索引での検証手順](docs/gemma-model-updates.md)を参照してください。`recall model manifest` を重み・tokenizer・対応索引と一緒に保存し、`--model-manifest` / `RECALL_MODEL_MANIFEST` で対応する新版・旧版を選びます。異なるmanifestは既定の索引も分離し、モデルの取得・更新は明示操作に限定します。
 
 埋め込み待ち本文は最大1,024件・8 MiBのページ単位で取得し、処理後に解放してから次を取得します。8 MiBを超える単一チャンクは切り捨てず単独で処理します。ID・世代・長さの一覧は未処理件数に比例し、モデルや他の索引処理のメモリは別です。推論・保存に失敗したバッチは再試行対象に残し、後続を処理します。保存エラーは一覧の処理後に返します。[保持量と比較計測](docs/index-observability.md#未処理本文の有限ページと比較計測)を参照してください。
 
@@ -193,7 +191,7 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 }
 ```
 
-`recall index` はソースを環境変数から読み、hook の stdin payload は無視するため、追加の配線は不要です。モデルがあれば、初回の発火は一度きりの cold start で全バックログを embedding（28kチャンクで約11分）します。以降の発火は新規チャンクのみ処理します。モデルがなければ `recall model download` を実行するまで発火はFTS5のみです。Codex には SessionEnd hook がないため、Codex セッションは `recall index` を手動実行してください。
+`recall index` はソースを環境変数から読み、hook の stdin payload は無視するため、追加の配線は不要です。モデルがあれば、初回の発火は一度きりの cold start で全バックログを embedding（時間はデータ量と機器によります）します。以降の発火は新規チャンクのみ処理します。モデルがなければ `recall model download` を実行するまで発火はFTS5のみです。Codex には SessionEnd hook がないため、Codex セッションは `recall index` を手動実行してください。
 
 ## 仕組み
 
@@ -207,7 +205,7 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 
 **検索** — `recall search` は構築済みインデックスを読むだけで、インデックスは作成しません。事前に `recall index` でリフレッシュするか、[Hook](#hook) を登録してセッション終了時に自動インデックスしてください。空のインデックスを検索すると `No sessions indexed. Run recall index first.` を表示します。
 
-**Embedding** — `recall index` が新規チャンク（embedding未生成のもの）をすべてembeddingします。Ruri v3（310Mパラメータ）をmlx-rs + MLXでApple Silicon上で実行します。バッチ推論（batch=128）と長さソートによるpadding最小化。モデルは `recall model download` で一度ダウンロードします。未ダウンロード時はindexがFTS5のみ構築し、検索はキーワードランキングにフォールバックします。
+**Embedding** — EmbeddingGemma 2 BF16を固定SHA・固定llama.cpp/Metalで実行し、768次元のmean pooling・L2正規化を使います。queryの初期512 token容量は8192まで拡張し、超過時はEOSを維持します。文書は8192 token以下・2048 token重複のtoken境界で分割します。既存の世代照合保存・未処理本文のページ制限を維持し、モデル未導入時はFTS5へフォールバックします。`--token-budget` はwindowのpackingを制御し、8192を実効上限とします。小さいbudgetでも単一の双方向attention windowは切り詰めず単独処理し、指定budgetを超えることがあります。
 
 **ランキング** — embeddingがあればReciprocal Rank Fusion (RRF) でFTS5キーワードスコアとベクトル類似度を統合します。スコアが近い場合は新しいセッションにrecency boostがかかります。
 
@@ -220,30 +218,23 @@ src/
 ├── indexer.rs    mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
 ├── hybrid.rs     RRF 統合 + recency boost
-├── embedder.rs   index時embeddingのオーケストレーション（チャンクをruricoでバッチ処理）
+├── embedder.rs   index時embeddingのオーケストレーション（世代を照合してチャンクをバッチ保存）
 ├── chunker.rs    Q&Aペアチャンカー（サイズ分割。本文照合による再利用はindexer）
 ├── db.rs         SQLite スキーマ（WAL, FTS5, sqlite-vec）
 └── date.rs       日付ユーティリティ
 ```
 
-シングルバイナリ。SQLite、mlx-rs、sqlite-vecは静的リンクしています。
+シングルバイナリ。SQLite、llama.cpp、sqlite-vecは静的リンクしています。
 
 ## パフォーマンス
 
-| 操作                        | 所要時間                            |
-| --------------------------- | ----------------------------------- |
-| `recall index`（差分）      | 約0.5秒 + 新規チャンク分のembedding |
-| `recall index`（初回, 28k） | 約11分（embedding支配, M3 + MLX）   |
-| `recall rebuild`（28k）     | 約11分（全件再embedding）           |
-| `recall search`             | 即座（読み取り専用）                |
-| embeddingスループット       | 約45 chunks/sec（M3 + MLX）         |
-| 初回モデルダウンロード      | 約1.2 GB                            |
+Gemma製品版の時間・スループットはデータ量・機器・checksum確認・独立probeで変わります。従来のRuri/MLX計測値をGemmaの性能値としては使いません。固定BF16重みは557,950,176 bytesで、tokenizerは別です。測定条件は独立検証報告に記録し、即時検索や一定の処理速度は保証しません。
 
 ## 制限事項
 
 - `~/.claude/projects/` と `~/.codex/sessions/` のローカルセッションのみ対応。クラウド同期なし
 - 画像、ツール結果、バイナリコンテンツはインデックスしない
-- Apple Siliconが必要。MLXバックエンドにCPU/Linuxフォールバックはなし
+- Apple Siliconが必要。検証対象はllama.cpp/MetalのGPU backend
 - 検索結果は抜粋表示。完全な会話は `recall show <id>` で表示可能
 
 ## 終了コード
@@ -267,3 +258,5 @@ recall は汎用的な `1` / `2` ではなく、sysexits 系の終了コード�
 ## ライセンス
 
 MIT
+
+ソースからのbuildは `git submodule update --init --recursive` 後に `cargo build --release --locked` を実行します。検証済みllama.cppを固定し、amici・ruricoの実行・build依存はありません。

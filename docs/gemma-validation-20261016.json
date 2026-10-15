@@ -1,0 +1,30 @@
+{
+  "status": "complete",
+  "date_JST": "2026-10-16",
+  "local_standard_tests_passed": 549,
+  "standard_tests_skipped": 3,
+  "fmt_passed": true,
+  "clippy_passed": true,
+  "cargo_deny_passed": true,
+  "cargo_audit_passed": true,
+  "forbidden_dependencies_absent": [
+    "amici",
+    "mlx-rs",
+    "mlx-sys",
+    "rurico"
+  ],
+  "frozen_full_search_requests": 286,
+  "frozen_full_search_rows": 572,
+  "frozen_ranked_hits": 2810,
+  "native_query_vectors_compared": 146,
+  "max_query_component_error": 2.7755575615628914e-17,
+  "synthetic_sessions": 6,
+  "synthetic_QA": 8,
+  "synthetic_vectors": 10,
+  "simulated_update_and_rollback_verified": true,
+  "production_index_accessed": false,
+  "production_promotion_performed": false,
+  "amici_used": false,
+  "GitHub_CI_and_diff_coverage_verified": false,
+  "scope": "local Apple M3 / Rust 1.99.0; full frozen corpus search parity plus a newly built synthetic product CLI index; candidate update changes prefix, not weights"
+}

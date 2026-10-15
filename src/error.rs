@@ -3,7 +3,7 @@
 //! recall stays anyhow-based internally. `RecallError` types only the explicit
 //! failures recall raises, so a classification survives to the CLI boundary
 //! where [`classify_exit_code`] maps the anyhow error chain to a sysexits exit
-//! code (via [`amici::cli::exit_code::codes`]). This replaces the former
+//! code (via [`crate::runtime::codes`]). This replaces the former
 //! `USER_ERROR_MARKERS` stderr-string match, which silently broke whenever a
 //! `bail!` message was reworded (#26 / #82 / #83).
 //!
@@ -14,9 +14,11 @@
 use std::io;
 use std::process::ExitCode;
 
-use amici::cli::exit_code::{CliError, codes};
-use amici::model::ModelDownloadError;
-use rurico::storage::SanitizeError;
+use crate::model::ModelDownloadError;
+#[cfg(test)]
+use crate::runtime::CliError;
+use crate::runtime::codes;
+use crate::storage::SanitizeError;
 use serde::Serialize;
 
 use crate::envelope::{ErrorEnvelope, ErrorPayload};
@@ -71,7 +73,7 @@ pub(crate) enum RecallError {
     /// The message carries the specific remedy; query syntax advice does not apply.
     #[error("{0}")]
     DatabaseRead(String),
-    /// Invariant violation or permanent environment fault, e.g. the MLX backend
+    /// Invariant violation or permanent environment fault, e.g. the GPU backend
     /// is missing on non-Apple-Silicon hardware (maps to `INTERNAL`, 70).
     #[error("{0}")]
     Internal(String),
@@ -132,6 +134,7 @@ impl RecallError {
     }
 }
 
+#[cfg(test)]
 impl CliError for RecallError {
     fn exit_code(&self) -> ExitCode {
         ExitCode::from(self.error_code().code())
@@ -140,7 +143,7 @@ impl CliError for RecallError {
 
 /// Classify an error that propagated to the CLI boundary into an exit code.
 ///
-/// Resolution order: a typed [`RecallError`] wins; then rurico's
+/// Resolution order: a typed [`RecallError`] wins; then local FTS
 /// [`SanitizeError`] (a failed vocab lookup is I/O, a bad vocab table is a
 /// programmer bug); then raw I/O and SQLite errors; otherwise `UNKNOWN` (104),
 /// which signals an `anyhow` path that should be promoted to a typed variant.

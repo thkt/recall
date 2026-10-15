@@ -23,16 +23,15 @@ use crate::classify::classify_session;
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
-// Completion also identifies the parser/chunker/embedding contract. Version 1
-// is the existing #320 pipeline: Ruri v3 310m, pinned snapshot
-// 18b60fb8c2b9df296fb4212bb7d23ef94e579cd3 (rurico 7b2b256).
+// Version 2 switches the embedding contract to pinned Gemma. Model manifests
+// additionally isolate incompatible embedding spaces in separate indexes.
 // Bump for parser semantics, grouping/splitting, model/tokenizer/pooling changes.
 // A mismatch forces a reread and disables reuse; unavailable models still defer.
 // chunks_indexed: -version = parsed at that version, awaiting chunking;
 // +version = completed at that version; NULL = pending with unknown parser;
 // 0 = chunked with an unknown/outdated parser, still requiring a source reread.
 // Chunking alone must never certify an unknown parser, even during a root outage.
-const INDEX_RULES_VERSION: i64 = 1;
+const INDEX_RULES_VERSION: i64 = 2;
 
 struct SessionEntry {
     session_id: String,
