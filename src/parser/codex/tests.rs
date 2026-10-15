@@ -1,7 +1,7 @@
 use std::fs;
 
 use super::*;
-use crate::parser::write_test_jsonl as write_jsonl;
+use crate::parser::{assert_classification_matches, write_test_jsonl as write_jsonl};
 
 #[test]
 fn test_codex_response_item_extraction() {
@@ -187,4 +187,14 @@ fn provenance_accepts_known_wire_shapes_and_fails_open_on_unknown_or_malformed_v
             .origin
             .automated
     );
+}
+
+// Reuse the existing format corpus and its independent expected values for both
+// readers, so a fast path cannot silently omit a format or identity check.
+fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
+    let parsed = super::parse_codex_session(path)?;
+    if let Some(full) = &parsed {
+        assert_classification_matches(path, Source::Codex, full);
+    }
+    Ok(parsed)
 }

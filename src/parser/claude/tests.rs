@@ -1,5 +1,5 @@
 use super::*;
-use crate::parser::write_test_jsonl as write_jsonl;
+use crate::parser::{assert_classification_matches, write_test_jsonl as write_jsonl};
 
 #[test]
 fn test_claude_text_string_content() {
@@ -295,4 +295,14 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
         assert!(!parsed.origin.automated, "{relative}");
         assert!(parsed.origin.identity_conflict, "{relative}");
     }
+}
+
+// Reuse the existing format corpus and its independent expected values for both
+// readers, so a fast path cannot silently omit a format or identity check.
+fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
+    let parsed = super::parse_claude_session(path)?;
+    if let Some(full) = &parsed {
+        assert_classification_matches(path, Source::Claude, full);
+    }
+    Ok(parsed)
 }
