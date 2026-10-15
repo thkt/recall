@@ -249,14 +249,22 @@ pub fn handle_probe_if_needed() {
     process::exit(if result.is_ok() { 0 } else { 1 });
 }
 fn probe() -> Result<bool> {
-    let mut child = Command::new(env::current_exe()?)
+    let mut command = Command::new(env::current_exe()?);
+    command
         .env("__RECALL_GEMMA_PROBE", "1")
-        .env("__RECALL_GEMMA_SPEC", serde_json::to_string(selected())?)
+        .env("__RECALL_GEMMA_SPEC", serde_json::to_string(selected())?);
+    run_probe(&mut command, Duration::from_secs(30))
+}
+
+/// Keep child supervision separate from model selection so failure and timeout
+/// cleanup can be checked without deliberately hanging a native inference call.
+fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
             if status.code() == Some(2) {
@@ -415,6 +423,84 @@ pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn process_model_selection_is_idempotent_and_cannot_change_mid_run() {
+        let original = selected().clone();
+        select(None).unwrap();
+        select(None).unwrap();
+        let mut next = original.clone();
+        next.document_prefix.push_str("candidate ");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("candidate.json");
+        fs::write(&path, serde_json::to_vec(&next).unwrap()).unwrap();
+        assert!(
+            select(Some(&path))
+                .unwrap_err()
+                .to_string()
+                .contains("already selected")
+        );
+        assert_eq!(selected().identity(), original.identity());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn probe_distinguishes_success_unavailable_failure_and_reaps_timeouts() {
+        for (script, expected) in [
+            ("exit 0", Some(true)),
+            ("exit 2", Some(false)),
+            ("exit 1", None),
+        ] {
+            let actual = run_probe(
+                Command::new("/bin/sh").args(["-c", script]),
+                Duration::from_secs(1),
+            );
+            match expected {
+                Some(value) => assert_eq!(actual.unwrap(), value),
+                None => assert!(actual.unwrap_err().to_string().contains("probe failed")),
+            }
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "echo $$ > \"$1\"; exec sleep 60", "probe"])
+            .arg(&pid_file);
+        let result = run_probe(&mut cmd, Duration::from_millis(200));
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        let pid = fs::read_to_string(pid_file).unwrap();
+        assert!(
+            !Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success(),
+            "timed-out child must have been killed and reaped before returning"
+        );
+        assert!(
+            run_probe(
+                &mut Command::new(dir.path().join("absent")),
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    #[ignore = "requires explicitly staged public model artifacts"]
+    fn public_model_contract_cache_and_loader() {
+        // The invocation must supply RECALL_MODEL_DIR. Never fall through to a
+        // developer's real model cache when this opt-in test is run manually.
+        assert!(env::var_os("RECALL_MODEL_DIR").is_some());
+        let root = cached_artifacts(ModelId::DEFAULT).unwrap().unwrap();
+        assert!(root.join("model.gguf").is_file());
+        let model = load_verified().unwrap();
+        assert_eq!(
+            model
+                .embed_query("public cache verification")
+                .unwrap()
+                .len(),
+            768
+        );
+        assert!(gpu_available().is_ok());
+    }
     #[test]
     fn verified_artifact_replaces_only_after_complete_checksum_match() {
         let dir = tempfile::TempDir::new().unwrap();

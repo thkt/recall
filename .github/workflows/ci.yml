@@ -41,10 +41,10 @@ jobs:
           tool: cargo-nextest
 
       - name: Test
-        run: cargo nextest run --profile ci
+        run: cargo nextest run --profile ci --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   coverage:
     # Diff coverage gate: fail when coverage of the lines this PR adds or
@@ -82,8 +82,27 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Generate lcov coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+      - name: Measure standard tests
+        run: cargo llvm-cov --locked --no-report
+
+      - name: Stage checksum-pinned public Gemma artifacts
+        run: |
+          target/llvm-cov-target/debug/recall model manifest > "$RUNNER_TEMP/gemma-manifest.json"
+          python3 scripts/fetch-gemma-test-artifacts.py \
+            "$RUNNER_TEMP/gemma-manifest.json" "$RUNNER_TEMP/gemma-public-model"
+
+      - name: Measure public model inference and CLI contracts
+        env:
+          RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
+          RECALL_MODEL_DIR: ${{ runner.temp }}/gemma-public-model
+        run: |
+          cargo llvm-cov --locked --no-report --bin recall -- \
+            --ignored public_model_contract --test-threads=1
+          cargo llvm-cov --locked --no-report --test gemma_cli -- \
+            --ignored public_model_cli_contract --test-threads=1 --nocapture
+
+      - name: Generate combined lcov coverage
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Test coverage filter script
         run: |

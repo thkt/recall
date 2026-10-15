@@ -55,3 +55,18 @@ pub trait Embed: Send + Sync {
         self.embed_documents_batch(texts)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_chunk_never_becomes_a_persistable_embedding() {
+        for chunks in [vec![], vec![vec![]], vec![vec![1.], vec![]]] {
+            assert!(matches!(
+                ChunkedEmbedding::try_new(chunks),
+                Err(EmbedError::EmptySequence)
+            ));
+        }
+    }
+}

@@ -289,6 +289,9 @@ impl Embed for Gemma {
 }
 
 #[cfg(test)]
+#[path = "native/public_tests.rs"]
+mod public_tests;
+#[cfg(test)]
 #[path = "native/real_tests.rs"]
 mod real_tests;
 #[cfg(test)]
