@@ -1,8 +1,8 @@
 {
-  "status": "complete",
+  "status": "local_validation_complete",
   "date_JST": "2026-10-16",
-  "local_standard_tests_passed": 549,
-  "standard_tests_skipped": 3,
+  "local_standard_tests_passed": 561,
+  "standard_tests_skipped": 7,
   "fmt_passed": true,
   "clippy_passed": true,
   "cargo_deny_passed": true,
@@ -25,6 +25,8 @@
   "production_index_accessed": false,
   "production_promotion_performed": false,
   "amici_used": false,
-  "GitHub_CI_and_diff_coverage_verified": false,
-  "scope": "local Apple M3 / Rust 1.99.0; full frozen corpus search parity plus a newly built synthetic product CLI index; candidate update changes prefix, not weights"
+  "scope": "Local Apple M3 / Rust 1.99.0; fixed full corpus search parity and synthetic product CLI indexes. Public-model inference and CLI tests are separate from the standard suite; GitHub CI results belong to each PR head and are linked above. The candidate update changes prefix, not weights.",
+  "public_model_tests_run_separately": 3,
+  "local_changed_line_coverage_percent": 97.39217652958877,
+  "GitHub_checks_url": "https://github.com/thkt/recall/pull/352/checks"
 }

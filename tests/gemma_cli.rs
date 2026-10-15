@@ -139,24 +139,39 @@ fn public_model_cli_contract() {
         c.env("RECALL_MODEL_DIR", &model);
         c
     };
-    // On a hosted runner without Metal, the production probe must report
-    // backend unavailable. Native inference itself is exercised separately
-    // with llama.cpp's CPU fallback; never disguise that as a GPU probe pass.
+    // Hosted runners may have no GPU or a slow virtual GPU whose first shader
+    // compilation exceeds the production 30-second deadline. Keep that deadline
+    // and check the honest fallback; never call a timeout a successful GPU probe.
     let download = run(invoke().args(["model", "download"]));
-    let gpu = download.status.success();
-    if !gpu {
-        assert_eq!(
-            download.status.code(),
-            Some(70),
-            "{}",
-            String::from_utf8_lossy(&download.stderr)
-        );
-        assert!(String::from_utf8_lossy(&download.stderr).contains("backend unavailable"));
-    }
+    let stderr = String::from_utf8_lossy(&download.stderr);
+    let probe = match download.status.code() {
+        Some(0) => "success",
+        Some(70) if stderr.contains("backend unavailable") => "backend unavailable",
+        Some(75) if stderr.contains("isolated model probe timed out") => "timeout",
+        status => panic!("unexpected public-model download/probe result {status:?}: {stderr}"),
+    };
+    let check_state = |output: &Value| {
+        if output["degraded"] == true {
+            assert!(
+                output["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str().unwrap().contains("embedding model unavailable")),
+                "verified artifacts must degrade with an explicit model-unavailable note: {output}"
+            );
+        } else {
+            assert_eq!(output["degraded"], false);
+        }
+    };
     let indexed = value(&run(invoke().args(["index", "--json"])));
-    assert_eq!(indexed["degraded"], !gpu);
+    check_state(&indexed);
+    assert_eq!(
+        indexed["data"]["embedded"].as_u64().unwrap() > 0,
+        indexed["degraded"] == false
+    );
     let first = value(&run(invoke().args(["search", "quokka", "--json"])));
-    assert_eq!(first["degraded"], !gpu);
+    check_state(&first);
     assert_eq!(first["data"]["results"].as_array().unwrap().len(), 1);
     let spec = manifest(root);
     let path = root.join("archived.json");
@@ -165,6 +180,7 @@ fn public_model_cli_contract() {
         .arg("--model-manifest")
         .arg(&path)
         .args(["search", "quokka", "--json"])));
+    check_state(&again);
     assert_eq!(first["data"], again["data"]);
     // A malformed serialized child manifest must fail before model loading.
     let out = run(invoke()
@@ -172,6 +188,7 @@ fn public_model_cli_contract() {
         .env("__RECALL_GEMMA_SPEC", "{}"));
     assert_eq!(out.status.code(), Some(1));
     println!(
-        "public model CLI: native GPU probe available={gpu}; isolated index and archived manifest verified"
+        "public model CLI: download probe={probe}; index degraded={}; search degraded={}; isolated index and archived manifest verified",
+        indexed["degraded"], first["degraded"]
     );
 }

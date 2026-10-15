@@ -91,13 +91,18 @@ jobs:
           python3 scripts/fetch-gemma-test-artifacts.py \
             "$RUNNER_TEMP/gemma-manifest.json" "$RUNNER_TEMP/gemma-public-model"
 
-      - name: Measure public model inference and CLI contracts
+      - name: Measure public model inference contracts
         env:
           RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
           RECALL_MODEL_DIR: ${{ runner.temp }}/gemma-public-model
         run: |
           cargo llvm-cov --locked --no-report --bin recall -- \
             --ignored public_model_contract --test-threads=1
+
+      - name: Measure public model CLI and probe contracts
+        env:
+          RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
+        run: |
           cargo llvm-cov --locked --no-report --test gemma_cli -- \
             --ignored public_model_cli_contract --test-threads=1 --nocapture
 

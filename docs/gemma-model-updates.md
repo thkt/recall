@@ -89,3 +89,19 @@ as well. The legacy Ruri binary and index are not converted in place; returning
 to that implementation requires that older matching binary. This migration does
 not execute it or depend on amici. Keep previous artifacts until the successor
 has been reviewed. No production index promotion is performed by this change.
+
+## Pull request verification
+
+[PR #352 checks](https://github.com/thkt/recall/pull/352/checks) record the GitHub
+results for each head. CI stages only the manifest's public, SHA-256-verified
+model and tokenizer, then combines standard-test coverage with opt-in native
+inference and synthetic CLI/probe tests. The changed-line coverage gate remains
+95%. Private frozen queries, rankings and full index copies stay local.
+
+The public tests check all 511/512/513/8192/8193 token boundaries and UTF-8 window
+coverage. Short inference exercises the initial 512 context and a 513-token
+inference exercises growth; full 8192-token inference was measured separately
+on Apple M3 with the frozen evaluation. Hosted runners may expose no GPU or a slow virtual GPU. Native inference is
+measured separately; CLI tests accept only a successful probe, explicit
+backend-unavailable error, or the production 30-second probe timeout, and verify
+honest FTS fallback for each degraded invocation. This is separate from the successful real GPU probe on Apple M3.

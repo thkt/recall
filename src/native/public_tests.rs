@@ -30,35 +30,47 @@ fn public_model_contract() {
         .embed_query("Find the database rollback instructions")
         .unwrap();
     unit_vector(&query);
-    let first = gemma
-        .embed_document("Keep the previous database for rollback.")
-        .unwrap();
-    unit_vector(&first.chunks()[0]);
+    let samples = [
+        "Keep the previous database for rollback.",
+        "A watercolor landscape with an orange sunset.",
+    ];
+    let references = samples.map(|text| gemma.embed_document(text).unwrap());
+    for reference in &references {
+        unit_vector(&reference.chunks()[0]);
+    }
     assert!(
         gemma.tokenizer.get().is_none(),
         "short inputs must not load the offset tokenizer"
     );
 
     // Sequence ownership must survive both the 32-sequence and token-budget
-    // packing boundaries. Repeating a known input catches mixing batch owners.
-    let texts = vec!["Keep the previous database for rollback."; 33];
+    // packing boundaries. Distinct alternating inputs catch swapped owners or
+    // attention leaking between documents in the same native batch.
+    let texts: Vec<_> = (0..33).map(|i| samples[i % samples.len()]).collect();
     for budget in [None, Some(1)] {
+        // The sequence-limit case needs 33 inputs; three distinct owners are
+        // sufficient for repeated flushes with a one-token packing budget.
+        let inputs = if budget.is_some() {
+            &texts[..3]
+        } else {
+            &texts[..]
+        };
         let out = gemma
             .embed_documents_batch_with_options(
-                &texts,
+                inputs,
                 &EmbedOptions {
                     token_budget: budget,
                     forward_pause: Some(Duration::from_millis(1)),
                 },
             )
             .unwrap();
-        assert_eq!(out.len(), texts.len());
-        for doc in out {
+        assert_eq!(out.len(), inputs.len());
+        for (i, doc) in out.into_iter().enumerate() {
             assert_eq!(doc.chunks().len(), 1);
             unit_vector(&doc.chunks()[0]);
             let max_diff = doc.chunks()[0]
                 .iter()
-                .zip(&first.chunks()[0])
+                .zip(&references[i % references.len()].chunks()[0])
                 .map(|(a, b)| (a - b).abs())
                 .fold(0_f32, f32::max);
             assert!(
@@ -96,7 +108,9 @@ fn public_model_contract() {
             // Exercise growing native contexts without a quadratic 8192-token
             // inference on CI's CPU fallback. Full-length inference was also
             // measured against the private frozen vectors on Apple M3.
-            if target <= 513 {
+            // Short query/document inference already uses the initial 512
+            // context above; one 513-token encode checks actual growth.
+            if target == 513 {
                 unit_vector(
                     &Gemma::encode(&model, &[tokens], &EmbedOptions::default()).unwrap()[0],
                 );
