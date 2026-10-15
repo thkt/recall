@@ -2,6 +2,7 @@
 use crate::{
     embedding::Embed,
     native::{Gemma, gpu_available},
+    runtime::home_dir,
 };
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
@@ -143,7 +144,7 @@ pub fn cache_dir() -> PathBuf {
                 .filter(|p| p.is_absolute())
                 .map(|p| p.join("recall"))
         })
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache/recall"));
+        .unwrap_or_else(|| home_dir().unwrap_or_default().join(".cache/recall"));
     base.join("models").join(selected().identity())
 }
 pub struct ModelId;

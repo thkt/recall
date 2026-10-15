@@ -39,7 +39,8 @@ use crate::model::{
 };
 use crate::model::{ModelId, cached_artifacts};
 use crate::runtime::{
-    codes, done, exit_error, info as cli_info, init_subscriber, try_expand_shorthand, warning,
+    codes, done, exit_error, home_dir, info as cli_info, init_subscriber, try_expand_shorthand,
+    warning,
 };
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
@@ -256,15 +257,15 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
         Some(p) => Ok(p.clone()),
         None => resolve_default_db_path(
             env::var_os("XDG_DATA_HOME").as_deref(),
-            dirs::home_dir().as_deref(),
+            home_dir().as_deref(),
         ),
     }
 }
 
 /// Resolve the default DB location under the XDG data dir as `recall/recall.db`.
 /// `XDG_DATA_HOME` wins only when it is absolute (per the XDG spec a relative
-/// value is ignored); otherwise fall back to `~/.local/share`. `dirs::data_local_dir`
-/// is deliberately avoided: on macOS it returns `~/Library/Application Support`,
+/// value is ignored); otherwise fall back to `~/.local/share`. Platform data-dir
+/// helpers are deliberately avoided: on macOS they return `~/Library/Application Support`,
 /// not the `~/.local/share` recall expects.
 fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -> Result<PathBuf> {
     let data_home = match xdg_data_home.map(Path::new) {
@@ -438,7 +439,7 @@ fn index_and_report(
     force: bool,
     embed_options: embedder::EmbedOptions,
 ) -> Result<IndexOutcome> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = home_dir().context("Could not determine home directory")?;
     let claude_dir = indexer::resolve_claude_dir(&home);
     let codex_dir = indexer::resolve_codex_dir(&home);
     let opts = indexer::IndexOptions {
