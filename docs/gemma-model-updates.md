@@ -101,7 +101,9 @@ inference and synthetic CLI/probe tests. The changed-line coverage gate remains
 The public tests check all 511/512/513/8192/8193 token boundaries and UTF-8 window
 coverage. Short inference exercises the initial 512 context and a 513-token
 inference exercises growth; full 8192-token inference was measured separately
-on Apple M3 with the frozen evaluation. Hosted runners may expose no GPU or a slow virtual GPU. Native inference is
+on Apple M3 with the frozen evaluation. Hosted runners may expose no GPU or a
+slow virtual GPU. Native inference is
 measured separately; CLI tests accept only a successful probe, explicit
 backend-unavailable error, or the production 30-second probe timeout, and verify
-honest FTS fallback for each degraded invocation. This is separate from the successful real GPU probe on Apple M3.
+honest FTS fallback for each degraded invocation. This is separate from the
+successful real GPU probe on Apple M3.

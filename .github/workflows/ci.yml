@@ -83,7 +83,11 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Measure standard tests
-        run: cargo llvm-cov --locked --no-report
+        run: |
+          # --no-report accumulates profiles across the following invocations.
+          # Clear restored artifacts first so only this head's tests count.
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --locked --no-report
 
       - name: Stage checksum-pinned public Gemma artifacts
         run: |
