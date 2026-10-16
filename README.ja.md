@@ -32,14 +32,19 @@ recall search "authentication"
       authentication with nonce...
 ```
 
-6,000+セッション、27,000+ Q&Aペアを2秒以内で検索できます。
-
 ## クイックスタート
 
+このREADMEはEmbeddingGemma 2 BF16を使う `main` の説明です。2026-10-16時点の
+[最新リリースv0.13.0](https://github.com/thkt/recall/releases/tag/v0.13.0)と
+`brew install thkt/tap/recall` は旧Ruri backendのままです。次のリリース前にGemmaを使う場合は、
+Apple Silicon上でRust・CMake・Xcode command-line toolsを用意し、このcheckoutからbuildしてください。
+
 ```sh
-# インストール
-brew install thkt/tap/recall
-# or: cargo install --path .
+# 固定llama.cppソースと一緒にmainを取得してインストール
+git clone --recurse-submodules https://github.com/thkt/recall.git
+cd recall
+cargo install --path . --locked
+export PATH="$HOME/.cargo/bin:$PATH"  # Homebrew版もある場合、このbuildを選ぶ
 
 # モデルを一度ダウンロード（約558MB＋tokenizer）してからインデックス作成
 recall model download
@@ -51,11 +56,11 @@ recall search "authentication"
 
 ## 検索の仕組み
 
-recallは各セッションをキーワード検索（FTS5）にインデックスし、同じパスで各チャンクをローカルのAIモデルでembeddingします。検索は両者を統合し（**セマンティック検索** — キーワードが一致しなくても意味で見つかる）、読み取り専用なので即座に返ります。
+recallは各セッションをキーワード検索（FTS5）にインデックスし、同じパスで各チャンクをローカルのAIモデルでembeddingします。検索は両者を統合し（**セマンティック検索** — キーワードが一致しなくても意味で見つかる）、文書を再embeddingせず、検索クエリをembeddingして既存の索引を読みます。
 
 ```
 recall index:   解析 + FTS5 + 新規チャンクを embedding（モデルがあれば）
-recall search:  ハイブリッドランキング（FTS5 + ベクトル類似度, RRF）、即座
+recall search:  クエリをembedding → FTS5 + ベクトル類似度 → RRFランキング
 継続:           indexを重ねるほどセマンティック検索のカバレッジ向上
 ```
 
@@ -116,9 +121,7 @@ embedding にはモデルが必要です。`recall model download`（約558MB＋
 
 世代管理がないだけで他の読取り条件を満たす索引は、移行や rebuild をせずに `search`・`status`・`show` で参照できます。書込み用に開く際に、既存のチャンクと埋め込みを保持して世代管理を追加します。
 
-既定の索引は `~/.local/share/recall/indexes/<manifest-sha256>/recall.db` です（絶対パスの `XDG_DATA_HOME` があればその配下）。`--db-path` / `RECALL_DB` で変更できますが、モデル識別の照合は省略しません。旧Ruri索引は保持し、Gemmaは別索引に構築してください。識別情報がない既存の非空ベクトル索引は、FTS-onlyのdegraded読取りとなり、暗黙の移行や書込みは拒否します。
-
-更新と切戻しは[独立索引での検証手順](docs/gemma-model-updates.md)を参照してください。`recall model manifest` を重み・tokenizer・対応索引と一緒に保存し、`--model-manifest` / `RECALL_MODEL_MANIFEST` で対応する新版・旧版を選びます。異なるmanifestは既定の索引も分離し、モデルの取得・更新は明示操作に限定します。
+モデルごとの索引パスと旧Ruriからの切替は[モデル](#モデル)を参照してください。
 
 埋め込み待ち本文は最大1,024件・8 MiBのページ単位で取得し、処理後に解放してから次を取得します。8 MiBを超える単一チャンクは切り捨てず単独で処理します。ID・世代・長さの一覧は未処理件数に比例し、モデルや他の索引処理のメモリは別です。推論・保存に失敗したバッチは再試行対象に残し、後続を処理します。保存エラーは一覧の処理後に返します。[保持量と比較計測](docs/index-observability.md#未処理本文の有限ページと比較計測)を参照してください。
 
@@ -127,8 +130,24 @@ indexとrebuildは、モデルロード/probe、未処理抽出を含む段階�
 ### モデル
 
 ```sh
-recall model download   # embeddingモデルをダウンロードして verify
+recall model download                       # 固定artifactを取得・検証
+recall model manifest > gemma-manifest.json   # 対応するモデル・索引と一緒に保管
 ```
+
+重みとtokenizerはロード前にSHA-256を検証します。取得・更新は明示操作で、searchやindexから
+自動downloadはしません。`RECALL_MODEL_DIR` で `model.gguf` と `tokenizer.json` のあるディレクトリを指定できます。
+
+既定の索引は `~/.local/share/recall/indexes/<manifest-sha256>/recall.db` です
+（絶対パスの `XDG_DATA_HOME` があればその配下）。`--db-path` / `RECALL_DB` で変更できますが、
+モデル識別の照合は省略しません。異なるmanifestは既定の索引も分離します。
+
+旧Ruriから切り替える場合は、旧バイナリと `~/.local/share/recall/recall.db` を切戻し用に保持します。
+旧 `RECALL_DB` 指定を解除するか新しい `--db-path` を選び、`recall model download` と
+`recall index` でセッションログからGemma用の索引を構築してください。旧vectorは変換しません。
+識別情報がない非空ベクトル索引はFTS-onlyのdegraded読取りとなり、書込みは拒否します。
+
+`--model-manifest` / `RECALL_MODEL_MANIFEST` による更新・切戻しと独立した検証用索引については、
+[モデルの検証・更新手順](docs/gemma-model-updates.md)を参照してください。
 
 ### セッション表示
 
@@ -217,11 +236,14 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 
 ```text
 src/
-├── main.rs       CLIサブコマンド（index, search, show, status）
+├── main.rs       CLIコマンド・出力・分類・status・doctor
 ├── parser/       Claude Code / Codex の JSONL パーサー
 ├── indexer.rs    mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
 ├── hybrid.rs     RRF 統合 + recency boost
+├── model.rs      固定manifest・artifact検証・独立probe・索引のモデル識別
+├── native.rs     llama.cpp/MetalによるEmbeddingGemma encoder
+├── embedding.rs  embeddingの共通型・オプション
 ├── embedder.rs   index時embeddingのオーケストレーション（世代を照合してチャンクをバッチ保存）
 ├── chunker.rs    Q&Aペアチャンカー（サイズ分割。本文照合による再利用はindexer）
 ├── db.rs         SQLite スキーマ（WAL, FTS5, sqlite-vec）
@@ -232,7 +254,7 @@ src/
 
 ## パフォーマンス
 
-Gemma製品版の時間・スループットはデータ量・機器・checksum確認・独立probeで変わります。従来のRuri/MLX計測値をGemmaの性能値としては使いません。固定BF16重みは557,950,176 bytesで、tokenizerは別です。測定条件は独立検証報告に記録し、即時検索や一定の処理速度は保証しません。
+Gemma製品版の時間・スループットはデータ量・機器・checksum確認・独立probeで変わります。従来のRuri/MLX計測値をGemmaの性能値としては使いません。固定BF16重みは557,950,176 bytesで、tokenizerは別です。検証範囲は[移行時の検証記録](docs/audit/2026-10-16-gemma-validation.json)、計測条件は[indexの計測手順](docs/index-observability.md)を参照してください。
 
 ## 制限事項
 
@@ -255,6 +277,23 @@ recall は汎用的な `1` / `2` ではなく、sysexits 系の終了コード�
 | 75     | `TEMP_FAILURE` | リトライ可能な一時失敗                    |
 | 104    | `UNKNOWN`      | 未分類のエラー経路                        |
 
+## 開発
+
+Rustは `Cargo.toml` の要求版以上を使います。Apple Silicon・CMake・Xcode command-line toolsを用意し、
+固定nativeソースを取得してbuildします。
+
+```sh
+git submodule update --init --recursive
+cargo build --release --locked
+cargo fmt -- --check
+cargo nextest run --profile ci --locked
+cargo clippy --locked --all-targets --all-features -- -D warnings
+```
+
+`cargo-nextest` は別途インストールしてください。モデルの推論・CLIテストはローカルではopt-inで、
+CIのcoverageジョブでも実行します。[検証・計測スクリプト](scripts/README.md)にartifactの準備と用途、
+[vendorの説明](vendor/README.md)に固定backendの組み合わせをまとめています。別のMetalライブラリや常駐サービスは不要です。
+
 ## 謝辞
 
 [arjunkmrm/recall](https://github.com/arjunkmrm/recall) のアイデアをもとにRustで書き直しました。セマンティック検索、シングルバイナリ、ローカルembedding、CJK対応。
@@ -262,5 +301,3 @@ recall は汎用的な `1` / `2` ではなく、sysexits 系の終了コード�
 ## ライセンス
 
 MIT
-
-ソースからのbuildは `git submodule update --init --recursive` 後に `cargo build --release --locked` を実行します。検証済みllama.cppを固定し、amici・ruricoの実行・build依存はありません。

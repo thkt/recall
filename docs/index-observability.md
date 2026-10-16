@@ -47,7 +47,7 @@ Gemma移行後の現行pipelineはversion 2です。以下の過去の時間・�
 
 ## 4ケースの実モデル計測
 
-macOS / Apple Silicon、Rust 1.96以上、Metal Toolchain、利用可能なモデルを用意したホストで実施する。再現手順を以下に示す。2026-09-21の結果は[実モデル・オーバーヘッド計測](../research/index-observability-measurements.md)を参照。[Issue #324](https://github.com/thkt/recall/issues/324) の受入条件と [ADR-0001](decisions/0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md) の出力契約に従う。媒体のcaptureは不要。
+macOS / Apple Silicon、`Cargo.toml` の要求版以上のRust、Xcode command-line tools・CMake、利用可能なモデルを用意したホストで実施する。再現手順を以下に示す。2026-09-21の結果は[実モデル・オーバーヘッド計測](../research/index-observability-measurements.md)を参照。[Issue #324](https://github.com/thkt/recall/issues/324) の受入条件と [ADR-0001](decisions/0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md) の出力契約に従う。媒体のcaptureは不要。
 
 ```sh
 python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-results \

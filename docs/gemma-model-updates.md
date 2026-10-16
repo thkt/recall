@@ -1,4 +1,4 @@
-# Gemma migration, updates, and rollback
+# Gemma model validation, updates, and rollback
 
 Recall defaults to the independently evaluated EmbeddingGemma 2 BF16 encoder.
 The artifact URLs, full revisions, SHA-256 checksums, 768-dimensional projection,
@@ -16,7 +16,21 @@ points. Gemma adoption is the user's explicit decision with that uncertainty.
 The earlier resource improvement compared Python/MLX FP32 with native BF16 encoder
 processes; it is not a measured end-to-end product CLI improvement.
 
-## Independent validation first
+## Migration status
+
+The Gemma backend is merged into `main`; amici, rurico and MLX are no longer
+runtime or build dependencies. The [migration validation record](audit/2026-10-16-gemma-validation.json)
+is a dated report, not the current test count or evidence that a user's index
+has been promoted. The latest published release on 2026-10-16 is still
+[v0.13.0](https://github.com/thkt/recall/releases/tag/v0.13.0), with the old backend.
+Build `main` from source until a Gemma release is published.
+
+To switch your own sessions, use the Gemma binary, download its model, and index
+into its new default namespace. Remove an old `RECALL_DB` override or select a
+new explicit path first. Keep the old binary, model and index for rollback.
+This is a new index from the session logs, not an in-place vector conversion.
+
+## Independent validation
 
 All migration validation must pass `--db-path` pointing to an owned test database
 and set `RECALL_CLAUDE_DIR` / `RECALL_CODEX_DIR` to fixture directories. Do not run
@@ -31,6 +45,7 @@ RECALL_MODEL_DIR=/absolute/verified/model \
 RECALL_CLAUDE_DIR=/absolute/fixture/claude \
 RECALL_CODEX_DIR=/absolute/fixture/codex \
 recall --model-manifest gemma-current.json --db-path /absolute/test/gemma.db index
+RECALL_MODEL_DIR=/absolute/verified/model \
 recall --model-manifest gemma-current.json --db-path /absolute/test/gemma.db search 'query' --json
 ```
 
@@ -38,6 +53,10 @@ recall --model-manifest gemma-current.json --db-path /absolute/test/gemma.db sea
 artifacts. Downloads are verified before atomic replacement and a separate child
 process probes the model before normal loading. A timeout kills and reaps that child.
 There are no automatic model downloads on search/index and no automatic updates.
+
+The [script guide](../scripts/README.md) documents the synthetic real-CLI
+update/rollback check and its Python `sqlite-vec` dependency. These checks use
+fixture logs and new databases; they do not promote a production index.
 
 ## Index identity
 
@@ -88,12 +107,11 @@ For an encoder/backend code rollback, retain and restore the corresponding binar
 as well. The legacy Ruri binary and index are not converted in place; returning
 to that implementation requires that older matching binary. This migration does
 not execute it or depend on amici. Keep previous artifacts until the successor
-has been reviewed. No production index promotion is performed by this change.
+has been reviewed. Validation does not promote a production index.
 
-## Pull request verification
+## CI verification
 
-[PR #352 checks](https://github.com/thkt/recall/pull/352/checks) record the GitHub
-results for each head. CI stages only the manifest's public, SHA-256-verified
+The [CI workflow](../.github/workflows/ci.yml) stages only the manifest's public, SHA-256-verified
 model and tokenizer, then combines standard-test coverage with opt-in native
 inference and synthetic CLI/probe tests. The changed-line coverage gate remains
 95%. Private frozen queries, rankings and full index copies stay local.
