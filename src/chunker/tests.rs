@@ -377,3 +377,24 @@ fn test_192_split_chunks_share_one_lo_hi_range() {
         );
     }
 }
+
+#[test]
+fn paragraph_splits_preserve_exact_content_with_and_without_question_prefix() {
+    let first = "界".repeat(4000);
+    let second = "末".repeat(2000);
+    let text = format!("{first}\n\n{second}");
+    for (messages, expected) in [
+        (
+            vec![msg(Role::User, &text)],
+            vec![format!("{first}\n\n"), second.clone()],
+        ),
+        (
+            vec![msg(Role::User, "質問"), msg(Role::Assistant, &text)],
+            vec![format!("質問\n{first}\n\n"), format!("質問\n{second}")],
+        ),
+    ] {
+        let chunks = chunk_messages("s1", &rowed(messages), None);
+        let content: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        assert_eq!(content, expected);
+    }
+}

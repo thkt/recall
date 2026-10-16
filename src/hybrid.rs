@@ -30,15 +30,18 @@ pub(crate) fn apply_recency_boost(
     results.sort_by(|a, b| b.1.total_cmp(&a.1));
 }
 
-pub(crate) fn rrf_merge_strings(
-    fts_hits: &[(String, f64)],
-    vec_hits: &[(String, f64)],
+pub(crate) fn rrf_merge_sessions<'a>(
+    fts_ids: impl IntoIterator<Item = &'a str>,
+    vec_ids: impl IntoIterator<Item = &'a str>,
 ) -> Vec<(String, f64)> {
     let mut scores: HashMap<String, f64> = HashMap::new();
-    for list in [fts_hits, vec_hits] {
-        for (rank, (sid, _)) in list.iter().enumerate() {
-            *scores.entry(sid.clone()).or_default() += 1.0 / (60.0 + rank as f64);
-        }
+    // Enumerate each source independently: fusion uses rank, not input scores.
+    for (rank, sid) in fts_ids
+        .into_iter()
+        .enumerate()
+        .chain(vec_ids.into_iter().enumerate())
+    {
+        *scores.entry(sid.to_owned()).or_default() += 1.0 / (60.0 + rank as f64);
     }
     let mut result: Vec<_> = scores.into_iter().collect();
     result.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

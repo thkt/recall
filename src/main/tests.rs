@@ -229,18 +229,33 @@ fn try_load_embedder_cached_records_degraded_non_install_failure() {
 }
 
 #[test]
-fn try_load_embedder_cached_reports_non_install_degraded_note() {
-    let mut notes = Vec::new();
-    let result = try_load_embedder_cached_with_reporter(
-        || Err(DegradedReason::ProbeFailed),
-        |msg| notes.push(msg.to_owned()),
-    );
+fn try_load_embedder_cached_reports_reason_aware_notes_once() {
+    for (reason, expected) in [
+        (
+            DegradedReason::NotInstalled,
+            vec![
+                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+            ],
+        ),
+        (
+            DegradedReason::ProbeFailed,
+            vec!["note: embedding model unavailable; results from text search only."],
+        ),
+        (
+            DegradedReason::BackendUnavailable,
+            vec!["note: embedding model unavailable; results from text search only."],
+        ),
+        (DegradedReason::Disabled, vec![]),
+    ] {
+        let mut notes = Vec::new();
+        let result = try_load_embedder_cached_with_reporter(
+            || Err(reason),
+            |msg| notes.push(msg.to_owned()),
+        );
 
-    assert!(result.is_err());
-    assert_eq!(
-        notes,
-        ["note: embedding model unavailable; results from text search only."]
-    );
+        assert_eq!(result.err(), Some(reason));
+        assert_eq!(notes, expected, "reason: {reason:?}");
+    }
 }
 
 #[test]
@@ -4041,4 +4056,39 @@ fn u002_snippet_hit_json_guides_full_show_without_inspect_line() {
         !payload.contains("--chunk"),
         "a snippet-tier hit must not emit a --chunk inspect line, got: {payload}"
     );
+}
+
+#[test]
+fn emit_success_preserves_text_newlines_and_json_envelope() {
+    for text in ["", "質問と回答", "answer\n", "answer\n\n"] {
+        let out = CommandOutput::with_notes(
+            text.to_owned(),
+            serde_json::json!({"messages": [{"text": "回答\n\"引用\""}]}),
+            true,
+            vec!["diagnostic\nwith \"quotes\"".to_owned()],
+        );
+        let mut buf = Vec::new();
+        assert_eq!(
+            emit_success_to(&out, false, &mut buf).unwrap(),
+            WriteOutcome::Written,
+        );
+        let expected = if text.is_empty() || text.ends_with('\n') {
+            text.to_owned()
+        } else {
+            format!("{text}\n")
+        };
+        assert_eq!(buf, expected.as_bytes());
+
+        buf.clear();
+        assert_eq!(
+            emit_success_to(&out, true, &mut buf).unwrap(),
+            WriteOutcome::Written,
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({"data": out.data, "degraded": true, "notes": out.notes}),
+        );
+        assert_eq!(buf.last(), Some(&b'\n'));
+    }
 }

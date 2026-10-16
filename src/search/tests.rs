@@ -2263,3 +2263,62 @@ fn segment_prolonged_sound_mark_does_not_strand_hiragana() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn combined_filters_apply_to_fts_hybrid_and_file_list() {
+    let (_dir, conn) = setup_test_db();
+    let now_ms = 1_750_000_000_000_i64;
+    let embedder = MockEmbedder::new();
+    for (chunk_id, (sid, source, project, timestamp, file)) in (1..).zip([
+        ("keep", "claude", "/proj", now_ms, "/proj/shared.rs"),
+        ("project", "claude", "/other", now_ms, "/proj/shared.rs"),
+        (
+            "old",
+            "claude",
+            "/proj",
+            now_ms - 8 * MS_PER_DAY,
+            "/proj/shared.rs",
+        ),
+        ("source", "codex", "/proj", now_ms, "/proj/shared.rs"),
+        ("file", "claude", "/proj", now_ms, "/proj/other.rs"),
+        ("current", "claude", "/proj", now_ms, "/proj/shared.rs"),
+        ("automated", "claude", "/proj", now_ms, "/proj/shared.rs"),
+    ]) {
+        // Each session is reachable by both FTS and vector search, so omitting
+        // a filter from either path lets its corresponding decoy reappear.
+        insert_session(&conn, sid, source, project, timestamp);
+        insert_message(&conn, sid, "user", "authentication flow");
+        insert_chunk_with_embedding(&conn, chunk_id, sid, "authentication", timestamp);
+        insert_session_file(&conn, sid, file);
+    }
+    set_session_type(&conn, "automated", "automated");
+    let opts = SearchOptions {
+        project: Some("/proj".to_owned()),
+        days: Some(7),
+        source: Some(Source::Claude),
+        file: Some("shared.rs".to_owned()),
+        current: CurrentSession::Exclude("current".to_owned()),
+        now_ms: Some(now_ms),
+        ..Default::default()
+    };
+
+    for (mode, query, model) in [
+        ("fts", Some("authentication"), None),
+        (
+            "hybrid",
+            Some("authentication"),
+            Some(&embedder as &dyn Embed),
+        ),
+        ("file list", None, None),
+    ] {
+        let outcome = search_with_embedder(&conn, query, &opts, model).unwrap();
+        let ids: Vec<&str> = outcome
+            .results
+            .iter()
+            .map(|r| r.session.session_id.as_str())
+            .collect();
+        assert_eq!(ids, ["keep"], "filters leaked a session in {mode}");
+        assert!(!outcome.vec_degraded, "{mode}");
+        assert!(!outcome.results_incomplete, "{mode}");
+    }
+}

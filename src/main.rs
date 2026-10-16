@@ -19,6 +19,7 @@ mod runtime;
 mod search;
 mod storage;
 
+use std::borrow::Cow;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
@@ -1756,14 +1757,6 @@ fn result_to_json(r: &search::SearchResult) -> serde_json::Value {
     })
 }
 
-fn render_success_body(out: &CommandOutput, json_mode: bool) -> String {
-    if json_mode {
-        render_json_success(out)
-    } else {
-        out.markdown.clone()
-    }
-}
-
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
     emit_success_to(out, json_mode, &mut io::stdout().lock())
 }
@@ -1773,7 +1766,11 @@ fn emit_success_to<W: Write>(
     json_mode: bool,
     w: &mut W,
 ) -> io::Result<WriteOutcome> {
-    let body = render_success_body(out, json_mode);
+    let body = if json_mode {
+        Cow::Owned(render_json_success(out))
+    } else {
+        Cow::Borrowed(out.markdown.as_str())
+    };
     if body.is_empty() {
         return Ok(WriteOutcome::Written);
     }

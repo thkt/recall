@@ -3,11 +3,8 @@ use std::collections::HashMap;
 use super::*;
 
 #[test]
-fn test_008_rrf_merge_both_lists() {
-    let fts: Vec<(String, f64)> = vec![("A".into(), 0.0), ("B".into(), 0.0)];
-    let vec: Vec<(String, f64)> = vec![("B".into(), 0.0), ("C".into(), 0.0)];
-
-    let merged = rrf_merge_strings(&fts, &vec);
+fn rrf_merge_both_lists() {
+    let merged = rrf_merge_sessions(["A", "B"], ["B", "C"]);
 
     assert_eq!(merged[0].0, "B");
     let b_expected = 1.0 / 61.0 + 1.0 / 60.0;
@@ -19,11 +16,8 @@ fn test_008_rrf_merge_both_lists() {
 }
 
 #[test]
-fn test_010_rrf_single_list_hit() {
-    let fts: Vec<(String, f64)> = vec![("A".into(), 0.0)];
-    let vec: Vec<(String, f64)> = vec![];
-
-    let merged = rrf_merge_strings(&fts, &vec);
+fn rrf_single_list_hit() {
+    let merged = rrf_merge_sessions(["A"], []);
 
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].0, "A");
@@ -86,9 +80,17 @@ fn test_apply_recency_boost_scales_with_weight() {
 }
 
 #[test]
-fn test_rrf_empty_inputs() {
-    let fts: Vec<(String, f64)> = vec![];
-    let vec: Vec<(String, f64)> = vec![];
-    let merged = rrf_merge_strings(&fts, &vec);
+fn rrf_empty_inputs() {
+    let merged = rrf_merge_sessions([], []);
     assert!(merged.is_empty());
+}
+
+#[test]
+fn rrf_vector_only_preserves_rank_order() {
+    let merged = rrf_merge_sessions([], ["B", "A"]);
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].0, "B");
+    assert_eq!(merged[1].0, "A");
+    assert!((merged[0].1 - 1.0 / 60.0).abs() < 1e-10);
+    assert!((merged[1].1 - 1.0 / 61.0).abs() < 1e-10);
 }
