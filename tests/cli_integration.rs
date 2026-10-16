@@ -592,16 +592,25 @@ fn status_json_without_index_reports_zero_counts() {
 /// An explicit fixture manifest verifies exact artifacts without claiming that
 /// synthetic bytes can pass the separate live model probe.
 fn setup_cached_default_model(root: &Path) -> PathBuf {
-    use sha2::{Digest, Sha256};
     let output = recall(root).args(["model", "manifest"]).output().unwrap();
     assert!(output.status.success());
     let mut spec: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    for (name, key, bytes) in [
-        ("model.gguf", "model_sha256", b"fixture GGUF".as_slice()),
-        ("tokenizer.json", "tokenizer_sha256", b"{}".as_slice()),
+    for (name, key, bytes, checksum) in [
+        (
+            "model.gguf",
+            "model_sha256",
+            b"fixture GGUF".as_slice(),
+            "b28d94311aea5e81429ea07fc7a4af5c118665010865bf8bd9114d17a23f0820",
+        ),
+        (
+            "tokenizer.json",
+            "tokenizer_sha256",
+            b"{}".as_slice(),
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        ),
     ] {
         fs::write(root.join(name), bytes).unwrap();
-        spec[key] = format!("{:x}", Sha256::digest(bytes)).into();
+        spec[key] = checksum.into();
     }
     let path = root.join("manifest.json");
     fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
