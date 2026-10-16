@@ -85,9 +85,8 @@ fn quote(term: &str) -> String {
     format!("\"{}\"", term.replace('"', "\"\""))
 }
 
-// Independent implementation of frozen recall ADR 0010's wire contract.
-// Parse quoted literals before measuring their length or counting alternatives.
 pub fn clean_for_trigram(query: &MatchFtsQuery) -> Option<String> {
+    // The frozen FTS contract caps combinations before discarding short terms.
     let segments = Wire {
         text: query.as_str().as_bytes(),
         pos: 0,

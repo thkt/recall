@@ -1,4 +1,3 @@
-//! The frozen, independently evaluated EmbeddingGemma 2 inference contract.
 use crate::{
     embedding::{ChunkedEmbedding, EMBEDDING_DIMS, Embed, EmbedError, EmbedOptions},
     model::ModelSpec,
@@ -77,8 +76,6 @@ impl Gemma {
         })
     }
 
-    /// Queries and short documents use the GGUF vocabulary directly. Only a
-    /// long document needs the separate tokenizer's UTF-8 byte offsets.
     fn offset_tokenizer(&self) -> Result<&Tokenizer> {
         self.tokenizer
             .get_or_init(|| Tokenizer::from_file(&self.tokenizer_path).map_err(|e| e.to_string()))
@@ -86,7 +83,6 @@ impl Gemma {
             .map_err(|e| anyhow::anyhow!(e.clone()))
     }
 
-    // Unit normalization bounds each output to [-1,1]; persisted vectors use f32.
     #[allow(clippy::cast_possible_truncation)]
     fn encode(
         model: &LlamaModel,
@@ -184,6 +180,7 @@ impl Gemma {
         );
         let mut result = Vec::new();
         let mut start = 0;
+        // Re-tokenize offset windows with the prefix to enforce the native token budget.
         while start < count {
             let mut end = (start + budget).min(count);
             let lo = if start == 0 { 0 } else { offsets[start].0 };
@@ -276,8 +273,6 @@ impl Embed for Gemma {
                     flush(&mut batch, &mut owners, &mut out)?;
                     count = 0;
                 }
-                // A single window is atomic for bidirectional attention. Small budgets
-                // reduce packing; they never silently shorten the input window.
                 count += tokens.len();
                 batch.push(tokens);
                 owners.push(i);

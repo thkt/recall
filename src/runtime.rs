@@ -1,11 +1,8 @@
-//! Small CLI primitives owned by recall; no shared application runtime.
 #[cfg(test)]
 use std::process::ExitCode;
 use std::{env, ffi::OsString, io, path::PathBuf};
 use tracing_subscriber::EnvFilter;
 
-/// Preserve the previous nonempty home-directory policy, including the OS
-/// account fallback when HOME is empty or unset, without a directories crate.
 pub fn home_dir() -> Option<PathBuf> {
     env::home_dir().filter(|path| !path.as_os_str().is_empty())
 }
@@ -46,7 +43,6 @@ pub fn notify_schema_change(app: &str, what: &str, count: usize, remedy: &str) {
     ));
 }
 
-/// Preserve global options (including their separate values) before shorthand.
 pub fn try_expand_shorthand(
     args: &[OsString],
     commands: &[&str],

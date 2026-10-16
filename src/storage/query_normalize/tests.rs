@@ -31,8 +31,6 @@ fn hiragana_unchanged() {
 
 #[test]
 fn katakana_unchanged() {
-    // NFKC does not map Hiragana ↔ Katakana — only halfwidth katakana
-    // (`ｱ` = U+FF71) folds to fullwidth katakana (`ア` = U+30A2).
     assert_eq!(run("カタカナ"), "カタカナ");
 }
 
@@ -43,7 +41,6 @@ fn halfwidth_katakana_to_fullwidth() {
 
 #[test]
 fn ideographic_space_collapsed() {
-    // U+3000 (ideographic space) NFKC-folds to U+0020, then collapses.
     assert_eq!(run("foo　bar"), "foo bar");
 }
 
@@ -139,6 +136,5 @@ fn config_round_trips_through_serde() {
 
 #[test]
 fn fullwidth_punctuation_folds_under_nfkc() {
-    // Fullwidth `！` (U+FF01) NFKC-folds to ASCII `!` (U+0021).
     assert_eq!(run("hello！"), "hello!");
 }

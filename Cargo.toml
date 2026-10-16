@@ -21,8 +21,7 @@ tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"
 unicode-normalization = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Artifact downloads stream bytes; charset decoding is unnecessary. Retain the
-# existing TLS, HTTP/2 and system proxy support.
+# Artifact bytes need TLS, HTTP/2 and proxy support, without charset decoding.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "system-proxy"] }
 thiserror = "2"
 
@@ -33,21 +32,16 @@ tempfile = "3"
 unsafe_code = "deny"
 
 [lints.clippy]
-# absolute paths
 absolute_paths = "deny"
-# idiomatic iterators
 cast_possible_truncation = "deny"
 redundant_closure_for_method_calls = "deny"
 filter_map_next = "deny"
 flat_map_option = "deny"
 manual_filter_map = "deny"
 manual_find_map = "deny"
-# imports
 wildcard_imports = "deny"
 enum_glob_use = "deny"
-# strings
 str_to_string = "deny"
-# arguments
 needless_pass_by_value = "deny"
 
 [profile.release]

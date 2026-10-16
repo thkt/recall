@@ -1,5 +1,3 @@
-//! Model selection and migration contracts through the installed CLI boundary.
-//! All roots and databases are owned synthetic fixtures.
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::{
@@ -82,8 +80,6 @@ fn manifest_validation_and_cache_failures_are_explicit() {
     let out = value(&run(cli(root).args(["search", "quokka", "--json"])));
     assert_eq!(out["degraded"], true);
     assert!(out["data"]["results"].as_array().unwrap().len() == 1);
-    // A failed network install must remain a transient CLI error. A loopback
-    // closed port is deterministic and sends no request to an external host.
     let mut spec = original;
     spec["model_url"] = json!("https://127.0.0.1:9/model.gguf");
     fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
@@ -139,9 +135,6 @@ fn public_model_cli_contract() {
         c.env("RECALL_MODEL_DIR", &model);
         c
     };
-    // Hosted runners may have no GPU or a slow virtual GPU whose first shader
-    // compilation exceeds the production 30-second deadline. Keep that deadline
-    // and check the honest fallback; never call a timeout a successful GPU probe.
     let download = run(invoke().args(["model", "download"]));
     let stderr = String::from_utf8_lossy(&download.stderr);
     let probe = match download.status.code() {
@@ -182,7 +175,6 @@ fn public_model_cli_contract() {
         .args(["search", "quokka", "--json"])));
     check_state(&again);
     assert_eq!(first["data"], again["data"]);
-    // A malformed serialized child manifest must fail before model loading.
     let out = run(invoke()
         .env("__RECALL_GEMMA_PROBE", "1")
         .env("__RECALL_GEMMA_SPEC", "{}"));

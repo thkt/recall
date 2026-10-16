@@ -8,8 +8,6 @@ use crate::index_observer::recording;
 use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
 
-/// Collect a single-TEXT-column query into a Vec, replacing the verbose
-/// prepare / query_map / push loop at each assertion site.
 fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
     let mut stmt = conn.prepare(sql).unwrap();
     let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
@@ -58,10 +56,6 @@ fn test_index_from_dirs_indexes_and_skips() {
     assert_eq!(stats2.total_sessions, 1);
 }
 
-// TC-003 (#130): the production steady state is a hook re-indexing an
-// already-indexed tree. Beyond `indexed == 0` (parse skip, pinned above),
-// the DB content must be byte-stable: no duplicate chunks, no FTS growth,
-// no re-created sessions.
 #[test]
 fn test_index_from_dirs_steady_state_keeps_db_stable() {
     let (_dir, mut conn) = setup_test_db();
@@ -114,10 +108,6 @@ fn test_index_from_dirs_steady_state_keeps_db_stable() {
     );
 }
 
-// TC-004 (#130): mtime-forward re-index is the self-heal core — a session
-// file appended after indexing (the tail of a live session) must be
-// re-parsed, surface the new message, and replace its chunks without
-// duplicating the session.
 #[test]
 fn test_index_from_dirs_reindexes_appended_file() {
     let (_dir, mut conn) = setup_test_db();
@@ -141,7 +131,6 @@ fn test_index_from_dirs_reindexes_appended_file() {
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
 
-    // Append a turn and push mtime clearly past the 0.001s freshness epsilon.
     let mut all = fs::read_to_string(&file).unwrap();
     all.push_str(
             r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":"appended answer"},"timestamp":"2026-03-01T00:00:01Z"}"#,
@@ -183,7 +172,6 @@ fn test_index_from_dirs_reindexes_appended_file() {
     );
 }
 
-// Synthetic records only; no private session fixtures (#321).
 const FRESHNESS_QUESTION: &str = concat!(
     r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"original question"}}"#,
     "\n",
@@ -241,8 +229,6 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
             rewrite_with_mtime(&file, question, initial);
             index_from_dirs(&mut conn, &opts, true).unwrap();
 
-            // Same-size edits still depend on mtime. An mtime-only regression must
-            // not hide behind the new size check.
             rewrite_with_mtime(
                 &file,
                 &question.replace("original", "modified"),
@@ -253,8 +239,6 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
                 collect_strings(&conn, "SELECT text FROM messages"),
                 ["modified question"]
             );
-            // Invalid truncation is not a successful empty read and must not erase
-            // the old body or acknowledge its stamp.
             rewrite_with_mtime(&file, "{", initial + Duration::from_secs(2));
             assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
             assert_eq!(
@@ -368,8 +352,6 @@ fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
 
 #[test]
 fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
-    // Append after the first stat, after EOF, or after the final stat. The last
-    // order must keep the old stamp; the other orders must leave a pending mark.
     for order in 0..3 {
         let (_db_dir, mut conn) = setup_test_db();
         let root = TempDir::new().unwrap();
@@ -486,8 +468,6 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
     };
     let before = snapshot(&conn);
     assert!(!before[3].is_empty());
-    // Reconstruct the immediate predecessor's sessions shape, retaining real
-    // rows, chunks and vectors. Migration must not bless today's changed size.
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN file_size;")
         .unwrap();
     drop(conn);
@@ -542,8 +522,6 @@ fn index_one_claude_session(content: &str) -> Option<String> {
         .unwrap()
 }
 
-// T-004 (#24/FR-003): ingest tags session_type from the first user turn — an
-// automated marker yields 'automated', a human turn yields 'interactive'.
 #[test]
 fn test_ingest_tags_session_type_from_first_user_turn() {
     assert_eq!(
@@ -585,9 +563,6 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
     assert_eq!(stats1.indexed, 1);
     index_chunks(&mut conn, None).unwrap();
 
-    // New session added into the SAME existing day dir. The parent `2026/` mtime
-    // does not change, so the old dirs_changed_since optimization skipped the scan
-    // and permanently missed the new session (#52 / #70).
     let s2 = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"codex-s2","cwd":"/proj"}}
 {"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"second codex session"}]}}"#;
     fs::write(day_dir.join("s2.jsonl"), s2).unwrap();
@@ -635,7 +610,6 @@ fn test_index_from_dirs_force_reindexes() {
     .unwrap();
     assert_eq!(stats.indexed, 1);
 
-    // Populate qa_chunks + vec_chunks before force reindex
     index_chunks(&mut conn, None).unwrap();
     let embedder = MockEmbedder::new();
     embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
@@ -700,7 +674,6 @@ fn test_orphan_cleanup_removes_deleted_files() {
     assert_eq!(stats.indexed, 2);
     assert_eq!(stats.total_sessions, 2);
 
-    // Create chunks + embeddings for session2 before deleting the file
     index_chunks(&mut conn, None).unwrap();
     let embedder = MockEmbedder::new();
     embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
@@ -721,8 +694,6 @@ fn test_orphan_cleanup_removes_deleted_files() {
     );
 
     fs::remove_file(&f2).unwrap();
-    // force: false exercises cleanup_orphans on the incremental path; force: true
-    // takes the same source-keyed cleanup, so either flag drives this cascade.
     let stats2 = index_from_dirs(
         &mut conn,
         &IndexOptions {
@@ -750,15 +721,12 @@ fn test_orphan_cleanup_removes_deleted_files() {
     let vecs_for_session1: i64 = conn
         .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
         .unwrap();
-    // session1 still exists, so its vec_chunks should remain; session2's should be gone
     assert!(
         vecs_for_session1 < vecs_before,
         "orphan cleanup should remove session2 vec_chunks: before={vecs_before}, after={vecs_for_session1}"
     );
 }
 
-// Seeds one claude session and one codex session into a populated DB and
-// returns (tmp, claude_dir, codex_dir). Used by the #165 regression tests.
 fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -790,8 +758,6 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     (tmp, claude_dir, codex_dir)
 }
 
-// #165: a refresh where every source root is missing must not be read as
-// proof that all indexed files were deleted. The existing rows survive.
 #[test]
 fn test_missing_source_roots_preserve_existing_index() {
     let (_dir, mut conn) = setup_test_db();
@@ -821,15 +787,11 @@ fn test_missing_source_roots_preserve_existing_index() {
     );
 }
 
-// #165: with one root scanned and the other missing, cleanup is selective —
-// a file deleted under the scanned root is removed, while the missing root's
-// session is preserved (its absence is unproven).
 #[test]
 fn test_partial_missing_root_preserves_unscanned_source_only() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
-    // Legitimately delete the claude file; point codex at a missing root.
     fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
     let gone_codex = tmp.path().join("missing_codex");
     let stats = index_from_dirs(
@@ -856,9 +818,6 @@ fn test_partial_missing_root_preserves_unscanned_source_only() {
     );
 }
 
-// #165 high-severity variant: a root that exists but cannot be read
-// (e.g. permission denied) yields zero sources without proving deletion.
-// `is_dir()` is true, so the fix must gate cleanup on read success.
 #[cfg(unix)]
 #[test]
 fn test_unreadable_source_root_preserves_index() {
@@ -867,7 +826,6 @@ fn test_unreadable_source_root_preserves_index() {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
-    // Strip all permissions so read_dir fails while is_dir() still succeeds.
     let locked = fs::metadata(&claude_dir).unwrap().permissions();
     let mut zero = locked.clone();
     zero.set_mode(0o000);
@@ -883,7 +841,6 @@ fn test_unreadable_source_root_preserves_index() {
         true,
     );
 
-    // Restore permissions before asserting so TempDir cleanup always works.
     fs::set_permissions(&claude_dir, locked).unwrap();
     let stats = stats.unwrap();
 
@@ -893,9 +850,6 @@ fn test_unreadable_source_root_preserves_index() {
     );
 }
 
-// #165 (CHX-1): a root whose top level reads fine but holds an unreadable
-// nested subdirectory is only partially enumerated. Files under the locked
-// subtree appear absent, so the source must be preserved, not deleted.
 #[cfg(unix)]
 #[test]
 fn test_unreadable_child_subdir_preserves_source() {
@@ -904,8 +858,6 @@ fn test_unreadable_child_subdir_preserves_source() {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
-    // Lock the codex year subdir: read_dir(codex_dir) lists it, but
-    // descending into it fails, so codex's tree is not fully enumerated.
     let locked_subdir = codex_dir.join("2026");
     let orig = fs::metadata(&locked_subdir).unwrap().permissions();
     let mut zero = orig.clone();
@@ -931,9 +883,6 @@ fn test_unreadable_child_subdir_preserves_source() {
     );
 }
 
-// #165 negative control: with both roots present and readable, deleting a
-// file under a scanned root still removes its session AND cascades to its
-// messages and qa_chunks — the fix narrows cleanup, it does not disable it.
 #[test]
 fn test_deleted_file_under_scanned_root_cascades_cleanup() {
     let (_dir, mut conn) = setup_test_db();
@@ -958,7 +907,6 @@ fn test_deleted_file_under_scanned_root_cascades_cleanup() {
         "seed should leave messages for the session"
     );
 
-    // Delete the claude file; both roots stay present and readable.
     fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
     let stats = index_from_dirs(
         &mut conn,
@@ -1008,8 +956,6 @@ fn test_deleted_file_under_scanned_root_cascades_cleanup() {
     );
 }
 
-// #165 follow-up: a skipped root that preserved sessions is reported so the
-// silent preservation stays visible to the operator.
 #[test]
 fn test_skipped_root_reports_preserved_count() {
     let (_dir, mut conn) = setup_test_db();
@@ -1045,9 +991,6 @@ fn test_skipped_root_reports_preserved_count() {
     );
 }
 
-// #165 CHX-1 regression: when an unscanned source holds BOTH a re-indexed
-// present file and a preserved absent file, only the absent row is at risk.
-// Counting every row of the source would over-report the preserved magnitude.
 #[cfg(unix)]
 #[test]
 fn test_skipped_root_counts_only_file_absent_rows() {
@@ -1056,8 +999,6 @@ fn test_skipped_root_counts_only_file_absent_rows() {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
-    // Add a second codex session at the root level (outside 2026), so it
-    // stays readable — hence re-indexed and present — when 2026 is locked.
     fs::write(
             codex_dir.join("top.jsonl"),
             "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-top\",\"cwd\":\"/proj\"}}\n{\"timestamp\":\"2026-05-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex top turn\"}]}}",
@@ -1074,9 +1015,6 @@ fn test_skipped_root_counts_only_file_absent_rows() {
     )
     .unwrap();
 
-    // Lock the year subdir: top.jsonl is re-read (present in sources),
-    // s1.jsonl is not (preserved). The codex tree is not fully enumerated,
-    // so codex is unscanned and reported.
     let locked_subdir = codex_dir.join("2026");
     let orig = fs::metadata(&locked_subdir).unwrap().permissions();
     let mut zero = orig.clone();
@@ -1112,9 +1050,6 @@ fn test_skipped_root_counts_only_file_absent_rows() {
     );
 }
 
-// #185 T-185-1: a present root that fails to fully enumerate must surface even
-// when nothing was preserved (an empty DB / first index). The partial read
-// silently dropped files, which is the under-index this signal exists to catch.
 #[cfg(unix)]
 #[test]
 fn test_incomplete_enumeration_surfaces_with_empty_db() {
@@ -1122,11 +1057,8 @@ fn test_incomplete_enumeration_surfaces_with_empty_db() {
 
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
-    // claude root: present and empty, so it scans cleanly (not skipped).
     let claude_dir = tmp.path().join("claude_projects");
     fs::create_dir_all(&claude_dir).unwrap();
-    // codex root: present, but its only subtree is unreadable, so the tree is
-    // not fully enumerated and no codex file is indexed (preserved stays 0).
     let codex_dir = tmp.path().join("codex_sessions");
     let locked_subdir = codex_dir.join("2026");
     fs::create_dir_all(&locked_subdir).unwrap();
@@ -1165,9 +1097,6 @@ fn test_incomplete_enumeration_surfaces_with_empty_db() {
     assert_eq!(codex.reason, SkippedReason::IncompleteEnumeration);
 }
 
-// #185 T-185-2: a missing root with nothing preserved is a tool the user never
-// ran, so it must stay silent (the suppressed false side of the MissingRoot
-// gate, covering the changed branch for the #49/#121 diff-cover gate).
 #[test]
 fn test_missing_root_with_no_preserved_rows_is_silent() {
     let (_dir, mut conn) = setup_test_db();
@@ -1192,9 +1121,6 @@ fn test_missing_root_with_no_preserved_rows_is_silent() {
     );
 }
 
-// #183 T-003: both reasons render distinct remediation wording and machine
-// tags. Calling both variants directly keeps every match arm DA>0 without
-// constructing an APFS-unreachable failure (the #49/#121 coverage trap).
 #[test]
 fn test_skipped_reason_note_and_tag_differ_per_variant() {
     let missing = SkippedReason::MissingRoot.note("codex", 3);
@@ -1206,9 +1132,6 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
         !missing.contains("reconcile any real deletions"),
         "the missing-root note must use forward-looking framing, not past-tense deletions (#187): {missing}"
     );
-    // Mirror the IncompleteEnumeration preserved>0 test: the negative guard alone
-    // only blocks the one historical phrase, so pin the new forward-looking content
-    // positively too, else a revert that drops it (OPS-01 harmonization) goes unseen.
     assert!(
         missing.contains("none deleted this run"),
         "the missing-root note must state nothing was deleted this run (#187): {missing}"
@@ -1233,10 +1156,6 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
     );
 }
 
-// #185 T-185-3: with nothing preserved, the incomplete-enumeration note must
-// drop the "preserved N / reconcile deletions" framing (there is nothing to
-// reconcile) yet still advise fixing access. Calling the variant directly keeps
-// the new preserved==0 match arm DA>0 deterministically (#49/#121 trap).
 #[test]
 fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
     let note = SkippedReason::IncompleteEnumeration.note("claude", 0);
@@ -1258,11 +1177,6 @@ fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
     );
 }
 
-// #187: with rows preserved, the reconcile clause is forward-looking — it points
-// at the next full scan, not deletions that already happened. The note must say
-// nothing was deleted this run and frame the reconcile as a future scan, so the
-// audit-style misreading ("reconcile any real deletions" = deletions occurred)
-// cannot recur. Calling the variant directly keeps the arm DA>0 (#49/#121 trap).
 #[test]
 fn test_incomplete_note_at_nonzero_preserved_frames_reconcile_as_future() {
     let note = SkippedReason::IncompleteEnumeration.note("claude", 2);
@@ -1274,31 +1188,17 @@ fn test_incomplete_note_at_nonzero_preserved_frames_reconcile_as_future() {
         note.contains("next full scan"),
         "the reconcile must be framed as a future scan, not a past deletion: {note}"
     );
-    // Mirror the preserved==0 guard (test_incomplete_note_at_zero_preserved_omits_reconcile):
-    // a positive-only test would still pass if the old past-tense clause were re-added
-    // alongside the new one, so block the exact banned phrase from returning.
     assert!(
         !note.contains("reconcile any real deletions"),
         "the old past-tense deletion framing must not re-appear: {note}"
     );
 }
 
-// #183 T-004 (CHX-1 regression): the count-based early-return in cleanup_orphans
-// must not mask a real deletion when an unrelated new file enters the same scan.
-// existing {s1 codex, claude rows}; on disk the claude file is gone but a new
-// claude file appears, so indexed>0 and the early-return guard stays off — the
-// absent claude row must be deleted, not preserved by the early return.
 #[test]
 fn test_cleanup_deletes_real_orphan_when_new_file_added() {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
-    // The regression this test guards depends on the early-return's count-equality
-    // half (sources.len() == existing.len()) being TRUE at cleanup, so only the
-    // `indexed == 0` term keeps the guard off (the CHX-1 shape). That requires the
-    // seed to hold exactly 2 sessions and the swap below to keep on-disk count at 2.
-    // Anchor it so the test fails loudly if the shared seed later drifts, rather
-    // than silently degrading into a plain cleanup test.
     let seeded: i64 = conn
         .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
         .unwrap();
@@ -1307,8 +1207,6 @@ fn test_cleanup_deletes_real_orphan_when_new_file_added() {
         "T-004 needs exactly 2 seeded sessions to reach the guard's count-equality branch"
     );
 
-    // The originally-seeded claude file is gone; replace it with a brand-new one
-    // so the claude root is fully scanned with a non-empty, different file set.
     for entry in fs::read_dir(&claude_dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "jsonl") {
@@ -1360,8 +1258,6 @@ fn test_cleanup_deletes_real_orphan_when_new_file_added() {
 fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Malformed JSON is skipped; an unreadable file exercises a real parser
-    // error. Both must allow cleanup after complete directory enumeration.
     for (replacement, unreadable) in [("", false), ("invalid JSON\n", false), ("", true)] {
         for incomplete_codex in [false, true] {
             let (_dir, mut conn) = setup_test_db();
@@ -1378,8 +1274,6 @@ fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
                 seed_session_file(&conn, sid, &format!("/proj/{sid}.rs"));
             }
 
-            // Compare actual rows and vector bytes, not just counts: a cleanup
-            // that rewrites the survivor or leaves dangling vectors must fail.
             let snapshot = |conn: &Connection, sid: &str| {
                 [
                     "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions WHERE session_id = ? ORDER BY session_id",
@@ -1412,8 +1306,6 @@ fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
                 }
                 fs::create_dir_all(&deep).unwrap();
                 fs::rename(codex_dir.join("2026/04/27/s1.jsonl"), deep.join("s1.jsonl")).unwrap();
-                // Keep the observed file count equal even when the original
-                // Codex file is hidden below the enumeration depth limit.
                 fs::write(codex_dir.join("empty.jsonl"), "").unwrap();
             }
             fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
@@ -1431,8 +1323,6 @@ fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
                 if unreadable {
                     fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
                 }
-                // Model absence must not retain genuinely deleted embedded
-                // sessions when no parsed replacement identifies their ID.
                 let stats = index_from_dirs(&mut conn, &opts, false);
                 fs::set_permissions(&fresh, permissions).unwrap();
                 let stats = stats.unwrap();
@@ -1493,19 +1383,11 @@ fn complete_scan_preserves_sessions_with_unknown_source() {
     );
 }
 
-// #177: `rebuild` (force) with a missing source root must not destroy that
-// root's index. The force path used to bulk-delete every table before re-scan,
-// so a transient root outage wiped the preserved root's sessions and their
-// embeddings unrecoverably. The fix removes the blanket delete and routes force
-// deletion through the same source-keyed cleanup as #165: the present root is
-// genuinely rebuilt while the missing root's rows survive.
 #[test]
 fn test_force_rebuild_preserves_missing_source_root() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
-    // Build chunks + embeddings for both seeded sessions so the data-loss is
-    // observable at the embedding layer, not just the session row.
     index_chunks(&mut conn, None).unwrap();
     let embedder = MockEmbedder::new();
     embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
@@ -1522,7 +1404,6 @@ fn test_force_rebuild_preserves_missing_source_root() {
         "the codex session must have embeddings before the rebuild"
     );
 
-    // Rebuild (force) while the codex root is missing.
     let gone_codex = tmp.path().join("missing_codex");
     let stats = index_from_dirs(
         &mut conn,
@@ -1551,8 +1432,6 @@ fn test_force_rebuild_preserves_missing_source_root() {
         codex_vecs_after, codex_vecs_before,
         "the missing root's embeddings must survive the rebuild unchanged"
     );
-    // The present claude root is genuinely rebuilt: its chunks are cleared,
-    // awaiting re-embed — force is not silently downgraded to incremental.
     let claude_chunks_after: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'c'",
@@ -1572,9 +1451,6 @@ fn test_force_rebuild_preserves_missing_source_root() {
     assert_eq!(stats.skipped_roots[0].source, Source::Codex);
 }
 
-// #177 worst case: a force rebuild where BOTH source roots are missing must not
-// wipe the index. With nothing successfully scanned, every session and its
-// embeddings survive and both roots are reported as preserved.
 #[test]
 fn test_force_rebuild_all_roots_missing_preserves_index() {
     let (_dir, mut conn) = setup_test_db();
@@ -1619,11 +1495,6 @@ fn test_force_rebuild_all_roots_missing_preserves_index() {
     );
 }
 
-// #177 force-path cascade: the two missing-root force tests above exit
-// cleanup_orphans early (the absent root is unscanned, so its rows are
-// preserved). This pins the other branch — a force rebuild where both roots
-// are scanned and a file genuinely vanished must still delete that session and
-// cascade to its messages and qa_chunks, exactly as the incremental path does.
 #[test]
 fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
     let (_dir, mut conn) = setup_test_db();
@@ -1648,8 +1519,6 @@ fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
         "seed should leave messages for the session"
     );
 
-    // Delete the claude file; both roots stay present and readable, so both
-    // are scanned and the deleted row is delete-eligible under force.
     fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
     let stats = index_from_dirs(
         &mut conn,
@@ -1794,8 +1663,6 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
             1
         );
 
-        // Include rowids/ranges and embedding bytes: equal counts alone would miss
-        // replacing the body while leaving stale chunks or vectors behind.
         let snapshot = |conn: &Connection| {
             [
                 "SELECT json_array(session_id, file_path, mtime, file_size, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
@@ -1815,9 +1682,6 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
         )
         .unwrap();
 
-        // Exercise both a collision with the old file still present and a move.
-        // Cleanup must honor the deferred update across repeated runs. No mtime
-        // changes or sleeps are required.
         assert!(original.is_file());
         if remove_original {
             fs::remove_file(&original).unwrap();
@@ -1834,13 +1698,9 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
             assert_eq!(snapshot(&conn), before);
         }
 
-        // Once embedding is available, the same pending replacement must proceed
-        // and remove the old vectors/chunks before generating the new content.
         let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
         assert_eq!(stats.indexed, 1);
         assert_eq!(stats.preserved_embedded, 0);
-        // A still-present corrupt file remains reportable; a moved file no
-        // longer backs retained content once its replacement is ingested.
         assert_eq!(stats.parse_diagnostics.len(), usize::from(!remove_original));
         assert_eq!(stats.total_sessions, 1);
         assert_eq!(
@@ -1912,14 +1772,6 @@ fn test_collect_skips_symlinks() {
     assert!(files[0].0.ends_with("real.jsonl"));
 }
 
-// #181: a per-entry read failure (DirEntry or file_type() error) leaves that
-// entry unseen, so the enumeration must report incomplete (false) — otherwise
-// the source counts as scanned and cleanup_orphans deletes the unseen file's
-// row. APFS never triggers this path (readdir returns d_type), so the only way
-// to cover the merged error arm is to inject an Err item directly. The Err is
-// chained FIRST so that real.jsonl is read after it: collecting the file proves
-// the error arm only suppresses cleanup and lets enumeration continue (a `break`
-// or early `return` in place of `continue` would yield an empty `files`).
 #[test]
 fn test_collect_from_entries_incomplete_on_entry_error_still_collects() {
     use std::{io, iter};
@@ -1971,7 +1823,6 @@ fn test_011_index_chunks_incremental() {
         (0, 1, 1)
     );
 
-    // Durability matters: another hook opens a fresh connection.
     drop(conn);
     let mut conn = open_db(&dir.path().join("test.db")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
@@ -1999,7 +1850,6 @@ fn test_011_index_chunks_incremental() {
         ),
     )
     .unwrap();
-    // Avoid depending on filesystem timestamp precision for the append.
     conn.execute("UPDATE sessions SET mtime = 0", []).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
     let appended = index_chunks(&mut conn, None).unwrap();
@@ -2038,8 +1888,6 @@ fn test_index_chunks_progress_callback_counts_sessions() {
     )
     .unwrap();
 
-    // Progress advances per session processed, not per chunk created:
-    // s2 has no messages (0 chunks) yet still counts toward done/total.
     assert_eq!(calls.into_inner().unwrap(), vec![(1, 2), (2, 2)]);
     assert_eq!(stats.chunks_created, 1);
 }
@@ -2055,8 +1903,6 @@ fn test_index_chunks_progress_callback_silent_when_all_chunked() {
     .unwrap();
     index_chunks(&mut conn, None).unwrap();
 
-    // Every session is chunked, so the empty early-return must not
-    // invoke the callback even when one is supplied.
     let calls = Mutex::new(Vec::new());
     let stats = index_chunks(
         &mut conn,
@@ -2163,15 +2009,6 @@ fn test_embed_recent_chunks_populates_vec_chunks() {
     assert_eq!(result2.embedded, 0);
 }
 
-// T-007 (FR-001, FR-002): a mid-run batch failure is non-blocking — the run
-// continues past it and counts the rest as failed. With failing_after(128) the
-// first batch (128 chunks) succeeds and commits; the MockEmbedder counter is not
-// reset, so every later batch fails (call_count stays >= 128). Under continue the
-// run does not stop at batch 2: it reports embedded == 128 and failed_count ==
-// the remaining chunks, and the committed batch survives.
-// (Updated from test_embed_chunks_stops_on_error_preserves_progress, whose
-// stopped_at_error.is_some() assertion predates the break->continue change.)
-// Perspective: branch (the Err arm continues) + boundary (split at EMBED_BATCH_SIZE).
 #[test]
 fn test_embed_chunks_continues_past_failed_batch_and_counts_remainder() {
     let (_dir, mut conn) = setup_test_db();
@@ -2228,8 +2065,6 @@ fn test_embed_chunks_continues_past_failed_batch_and_counts_remainder() {
     );
 }
 
-/// Seeds one message into the default test session `s1`. Returns its rowid so the
-/// backfill tests can pin which range a chunk should receive.
 fn seed_message(conn: &Connection, role: &str, text: &str) -> i64 {
     conn.execute(
         "INSERT INTO messages (session_id, role, text) VALUES ('s1', ?1, ?2)",
@@ -2244,9 +2079,6 @@ fn seed_message(conn: &Connection, role: &str, text: &str) -> i64 {
     .unwrap()
 }
 
-/// Seeds a legacy qa_chunk (NULL src_rowid_lo/hi) plus its vec_chunks embedding,
-/// mirroring a row written before #192. Backfill must populate lo/hi in place
-/// without disturbing id or the embedding.
 fn seed_legacy_chunk(conn: &Connection, id: i64, content: &str) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, 's1', ?2, 0)",
@@ -2261,20 +2093,12 @@ fn seed_legacy_chunk(conn: &Connection, id: i64, content: &str) {
     .unwrap();
 }
 
-// T-192e (#192, FR-6): migration backfill on a count-matching session. A legacy
-// session whose stored qa_chunks count equals the re-derived chunk count gets
-// its NULL src_rowid_lo/hi populated by re-running the chunker and zipping by
-// qa_chunks.id ascending. The embedding rows (vec_chunks) and qa_chunks.id must
-// be untouched — no re-embed, no row churn (FR-5). Perspective: State (NULL →
-// populated) + Hazard (embedding loss / id reassignment on migration).
 #[test]
 fn test_192e_backfill_populates_rowid_range_count_match() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
-    // One user+assistant pair → the chunker re-derives exactly one chunk.
     let user_rowid = seed_message(&conn, "user", "how to rotate tokens");
     let assistant_rowid = seed_message(&conn, "assistant", "use a refresh grant");
-    // Legacy stored chunk: NULL lo/hi, one row → matches the re-derived count of 1.
     seed_legacy_chunk(&conn, 1, "how to rotate tokens\nuse a refresh grant");
 
     let vec_before: i64 = conn
@@ -2322,20 +2146,11 @@ fn test_192e_backfill_populates_rowid_range_count_match() {
     );
 }
 
-// T-192f (#192, FR-6): migration safety on a count mismatch. When the re-derived
-// chunk count does not equal the stored count, the id-order zip is unsafe (a
-// chunk would get the wrong message's rowid), so backfill leaves the rows' lo/hi
-// NULL and does not panic. Those rows then resolve via the instr fallback
-// (T-192d). Perspective: Error (mismatched cardinality) + Hazard (silent
-// mis-stamping). The stored count is 2; the seeded single user message re-derives
-// to 1 chunk → mismatch.
 #[test]
 fn test_192f_backfill_leaves_null_on_count_mismatch() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
-    // One user-only message → the chunker re-derives exactly one chunk.
     seed_message(&conn, "user", "single turn");
-    // But two legacy chunks are stored → re-derived (1) != stored (2): mismatch.
     seed_legacy_chunk(&conn, 1, "single turn");
     seed_legacy_chunk(&conn, 2, "orphaned extra chunk");
 
@@ -2358,27 +2173,13 @@ fn test_192f_backfill_leaves_null_on_count_mismatch() {
     );
 }
 
-// T-229b (#229): backfill must not widen a legacy chunk's range over stale
-// content. A pre-#192 DB indexed before the consecutive-assistant merge stored
-// [Q, A1, A2] as one chunk "Q\nA1" (the trailing A2 was orphaned). The merged
-// chunker now re-derives a single chunk "Q\nA1\nA2" spanning [Q..A2] — the count
-// still matches (1 == 1), so the old count-only guard would stamp the widened
-// range onto the stale "Q\nA1" content, making an FTS hit on A2 resolve to a
-// chunk that never held it. The content-equality guard must catch the drift and
-// keep NULL so the row stays on the safe instr fallback until `rebuild`.
-// Perspective: Hazard (count-preserving re-grouping) + Boundary (content differs
-// while count matches).
 #[test]
 fn test_229b_backfill_skips_count_match_with_content_drift() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
-    // Three messages: the merge collapses A1+A2 into the Q chunk → 1 re-derived.
     seed_message(&conn, "user", "how do i tune the cache");
     seed_message(&conn, "assistant", "raise the ttl first");
     seed_message(&conn, "assistant", "then widen the shard count");
-    // Legacy stored chunk: NULL range, content stops at A1 (pre-merge grouping).
-    // Re-derived count is 1 == stored 1, but content "...ttl first" differs from
-    // the re-derived "...ttl first\nthen widen the shard count".
     seed_legacy_chunk(&conn, 1, "how do i tune the cache\nraise the ttl first");
 
     let updated = backfill_rowid_ranges(&mut conn).unwrap();
@@ -2402,23 +2203,12 @@ fn test_229b_backfill_skips_count_match_with_content_drift() {
     );
 }
 
-// T-229 (#229): in a multi-assistant tool-use turn the parser drops the
-// tool_result-only user turns between assistant messages, leaving consecutive
-// assistant rows in the DB. The trailing assistant's text reaches FTS (every
-// message is inserted) but the embedding path only sees chunked content, so if
-// chunking orphans the trailing assistant it becomes invisible to semantic /
-// vector search. Reproduce the bug surface (embed path): seed user, assistant,
-// assistant, then assert the trailing assistant's unique term lands in a
-// qa_chunk that actually has a vec_chunks embedding row.
-// Red before the chunker merge fix (orphaned → no chunk → no embedding).
 #[test]
 fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
     seed_message(&conn, "user", "how do i configure the retry backoff");
     seed_message(&conn, "assistant", "first set the base interval");
-    // A tool_result-only user turn sat here in the source session; the parser
-    // dropped it, so this second assistant is stored adjacent to the first.
     seed_message(
         &conn,
         "assistant",
@@ -2444,28 +2234,20 @@ fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
     );
 }
 
-// T-001 (U-001): deleting a session through delete_session_dependents must also
-// remove its session_files scanned-file markers, so a session deletion / re-parse
-// leaves no orphaned rows. The schema is built via the real setup_test_db →
-// open_db → create_schema path, so this guards both halves of the contract: if
-// the table exists but the DELETE is missing, the count assertion fails at 1.
 #[test]
 fn セッション削除で_session_files_の行も消える() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
-    // given: the session owns a session_files row
     conn.execute(
         "INSERT INTO session_files (session_id, path) VALUES ('s1', '/proj/s1.jsonl')",
         [],
     )
     .unwrap();
 
-    // when: the session is deleted via delete_session_dependents
     let tx = conn.transaction().unwrap();
     delete_session_dependents(&tx, "s1").unwrap();
     tx.commit().unwrap();
 
-    // then: no session_files row remains for that session_id
     let remaining: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM session_files WHERE session_id = 's1'",
@@ -2479,17 +2261,12 @@ fn セッション削除で_session_files_の行も消える() {
     );
 }
 
-// T-002 (U-002): Edit/Write の file_path が session_files に入る（given: Edit と Write の
-// tool_use を含む Claude JSONL / when: recall index を実行 / then: session_files に両パスが
-// 入り、messages / qa_chunks の内容は tool_use 由来のテキストを含まない）
 #[test]
 fn edit_write_の_file_path_が_session_files_に入る() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
     fs::create_dir_all(&claude_dir).unwrap();
-    // given: an assistant turn issues an Edit and a Write tool_use, each with a
-    // distinctive file_path marker that appears nowhere in any text block.
     fs::write(
         claude_dir.join("edit_session.jsonl"),
         concat!(
@@ -2501,7 +2278,6 @@ fn edit_write_の_file_path_が_session_files_に入る() {
     .unwrap();
     let codex_dir = tmp.path().join("codex_sessions");
 
-    // when: recall index (index_from_dirs) then chunk the session.
     index_from_dirs(
         &mut conn,
         &IndexOptions {
@@ -2514,7 +2290,6 @@ fn edit_write_の_file_path_が_session_files_に入る() {
     .unwrap();
     index_chunks(&mut conn, None).unwrap();
 
-    // then: both file_path values are recorded in session_files.
     let paths = collect_strings(&conn, "SELECT path FROM session_files ORDER BY path");
     assert_eq!(
         paths,
@@ -2525,8 +2300,6 @@ fn edit_write_の_file_path_が_session_files_に入る() {
         "Edit and Write file_path values must land in session_files"
     );
 
-    // then: the tool_use-derived text (paths, write content) never leaks into the
-    // searchable body — neither messages nor qa_chunks.
     let message_texts = collect_strings(&conn, "SELECT text FROM messages");
     let chunk_contents = collect_strings(&conn, "SELECT content FROM qa_chunks");
     for marker in ["alpha_marker", "beta_marker", "filecontents"] {
@@ -2541,8 +2314,6 @@ fn edit_write_の_file_path_が_session_files_に入る() {
     }
 }
 
-// T-003 (U-002): 妥当でない値は捨てられる（given: 改行入り・長さ超過・非パス形状の
-// file_path を含む tool_use / when: parse する / then: session_files に入らない）
 #[test]
 fn 妥当でない値は捨てられる() {
     let (_dir, mut conn) = setup_test_db();
@@ -2550,12 +2321,6 @@ fn 妥当でない値は捨てられる() {
     let claude_dir = tmp.path().join("claude_projects");
     fs::create_dir_all(&claude_dir).unwrap();
 
-    // given: one valid Edit file_path as a control, plus three invalid ones, each
-    // failing exactly one validity rule: an embedded newline, an over-length path
-    // (~100k chars — unambiguously beyond any filesystem PATH_MAX so the test does
-    // not hinge on Green's exact cap), and an empty (non-path-shaped) value.
-    // Built via serde_json so the newline is stored as the JSON escape `\n` on one
-    // physical line and decodes back to a real newline at parse time.
     let long_path = format!("/proj/{}.rs", "a".repeat(100_000));
     let assistant = serde_json::json!({
         "type": "assistant",
@@ -2585,7 +2350,6 @@ fn 妥当でない値は捨てられる() {
     fs::write(claude_dir.join("filter_session.jsonl"), contents).unwrap();
     let codex_dir = tmp.path().join("codex_sessions");
 
-    // when: recall index parses the session.
     index_from_dirs(
         &mut conn,
         &IndexOptions {
@@ -2597,9 +2361,6 @@ fn 妥当でない値は捨てられる() {
     )
     .unwrap();
 
-    // then: only the valid path survives; the newline / over-length / empty values
-    // are dropped. Asserting the exact set (not merely "invalids absent") keeps the
-    // test from passing vacuously and pins the filter's effect.
     let paths = collect_strings(&conn, "SELECT path FROM session_files ORDER BY path");
     assert_eq!(
         paths,
@@ -2608,19 +2369,9 @@ fn 妥当でない値は捨てられる() {
     );
 }
 
-// #293 audit M (U-003 改訂): a legacy session whose stored file_path does not
-// resolve to a readable JSONL stays UNMARKED (files_scanned NULL), so a transient
-// read failure during the one-time backfill is retried on the next index instead
-// of locking the session out of --file permanently (recoverable before only via
-// a full rebuild). The retry cost for a permanently-vanished file is one failed
-// open per index run — the same skip-and-retry stance as check_freshness on an
-// inaccessible mtime. seed_session stores file_path '/f', which does not exist,
-// so reread_scanned_files takes its I/O-failure arm. Perspective: Error
-// (unreadable input) + State (the marker must not advance on a failed read).
 #[test]
 fn 読めない_jsonl_のセッションはマーカーを立てず次回に再試行する() {
     let (_dir, mut conn) = setup_test_db();
-    // given: a legacy session (files_scanned NULL) whose file_path '/f' is unreadable.
     seed_session(&conn, "gone-session");
     let unmarked_before: i64 = conn
         .query_row(
@@ -2631,10 +2382,8 @@ fn 読めない_jsonl_のセッションはマーカーを立てず次回に再�
         .unwrap();
     assert_eq!(unmarked_before, 1, "precondition: one unmarked session");
 
-    // when: the path-only backfill runs over the unreadable JSONL.
     let marked = backfill_session_files(&mut conn, None).unwrap();
 
-    // then: the session is NOT counted as marked and stays retryable.
     assert_eq!(
         marked, 0,
         "an unreadable session must not be counted as marked"
@@ -2662,7 +2411,6 @@ fn 読めない_jsonl_のセッションはマーカーを立てず次回に再�
     assert_eq!(diagnostics.len(), 1);
     assert!(diagnostics[0].read_error);
 
-    // and: a second backfill sees the same unmarked session again (retry path).
     let retried = backfill_session_files(&mut conn, None).unwrap();
     assert_eq!(
         retried, 0,
@@ -2670,20 +2418,14 @@ fn 読めない_jsonl_のセッションはマーカーを立てず次回に再�
     );
 }
 
-// #293 audit M (U-003 改訂の対面): 再読しても決して増えない終端ケース — 未知
-// source と、読めるが本文ゼロで parse が Ok(None) に落ちる JSONL — はマーカーを
-// 立てて以後の index で再読しない。unmarked 温存（再試行）は読み取り失敗だけに
-// 限る。ここが崩れると該当セッション全件が index のたびに再読され続ける。
 #[test]
 fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再読しない() {
     let (_dir, mut conn) = setup_test_db();
-    // 未知 source: 再読しても解釈できるようにはならない終端ケース。
     conn.execute(
         "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL)",
         [],
     )
     .unwrap();
-    // 読める空 JSONL: parse は本文ゼロで Ok(None) に落ちる終端ケース。
     let tmp = TempDir::new().unwrap();
     let empty = tmp.path().join("empty-session.jsonl");
     fs::write(&empty, "").unwrap();
@@ -2716,8 +2458,6 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
     );
 }
 
-// #320: failures after staged work must not turn pending sessions into permanent
-// empty successes. Exercise both SQL failure and #121's callback interruption.
 #[test]
 fn chunk_completion_rolls_back_with_chunks_and_retries() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -2834,8 +2574,6 @@ fn chunk_batches_limit_session_count_and_source_bytes() {
 #[test]
 fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     let (_dir, mut conn) = setup_test_db();
-    // Insert sessions and messages in opposite orders; 65 sessions cross the
-    // batch boundary. Unknown roles and consecutive answers must not disturb it.
     for i in 0..65 {
         seed_session(&conn, &format!("s{i:03}"));
     }
@@ -2878,8 +2616,6 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
         );
         assert_eq!((lo, hi), (65 - i, 260 - i));
     }
-    // Pin the performance contract to SQLite's actual plan, not just counters:
-    // rowid lookups must not silently become a full FTS scan per batch/session.
     conn.execute_batch("CREATE TEMP TABLE chunk_message_rows (session_id TEXT, message_rowid INTEGER, text_bytes INTEGER, PRIMARY KEY(session_id, message_rowid)) WITHOUT ROWID;").unwrap();
     let stage_plan: Vec<String> = conn
         .prepare(&format!("EXPLAIN QUERY PLAN {STAGE_CHUNK_MESSAGES}"))
@@ -2935,7 +2671,6 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         "SELECT json_array(id, content, generation) FROM qa_chunks",
     );
     let vectors = collect_strings(&conn, "SELECT hex(embedding) FROM vec_chunks");
-    // Persistence across connection lifetimes and a real freshness skip.
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
@@ -2972,8 +2707,6 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         ["retained question"]
     );
 
-    // A file with only an incomplete tail has no session yet. A later append
-    // completes the message and resolves its diagnostic without a rebuild.
     let tail = claude_dir.join("tail.jsonl");
     fs::write(
         &tail,
@@ -2997,7 +2730,6 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     );
     fs::remove_file(tail).unwrap();
 
-    // Files without a session still report loss; confirmed deletion clears it.
     let empty = claude_dir.join("no-messages.jsonl");
     fs::write(&empty, "invalid\n").unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
@@ -3033,7 +2765,6 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
         force: true,
         embedded_sessions: None,
     };
-    // Deterministic read failure after discovery, including for privileged hosts.
     index_file_with_parser(&ctx, &path, &Source::Claude, |_, _| {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -3050,7 +2781,6 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
         collect_strings(&conn, "SELECT text FROM messages"),
         ["kept"]
     );
-    // The original metadata still matches, but a read error must force retry.
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
     assert_eq!(stats.indexed, 1);
     assert!(!stats.parse_diagnostics[0].read_error);
@@ -3062,9 +2792,6 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
 fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resolved() {
     use std::os::unix::ffi::OsStringExt;
 
-    // Not every filesystem permits these names. Supply the collector's list at
-    // the ingestion boundary; parsing, persistence and cleanup are production
-    // code, and the valid UTF-8 path below is a real file.
     fn observe(conn: &mut Connection, paths: &[PathBuf]) -> Vec<FileParseDiagnostics> {
         let existing = load_existing_sessions(conn).unwrap();
         let tx = conn.transaction().unwrap();
@@ -3110,7 +2837,6 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         1
     );
 
-    // Reload real persisted keys, then clear only the valid UTF-8 file's loss.
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     fs::write(&paths[2], "{\"type\":\"user\",\"message\":\"readable\"}\n").unwrap();
@@ -3122,8 +2848,6 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         let reported: HashSet<_> = diagnostics.iter().map(|d| &d.file_path).collect();
         assert_eq!(reported, HashSet::from([&paths[0], &paths[1]]));
     }
-    // Cleanup must compare exact paths too: the colliding display name still
-    // exists, but only the deleted file's diagnostic should disappear.
     let diagnostics = observe(&mut conn, &paths[1..]);
     assert_eq!(diagnostics.len(), 1);
     assert_eq!(diagnostics[0].file_path, paths[1]);
@@ -3227,9 +2951,6 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
         }
     }
 
-    // With another session's vectors protected, a completed but unembedded
-    // conversation can still reconcile. Its matched chunk is not a reused
-    // embedding, and the protected session's bytes must remain untouched.
     let protected = chunk_vectors(&conn);
     assert_eq!(protected.len(), 1);
     let unembedded = source.path().join("unembedded.jsonl");
@@ -3269,8 +2990,6 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     );
 }
 
-// The lifecycle checks inference inputs and persistent vectors, rather than
-// merely counting chunks. A fresh rebuild is the oracle for final saved data.
 fn write_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
     let text = messages
         .iter()
@@ -3296,9 +3015,6 @@ fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    // The observer controls the interleaving without sleeps or a test-only
-    // indexing path. A second index either saves before cleanup, or gets BUSY
-    // and retries after the first writer commits. Both must preserve its work.
     for embed_capable in [true, false] {
         let (db_dir, mut conn) = setup_test_db();
         let tmp = TempDir::new().unwrap();
@@ -3410,8 +3126,6 @@ fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
         write_reuse_conversation(&path, &original);
         index_from_dirs(&mut conn, &opts, true).unwrap();
         if scenario == "pending-current-rules" {
-            // FTS committed with the current parser before interruption. A new
-            // connection must be able to finish chunking during a root outage.
             let offline = tmp.path().join("offline");
             fs::rename(&root, &offline).unwrap();
             let mut resumed = open_db(&_db_dir.path().join("test.db")).unwrap();
@@ -3445,8 +3159,6 @@ fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
             &conn,
             "SELECT json_array(c.id, c.generation, c.content, v.rowid, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id",
         );
-        // Force new message rowids to differ, as happens when another session
-        // has been indexed after this one. Old rowid links must not survive.
         conn.execute(
             "INSERT INTO messages (session_id, role, text) VALUES ('other', 'user', 'unrelated')",
             [],
@@ -3484,16 +3196,11 @@ fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
                 (0, 3)
             }
             "pending-rules" | "pending-old-rules" => {
-                // An older parser committed FTS, then stopped before chunking.
-                // The file stamp still matches, but its parsing rules are unknown.
                 conn.execute_batch("DELETE FROM vec_chunks; DELETE FROM qa_chunks; UPDATE sessions SET chunks_indexed = NULL; UPDATE messages SET text = 'obsolete parser output' WHERE session_id = 'reuse';").unwrap();
                 if scenario == "pending-old-rules" {
                     conn.execute("UPDATE sessions SET chunks_indexed = -99", [])
                         .unwrap();
                 }
-                // Chunking a preserved body while its source root is absent
-                // cannot certify the parser version. Restore the same file,
-                // including its mtime and size, before the normal index below.
                 let stamp = resolve_file_stamp(&path);
                 let offline = tmp.path().join("offline");
                 fs::rename(&root, &offline).unwrap();
@@ -3502,7 +3209,6 @@ fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
                 assert_eq!(stats.total_sessions, 1);
                 assert_eq!(stats.skipped_roots[0].preserved_sessions, 1);
                 assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 1);
-                // A second absent-root run must not duplicate chunks.
                 assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
                 embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
                 fs::rename(&offline, &root).unwrap();
@@ -3612,7 +3318,6 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     write_reuse_conversation(&path, &messages);
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
-    // One vector committed, with an outstanding snapshot for both chunks.
     let old_pending = pending_chunks(&conn, 100).unwrap();
     let stable = conn
         .query_row(
@@ -3638,8 +3343,6 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         ["stable", "answer", "tail"]
     );
     conn.execute_batch("DROP TRIGGER fail_reconcile;").unwrap();
-    // Simulate a different index finishing its FTS work while the old worker
-    // still holds inference inputs, using an independent SQLite connection.
     let mut writer = open_db(&db_dir.path().join("test.db")).unwrap();
     index_from_dirs(&mut writer, &opts, true).unwrap();
     assert_eq!(chunk_vectors(&conn), before);

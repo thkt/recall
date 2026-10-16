@@ -7,7 +7,6 @@ use crate::date::MS_PER_DAY;
 pub(crate) const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
 pub(crate) const RECENCY_BOOST_WEIGHT: f64 = 0.2;
 
-/// Exponential recency decay: 1.0 for now, 0.5 at half-life, approaching 0.0.
 pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
     match ts {
         Some(ts) => {
@@ -18,10 +17,6 @@ pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
     }
 }
 
-/// Apply exponential recency boost to RRF scores.
-///
-/// `get_timestamp` resolves a session_id to its epoch-ms timestamp.
-/// `weight` scales the boost's influence on the final score.
 pub(crate) fn apply_recency_boost(
     results: &mut [(String, f64)],
     get_timestamp: impl Fn(&str) -> Option<i64>,
@@ -35,10 +30,6 @@ pub(crate) fn apply_recency_boost(
     results.sort_by(|a, b| b.1.total_cmp(&a.1));
 }
 
-/// Merge FTS and vector ranking lists by Reciprocal Rank Fusion, keyed by
-/// session id. Uses the frozen zero-based rank and k=60 contract, with a
-/// session-id tie break. Equivalent to the previous default WeightedRrf.
-/// Only list position (rank) feeds the fusion; input scores are ignored.
 pub(crate) fn rrf_merge_strings(
     fts_hits: &[(String, f64)],
     vec_hits: &[(String, f64)],

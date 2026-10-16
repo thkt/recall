@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage only the public checksum-pinned artifacts from a CLI model manifest."""
+
 import hashlib
 import json
 import pathlib

@@ -1,4 +1,3 @@
-//! Opt-in tests: inputs must be explicitly provided owned evaluation artifacts.
 use super::*;
 use crate::model::hash_file;
 use serde_json::Value;

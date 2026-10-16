@@ -1,8 +1,3 @@
-//! Opt-in synthetic measurement, never part of the normal test runtime.
-//! Run the command in docs/research/issue-342-scope.md in a release build.
-
-// Keep opt-in measurement helpers inside an explicit test-only item so the
-// existing coverage filter excludes the harness, including its ignored test.
 #[cfg(test)]
 mod tests {
     use std::array;
@@ -53,8 +48,6 @@ mod tests {
         Ok(parsed.origin.automated)
     }
 
-    // Baseline is installed from the handoff commit by scripts/measure-classify.py.
-    // Refuse direct execution rather than silently measuring a reconstructed control.
     fn legacy(
         _: &mut Connection,
         _: impl FnMut(&str, &str, &str) -> Result<bool, &'static str>,
@@ -76,7 +69,6 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut bytes = 0;
         let mut file_bytes = Vec::new();
-        // Deterministic enumeration (no random generator/seed or private inputs).
         for i in 0..sessions {
             let id = format!("synthetic-{i:04}");
             let automated = i % 4 < 2;
@@ -123,8 +115,6 @@ mod tests {
     }
 
     fn measure(corpus: &Corpus, mode: Mode, repeat: bool, concurrent: bool) -> Metrics {
-        // Every trial starts with a fresh, identically seeded product schema (WAL,
-        // synchronous=NORMAL); creation/seeding and source generation are untimed.
         let db_dir = tempfile::tempdir().unwrap();
         let db = db_dir.path().join("index.db");
         let mut conn = open_db(&db).unwrap();
@@ -143,8 +133,6 @@ mod tests {
             conn.execute("INSERT INTO messages(session_id, role, text) VALUES (?1, 'user', 'Synthetic first turn')", [&id]).unwrap();
         }
         let other = open_db(&db).unwrap();
-        // A bounded synchronous probe while the log reader is paused. No sleep,
-        // scheduler race, or 30-second timeout is included in the parser measurement.
         other.busy_timeout(Duration::ZERO).unwrap();
         let metrics = RefCell::new(Metrics::default());
         let mut probed = false;
@@ -153,7 +141,6 @@ mod tests {
             let origin = match mode {
                 Mode::SplitOrigin => read_classification_origin(file.unwrap(), path, source, id),
                 _ => {
-                    // Keep the pinned full reader's own open in the controls.
                     drop(file);
                     full_origin(path, source, id)
                 }
@@ -273,12 +260,10 @@ mod tests {
             for repeat in [false, true] {
                 for concurrent in [false, true] {
                     let modes = [Mode::Legacy, Mode::SplitFull, Mode::SplitOrigin];
-                    // Warm each mode once. Sources are reused; no OS cache eviction.
                     for mode in modes {
                         measure(&corpus, mode, repeat, concurrent);
                     }
                     let mut samples: [Vec<Metrics>; 3] = array::from_fn(|_| Vec::new());
-                    // Rotate order across rounds to reduce cache/order bias.
                     for round in 0..5 {
                         for offset in 0..3 {
                             let i = (round + offset) % 3;

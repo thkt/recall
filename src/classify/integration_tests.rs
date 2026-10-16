@@ -40,7 +40,6 @@ fn bodies_and_vectors(conn: &Connection) -> Vec<Vec<String>> {
     ].iter().map(|sql| strings(conn, sql)).collect()
 }
 
-// SHM holds SQLite's reader coordination, not persistent index contents.
 fn persistent_files(path: &Path) -> Vec<Option<(Vec<u8>, fs::Permissions)>> {
     [path.to_path_buf(), path.with_extension("db-wal")]
         .iter()
@@ -57,8 +56,6 @@ fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("recall.db");
     let conn = Connection::open(&path).unwrap();
-    // Shape predating parse_diagnostics and the index-only columns. The
-    // pre-fix command migrated even when the only row was already classified.
     conn.execute_batch(
         "CREATE TABLE sessions (
             session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
@@ -181,16 +178,12 @@ fn classify_preview_rejects_missing_read_structure_without_writes() {
 #[test]
 fn provenance_classification_removes_synthetic_contamination_without_human_omissions() {
     let (db_dir, mut conn) = setup_test_db();
-    // Keep all corpus rows in the WAL: ignoring committed frames would return
-    // zero classifications from the checkpointed, empty schema.
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA wal_autocheckpoint=0;")
         .unwrap();
     let root = tempfile::tempdir().unwrap();
     let claude = root.path().join("claude");
     let codex = root.path().join("codex");
     let parent = "01234567-89ab-cdef-0123-456789abcdef";
-    // Public synthetic corpus: seven known automated and seven human/unknown cases.
-    // The label is independently specified here, not derived from the classifier.
     let cases: [(&str, &str, Value, &str, bool); 14] = [
         (
             "claude",
@@ -366,7 +359,6 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
         !before[3].is_empty(),
         "preservation check must include actual vectors"
     );
-    // Reconstruct old persisted classification under the same corpus/DB.
     conn.execute("UPDATE sessions SET session_type = 'interactive'", [])
         .unwrap();
     let old_labels = labels(&conn);
@@ -400,7 +392,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
     for _ in 0..2 {
         assert_eq!(
             reclassify_sessions(&mut conn, true, false).unwrap().len(),
-            13, // The conflicting agent retains its existing label.
+            13,
         );
         assert_eq!(labels(&conn), expected);
         assert_eq!(bodies_and_vectors(&conn), before);
@@ -435,8 +427,6 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             "include-automated: {id}"
         );
     }
-    // No FTS hits: the new agent's exclusion and opt-in must also work through
-    // the shared vector filter. Reuse the real mock vectors already saved above.
     let query = "unmatchedvectorquery";
     assert!(
         search(&conn, query, &SearchOptions::default())
@@ -512,7 +502,6 @@ fn reclassification_retains_unverifiable_labels_and_falls_back_only_for_null_row
             ["automated"]
         );
     }
-    // A readable unknown origin is different: re-evaluate with the stored turn.
     let path = root.path().join("broken.jsonl");
     fs::write(
         &path,
@@ -556,7 +545,6 @@ fn reclassification_retries_after_a_writer_commits_during_source_read() {
     let outcomes = crate::reclassify_sessions_with(&mut conn, true, false, |_, _, _, _| {
         reads += 1;
         if reads == 1 {
-            // This synchronous commit must finish while the reader is paused here.
             other.execute("UPDATE messages SET text = '<command-message>run</command-message>' WHERE session_id = 's'", []).unwrap();
         }
         Ok(false)

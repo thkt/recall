@@ -1,5 +1,3 @@
-//! Source-specific evidence, not keywords from conversation text. Wire formats
-//! and their pinned sources are recorded in docs/research/session-provenance-classification.md.
 use std::path::Path;
 
 use serde_json::Value;
@@ -8,7 +6,6 @@ use serde_json::Value;
 pub struct SessionOrigin {
     pub automated: bool,
     pub identity_conflict: bool,
-    /// Distinguish an unknown origin on a session from an unrelated JSON file.
     pub has_records: bool,
 }
 
@@ -30,7 +27,6 @@ pub(super) fn claude_agent_id(path: &Path) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
-/// Check the <parent UUID>/subagents directory after `claude_agent_id` validates the filename.
 pub(super) fn claude_parent(path: &Path) -> Option<&str> {
     let dir = path.parent()?;
     if dir.file_name()?.to_str()? != "subagents" {
@@ -41,8 +37,6 @@ pub(super) fn claude_parent(path: &Path) -> Option<&str> {
 }
 
 pub(super) fn codex_automated(payload: &Value) -> bool {
-    // Either independently known field suffices, even with an unknown feature
-    // in the other field. Arbitrary `other`/feature strings are not evidence.
     if matches!(
         payload.get("thread_source").and_then(Value::as_str),
         Some("subagent" | "guardian_review" | "memory_consolidation")
@@ -85,7 +79,6 @@ pub(super) fn codex_automated(payload: &Value) -> bool {
     }
 }
 
-/// The same all-record identity/provenance scan is used by ingestion and classify.
 pub(super) struct ClaudeOrigin<'a> {
     session_id: &'a str,
     agent_id: Option<&'a str>,
@@ -132,8 +125,6 @@ impl<'a> ClaudeOrigin<'a> {
         if let Some(id) = id {
             self.origin.identity_conflict |= id != self.session_id && Some(id) != self.parent;
         }
-        // Every message must attest to the same agent and UUID parent outside
-        // the canonical layout. Meta/role-only records cannot bypass identity.
         self.legacy_identity_matches = self.legacy_identity_matches
             && !is_meta
             && sidechain

@@ -81,12 +81,6 @@ fn claude_empty_messages_are_retained_for_diagnostics() {
     );
 }
 
-// U-002 dedupe: a write-target path repeated across tool_use blocks — within one
-// assistant turn and again in a later turn — collapses to a single scanned_files
-// entry, preserving first-seen order. T-002/T-003 never repeat a path, so this is
-// the only cover for the contract's "セッション内 dedupe" clause. The two assistant
-// turns carry no text block, so this also pins that a tool_use-only turn still
-// contributes paths (extraction runs before the empty-text early return).
 #[test]
 fn test_claude_scanned_files_deduped_within_session() {
     let tmp = write_jsonl(&[
@@ -102,7 +96,6 @@ fn test_claude_scanned_files_deduped_within_session() {
     );
 }
 
-// T-001: isMeta entries are skipped
 #[test]
 fn test_claude_is_meta_skipped() {
     let tmp = write_jsonl(&[
@@ -265,7 +258,6 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
     invalid_records.push(json!({"type":"user","message":{"content":valid.to_string()}}));
     let path = root.path().join("agent-example.jsonl");
     for invalid in invalid_records {
-        // Both orders must reject the whole exception, including role-only logs.
         let mut role_only = invalid.clone();
         role_only.as_object_mut().unwrap().remove("type");
         role_only["role"] = json!("assistant");
@@ -279,8 +271,6 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
             assert!(parsed.origin.identity_conflict, "{records}");
         }
     }
-    // A matching record cannot grant the exception to a different filename,
-    // an empty agent suffix, a non-jsonl file, or a conflicting canonical parent.
     for relative in [
         "agent-other.jsonl",
         "agent-.jsonl",
@@ -297,8 +287,6 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
     }
 }
 
-// Reuse the existing format corpus and its independent expected values for both
-// readers, so a fast path cannot silently omit a format or identity check.
 fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
     let parsed = super::parse_claude_session(path)?;
     if let Some(full) = &parsed {
