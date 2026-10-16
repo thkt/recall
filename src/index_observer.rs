@@ -1,4 +1,3 @@
-//! Numeric-only observations for one index invocation. No source text or paths.
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -93,7 +92,6 @@ pub(crate) struct Stage<'a> {
 }
 
 impl Stage<'_> {
-    /// Uses already-known totals; never scans the DB just to render progress.
     pub(crate) fn progress(&self, processed: usize, total: usize, saved: usize) {
         if processed != total && self.last.borrow().elapsed() < Duration::from_secs(1) {
             return;

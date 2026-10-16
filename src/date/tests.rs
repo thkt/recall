@@ -8,7 +8,6 @@ fn test_epoch() {
 
 #[test]
 fn test_known_date() {
-    // 2024-03-01 = day 19783
     assert_eq!(civil_from_days(19783), (2024, 3, 1));
     assert_eq!(days_from_civil(2024, 3, 1), Some(19783));
 }
@@ -41,11 +40,8 @@ fn test_invalid_month_day() {
 
 #[test]
 fn test_invalid_day_per_month() {
-    // Feb 29 on non-leap year
     assert_eq!(days_from_civil(2023, 2, 29), None);
-    // Feb 30 even on leap year
     assert_eq!(days_from_civil(2024, 2, 30), None);
-    // Apr, Jun, Sep, Nov have 30 days max
     assert_eq!(days_from_civil(2024, 4, 31), None);
     assert_eq!(days_from_civil(2024, 6, 31), None);
     assert_eq!(days_from_civil(2024, 9, 31), None);

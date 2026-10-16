@@ -7,54 +7,41 @@ description = "Full-text search CLI for past Claude Code and Codex sessions"
 license = "MIT"
 repository = "https://github.com/thkt/recall"
 
-[features]
-test-support = ["rurico/test-support"]
-
 [dependencies]
-# amici pins its own rurico rev; a git source resolves to one rev across the
-# dependency graph, so the rurico rev below must match the one amici pins or
-# the build breaks on the rev conflict. When bumping amici, align rurico to it.
-amici = { git = "https://github.com/thkt/amici", rev = "4b2e0de8e0cca04fd454d30bc4c3edf1fe00d5ca" }
 anyhow = "1.0.102"
 bytemuck = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
-dirs = "7.0.0"
-# Keep in lockstep with the rurico rev amici pins (see the amici note above).
-rurico = { git = "https://github.com/thkt/rurico", rev = "7b2b2565a9e6ac80732d4a153bc64d47b137368b" }
+llama-cpp-2 = { path = "vendor/llama-cpp-2", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
+sqlite-vec = "=0.1.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-thiserror = "2"
+sha2 = { version = "0.11.1", default-features = false }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+unicode-normalization = "0.1"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Artifact bytes need TLS, HTTP/2 and proxy support, without charset decoding.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "system-proxy"] }
+thiserror = "2"
 
 [dev-dependencies]
-amici = { git = "https://github.com/thkt/amici", rev = "4b2e0de8e0cca04fd454d30bc4c3edf1fe00d5ca", features = [
-  "test-support",
-] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "7b2b2565a9e6ac80732d4a153bc64d47b137368b", features = [
-  "test-support",
-] }
 tempfile = "3"
 
 [lints.rust]
 unsafe_code = "deny"
 
 [lints.clippy]
-# absolute paths
 absolute_paths = "deny"
-# idiomatic iterators
 cast_possible_truncation = "deny"
 redundant_closure_for_method_calls = "deny"
 filter_map_next = "deny"
 flat_map_option = "deny"
 manual_filter_map = "deny"
 manual_find_map = "deny"
-# imports
 wildcard_imports = "deny"
 enum_glob_use = "deny"
-# strings
 str_to_string = "deny"
-# arguments
 needless_pass_by_value = "deny"
 
 [profile.release]

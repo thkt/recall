@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Remove Rust `#[cfg(test)]` item ranges from an lcov tracefile.
-
-`diff-cover` works on changed lines from the lcov `DA:` entries. Inline Rust
-test modules live in production source files, so filename-based exclusions do
-not remove them. This filter drops coverage records for any source range guarded
-by `#[cfg(test)]`, matching the repo policy that test code is excluded from the
-diff coverage gate.
-"""
+"""Exclude cfg(test) code from the LCOV changed-line coverage gate."""
 
 from __future__ import annotations
 
@@ -16,17 +9,9 @@ from pathlib import Path
 
 
 def _scan_line(line: str, state):
-    """Count code-context braces in one line, carrying string state across lines.
+    """Count braces outside strings, chars and line comments; carry string state.
 
-    `state` is None in code context, "str" inside a normal "..." string, or an
-    int n inside a raw string with n hashes (carried across lines so multi-line
-    strings are handled). Braces inside string literals, char literals, and line
-    comments are ignored so a stray `{` in `write!("{{")` or `'{'` does not
-    corrupt the cfg(test) range scan. Block comments (`/* */`) are intentionally
-    unhandled: no recall source uses them inside `#[cfg(test)]` items. A brace in
-    one is counted as code, so an unbalanced `/* { */` over-extends a range
-    exactly as the pre-refactor raw counter did -- never worse, but not fixed.
-    Returns (delta, state).
+    Block comments are unsupported in cfg(test) items.
     """
     delta = 0
     i = 0
@@ -42,36 +27,36 @@ def _scan_line(line: str, state):
             else:
                 i += 1
             continue
-        if isinstance(state, int):  # raw string with `state` hashes
+        if isinstance(state, int):
             if c == '"' and line[i + 1 : i + 1 + state] == "#" * state:
                 i += 1 + state
                 state = None
             else:
                 i += 1
             continue
-        if c == '"':  # normal string opens
+        if c == '"':
             state = "str"
             i += 1
-        elif c == "r" and i + 1 < n and line[i + 1] in '#"':  # raw string?
+        elif c == "r" and i + 1 < n and line[i + 1] in '#"':
             j = i + 1
             while j < n and line[j] == "#":
                 j += 1
             if j < n and line[j] == '"':
-                state = j - (i + 1)  # hash count (0 for r"...")
+                state = j - (i + 1)
                 i = j + 1
             else:
-                i += 1  # raw identifier r#ident, not a raw string
+                i += 1
         elif c == "'":
-            if i + 1 < n and line[i + 1] == "\\":  # escaped char '\n' '\u{7b}'
+            if i + 1 < n and line[i + 1] == "\\":
                 j = i + 3
                 while j < n and line[j] != "'":
                     j += 1
                 i = j + 1
-            elif i + 2 < n and line[i + 2] == "'":  # simple char 'X' incl '{'
+            elif i + 2 < n and line[i + 2] == "'":
                 i += 3
-            else:  # lifetime 'a / 'static: treat ' as ordinary
+            else:
                 i += 1
-        elif c == "/" and i + 1 < n and line[i + 1] == "/":  # line comment
+        elif c == "/" and i + 1 < n and line[i + 1] == "/":
             break
         elif c == "{":
             delta += 1
@@ -85,8 +70,6 @@ def _scan_line(line: str, state):
 
 
 def brace_delta(line: str) -> int:
-    # Single-line net brace count in code context (no carried state). Thin
-    # wrapper over the stateful core for callers that scan a line in isolation.
     delta, _ = _scan_line(line, None)
     return delta
 
@@ -96,6 +79,8 @@ def cfg_test_ranges(path: Path) -> set[int]:
         return set()
 
     lines = path.read_text(encoding="utf-8").splitlines()
+    if lines and lines[0].strip() == "#![cfg(test)]":
+        return set(range(1, len(lines) + 1))
     ignored: set[int] = set()
     idx = 0
     while idx < len(lines):
@@ -132,15 +117,6 @@ def cfg_test_ranges(path: Path) -> set[int]:
     return ignored
 
 
-# The lcov record parsers below are tightly coupled to cargo llvm-cov's line
-# format (DA:<line>,<hit>  FN:<line>,<name>  FNDA:<count>,<name>). A parse failure
-# means that format contract is violated (tool upgrade, truncation, corruption),
-# so the filter's output can no longer be trusted. Fail loud rather than default
-# silently: a None/0 default would skew the gate in an unverifiable direction (a
-# dropped line number leaves test code in; a defaulted hit count marks a covered
-# line uncovered). The empty-tracefile and path-resolution guards below fail
-# loud against gate-weakening specifically; here the format contract itself is
-# the invariant.
 def parse_line_number(record: str, context: str) -> int:
     try:
         return int(record.split(":", 1)[1].split(",", 1)[0])
@@ -167,11 +143,6 @@ def parse_fnda(record: str, context: str) -> tuple[int, str]:
 
 
 def render_record(record: list[str], ignored: set[int], input_path: Path) -> list[str]:
-    # `context` carries input_path + the enclosing SF (record[0]) into every
-    # parse/validation error so a malformed record in a multi-SF lcov is locatable
-    # without grepping. The malformed entry itself is bounded to 80 chars (log
-    # hygiene: the raw record may embed a path, and CI logs are public); the SF
-    # path stays full because it IS the locality signal being added.
     context = f"{input_path} [{record[0]}]" if record else str(input_path)
     output: list[str] = []
     skipped_functions: set[str] = set()
@@ -204,10 +175,6 @@ def render_record(record: list[str], ignored: set[int], input_path: Path) -> lis
                 continue
             saw_branch = True
             branch_count += 1
-            # BRDA taken is "-" (branch not instrumented) or an execution count.
-            # Symmetric with the DA hit-count fail-loud above: a non-"-",
-            # non-integer taken violates the cargo llvm-cov format contract and
-            # would silently inflate BRH if treated as a hit, so raise instead.
             taken = entry.rsplit(",", 1)[-1]
             if taken != "-":
                 try:
@@ -258,15 +225,6 @@ def _is_under(path: Path, root: Path) -> bool:
 
 
 def _check_source_resolvable(source: Path, repo_root: Path) -> bool:
-    # Decide whether `source` should be scanned for cfg(test) ranges.
-    #   non-.rs          -> scan (cfg_test_ranges returns set() anyway).
-    #   .rs outside root -> skip WITHOUT reading. An external/registry dep cannot
-    #                       affect the gate (diff-cover scores only this repo's
-    #                       changed lines), and skipping avoids reading an
-    #                       out-of-tree path even when it exists (a traversed SF).
-    #   .rs under root,
-    #     missing        -> fail loud: SF path resolution is broken and test
-    #                       code would leak into the gate.
     if source.suffix != ".rs":
         return True
     if not _is_under(source, repo_root):
@@ -281,13 +239,6 @@ def _check_source_resolvable(source: Path, repo_root: Path) -> bool:
 
 
 def _validate_filtered(filtered: list[str], sf_count: int, input_path: Path) -> None:
-    # diff-cover treats an empty / record-less tracefile as 100%
-    # covered, so an over-aggressive filter that drops every record would
-    # silently disable the gate. Require at least one SF and one end_of_record
-    # per SF. The mismatch branch is defense-in-depth: it backstops the invariant
-    # that the filtered output carries exactly one end_of_record per SF, catching
-    # any upstream record-accounting bug regardless of cause (the orphan check
-    # above already handles a truncated trailing record).
     if sf_count == 0:
         raise ValueError(
             f"filtered lcov has no SF records; coverage input {input_path} "

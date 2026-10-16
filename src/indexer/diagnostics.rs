@@ -12,7 +12,6 @@ use crate::ansi;
 use crate::parser::LineDiagnostics;
 use crate::parser::Source;
 
-/// The last unresolved observation of a file, including files without sessions.
 #[derive(Debug)]
 pub struct FileParseDiagnostics {
     pub file_path: PathBuf,
@@ -54,9 +53,6 @@ impl FileParseDiagnostics {
     }
 }
 
-// Keep UTF-8 keys compatible with existing rows and sessions.file_path. SQLite
-// stores non-UTF-8 paths as BLOBs without applying the column's TEXT affinity.
-// Lossy conversion belongs only at the display boundary, never in identity.
 fn path_key(path: &Path) -> Value {
     match path.to_str() {
         Some(path) => Value::Text(path.to_owned()),
@@ -90,7 +86,6 @@ pub(super) fn save_parse_diagnostics(
 }
 
 pub(super) fn save_read_error(tx: &Transaction, path: &Path, source: Source) -> Result<()> {
-    // Keep previously observed line loss until a successful read replaces it.
     tx.execute(
         "INSERT INTO parse_diagnostics (file_path, source, read_error) VALUES (?1, ?2, 1)
          ON CONFLICT(file_path) DO UPDATE SET read_error = 1",
@@ -135,9 +130,6 @@ pub(super) fn cleanup_parse_diagnostics(
         if scanned.contains(&diagnostic.source)
             && !source_paths.contains(diagnostic.file_path.as_path())
         {
-            // Orphan cleanup has already run. A session still pointing here
-            // retains its old body (e.g. a deferred replacement at another path),
-            // so its unresolved loss must survive along with that body.
             let removed = tx.execute(
                 "DELETE FROM parse_diagnostics WHERE file_path = ?1
                  AND NOT EXISTS (SELECT 1 FROM sessions WHERE file_path = ?1)",

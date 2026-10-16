@@ -1,3 +1,5 @@
+このページはGemma移行前の依存関係に関する履歴です。現行はamici/ruricoへ依存せず、固定Gemma artifactとllama.cpp/bindingsを使います。更新手順は [Gemma model updates](../gemma-model-updates.md) を参照してください。
+
 # rurico/amici の rev lockstep 依存更新
 
 ## 内容

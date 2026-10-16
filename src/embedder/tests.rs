@@ -42,9 +42,6 @@ fn replaying_the_same_generation_replaces_vectors_without_duplicates() {
     assert_eq!(vec_count, 1, "re-embedding must not duplicate vec rows");
 }
 
-/// Seed `count` qa_chunks whose content is the given closure of the row id, so
-/// a test controls each chunk's text (and thus its length-sort batch). Returns
-/// nothing; the rows live in `conn`.
 fn seed_chunks(conn: &Connection, count: usize, content: impl Fn(i64) -> String) {
     seed_session(conn, "s1");
     for id in 1..=count as i64 {
@@ -52,12 +49,6 @@ fn seed_chunks(conn: &Connection, count: usize, content: impl Fn(i64) -> String)
     }
 }
 
-// T-007 (FR-002, FR-004): when every batch fails, the embed run is non-fatal and
-// fully retryable. Given 1 pending chunk and failing_after(0) (every batch
-// fails), the production pending pipeline returns Ok (the index does not abort), counts the
-// whole batch as failed, and leaves no vec row so the next index retries it.
-// (Updated from the old T-009: stopped_at_error.is_some() → failed_count > 0.)
-// Perspective: error (the all-fail path) + boundary (failed_count == every chunk).
 #[test]
 fn all_batches_failing_is_non_fatal_and_retryable() {
     let (_dir, mut conn) = setup_test_db();
@@ -92,15 +83,12 @@ fn all_batches_failing_is_non_fatal_and_retryable() {
     );
 }
 
-// One poison batch exercises continuation, atomic batch failure, and retry
-// together; checking only the retry would miss wrong first-run accounting.
 #[test]
 fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     let (_dir, mut conn) = setup_test_db();
     seed_chunks(&conn, 1024, |id| format!("content_{id:04}"));
     seed_chunk(&conn, 1025, "x");
 
-    // Shortest text sorts into the first batch; the second batch still commits.
     let poisoned = MockEmbedder::failing_on_text("x");
     let (observer, lines) = recording();
     let first = embed_pending_observed(
@@ -178,9 +166,6 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     assert_eq!(pending, 0, "no chunk is left behind after the retry");
 }
 
-/// Interrupt after vectors have been computed but before embed_chunks can save.
-/// The production Embed boundary gives deterministic scheduling without a
-/// product flag, model download, or timing-dependent inference delay.
 struct InterruptedEmbedder<F>(F);
 
 impl<F: Fn() + Send + Sync> Embed for InterruptedEmbedder<F> {
@@ -220,7 +205,7 @@ fn assert_vectors_match_current_content(conn: &Connection) {
         })
         .unwrap();
     for row in rows {
-        let (bytes, content, sub_idx) = row.unwrap(); // NULL content fails for orphans.
+        let (bytes, content, sub_idx) = row.unwrap();
         assert_eq!(
             bytes,
             f32_as_bytes(&MockEmbedder::deterministic_vector(&content))
@@ -234,8 +219,6 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
     let (dir, mut conn) = setup_test_db();
     seed_chunks(&conn, 7, |id| {
         if id == 1 {
-            // This valid result sorts AFTER the discarded ones, exposing any
-            // accidental re-pairing of filtered IDs with unfiltered vectors.
             "unchanged input that sorts last".to_owned()
         } else {
             format!("old {id}")
@@ -329,9 +312,6 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
     assert_vectors_match_current_content(&conn);
 }
 
-// The same test executable is launched twice, each invoking the index command's
-// real orchestration with a deterministic embedder. Files are barriers, not
-// sleeps intended to guess inference duration. Keep all inputs synthetic.
 #[test]
 fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
     use std::env;
@@ -467,8 +447,6 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
 
 #[test]
 fn later_page_database_save_failure_preserves_other_batches_and_retries_only_failed_chunks() {
-    // Fail the second INSERT of page 2, after all eight page-1 batches committed and one
-    // vector in that failing batch was staged. This exercises rollback, not only BEGIN.
     struct InvalidLaterBatch(AtomicUsize);
     impl Embed for InvalidLaterBatch {
         fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
@@ -576,7 +554,6 @@ fn later_page_database_save_failure_preserves_other_batches_and_retries_only_fai
     let mut remaining_ids: Vec<_> = remaining.iter().map(|chunk| chunk.id).collect();
     remaining_ids.sort_unstable();
     assert_eq!(remaining_ids, (1025..=1152).collect::<Vec<_>>());
-    // Reuse the real pending gate on restart; saved chunks must not be retried.
     let (resumed, _) = recording();
     let result = embed_pending_observed(
         &mut conn,
@@ -599,7 +576,6 @@ fn failed_database_save_is_counted_without_claiming_a_commit() {
     let (_dir, mut conn) = setup_test_db();
     seed_chunks(&conn, 1, |_| "private input".to_owned());
     let pending = pending_chunks(&conn, 1).unwrap();
-    // Keep BEGIN failure coverage as well as the later INSERT/rollback case.
     conn.execute_batch("PRAGMA query_only = ON;").unwrap();
     let (observer, lines) = recording();
     assert!(
@@ -645,12 +621,9 @@ fn failed_database_save_is_counted_without_claiming_a_commit() {
 fn byte_bounded_pages_preserve_unicode_nuls_and_an_oversized_chunk() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
-    // Descending lengths force the real length bucketing to change ID order.
     seed_chunk(&conn, 1, &"c".repeat(PENDING_PAGE_BYTES + 1));
     seed_chunk(&conn, 2, &"b".repeat(PENDING_PAGE_BYTES / 2));
     seed_chunk(&conn, 3, &"a".repeat(PENDING_PAGE_BYTES / 2 - 3));
-    // Four UTF-8 bytes: counting characters (or stopping at NUL) would wrongly
-    // admit chunk 2 into the first page, whose bodies would exceed 8 MiB by one.
     seed_chunk(&conn, 4, "é\0x");
     let observer = Observer::default();
     let pages = Mutex::new(Vec::new());
