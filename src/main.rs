@@ -1,17 +1,23 @@
 mod ansi;
 mod chunker;
 mod classify;
+mod compat;
 mod date;
 mod db;
 mod embedder;
+mod embedding;
 mod envelope;
 mod error;
 mod hybrid;
 mod index_observer;
 mod indexer;
+mod model;
+mod native;
 mod output;
 mod parser;
+mod runtime;
 mod search;
+mod storage;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -24,19 +30,21 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use amici::cli::exit_code::codes;
-use amici::cli::{done, exit_error, info as cli_info, try_expand_shorthand, warning};
-use amici::logging::init_subscriber;
-use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
-use amici::model::{
-    EmbedderDegraded, degrade_with_warn, download_and_verify_model, record_degraded,
+use crate::compat::filter::escape_like;
+use crate::embedding::{EMBEDDING_DIMS, Embed};
+use crate::model::cached_artifacts;
+use crate::model::handle_probe_if_needed;
+use crate::model::{
+    DegradedReason, EmbedderDegraded, degrade_with_warn, download_and_verify_model,
+    record_degraded, try_load_embedder_default_logging,
 };
-use amici::storage::{collect_rows, filter::escape_like};
+use crate::runtime::{
+    codes, done, exit_error, home_dir, info as cli_info, init_subscriber, try_expand_shorthand,
+    warning,
+};
 use anyhow::{Context, Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand};
-use rurico::embed::{EMBEDDING_DIMS, Embed, ModelId, cached_artifacts};
-use rurico::handle_probe_if_needed;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, warn};
 
@@ -62,6 +70,10 @@ struct Cli {
     #[arg(long, env = "RECALL_DB", global = true)]
     db_path: Option<PathBuf>,
 
+    /// Pinned Gemma model manifest. Select an older saved manifest to roll back.
+    #[arg(long, env = "RECALL_MODEL_MANIFEST", global = true)]
+    model_manifest: Option<PathBuf>,
+
     /// Emit a machine-readable JSON envelope instead of human-readable text
     #[arg(long, global = true)]
     json: bool,
@@ -69,13 +81,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Parse and chunk new session logs (incremental). No model calls.
+    /// Parse, chunk, and embed new session logs (incremental).
     Index {
         #[command(flatten)]
         embed_flags: EmbedFlags,
     },
     /// Re-parse and re-embed every present session; a missing or unreadable
-    /// source root keeps its existing index. No model calls.
+    /// source root keeps its existing index.
     Rebuild {
         #[command(flatten)]
         embed_flags: EmbedFlags,
@@ -171,6 +183,8 @@ enum Command {
 enum ModelCommand {
     /// Download the embedding model and verify it loads.
     Download,
+    /// Print the selected pinned manifest for archiving, updates, or rollback.
+    Manifest,
 }
 
 /// Embed-pass tuning flags shared verbatim by `index` and `rebuild`
@@ -180,8 +194,8 @@ enum ModelCommand {
 struct EmbedFlags {
     /// Forward-pass token budget override; smaller values shorten each GPU
     /// forward so the host stays responsive during large embed runs. Clamped
-    /// down to 256_000 (never up) so it cannot exceed the embedder's own
-    /// OOM ceiling.
+    /// down to 256_000 (never up). Gemma packing is additionally capped at
+    /// 8192 tokens; one attention window remains atomic.
     #[arg(long, env = "RECALL_TOKEN_BUDGET", value_parser = parse_token_budget)]
     token_budget: Option<usize>,
 
@@ -193,7 +207,6 @@ struct EmbedFlags {
 }
 
 fn create_db_file(path: &Path) -> io::Result<()> {
-    // create_dir_all("") is a no-op, so a parentless path needs no special case.
     create_dir_all(path.parent().unwrap_or(Path::new("")))?;
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
@@ -206,13 +219,8 @@ fn create_db_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-// UTC civil date with no local-timezone offset, by design (issue #232). recall
-// labels are consumed by AI agents (human calendar browsing is an OUTCOME
-// non-goal), and `--days N` filters a rolling 24h window rather than calendar
-// boundaries, so a fixed UTC label keeps the shown date independent of the
-// viewer's timezone. A late-night JST session can therefore display the prior
-// UTC day; that is accepted, not a bug.
 fn format_timestamp(ts_ms: Option<i64>) -> String {
+    // Display UTC dates; --days filters a rolling 24-hour window.
     let Some(ts) = ts_ms else {
         return "unknown".to_owned();
     };
@@ -227,7 +235,15 @@ fn open_or_create_db(path: &Path) -> Result<Connection> {
         Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
         Err(e) => return Err(e).context("Failed to create database file"),
     }
-    db::open_db(path).context("Failed to open database")
+    {
+        // Reject a mismatched model before any schema or journal-mode write.
+        let (existing, _) = db::open_db_readonly(path)?;
+        model::check_index(&existing, model::selected())
+            .map_err(|e| RecallError::DatabaseRead(e.to_string()))?;
+    }
+    let mut conn = db::open_db(path).context("Failed to open database")?;
+    model::bind_index(&mut conn, model::selected())?;
+    Ok(conn)
 }
 
 fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
@@ -235,16 +251,11 @@ fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
         Some(p) => Ok(p.clone()),
         None => resolve_default_db_path(
             env::var_os("XDG_DATA_HOME").as_deref(),
-            dirs::home_dir().as_deref(),
+            home_dir().as_deref(),
         ),
     }
 }
 
-/// Resolve the default DB location under the XDG data dir as `recall/recall.db`.
-/// `XDG_DATA_HOME` wins only when it is absolute (per the XDG spec a relative
-/// value is ignored); otherwise fall back to `~/.local/share`. `dirs::data_local_dir`
-/// is deliberately avoided: on macOS it returns `~/Library/Application Support`,
-/// not the `~/.local/share` recall expects.
 fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -> Result<PathBuf> {
     let data_home = match xdg_data_home.map(Path::new) {
         Some(p) if p.is_absolute() => p.to_path_buf(),
@@ -253,15 +264,15 @@ fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -
             .join(".local")
             .join("share"),
     };
-    Ok(data_home.join("recall").join("recall.db"))
-}
-
-fn open_cached_embedder() -> Result<Arc<dyn Embed>, DegradedReason> {
-    try_load_embedder_default_logging()
+    Ok(data_home
+        .join("recall")
+        .join("indexes")
+        .join(model::selected().identity())
+        .join("recall.db"))
 }
 
 fn try_load_embedder_cached() -> Result<Arc<dyn Embed>, DegradedReason> {
-    try_load_embedder_cached_with(open_cached_embedder)
+    try_load_embedder_cached_with(try_load_embedder_default_logging)
 }
 
 fn try_load_embedder_cached_with<F>(open_embedder: F) -> Result<Arc<dyn Embed>, DegradedReason>
@@ -271,11 +282,6 @@ where
     try_load_embedder_cached_with_reporter(open_embedder, cli_info)
 }
 
-/// Load the cached embedder, returning the [`DegradedReason`] on failure so the
-/// caller can build a reason-aware `--json` note. The human-facing stderr note
-/// (via `report_info`) and the structured warn (`record_degraded`) are emitted
-/// here as side effects; the reason itself is surfaced to the caller rather than
-/// flattened to `None`, so the agent channel can say *why* search degraded.
 fn try_load_embedder_cached_with_reporter<F, I>(
     open_embedder: F,
     mut report_info: I,
@@ -284,43 +290,22 @@ where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
     I: FnMut(&str),
 {
-    match open_embedder() {
-        Ok(e) => Ok(e),
-        Err(reason @ DegradedReason::NotInstalled) => {
-            if let Some(note) = search_degraded_note(reason) {
-                report_info(&note);
-            }
-            Err(reason)
+    open_embedder().inspect_err(|&reason| {
+        if let Some(note) = search_degraded_note(reason) {
+            report_info(&note);
         }
-        Err(reason) => {
-            if let Some(note) = search_degraded_note(reason) {
-                report_info(&note);
-            }
+        if reason != DegradedReason::NotInstalled {
             record_degraded(reason, "embedder load");
-            Err(reason)
         }
-    }
+    })
 }
 
-/// The human-facing stderr note for a degraded embedder load (`note: ...`).
 fn search_degraded_note(reason: DegradedReason) -> Option<String> {
     EmbedderDegraded(reason)
         .user_note("recall model download")
         .map(|note| format!("note: {note}."))
 }
 
-/// Note for embedded sessions preserved because the model could not rebuild them
-/// this run (#215). Reason-neutral wording so it reads true on both preserve
-/// triggers: the model is absent (#215, `NotInstalled`) or it loaded but failed
-/// the inference probe (#230, a present but corrupt model). `None` when nothing
-/// was preserved so the surface stays quiet on the common path. The single source
-/// for both the human note and the `--json` `notes[]` entry, mirroring
-/// `SkippedReason::note` so the two channels never disagree. The remedy command is
-/// deferred to the degraded note, which carries `recall model download` only for
-/// `NotInstalled`: re-downloading cannot repair the corrupt cache behind a
-/// `ProbeFailed`, so naming it here would misdirect the #230 path. This note names
-/// only the magnitude, that search stayed intact, and a reason-neutral refresh
-/// step once the model can embed again.
 fn preserved_embedded_note(count: usize) -> Option<String> {
     (count > 0).then(|| {
         format!(
@@ -329,13 +314,6 @@ fn preserved_embedded_note(count: usize) -> Option<String> {
     })
 }
 
-/// The `--json` `notes[]` entry for a search that fell back to FTS-only, derived
-/// from the same per-reason source as [`search_degraded_note`] so the agent and
-/// human channels never disagree. `NotInstalled` keeps the actionable download
-/// hint; a probe or backend failure reports unavailability without it, because
-/// re-downloading cannot repair a corrupt cache or a missing backend. An empty
-/// list means no degradation note applies (a caller-disabled model), so the
-/// caller's `degraded` flag co-varies with it.
 fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
     EmbedderDegraded(reason)
         .user_note("recall model download")
@@ -343,11 +321,6 @@ fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Derive the `(degraded, notes)` pair for a search from the embedder load
-/// result. A loaded embedder is the ideal path (not degraded, no notes); a
-/// failure degrades to FTS-only with a reason-aware note from
-/// [`search_fallback_notes`]. `degraded` co-varies with the note (an empty list
-/// keeps it false), so the bool and the text never disagree.
 fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool, Vec<String>) {
     match load {
         Ok(_) => (false, Vec::new()),
@@ -358,11 +331,6 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
     }
 }
 
-// -- Subcommands --
-
-/// Clap `value_parser` for `--token-budget`: clamps down (never up) to
-/// [`embedder::TOKEN_BUDGET_CEILING`] so an over-large flag cannot push a
-/// forward pass past the Metal OOM ceiling that ceiling was chosen to avoid.
 fn parse_token_budget(s: &str) -> Result<usize, ParseIntError> {
     let value: usize = s.parse()?;
     Ok(value.min(embedder::TOKEN_BUDGET_CEILING))
@@ -392,9 +360,6 @@ fn run_rebuild(
     )
 }
 
-/// Builds the embed pass's [`embedder::EmbedOptions`] from the `--token-budget`
-/// / `--forward-pause-ms` CLI flags. Both absent (the pre-flag default) yields
-/// `EmbedOptions::default()`, preserving current behavior.
 fn embed_options_from_flags(
     token_budget: Option<usize>,
     forward_pause_ms: Option<u64>,
@@ -405,15 +370,12 @@ fn embed_options_from_flags(
     }
 }
 
-/// Shared index pipeline for `index` (incremental) and `rebuild` (full).
-/// Resolves source dirs from the environment, then delegates to
-/// [`index_and_report_with`] with the real cached-embedder loader.
 fn index_and_report(
     db_path: &Option<PathBuf>,
     force: bool,
     embed_options: embedder::EmbedOptions,
 ) -> Result<IndexOutcome> {
-    let home = dirs::home_dir().context("Could not determine home directory")?;
+    let home = home_dir().context("Could not determine home directory")?;
     let claude_dir = indexer::resolve_claude_dir(&home);
     let codex_dir = indexer::resolve_codex_dir(&home);
     let opts = indexer::IndexOptions {
@@ -421,12 +383,10 @@ fn index_and_report(
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
     };
-    // Load silently: IndexOutcome carries the degraded note and the block below is
-    // its single emitter, so passing cli_info to the loader too would print twice.
     let outcome = index_and_report_with_options(
         db_path,
         &opts,
-        || try_load_embedder_cached_with_reporter(open_cached_embedder, |_: &str| {}),
+        || try_load_embedder_cached_with_reporter(try_load_embedder_default_logging, |_: &str| {}),
         embed_options,
     )?;
     if let Some(note) = &outcome.degraded_note {
@@ -438,39 +398,20 @@ fn index_and_report(
     Ok(outcome)
 }
 
-/// Outcome of an index run, surfaced to the caller for the `--json` envelope.
-/// `degraded_note` is `Some` when the embedder could not load (model-less): the
-/// index still completes FTS-only. `embedded`/`failed_count`/`first_error` report
-/// the embed pass: `failed_count > 0` means some batches failed but the index is
-/// queryable and those chunks stay pending for the next run. These two embedding
-/// reasons are mutually exclusive (a model-less run skips embedding, so
-/// `failed_count == 0`); parsing and root diagnostics can coexist with either.
 #[derive(Default)]
 struct IndexOutcome {
     degraded_note: Option<String>,
     embedded: usize,
     failed_count: usize,
     first_error: Option<String>,
-    /// Source roots that were missing/unreadable this run while still holding
-    /// preserved sessions in the DB (#165). Carried into the `--json` envelope so
-    /// an agent reading the machine path — not just the human stderr warning —
-    /// learns a root outage may be masking real deletions.
     skipped_roots: Vec<indexer::SkippedRoot>,
-    /// Embedded sessions left untouched because the model was absent this run
-    /// (#215). Carried so both the human note and the `--json` envelope can report
-    /// that semantic search for those sessions stayed intact instead of being
-    /// silently rebuilt-then-degraded.
     preserved_embedded: usize,
     parse_diagnostics: Vec<indexer::FileParseDiagnostics>,
     observations: serde_json::Value,
 }
 
-/// Cap on the `first_error` portion of the embed-stop note (chars, not bytes, so
-/// truncation never splits a UTF-8 boundary).
 const EMBED_ERROR_NOTE_MAX_CHARS: usize = 120;
 
-/// Combine embedding, source-root, and persistent parsing diagnostics without
-/// changing the outer envelope. `degraded` is true exactly when notes are present.
 fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     debug_assert!(
         outcome.degraded_note.is_none() || outcome.failed_count == 0,
@@ -481,10 +422,6 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         notes.push(note.clone());
     }
     if outcome.failed_count > 0 {
-        // first_error is always Some when failed_count > 0 (both are set in
-        // embed_page's inference error arm together); the fallback is defensive only. Like
-        // every other envelope-bound string the error is control-char-stripped,
-        // and capped so a verbose MLX error cannot bloat the note.
         let raw = outcome.first_error.as_deref().unwrap_or("unknown error");
         let err: String = ansi::strip_control_chars(raw)
             .chars()
@@ -548,16 +485,6 @@ fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     CommandOutput::with_notes(String::new(), data, degraded, notes)
 }
 
-/// Index pipeline with an injected embedder loader. Runs FTS indexing + chunking,
-/// then embeds every pending chunk via the loaded embedder so `recall search`
-/// reads a complete index without embedding on the search path. A model-less
-/// loader (`Err`) skips embedding but keeps the parsed FTS content, returning a
-/// degraded note. `load_embedder` is a seam: tests inject a `MockEmbedder` or a
-/// degraded `Err`, production passes [`try_load_embedder_cached`]. Source dirs
-/// arrive via `opts` so tests control them without `set_var`.
-/// Production calls [`index_and_report_with_options`] directly (it needs to
-/// thread the `--token-budget`/`--forward-pause-ms` `EmbedOptions`), so this
-/// default-options entry point is now test-only.
 #[cfg(test)]
 fn index_and_report_with<F>(
     db_path: &Option<PathBuf>,
@@ -575,10 +502,6 @@ where
     )
 }
 
-/// [`index_and_report_with`] plus an [`embedder::EmbedOptions`] threaded from
-/// the `--token-budget` / `--forward-pause-ms` CLI flags down to the embed
-/// step. `index_and_report_with` delegates here with `EmbedOptions::default()`
-/// so its existing callers keep the pre-flag behavior unchanged.
 fn index_and_report_with_options<F>(
     db_path: &Option<PathBuf>,
     opts: &indexer::IndexOptions,
@@ -613,22 +536,6 @@ where
     let mut conn = open_or_create_db(&path)?;
     opening.finish("complete");
 
-    // Load the embedder once, up front: its presence gates whether indexing
-    // preserves embedded sessions (model absent) or re-indexes them (model
-    // present), and the same handle is reused for the embed step below so the
-    // model loads at most once (#215). The seam's `FnOnce` bound makes the single
-    // call structural.
-    // A loaded model can still fail the forward pass: the production load probe
-    // only constructs the model (rurico dispatch.rs `Embedder::new().map(|_| ())`)
-    // and runs no inference, so corrupt weights that error during real embedding
-    // pass load yet return load-Ok. Run one minimal `embed_document` probe so
-    // `embed_capable` reflects inference capability, not just load. On failure,
-    // demote to `ProbeFailed` so the preserve path runs instead of a destructive
-    // re-index the failing embed step cannot rebuild (#230, guarding #215's
-    // preserve). `degrade_with_warn` keeps the typed error in the structured warn
-    // before collapsing to the coarse reason (amici ADR-0009 house rule). The probe
-    // input is a non-degenerate string; an empty one would make pooling reject a
-    // healthy model's all-zero mask.
     let loading = observer.stage("model_load_probe");
     let load_result = load_embedder().and_then(|embedder| {
         embedder
@@ -674,8 +581,6 @@ where
 
     let chunk_stats = indexer::index_chunks_observed(&mut conn, None, observer)?;
     let backfill = observer.stage("legacy_backfill");
-    // Link pre-#192 chunks to their source message rowid range; see
-    // `backfill_rowid_ranges` for the no-op-once-linked and count-mismatch behavior.
     let backfilled = indexer::backfill_rowid_ranges(&mut conn)?;
     if backfilled > 0 {
         debug!(
@@ -683,16 +588,11 @@ where
             "linked legacy chunks to rowid ranges"
         );
     }
-    // Fill session_files for legacy sessions (see `backfill_session_files` for
-    // the contract). The pass re-parses every legacy JSONL and can run minutes on
-    // a large legacy set, so it reports per-session progress instead of leaving
-    // the chunk spinner text stale (long index passes read as hangs otherwise).
     let on_backfill_progress = |done: usize, total: usize| {
         backfill.progress(done.saturating_sub(1), total, 0);
     };
     let scanned_backfilled =
         indexer::backfill_session_files(&mut conn, Some(&on_backfill_progress))?;
-    // Include observations made by legacy path backfill as well as ingestion.
     let parse_diagnostics = indexer::load_parse_diagnostics(&conn)?;
     for note in parse_diagnostics
         .iter()
@@ -713,21 +613,10 @@ where
         done("Chunks up to date");
     }
 
-    // #221: a force rebuild is the full, destructive repair path, so self-heal any
-    // true orphan vec row here — one whose chunk_id resolves to no qa_chunks row,
-    // which the id/session_id-scoped index deletes never reach. Embed-independent,
-    // so it runs on both model arms; gated on force to keep the incremental hot
-    // path free of the O(N) vec_chunks scan. Single statement so diff-cover marks
-    // the call covered (the `?` Err region is an unreachable early return; #49/#121).
     if opts.force {
         fix_orphan_embeddings(&conn)?;
     }
 
-    // Model present: embed all pending with the handle loaded up front. Model
-    // absent (degraded): skip embed but keep the completed FTS index and carry a
-    // note naming `recall model download` so the wrapper can guide the user
-    // (FR-004a/004b). The model-absent run also preserved any embedded sessions it
-    // would otherwise have re-indexed (#215); that count rides along either arm.
     let preserved_embedded = stats.preserved_embedded;
     let outcome: Result<IndexOutcome> = match load_result {
         Ok(embedder) => {
@@ -770,7 +659,6 @@ where
     Ok(outcome)
 }
 
-/// Test adapter for the production finite-page pipeline.
 #[cfg(test)]
 fn embed_all_pending(
     conn: &mut Connection,
@@ -784,11 +672,6 @@ fn embed_all_pending(
         options,
         &index_observer::Observer::default(),
     )?;
-    // A mid-run batch failure is non-fatal: chunks already embedded are committed,
-    // the rest stay pending, and the parsed FTS content stays queryable. The next
-    // `recall index` retries the remaining pending via the pending gate, so we
-    // warn rather than fail. The stop is also surfaced in the index `--json`
-    // envelope via `failed_count` (index_command_output).
     result.warn_if_batches_failed();
     Ok(result)
 }
@@ -797,15 +680,10 @@ fn run_model_download() -> Result<()> {
     download_and_verify_model().map_err(|e| download_error(&e).into())
 }
 
-/// Guidance when search runs against an empty index. `recall search` no longer
-/// auto-indexes, so zero sessions means the user must run `recall index` first.
 fn search_idle_message(session_count: i64) -> Option<&'static str> {
     (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
 }
 
-/// The empty-index search result: prints the idle guidance and returns an empty,
-/// non-degraded envelope at exit 0. Shared by the missing-file, never-indexed
-/// (`Empty` schema), and zero-session branches so all three behave identically.
 fn search_idle_output() -> CommandOutput {
     if let Some(msg) = search_idle_message(0) {
         done(msg);
@@ -813,11 +691,6 @@ fn search_idle_output() -> CommandOutput {
     CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
 }
 
-/// Gate the non-doctor read commands (`search`, `status`, `show`) on read
-/// compatibility. A read-only open cannot migrate, so an incompatible schema surfaces
-/// as an explicit `DataError` naming `recall rebuild` rather than a silent stale
-/// result (SOW assumption 1). `Empty` is handled by each command's own empty path
-/// before this is called, so it maps to `Ok` here (never reached in practice).
 fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
     match state {
         db::SchemaState::Current | db::SchemaState::Empty => Ok(()),
@@ -827,8 +700,6 @@ fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
     }
 }
 
-/// The three mutually exclusive `--*-current` flags, grouped so
-/// `resolve_current_session` takes one argument instead of three booleans.
 #[derive(Clone, Copy, Debug)]
 struct CurrentSessionFlags {
     exclude: bool,
@@ -836,21 +707,11 @@ struct CurrentSessionFlags {
     only: bool,
 }
 
-/// Resolve how `recall search` treats the invoking session, from the
-/// `--*-current` flags and the `CLAUDE_CODE_SESSION_ID` env value (read by the
-/// caller and passed in, so the truth table is testable without touching process
-/// env). With no flag, an env id present defaults to excluding the current
-/// session: an agent searching mid-session does not want its own in-progress
-/// transcript echoed back. A blank (empty or whitespace-only) env value is
-/// treated as absent, so `--only-current` still reports the usage error instead
-/// of silently matching no session.
 fn resolve_current_session(
     flags: CurrentSessionFlags,
     env_session_id: Option<String>,
 ) -> Result<search::CurrentSession, RecallError> {
     use search::CurrentSession;
-    // A set-but-blank env value (e.g. exported empty in a shell) is not a usable
-    // session id; treat it as absent so every mode below behaves consistently.
     let env_session_id = env_session_id.filter(|s| !s.trim().is_empty());
     if flags.only {
         return match env_session_id {
@@ -879,11 +740,6 @@ fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> 
     run_search_with(cmd, db_path, try_load_embedder_cached)
 }
 
-/// Search pipeline with an injected embedder loader. Reads the pre-built index
-/// (no indexing, no embedding on the search path — embedding happens at `recall
-/// index` time). `load_embedder` is a seam so tests can inject a loaded or
-/// degraded embedder and exercise the FTS-fallback path. A failed load degrades
-/// to FTS-only.
 fn run_search_with<F>(
     cmd: Command,
     db_path: &Option<PathBuf>,
@@ -919,38 +775,36 @@ where
 
     let path = resolve_db_path(db_path)?;
 
-    // A missing DB file is the pre-index state, not an error: emit the same idle
-    // guidance search shows for a zero-session index, at exit 0 (never a stale or
-    // not-found failure). Read commands open read-only, so an absent file is not
-    // created here as a side effect (unlike the former open_or_create_db path).
     if !path.exists() {
         return Ok(search_idle_output());
     }
 
     let (conn, tier) = db::open_db_readonly(&path)?;
     match db::schema_state(&conn)? {
-        // A file exists but recall never indexed it: idle, not stale.
         db::SchemaState::Empty => return Ok(search_idle_output()),
-        // A read-only open cannot migrate an old shape; fail explicitly.
         state => require_current_schema(state)?,
     }
-    // Only the immutable (tier-2) branch can miss un-checkpointed `-wal` changes.
     let wal_note = db::stale_wal_note(&path, tier);
 
-    // Search reads the pre-built index; indexing happens via `recall index`,
-    // not on every search, so search latency no longer depends on scan cost.
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     if search_idle_message(session_count).is_some() {
         return Ok(search_idle_output());
     }
 
-    // The query-less --file list never runs the semantic leg (search routes it to
-    // a MATCH-free SELECT), so loading the embedder there would only pay a model
-    // load + probe forward pass to discard it — and, model-less, stamp a false
-    // degraded:true on a complete file list (#249 honest-degraded contract).
-    // A failed embedder load on the query path degrades search to FTS-only with
-    // a reason-aware note for the `--json` channel; see search_degraded_state.
-    let (mut degraded, mut notes, embedder) = if query.is_some() {
+    let identity_error = if query.is_some() {
+        model::check_index(&conn, model::selected()).err()
+    } else {
+        None
+    };
+    let (mut degraded, mut notes, embedder) = if let Some(error) = identity_error {
+        (
+            true,
+            vec![format!(
+                "semantic search unavailable: {error}; results are text-only"
+            )],
+            None,
+        )
+    } else if query.is_some() {
         let embedder = load_embedder();
         let (degraded, notes) = search_degraded_state(&embedder);
         (degraded, notes, embedder.ok())
@@ -975,10 +829,6 @@ where
     )?;
     let results = outcome.results;
 
-    // A loaded embedder that failed at query time (vector search dropped to
-    // FTS-only mid-run) degrades the result just as a failed load does. Merge the
-    // runtime signal into the load-time one so the envelope never reports
-    // `degraded:false` over a thinned or empty text-only result set (#204).
     if outcome.vec_degraded {
         degraded = true;
         notes.push(
@@ -987,10 +837,6 @@ where
         );
     }
 
-    // The FTS leg silently dropped matched sessions (a candidate row failed to
-    // deserialize, or a matched session was pruned for missing/unknown-source
-    // metadata). The returned set is a subset of the true matches, so the envelope
-    // must not report it as complete (#249 RC-002/RC-003).
     if outcome.results_incomplete {
         degraded = true;
         notes.push(
@@ -999,11 +845,7 @@ where
         );
     }
 
-    // Surface the default automated-session exclusion so an agent consumer can
-    // discover --include-automated; skipped when the agent already opted in.
     if !include_automated {
-        // Best-effort: a failed count skips the advisory note rather than aborting
-        // an otherwise-successful search.
         let automated: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions WHERE session_type = 'automated'",
@@ -1023,23 +865,14 @@ where
         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
     });
 
-    // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; surface
-    // that as a note + degraded so an agent knows the result may lag the writer.
     if let Some(note) = wal_note {
         degraded = true;
         notes.push(note);
     }
 
-    // Search is read-only: embedding happens at `recall index` time, never on the
-    // search path, so search latency does not depend on embedding cost.
     Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
 }
 
-/// Write the markdown header shared by every `recall show` render: title, the four
-/// always-present metadata bullets, any caller-supplied extra bullets (e.g.
-/// `- chunk:`, `- window:`), then the `- file:` bullet gated on `verbose`, followed
-/// by a blank line. Extracted because the full render, windowed render, and legacy
-/// chunk fallback all wrote this same block (#282).
 fn write_show_header(
     buf: &mut Vec<u8>,
     session: &parser::SessionData,
@@ -1066,10 +899,8 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
     let mut msg_stmt =
         conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
     let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let messages: Vec<(String, String)> = collect_rows::<_, _, _, Error>(rows)?;
+    let messages: Vec<(String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // Writes to an in-memory Vec are infallible; the pipe is only touched later
-    // by the single emit_success -> emit_success_to write path.
     let mut buf = Vec::new();
     write_show_header(&mut buf, &session, verbose, &[]);
     for (role, text) in &messages {
@@ -1094,18 +925,10 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
     Ok(CommandOutput::ok(markdown, data))
 }
 
-/// Default per-side neighbor count when `--chunk` is given without `--window`.
 const DEFAULT_WINDOW: i64 = 5;
-/// Upper bound on the per-side neighbor count so a windowed show stays bounded for
-/// agent consumption (contract: 片側 N に cap). A negative `--window` clamps to 0.
 const MAX_WINDOW: i64 = 50;
-/// Upper bound on one rendered message's character length (contract: 1 メッセージ
-/// 表示長に cap). Longer messages are truncated with an ellipsis marker.
 const MAX_MSG_CHARS: usize = 4000;
 
-/// Resolve a session-id prefix to exactly one session (prefix-match / no-match /
-/// ambiguous-match rules), shared by `show_session` and `show_session_windowed` so
-/// `--chunk` windowing uses the same resolution semantics as the full render.
 fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::SessionData> {
     let mut stmt = conn.prepare(
         "SELECT session_id, source, file_path, project, slug, timestamp \
@@ -1126,7 +949,7 @@ fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::Sessio
             timestamp: row.get(5)?,
         })
     })?;
-    let matches: Vec<parser::SessionData> = collect_rows::<_, _, _, Error>(rows)?;
+    let matches: Vec<parser::SessionData> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     if matches.is_empty() {
         return Err(RecallError::Usage(format!("No session found matching '{session_id}'")).into());
@@ -1139,12 +962,9 @@ fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::Sessio
         msg.push_str("Narrow the session ID prefix to match exactly one session");
         return Err(RecallError::Usage(msg).into());
     }
-    // len() == 1 is guaranteed by the two guards above.
     Ok(matches.into_iter().next().expect("exactly one match"))
 }
 
-/// Truncate one message to `MAX_MSG_CHARS` characters (contract cap). Splits on a
-/// char boundary so multibyte text (Japanese) never panics.
 fn cap_message(text: &str) -> String {
     if text.chars().count() <= MAX_MSG_CHARS {
         return text.to_owned();
@@ -1153,12 +973,6 @@ fn cap_message(text: &str) -> String {
     format!("{cut}…")
 }
 
-/// `recall show <id> --chunk <cid> --window <N>`: anchor on a chunk and show only
-/// the same-session messages within its range plus N neighbors on each side.
-///
-/// `chunk = None` preserves the pre-feature full render (backward compat). A chunk
-/// whose `src_rowid_lo/hi` are NULL (pre-#192 legacy row) has no message anchor, so
-/// it falls back to its own body plus a pointer to the full `recall show`.
 fn show_session_windowed(
     conn: &Connection,
     session_id: &str,
@@ -1190,8 +1004,6 @@ fn show_session_windowed(
         .ok_or_else(|| RecallError::Usage(format!("No chunk found with id {chunk_id}")))?;
     let (chunk_session, content, lo, hi) = anchor;
 
-    // `messages` is a single fts5 table shared by every session; a chunk belongs to
-    // exactly one session, so refuse to window it against a different one.
     if chunk_session != session.session_id {
         return Err(RecallError::Usage(format!(
             "chunk {chunk_id} belongs to session '{chunk_session}', not '{}'",
@@ -1206,7 +1018,6 @@ fn show_session_windowed(
     }
 }
 
-/// Render the message-range body plus N same-session neighbors on each side.
 fn render_windowed(
     conn: &Connection,
     session: &parser::SessionData,
@@ -1218,11 +1029,6 @@ fn render_windowed(
 ) -> Result<CommandOutput> {
     let n = window.clamp(0, MAX_WINDOW) as usize;
 
-    // The `session_id = ?1` filter is mandatory: `messages` rowids interleave
-    // across sessions (single shared fts5 table), so neighbors are only well
-    // defined as positions within this one session's rowid-ordered list. Slicing
-    // by session-local position is what keeps the window from leaking across the
-    // boundary.
     let mut stmt = conn
         .prepare("SELECT rowid, role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
     let rows = stmt.query_map([&session.session_id], |row| {
@@ -1232,10 +1038,8 @@ fn render_windowed(
             row.get::<_, String>(2)?,
         ))
     })?;
-    let msgs: Vec<(i64, String, String)> = collect_rows::<_, _, _, Error>(rows)?;
+    let msgs: Vec<(i64, String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    // Body = messages whose rowid lands in [lo, hi]; neighbors are n positions to
-    // each side of that body within the same-session list.
     let first_body = msgs.iter().position(|(rid, ..)| *rid >= lo);
     let last_body = msgs.iter().rposition(|(rid, ..)| *rid <= hi);
     let slice: &[(i64, String, String)] = match (first_body, last_body) {
@@ -1288,8 +1092,6 @@ fn render_windowed(
     Ok(CommandOutput::ok(markdown, data))
 }
 
-/// Render a pre-#192 legacy chunk that has no message-range anchor: its own body
-/// plus a pointer to the full `recall show` for the whole conversation.
 fn render_chunk_fallback(
     session: &parser::SessionData,
     chunk_id: i64,
@@ -1344,7 +1146,6 @@ fn run_show(
 
     let (conn, _tier) = db::open_db_readonly(&path)?;
     match db::schema_state(&conn)? {
-        // A file exists but recall never indexed it: same as not-found.
         db::SchemaState::Empty => Err(RecallError::Usage(
             "Database not found. Run `recall index` first.".to_owned(),
         )
@@ -1359,22 +1160,7 @@ fn run_show(
 fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
 
-    // Model readiness reflects the cached HF artifacts, not the index DB: an agent
-    // can install the model (`recall model download`) before ever creating an
-    // index. Compute it once so both the no-database and live branches report the
-    // same state (#166). `cached_artifacts` only reads the HF cache, so hoisting
-    // it above the existence check keeps `status` read-only and the no-DB counts
-    // at zero.
-    //
-    // A not-installed model is reported here as a plain `model_ready:false` fact,
-    // never as `degraded`. `status` and `doctor` share this health axis: FTS-only
-    // is a supported mode, not a broken index (DoctorCheck::info, ~L834). `search`
-    // deliberately diverges, marking the no-model case `degraded:true` on its
-    // coverage axis; that asymmetry is the contract, not a bug to reconcile (the
-    // degraded-trigger amendment in ADR-0001).
-    let model_ok = cached_artifacts(ModelId::DEFAULT)
-        .map(|opt| opt.is_some())
-        .unwrap_or(false);
+    let model_ok = cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false);
 
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
@@ -1392,9 +1178,6 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
 
     let (conn, tier) = db::open_db_readonly(&path)?;
 
-    // A never-indexed DB (no `sessions` table) reports zero counts, same as a
-    // missing file; a stale on-disk schema cannot be migrated read-only, so it
-    // fails explicitly. Only `Current` runs the count queries.
     let (sessions, chunks, embedded) = match db::schema_state(&conn)? {
         db::SchemaState::Empty => (0, 0, 0),
         state => {
@@ -1402,10 +1185,6 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
             let sessions: i64 =
                 conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
             let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
-            // Count distinct embedded chunks, not vec_chunks rows: one qa_chunk can hold
-            // several sub-embedding rows (embedder.rs:80 inserts one per sub-chunk), so
-            // COUNT(*) overstates coverage and can exceed qa_chunks. This mirrors the
-            // chunk-level coverage `pending_chunks` uses (DISTINCT chunk_id, embedder.rs:127).
             let embedded: i64 =
                 conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
                     r.get(0)
@@ -1414,7 +1193,6 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
         }
     };
 
-    // Writes to an in-memory Vec are infallible, so the io::Result is discarded.
     let mut buf = Vec::new();
     let _ = writeln!(buf, "Sessions: {sessions}");
     let _ = writeln!(buf, "QA chunks: {chunks}");
@@ -1439,17 +1217,20 @@ fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput>
         "model_ready": model_ok,
     });
 
-    // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; the
-    // reported counts may lag the writer, so mark the envelope degraded.
-    match db::stale_wal_note(&path, tier) {
-        Some(note) => Ok(CommandOutput::with_notes(markdown, data, true, vec![note])),
-        None => Ok(CommandOutput::ok(markdown, data)),
+    let mut notes: Vec<_> = db::stale_wal_note(&path, tier).into_iter().collect();
+    if let Err(error) = model::check_index(&conn, model::selected()) {
+        notes.push(format!(
+            "semantic search unavailable: {error}; results are text-only"
+        ));
     }
+    Ok(CommandOutput::with_notes(
+        markdown,
+        data,
+        !notes.is_empty(),
+        notes,
+    ))
 }
 
-/// One diagnostic check's result: a stable `name`, whether it passed, an optional
-/// human `detail` (e.g. the orphan count or corruption message), and the remedy
-/// command an agent should run when it failed. `ok` checks carry no remedy.
 struct DoctorCheck {
     name: &'static str,
     ok: bool,
@@ -1467,10 +1248,6 @@ impl DoctorCheck {
         }
     }
 
-    /// A non-fault note: the check passed (`ok`, no remedy) but carries context
-    /// worth surfacing. Used for a not-installed model — search runs FTS-only,
-    /// which is a supported mode, not breakage, so it must not flip `healthy`.
-    /// This keeps `doctor` and `status` agreeing on the no-model state.
     fn info(name: &'static str, detail: String) -> Self {
         Self {
             name,
@@ -1489,32 +1266,21 @@ impl DoctorCheck {
         }
     }
 
-    /// True only for a clean [`pass`](Self::pass): `ok` with no detail. The
-    /// not-installed [`info`](Self::info) note is `ok` but carries a detail, and a
-    /// [`fail`](Self::fail) is not `ok`, so both fall through. Centralizes the
-    /// "no recovery needed" invariant so callers don't re-encode `detail.is_none()`.
     fn is_fully_usable(&self) -> bool {
         self.ok && self.detail.is_none()
     }
 }
 
-/// Remedy for a database that is corrupt, unopenable, or whose check query can't
-/// run: re-create the index from the JSONL sources (the data-loss tier).
 const CORRUPT_DB_REMEDY: &str = "remove the database file and run `recall index`";
+const MODEL_INDEX_REMEDY: &str =
+    "select the matching --model-manifest and index, or build this model in a separate --db-path";
 
-/// Run a DB-backed check, converting an error from the query itself into a
-/// degraded verdict instead of propagating. doctor exists to report on a broken
-/// index, so a DB corrupt enough that the check can't even execute must surface
-/// as a `fail` verdict, not abort the whole run.
 fn run_db_check(name: &'static str, check: impl FnOnce() -> Result<DoctorCheck>) -> DoctorCheck {
     check().unwrap_or_else(|e| {
         DoctorCheck::fail(name, format!("check could not run: {e}"), CORRUPT_DB_REMEDY)
     })
 }
 
-/// The doctor verdict for a DB that could not be opened or read at the schema
-/// level: a single `integrity` FAIL naming the data-loss remedy. Shared by the
-/// open-failure and schema-read-error branches so their message stays identical.
 fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
     vec![DoctorCheck::fail(
         "integrity",
@@ -1523,15 +1289,6 @@ fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
     )]
 }
 
-/// The doctor verdict for an existing-but-never-indexed DB (`SchemaState::Empty`):
-/// there are no tables to check, so skip the data/integrity checks and emit an
-/// explicit unhealthy verdict. `schema_state` proves only the absence of a
-/// `sessions` table, never that recall created the file, so the detail names the
-/// resolved `path` the reader should verify — carried in the check detail (which
-/// renders in both the default human output and the `--json` `checks[].detail`),
-/// so the "verify the path" instruction is followable in both surfaces. Shared by
-/// the read-only and `--fix` branches so the mutating path stays no less
-/// forthcoming than the read-only one before it would graft recall's tables in.
 fn empty_index_check(path: &Path) -> DoctorCheck {
     DoctorCheck::fail(
         "index",
@@ -1543,11 +1300,6 @@ fn empty_index_check(path: &Path) -> DoctorCheck {
     )
 }
 
-/// `PRAGMA quick_check` (not `integrity_check`): the page-level scan returns a
-/// single `ok` row on a healthy DB and one error row per problem otherwise.
-/// quick_check skips the expensive cross-index verification integrity_check runs,
-/// which matters at the 27k+ chunk scale recall reaches. A corrupt DB is the
-/// data-loss tier, so the remedy re-creates the index from the JSONL sources.
 fn check_integrity(conn: &Connection) -> Result<DoctorCheck> {
     let result: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     Ok(if result == "ok" {
@@ -1561,12 +1313,6 @@ fn check_integrity(conn: &Connection) -> Result<DoctorCheck> {
     })
 }
 
-/// Count `vec_chunks` embeddings whose `chunk_id` no longer resolves to a
-/// `qa_chunks` row. A vector hit on such a row fetches an empty or wrong excerpt,
-/// so the agent sees a phantom result (agent-misjudgment tier). `recall rebuild`
-/// does not reach these rows (its deletes are keyed on present `qa_chunks` ids /
-/// `session_id`, never the dangling set), so the remedy is `recall doctor --fix`,
-/// which deletes exactly the rows this check counts.
 fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
     let orphans: i64 = conn.query_row(
         "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
@@ -1584,17 +1330,6 @@ fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
     })
 }
 
-/// Delete the dangling `vec_chunks` rows `check_orphan_embeddings` counts: those
-/// whose `chunk_id` no longer resolves to a `qa_chunks` row. The DELETE predicate
-/// is identical to that check's COUNT predicate, so it removes exactly the
-/// counted rows (no more, no less). Returns the number deleted.
-///
-/// Run on the repair paths only: `doctor --fix` on demand, and once per
-/// `recall rebuild` (force index, #221). Never on the incremental index hot path:
-/// `chunk_id` is an unindexed vec0 auxiliary column, so the `NOT IN` predicate is
-/// an O(N) `SCAN vec_chunks` (see the DELETE note in `embedder::embed_chunks`). A
-/// one-shot repair or a full rebuild pays that scan once; folding it into every
-/// incremental index would add a full scan to the hot path.
 fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
     let deleted = conn.execute(
         "DELETE FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
@@ -1603,42 +1338,21 @@ fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
     Ok(deleted)
 }
 
-/// A repairable fault: the check `name` it clears and the `action` that fixes it,
-/// returning the number of rows repaired. Only faults `doctor` can fix safely and
-/// idempotently — without scanning the source JSONL or any external action — earn
-/// a `Repair`. The remaining checks stay remedy-only because their fix needs more
-/// than a local DELETE: `integrity` (a corrupt DB → re-index), `model` (re-download),
-/// and `orphan_chunks` (a `rebuild` re-stages the source JSONL and can *restore* the
-/// missing session link, whereas a blind DELETE here only destroys the chunk — the
-/// data-loss tier, #222).
 struct Repair {
     name: &'static str,
     action: fn(&Connection) -> Result<usize>,
 }
 
-/// One repair's outcome: the check `name` it targeted and the delete `result`
-/// (rows repaired, or the I/O error that stopped it). Carried per-repair so the
-/// report can render a name-keyed breakdown and keep each repair's error visible.
 struct RepairOutcome {
     name: &'static str,
     result: Result<usize>,
 }
 
-/// The single dispatch point for `doctor --fix`: every safely-repairable fault and
-/// its action, run in listed order. Sequence matters when one repair's deletes
-/// would create rows another repair counts (e.g. deleting chunks orphans their
-/// embeddings); with the one entry today order is moot, but `run_repairs` honors
-/// it so a future entry only needs the right position here. Adding a repair is a
-/// one-line append — its check already runs, so the verdict reflects the fix.
 const REPAIRS: &[Repair] = &[Repair {
     name: "orphan_embeddings",
     action: fix_orphan_embeddings,
 }];
 
-/// Run every [`REPAIRS`] action against `conn` in order, collecting each outcome.
-/// A repair error does not stop the rest: each is independent, and a stopped run
-/// would hide later repairs an agent could still apply. The orphan checks re-run
-/// after this, so a failed repair still surfaces as its check's FAIL.
 fn run_repairs(conn: &Connection) -> Vec<RepairOutcome> {
     REPAIRS
         .iter()
@@ -1649,10 +1363,6 @@ fn run_repairs(conn: &Connection) -> Vec<RepairOutcome> {
         .collect()
 }
 
-/// Count `qa_chunks` whose `session_id` no longer resolves to a `sessions` row.
-/// Such a chunk can match but has no session metadata to render (date, project,
-/// slug), so the hit can't be shown coherently. `recall rebuild` re-stages every
-/// present session, restoring the link or dropping the chunk.
 fn check_orphan_chunks(conn: &Connection) -> Result<DoctorCheck> {
     let orphans: i64 = conn.query_row(
         "SELECT COUNT(*) FROM qa_chunks WHERE session_id NOT IN (SELECT session_id FROM sessions)",
@@ -1670,12 +1380,6 @@ fn check_orphan_chunks(conn: &Connection) -> Result<DoctorCheck> {
     })
 }
 
-/// Live model probe: load the cached embedder and embed a probe string, asserting
-/// the output width matches [`EMBEDDING_DIMS`]. This goes beyond `status`'s
-/// cache-presence check — it catches a cached-but-unloadable model and a dimension
-/// drift that would silently degrade `search` to FTS-only. A not-installed model
-/// is reported as info (FTS-only is supported, not broken); a load error, embed
-/// error, or wrong width is a fault whose remedy is to re-fetch the model.
 fn check_model<F>(load_embedder: &F) -> DoctorCheck
 where
     F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
@@ -1683,9 +1387,6 @@ where
     const REMEDY: &str = "recall model download";
     let embedder = match load_embedder() {
         Ok(e) => e,
-        // A not-installed model is not a broken index: search runs FTS-only, a
-        // supported mode. Report it as info (ok, no remedy) so it never flips
-        // `healthy`, keeping `doctor` and `status` agreeing on the no-model state.
         Err(reason @ DegradedReason::NotInstalled) => {
             return DoctorCheck::info("model", format!("{reason}; search runs FTS-only"));
         }
@@ -1704,30 +1405,12 @@ where
     }
 }
 
-/// The outcome of the optional model re-fetch under `doctor --fix`.
-///
-/// `Skipped` covers both "no `--fix`" and "model already fully usable" — no
-/// re-fetch ran. `Succeeded` means the re-fetch ran *and* the re-probe came back
-/// fully usable. `Failed` covers both a re-fetch that errored and a re-fetch that
-/// returned `Ok` but whose re-probe still faults (the model is still unusable, so
-/// it is not a recovery). It keeps the typed [`RecallError`] (not a bare string)
-/// so the report can tell a transient download fault (retryable) from a permanent
-/// backend mismatch; collapsing to `String` here would discard that distinction
-/// before it reaches the `--json` consumer.
 enum ModelRecovery {
     Skipped,
     Succeeded,
     Failed(RecallError),
 }
 
-/// The model column under `--fix`. Without `--fix`, or when the model already
-/// probes healthy, this is just [`check_model`] and recovery is [`ModelRecovery::Skipped`].
-/// With `--fix` on a degraded model (a load/probe fault or the not-installed note),
-/// it runs `recover_model` — re-fetching the cached model — and re-probes, so
-/// the returned column reflects the post-recovery state. The recovery outcome is
-/// returned alongside so the report can surface that a re-fetch happened, or that
-/// it failed. `load_embedder` is `Fn` because a successful recovery re-loads to
-/// re-probe; `recover_model` is `FnOnce` (one re-fetch per run).
 fn check_model_with_optional_recovery<F, R>(
     fix: bool,
     load_embedder: F,
@@ -1738,8 +1421,6 @@ where
     R: FnOnce() -> Result<(), RecallError>,
 {
     let initial = check_model(&load_embedder);
-    // The not-installed info note and any fault both fall through to recovery;
-    // only a clean pass is fully usable. The invariant lives on DoctorCheck.
     if !fix || initial.is_fully_usable() {
         return (initial, ModelRecovery::Skipped);
     }
@@ -1749,12 +1430,6 @@ where
             if rechecked.is_fully_usable() {
                 (rechecked, ModelRecovery::Succeeded)
             } else {
-                // The re-fetch's own verify passed, yet the re-probe still faults:
-                // the model is still unusable, so reporting "recovered" would
-                // contradict the FAIL verdict. A re-fetch that verified clean but
-                // still fails the probe is deterministic — retrying re-runs the
-                // same download to the same fault — so this is a permanent
-                // Internal fault, not a retryable transient.
                 (
                     rechecked,
                     ModelRecovery::Failed(RecallError::Internal(
@@ -1773,14 +1448,6 @@ fn run_doctor(verbose: bool, fix: bool, db_path: &Option<PathBuf>) -> Result<Com
     })
 }
 
-/// Diagnose the index, reporting per-check verdicts plus an overall `healthy`
-/// flag. Read-only unless `fix` is set, which first deletes orphan embeddings
-/// (the only repairable fault) and then runs the checks, so every verdict
-/// reflects the post-repair state. `load_embedder` is injected so the model probe
-/// is testable without an MLX load. Mirrors `status`'s `!path.exists()` early
-/// return so diagnosing never auto-creates a DB. A failed check sets the
-/// envelope's `degraded` flag and adds its remedy to `notes`, so an agent reading
-/// `--json` gets both the verdict and the fix.
 fn run_doctor_with<F, R>(
     verbose: bool,
     fix: bool,
@@ -1797,10 +1464,6 @@ where
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
         cli_info("run `recall index` to create the index.");
-        // Carry the `repaired` / `model_recovered` / `model_recovery_retryable`
-        // keys render_doctor_report always emits, so the --json envelope key set
-        // stays identical on every doctor path. All null here: with no DB there is
-        // nothing to repair, and the model probe + recovery run only past this point.
         return Ok(CommandOutput::with_notes(
             String::new(),
             serde_json::json!({
@@ -1815,28 +1478,9 @@ where
         ));
     }
 
-    // A DB corrupt at the header level fails to open. doctor must report that, not
-    // crash on it, so an open failure becomes the integrity verdict; the model
-    // probe is DB-free and still runs.
-    //
-    // `--fix` deletes orphan rows, so it needs the writing `open_or_create_db` path
-    // (which also migrates a stale schema before repairing). Plain `doctor` is a
-    // read-only diagnostic (the issue's `inspect`): it opens read-only so it works
-    // in a read-only directory, and reads `schema_state` as a *verdict* rather than
-    // migrating. Under `--fix`, checks run after the repair so orphan_embeddings
-    // re-counts the post-delete state.
     let mut repairs: Option<Vec<RepairOutcome>> = None;
     let mut wal_note: Option<String> = None;
     let mut checks = if fix {
-        // Before the writing open, refuse to graft recall's tables into a DB that
-        // isn't recall's: an existing-but-empty file (`SchemaState::Empty`, no
-        // `sessions` table) would otherwise have recall's schema silently added by
-        // `open_or_create_db` -> `create_schema`. Emit the same unconfirmed-origin
-        // caveat the read-only path gives and skip the graft, so `--fix` is no less
-        // forthcoming than plain `doctor`. The read-only probe connection is dropped
-        // before the writing open. Any read-only open failure or non-`Empty` state
-        // falls through to `open_or_create_db`, preserving `--fix`'s stale-schema
-        // migration, orphan repair, and open-failure reporting.
         let empty_foreign_db = matches!(
             db::open_db_readonly(&path).map(|(conn, _)| db::schema_state(&conn)),
             Ok(Ok(db::SchemaState::Empty))
@@ -1853,6 +1497,16 @@ where
                         run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
                     ]
                 }
+                Err(e)
+                    if e.downcast_ref::<RecallError>()
+                        .is_some_and(|e| matches!(e, RecallError::DatabaseRead(_))) =>
+                {
+                    vec![DoctorCheck::fail(
+                        "integrity",
+                        e.to_string(),
+                        MODEL_INDEX_REMEDY,
+                    )]
+                }
                 Err(e) => open_failure_checks(e),
             }
         }
@@ -1866,19 +1520,11 @@ where
                         run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
                         run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
                     ],
-                    // A stale (migratable) schema is not corruption: emit a dedicated
-                    // non-destructive verdict and skip the data/integrity checks that
-                    // would misreport the destructive CORRUPT_DB_REMEDY on an old shape.
                     Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
                         "schema",
                         "database schema is out of date".to_owned(),
                         "run `recall rebuild`",
                     )],
-                    // A never-indexed DB has no tables to check; skip the DB checks
-                    // (they would query absent tables and misreport CORRUPT_DB_REMEDY)
-                    // but still emit an explicit unhealthy verdict, matching the
-                    // missing-DB path above (empty checks would otherwise render
-                    // `healthy: true` for an unusable index).
                     Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                     Err(e) => open_failure_checks(e),
                 }
@@ -1886,16 +1532,20 @@ where
             Err(e) => open_failure_checks(e),
         }
     };
-    // The model column comes last on every path (DB-free probe), so it runs even
-    // when the DB failed to open. Under --fix it may re-fetch a degraded model
-    // and re-probe; the recovery outcome rides alongside for the report.
-    let (model_check, model_recovery) =
+    let (mut model_check, model_recovery) =
         check_model_with_optional_recovery(fix, load_embedder, recover_model);
+    if let Ok((conn, _)) = db::open_db_readonly(&path)
+        && let Err(error) = model::check_index(&conn, model::selected())
+    {
+        model_check = DoctorCheck::fail(
+            "model",
+            error.to_string(),
+            "select the matching --model-manifest and index, or build this model in a separate --db-path",
+        );
+    }
     checks.push(model_check);
 
     let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
-    // A tier-2 (immutable) open cannot see un-checkpointed `-wal` changes; surface
-    // it in the same envelope notes[] the other read commands use, and mark degraded.
     if let Some(note) = wal_note {
         output.degraded = true;
         output.notes.push(note);
@@ -1903,13 +1553,6 @@ where
     Ok(output)
 }
 
-/// Assemble the doctor envelope from the per-check verdicts and the optional
-/// `--fix` outcomes. Split out as a pure function so the repair-outcome rendering
-/// (per-repair count, `Err` cause) is unit-testable without staging a real delete
-/// failure on an open DB. `repairs` is `None` when `--fix` was not passed, else one
-/// [`RepairOutcome`] per [`REPAIRS`] entry: `Ok(n)` for `n` rows deleted, `Err` when
-/// that delete failed (a rare I/O fault). A repair error stays visible in both the
-/// human output and `notes`, since the matching check re-emits only the symptom.
 fn render_doctor_report(
     verbose: bool,
     path: &Path,
@@ -1922,8 +1565,6 @@ fn render_doctor_report(
         .iter()
         .filter_map(|c| c.remedy.map(|r| format!("{}: {}", c.name, r)))
         .collect();
-    // A repair error must not vanish (the matching check still FAILs and re-emits
-    // its remedy, but the failed-delete cause stays invisible without this note).
     if let Some(outcomes) = repairs {
         for o in outcomes {
             if let Err(e) = &o.result {
@@ -1931,10 +1572,6 @@ fn render_doctor_report(
             }
         }
     }
-    // A failed model re-fetch — whether the re-fetch errored or it returned Ok but
-    // the re-probe still faults: the `model` column re-emits only its symptom (or,
-    // for a still-not-installed model, stays the `ok` info note), so the recovery
-    // cause stays invisible without this note.
     if let ModelRecovery::Failed(e) = model_recovery {
         notes.push(format!("fix: model: recovery failed: {e}"));
     }
@@ -1996,10 +1633,6 @@ fn render_doctor_report(
             })
         })
         .collect();
-    // `repaired`: null when `--fix` was absent, else a name-keyed breakdown — one
-    // entry per [`REPAIRS`] action, value = rows deleted (`Ok`) or null (the delete
-    // errored). The null-vs-object split lets a --json consumer tell "no repair ran"
-    // from "repair ran"; a null value pinpoints which repair failed.
     let repaired = match repairs {
         Some(outcomes) => {
             let map: serde_json::Map<String, serde_json::Value> = outcomes
@@ -2016,16 +1649,6 @@ fn render_doctor_report(
         }
         None => serde_json::Value::Null,
     };
-    // `model_recovered`: null when no re-fetch ran (no --fix, or model already
-    // usable), `true` only when the re-fetch ran and the re-probe came back fully
-    // usable, `false` when the re-fetch failed — either it errored or it returned
-    // Ok but the re-probe still faults (the model is still unusable).
-    // `model_recovery_retryable` pairs with the `false` case: `true` if retrying
-    // `--fix` may succeed (a transient download fault), `false` for a permanent
-    // backend mismatch — so an agent reading `model_recovered: false` can decide
-    // whether to retry instead of guessing from the note text. Both are null when
-    // no re-fetch ran or it succeeded. Kept beside `repaired` (not inside it)
-    // because that map counts deleted rows, which the model re-fetch has no analogue for.
     let (model_recovered, model_recovery_retryable) = match model_recovery {
         ModelRecovery::Skipped => (serde_json::Value::Null, serde_json::Value::Null),
         ModelRecovery::Succeeded => (serde_json::Value::Bool(true), serde_json::Value::Null),
@@ -2042,25 +1665,10 @@ fn render_doctor_report(
         "model_recovery_retryable": model_recovery_retryable,
     });
 
-    // A failed `--fix` recovery must flip `degraded` even when every check is `ok`.
-    // A not-installed model reports `ok` (FTS-only is supported), so `!healthy`
-    // alone stays false and a failed re-fetch would surface only in `notes` and
-    // `data.model_recovered` — a `degraded:false` envelope over a recovery that did
-    // not take (#249 RC-004).
     let degraded = !healthy || matches!(model_recovery, ModelRecovery::Failed(_));
     CommandOutput::with_notes(markdown, data, degraded, notes)
 }
 
-// -- Output formatting --
-
-/// Path structure: `{...}/{parent-session-uuid}/subagents/{agent-id}.jsonl`
-///
-/// Assumption/risk: this layout is owned by the upstream session writer (Claude
-/// Code / Codex), not by recall -- we only read it. If the writer changes where
-/// it nests subagent transcripts, the `/subagents/` segment or the parent-UUID
-/// position shifts and this silently returns `None` (subagent rows lose their
-/// parent link). recall cannot enforce the contract, so treat a `None` here as a
-/// "writer layout drifted" signal rather than a malformed-path error.
 fn extract_parent_session(file_path: &str) -> Option<&str> {
     let idx = file_path.find("/subagents/")?;
     let prefix = &file_path[..idx];
@@ -2109,17 +1717,11 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::
             writeln!(w, "    > {line}")?;
         }
     }
-    // Deep-dive guidance: anchor on the chunk id (chunk-backed hit) or point at the full
-    // show (snippet-tier hit). Uses the control-char-stripped session_id like the
-    // ID line above, keeping the copy-runnable command safe from stored escapes.
     writeln!(w, "    inspect: {}", inspect_hint(&session_id, r.chunk_id))?;
     writeln!(w)?;
     Ok(())
 }
 
-/// Render search results into the human-readable listing: empty results yield
-/// the no-match line, otherwise a header plus one block per result. Writes go
-/// to an in-memory buffer (infallible), so the result emits as a single write.
 fn render_results(results: &[search::SearchResult]) -> String {
     if results.is_empty() {
         return "No matching sessions found.".to_owned();
@@ -2133,11 +1735,6 @@ fn render_results(results: &[search::SearchResult]) -> String {
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// The deep-dive guidance for one hit: a chunk-backed hit (FTS rowid-tier /
-/// vector-tier) anchors `recall show` on the chunk id so an agent drills into just
-/// that message range plus a window of neighbors, while a chunk-less snippet-tier
-/// hit (no anchor) is steered to the full-conversation show. The session_id is
-/// printed in full — never a prefix — so the command is copy-runnable (#282).
 fn inspect_hint(session_id: &str, chunk_id: Option<i64>) -> String {
     match chunk_id {
         Some(id) => format!("recall show {session_id} --chunk {id} --window 3"),
@@ -2145,9 +1742,6 @@ fn inspect_hint(session_id: &str, chunk_id: Option<i64>) -> String {
     }
 }
 
-/// The machine payload for one search hit (#67 Phase 2), built explicitly so the
-/// `--json` schema stays decoupled from [`search::SearchResult`]'s internal
-/// shape (which is deliberately not `Serialize`).
 fn result_to_json(r: &search::SearchResult) -> serde_json::Value {
     let s = &r.session;
     serde_json::json!({
@@ -2170,19 +1764,10 @@ fn render_success_body(out: &CommandOutput, json_mode: bool) -> String {
     }
 }
 
-/// Emit a command's result to stdout: the JSON success envelope when
-/// `json_mode`, else the human-readable markdown. Delegates to
-/// [`emit_success_to`] with a locked stdout so production and tests share one
-/// write path (and the single SIGPIPE boundary).
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
     emit_success_to(out, json_mode, &mut io::stdout().lock())
 }
 
-/// Write a command's result to `w`: the JSON success envelope when `json_mode`,
-/// else the human-readable markdown. Empty markdown (a side-effect command in
-/// text mode) writes nothing. A closed pipe is a clean stop
-/// ([`WriteOutcome::PipeClosed`]); any other write error propagates to the CLI
-/// boundary for a non-zero I/O exit code. See [`crate::output`].
 fn emit_success_to<W: Write>(
     out: &CommandOutput,
     json_mode: bool,
@@ -2195,10 +1780,6 @@ fn emit_success_to<W: Write>(
     write_result(w, &body)
 }
 
-/// Emit an error to stderr: the JSON error envelope when `json_mode`, else the
-/// human-readable `error: <msg>` line. The exit code is decided separately by
-/// [`classify_exit_code`], so the rendered shape and the exit code never
-/// disagree.
 fn emit_error(err: &anyhow::Error, json_mode: bool) {
     if json_mode {
         eprintln!("{}", render_json_error(&error_envelope(err)));
@@ -2207,15 +1788,12 @@ fn emit_error(err: &anyhow::Error, json_mode: bool) {
     }
 }
 
-/// One session's reclassification result (#24 Phase 3).
 struct ClassifyOutcome {
     session_id: String,
     session_type: classify::SessionType,
-    /// First ~80 chars of the first user turn (after trim), for `--dry-run` display.
     excerpt: String,
 }
 
-/// Re-read provenance only. The caller checks availability and file freshness.
 fn read_classification_origin(
     file: File,
     path: &str,
@@ -2241,13 +1819,10 @@ struct ClassificationFileState {
     access: Result<(), &'static str>,
 }
 
-/// Include accessibility, even for an unavailable source: a recovered log must
-/// invalidate an old fallback. No log contents are read by the final check.
 fn classification_file_state(path: &str) -> ClassificationFileState {
     open_classification_file(path).0
 }
 
-/// Reuse the accessibility probe for scanning at the same read boundary.
 fn open_classification_file(path: &str) -> (ClassificationFileState, Result<File, &'static str>) {
     let stamp = (|| {
         let meta = metadata(path).map_err(|e| {
@@ -2302,8 +1877,6 @@ fn reclassify_sessions_with(
     reclassify_sessions_observed(conn, all, dry_run, read_origin, |_| {})
 }
 
-/// Observe transaction boundaries directly in deterministic tests/measurements.
-/// The production observer is a no-op, eliminated by monomorphization.
 fn reclassify_sessions_observed(
     conn: &mut Connection,
     all: bool,
@@ -2315,21 +1888,15 @@ fn reclassify_sessions_observed(
     use std::collections::BTreeMap;
 
     for _ in 0..3 {
-        // Same connection, BEFORE the snapshot, with no own writes until apply.
-        // Other commits (including change-and-restore) invalidate all candidates.
         let version: i64 = conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
         let tx = conn.transaction()?;
         let rows = {
             let mut stmt = tx.prepare(
-            // SQLite's single MIN aggregate takes text from that minimum row.
-            // Group once rather than scanning the FTS table for every session.
             "WITH first_turn AS (SELECT session_id, text, MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id) \
              SELECT s.session_id, s.source, s.file_path, s.session_type, m.text \
              FROM sessions s LEFT JOIN first_turn m ON m.session_id = s.session_id \
              WHERE ?1 OR s.session_type IS NULL ORDER BY s.session_id",
         ).map_err(|error| {
-            // Preparing the actual read checks only the structure classification
-            // needs. Index-only migrations must not gate a legacy preview.
             if dry_run {
                 anyhow::Error::from(RecallError::DatabaseRead(format!(
                     "cannot read database structure for classify --dry-run: {error}; \
@@ -2369,8 +1936,6 @@ fn reclassify_sessions_observed(
                     }
                     (origin, after)
                 }
-                // No read occurred, so this boundary needs no second probe.
-                // The fresh check inside apply still detects recovered files.
                 Err(reason) => (Err(reason), before),
             };
             files.push((path, after));
@@ -2411,8 +1976,6 @@ fn reclassify_sessions_observed(
                 Err(error) => return Err(error.into()),
             };
             observe(ClassifyPhase::WriterAcquired);
-            // Include the final stat/open checks in writer hold time. Never
-            // reparse bodies while holding the reservation.
             let current: i64 = tx.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
             if current != version
                 || files
@@ -2434,7 +1997,6 @@ fn reclassify_sessions_observed(
             tx.commit()?;
             observe(ClassifyPhase::WriterReleased);
         }
-        // Only the accepted attempt contributes warnings or success counts.
         for (reason, count) in unavailable {
             eprintln!(
                 "warning: provenance unavailable ({reason}): {count} session(s); existing labels retained, unclassified rows use first-turn fallback"
@@ -2447,9 +2009,6 @@ fn reclassify_sessions_observed(
     ).into())
 }
 
-/// `recall classify`: tag existing sessions using source provenance, then the
-/// stored first user turn (#327). `--all` re-classifies every session; otherwise only
-/// unclassified ones. `--dry-run` reports what would change without writing.
 fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
     let outcomes = if dry_run {
@@ -2501,20 +2060,11 @@ fn run_classify(all: bool, dry_run: bool, db_path: &Option<PathBuf>) -> Result<C
     Ok(CommandOutput::ok(markdown, data))
 }
 
-// -- Entry point --
-
-// Drives shorthand expansion in `try_expand_shorthand`: a token here is treated
-// as a subcommand, anything else as a bare `search` query. Add every new
-// subcommand (and keep it matching the `Command` enum) or its shorthand breaks.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "index", "rebuild", "model", "search", "show", "status", "classify", "doctor", "help",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
-/// Parse argv into a [`Cli`], expanding shorthand first. Both expansion
-/// branches funnel through one `try_parse_from`, so a parse error prints once.
-/// Returns the exit code to use when parsing does not yield a command:
-/// success for `--help`, `USAGE` (64) for a real parse error.
 fn parse_cli(args: Vec<OsString>) -> Result<Cli, ExitCode> {
     let parsed = match try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS) {
         Some(expanded) => Cli::try_parse_from(expanded),
@@ -2523,10 +2073,6 @@ fn parse_cli(args: Vec<OsString>) -> Result<Cli, ExitCode> {
     parsed.map_err(|e| handle_parse_error(&e))
 }
 
-/// Print a clap parse error (or `--help` text) and map it to an exit code.
-/// `--help` is not a failure (clap writes it to stdout); everything else is a
-/// usage error. recall defines no `--version`, so it falls through to `USAGE`
-/// like any other unknown flag.
 fn handle_parse_error(err: &clap::Error) -> ExitCode {
     let _ = err.print();
     match err.kind() {
@@ -2535,15 +2081,13 @@ fn handle_parse_error(err: &clap::Error) -> ExitCode {
     }
 }
 
-/// The [`CommandOutput`] for a side-effect command (index/embed/model): empty
-/// `markdown` and `null` `data`, since its progress already went to stderr. In
-/// `--json` mode [`emit_success`] still emits a `data: null` success envelope so
-/// an agent gets a parseable signal; in text mode it prints nothing.
 fn no_payload() -> CommandOutput {
     CommandOutput::ok(String::new(), serde_json::Value::Null)
 }
 
 fn run(cli: Cli) -> Result<CommandOutput> {
+    model::select(cli.model_manifest.as_deref())
+        .map_err(|e| RecallError::DatabaseRead(format!("invalid model manifest: {e}")))?;
     let default_filter = if cli.verbose {
         LOG_FILTER_VERBOSE
     } else {
@@ -2565,6 +2109,13 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         )
         .map(|o| index_command_output(&o)),
         Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
+        Some(Command::Model(ModelCommand::Manifest)) => {
+            let data = serde_json::to_value(model::selected())?;
+            Ok(CommandOutput::ok(
+                serde_json::to_string_pretty(&data)?,
+                data,
+            ))
+        }
         Some(cmd @ Command::Search { .. }) => run_search(cmd, &cli.db_path),
         Some(Command::Show {
             session_id,
@@ -2581,11 +2132,6 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     }
 }
 
-/// Map the stdout-write outcome of a successful command to an exit code: a
-/// written result or a consumer that closed the pipe early is success; any other
-/// write failure propagates to a non-zero I/O exit code. The error renders to
-/// stderr (never to the already-failing stdout). Split from [`main`] so the
-/// write-failure arm is unit-testable without a real broken stdout.
 fn exit_code_for_write(write: io::Result<WriteOutcome>, json_mode: bool) -> ExitCode {
     match write {
         Ok(WriteOutcome::Written | WriteOutcome::PipeClosed) => ExitCode::SUCCESS,
@@ -2616,4816 +2162,5 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::assert_matches;
-    use std::fs;
-
-    use rurico::embed::{ChunkedEmbedding, EmbedError};
-
-    use super::*;
-    use std::cell::Cell;
-
-    // ADR-0003 Confirmation: `create_db_file` creates the index DB with owner-only
-    // 0o600 permission. 0o600 sets only owner bits, so no umask (including the common
-    // 022 / 077) strips them and the assertion is stable across environments.
-    #[cfg(unix)]
-    #[test]
-    fn create_db_file_sets_owner_only_0600_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("index.db");
-
-        create_db_file(&db_path).unwrap();
-
-        let mode = fs::metadata(&db_path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "created DB must be owner-only 0o600, got {:o}",
-            mode & 0o777,
-        );
-    }
-
-    // create_db_file makes any missing parent dirs before creating the file, so
-    // the XDG subdirectory (~/.local/share/recall) is created on first run.
-    #[test]
-    fn create_db_file_creates_missing_parent_dirs() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("recall").join("recall.db");
-
-        create_db_file(&db_path).unwrap();
-
-        assert!(
-            db_path.exists(),
-            "DB file must be created under a fresh parent dir"
-        );
-    }
-
-    // When a parent component is a regular file, create_dir_all fails and
-    // create_db_file propagates the error instead of silently succeeding.
-    #[test]
-    fn create_db_file_errors_when_parent_cannot_be_created() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let blocker = dir.path().join("not_a_dir");
-        create_db_file(&blocker).unwrap(); // create `not_a_dir` as a regular file
-        let db_path = blocker.join("sub").join("recall.db");
-
-        let err = create_db_file(&db_path).unwrap_err();
-
-        assert_ne!(
-            err.kind(),
-            ErrorKind::AlreadyExists,
-            "expected a parent-creation failure, got {err:?}"
-        );
-    }
-
-    // Default DB path lives under the XDG data dir as recall/recall.db, falling
-    // back to ~/.local/share when XDG_DATA_HOME is unset.
-    #[test]
-    fn resolve_default_db_path_uses_local_share_when_xdg_unset() {
-        let home = Path::new("/home/u");
-
-        let path = resolve_default_db_path(None, Some(home)).unwrap();
-
-        assert_eq!(path, Path::new("/home/u/.local/share/recall/recall.db"));
-    }
-
-    // An absolute XDG_DATA_HOME wins over the ~/.local/share fallback.
-    #[test]
-    fn resolve_default_db_path_prefers_absolute_xdg_data_home() {
-        let path =
-            resolve_default_db_path(Some(OsStr::new("/xdg/data")), Some(Path::new("/home/u")))
-                .unwrap();
-
-        assert_eq!(path, Path::new("/xdg/data/recall/recall.db"));
-    }
-
-    // A relative XDG_DATA_HOME is ignored per the XDG spec; fall back to home.
-    #[test]
-    fn resolve_default_db_path_ignores_relative_xdg_data_home() {
-        let path = resolve_default_db_path(
-            Some(OsStr::new("relative/data")),
-            Some(Path::new("/home/u")),
-        )
-        .unwrap();
-
-        assert_eq!(path, Path::new("/home/u/.local/share/recall/recall.db"));
-    }
-
-    // An explicit --db-path / RECALL_DB value passes through untouched.
-    #[test]
-    fn resolve_db_path_passes_through_explicit_path() {
-        let explicit = PathBuf::from("/tmp/custom/recall.db");
-
-        let path = resolve_db_path(&Some(explicit.clone())).unwrap();
-
-        assert_eq!(path, explicit);
-    }
-
-    // With no explicit path, resolve_db_path wires the live env/home into the
-    // default resolver and yields a recall/recall.db under the data dir.
-    #[test]
-    fn resolve_db_path_defaults_to_recall_db_under_data_dir() {
-        let path = resolve_db_path(&None).unwrap();
-
-        assert!(
-            path.ends_with("recall/recall.db"),
-            "default path must end with recall/recall.db, got {path:?}"
-        );
-    }
-
-    // T-CS001: resolve_current_session is the single place the env-exclude policy
-    // lives, so this (flags x env) truth table is the contract.
-    #[test]
-    fn resolve_current_session_truth_table() {
-        use search::CurrentSession;
-        let flags = |exclude, include, only| CurrentSessionFlags {
-            exclude,
-            include,
-            only,
-        };
-        let with_env = || Some("sess-x".to_owned());
-        let exclude_x = || CurrentSession::Exclude("sess-x".to_owned());
-
-        // no flag: env present → default-exclude; env absent → ignore
-        assert_eq!(
-            resolve_current_session(flags(false, false, false), with_env()).unwrap(),
-            exclude_x()
-        );
-        assert_eq!(
-            resolve_current_session(flags(false, false, false), None).unwrap(),
-            CurrentSession::Ignore
-        );
-        // --exclude-current: env present → exclude; env absent → ignore (warns, no-op)
-        assert_eq!(
-            resolve_current_session(flags(true, false, false), with_env()).unwrap(),
-            exclude_x()
-        );
-        assert_eq!(
-            resolve_current_session(flags(true, false, false), None).unwrap(),
-            CurrentSession::Ignore
-        );
-        // --include-current: ignore regardless of env
-        assert_eq!(
-            resolve_current_session(flags(false, true, false), with_env()).unwrap(),
-            CurrentSession::Ignore
-        );
-        assert_eq!(
-            resolve_current_session(flags(false, true, false), None).unwrap(),
-            CurrentSession::Ignore
-        );
-        // --only-current: env present → only; env absent → usage error
-        assert_eq!(
-            resolve_current_session(flags(false, false, true), with_env()).unwrap(),
-            CurrentSession::Only("sess-x".to_owned())
-        );
-        assert!(
-            resolve_current_session(flags(false, false, true), None).is_err(),
-            "--only-current without CLAUDE_CODE_SESSION_ID must be a usage error"
-        );
-        // a blank (empty/whitespace) env value is treated as absent
-        assert_eq!(
-            resolve_current_session(flags(false, false, false), Some("  ".to_owned())).unwrap(),
-            CurrentSession::Ignore,
-            "blank CLAUDE_CODE_SESSION_ID must not produce a degenerate Exclude"
-        );
-        assert!(
-            resolve_current_session(flags(false, false, true), Some(String::new())).is_err(),
-            "--only-current with a blank env value must still be a usage error"
-        );
-    }
-
-    #[test]
-    fn test_format_timestamp() {
-        for (input, expected) in [
-            (None, "unknown"),
-            (Some(0), "1970-01-01"),
-            (Some(1709251200000), "2024-03-01"),
-            (Some(-date::MS_PER_DAY), "1969-12-31"),
-        ] {
-            assert_eq!(format_timestamp(input), expected, "input: {input:?}");
-        }
-    }
-
-    #[test]
-    fn try_load_embedder_cached_records_degraded_non_install_failure() {
-        let result = try_load_embedder_cached_with(|| Err(DegradedReason::ProbeFailed));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn try_load_embedder_cached_reports_non_install_degraded_note() {
-        let mut notes = Vec::new();
-        let result = try_load_embedder_cached_with_reporter(
-            || Err(DegradedReason::ProbeFailed),
-            |msg| notes.push(msg.to_owned()),
-        );
-
-        assert!(result.is_err());
-        assert_eq!(
-            notes,
-            ["note: embedding model unavailable; results from text search only."]
-        );
-    }
-
-    #[test]
-    fn search_degraded_note_covers_backend_failures() {
-        assert_eq!(
-            search_degraded_note(DegradedReason::BackendUnavailable).as_deref(),
-            Some("note: embedding model unavailable; results from text search only.")
-        );
-        assert_eq!(search_degraded_note(DegradedReason::Disabled), None);
-    }
-
-    // The `--json` agent channel carries a reason-aware fallback note, not a fixed
-    // "not installed" string: NotInstalled keeps the download hint, a probe/backend
-    // failure reports plain unavailability (re-downloading cannot fix either), and a
-    // disabled model yields no note so `degraded` stays false. These strings are
-    // recall's public `--json` surface, so they are pinned exactly.
-    #[test]
-    fn search_fallback_notes_are_reason_aware() {
-        assert_eq!(
-            search_fallback_notes(DegradedReason::NotInstalled),
-            [
-                "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"
-            ]
-        );
-        assert_eq!(
-            search_fallback_notes(DegradedReason::ProbeFailed),
-            [
-                "semantic search unavailable: embedding model unavailable; results from text search only"
-            ]
-        );
-        assert_eq!(
-            search_fallback_notes(DegradedReason::BackendUnavailable),
-            [
-                "semantic search unavailable: embedding model unavailable; results from text search only"
-            ]
-        );
-        assert!(
-            search_fallback_notes(DegradedReason::Disabled).is_empty(),
-            "a disabled model is intentional, not degraded: no note"
-        );
-    }
-
-    // search_degraded_state Ok arm: a loaded embedder is the ideal path. Driven by
-    // a MockEmbedder because CI has no real model, so run_search itself only
-    // exercises the Err arm — this is the sole coverage of the not-degraded branch.
-    #[test]
-    fn search_degraded_state_loaded_embedder_is_not_degraded() {
-        let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
-        let (degraded, notes) = search_degraded_state(&Ok(loaded));
-        assert!(!degraded, "a loaded embedder must not be marked degraded");
-        assert!(notes.is_empty(), "the ideal path carries no notes");
-    }
-
-    // search_degraded_state Err arm: a load failure degrades with a reason-aware
-    // note, and degraded co-varies with that note.
-    #[test]
-    fn search_degraded_state_reason_failure_degrades_with_note() {
-        let (degraded, notes) = search_degraded_state(&Err(DegradedReason::ProbeFailed));
-        assert!(degraded);
-        assert_eq!(
-            notes,
-            [
-                "semantic search unavailable: embedding model unavailable; results from text search only"
-            ]
-        );
-    }
-
-    // A caller-disabled model yields no note, so degraded stays false: the
-    // invariant degraded == !notes.is_empty() holds even on the Err path.
-    #[test]
-    fn search_degraded_state_disabled_is_not_degraded() {
-        let (degraded, notes) = search_degraded_state(&Err(DegradedReason::Disabled));
-        assert!(!degraded, "a disabled model is intentional, not degraded");
-        assert!(notes.is_empty());
-    }
-
-    // The Ok arm: a loaded embedder is returned so search can rank semantically.
-    // Injected via the loader seam to stay independent of whether a model is
-    // installed in the test environment (production coverage of this arm would
-    // otherwise flip with model presence).
-    #[test]
-    fn try_load_embedder_cached_returns_loaded_embedder() {
-        let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
-        let result = try_load_embedder_cached_with(|| Ok(loaded));
-        assert!(result.is_ok(), "a loaded embedder must be returned");
-    }
-
-    // The NotInstalled arm: a missing model degrades search to FTS-only (Err,
-    // surfaced as None at the call site) after the install note, rather than
-    // aborting the command.
-    #[test]
-    fn try_load_embedder_cached_returns_err_when_model_not_installed() {
-        let result = try_load_embedder_cached_with(|| Err(DegradedReason::NotInstalled));
-        assert!(
-            result.is_err(),
-            "a not-installed model must degrade (Err), not abort"
-        );
-    }
-
-    fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
-        search::SearchResult {
-            session: parser::SessionData {
-                session_id: session_id.to_owned(),
-                source: parser::Source::Claude,
-                file_path: "/path/to/file.jsonl".to_owned(),
-                project: project.to_owned(),
-                slug: "test-slug".to_owned(),
-                timestamp: Some(1709251200000),
-            },
-            excerpt: excerpt.to_owned(),
-            chunk_id: None,
-        }
-    }
-
-    #[test]
-    fn test_format_result_basic() {
-        let r = make_search_result("s1", "/home/me/project", "some excerpt");
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("[1] 2024-03-01"));
-        assert!(output.contains("test-slug"));
-        assert!(output.contains("project [claude]"));
-        assert!(output.contains("ID: s1"));
-        assert!(output.contains("> some excerpt"));
-    }
-
-    // T-RR001: empty results render the no-match line (not a header).
-    #[test]
-    fn test_render_results_empty_reports_no_match() {
-        assert_eq!(render_results(&[]), "No matching sessions found.");
-    }
-
-    // T-RR002: non-empty results render a count header plus one block per result.
-    #[test]
-    fn test_render_results_lists_header_and_each_result() {
-        let results = [
-            make_search_result("abc123", "/proj/a", "hello world"),
-            make_search_result("def456", "/proj/b", "another match"),
-        ];
-        let out = render_results(&results);
-        assert!(out.starts_with("Found 2 sessions:\n"), "got: {out}");
-        assert!(out.contains("ID: abc123"), "got: {out}");
-        assert!(out.contains("ID: def456"), "got: {out}");
-    }
-
-    #[test]
-    fn test_format_result_empty_project() {
-        let r = make_search_result("s1", "", "excerpt");
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("unknown [claude]"));
-        assert!(!output.contains("    /"));
-    }
-
-    // T-004 (#8/FR-004): the excerpt renders in full — no byte-cap truncation and
-    // no "..." marker — so the whole chunk reaches the agent in one search.
-    #[test]
-    fn test_format_result_excerpt_not_truncated() {
-        let long = "a".repeat(300);
-        let r = make_search_result("s1", "/proj", &long);
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(
-            output.contains(&format!("> {long}")),
-            "the full excerpt must render without truncation"
-        );
-        assert!(
-            !output.contains("> ..."),
-            "no truncation marker should be emitted, got: {output}"
-        );
-    }
-
-    struct FailingWriter;
-
-    impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("stdout unavailable"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn emit_success_propagates_non_pipe_write_error() {
-        let out = CommandOutput::ok("hello".to_owned(), serde_json::Value::Null);
-        let mut writer = FailingWriter;
-
-        let err = emit_success_to(&out, false, &mut writer).unwrap_err();
-
-        assert_eq!(err.kind(), ErrorKind::Other);
-    }
-
-    // exit_code_for_write Err arm: a non-pipe stdout write failure surfaces as the
-    // I/O exit code (74), the boundary that gives `recall ... > /full/disk` a
-    // non-zero status instead of a silent exit 0. The Ok arm is exercised by every
-    // integration test that emits a result; only the failure arm is pinned here.
-    #[test]
-    fn exit_code_for_write_maps_write_failure_to_io_error() {
-        let code = exit_code_for_write(Err(io::Error::other("stdout unavailable")), false);
-        assert_eq!(code, ExitCode::from(codes::IO_ERR));
-    }
-
-    #[test]
-    fn exit_code_for_write_maps_written_to_success() {
-        let code = exit_code_for_write(Ok(WriteOutcome::Written), false);
-        assert_eq!(code, ExitCode::SUCCESS);
-    }
-
-    // T-005 (#8 audit/C): the excerpt passes through ansi::strip_control_chars like
-    // every peer field (slug/project/session_id/file_path), so stored ANSI/control
-    // sequences from indexed content cannot reach the terminal raw. #8 expanded this
-    // surface (200-byte snippet -> full chunk content), making the gap material.
-    #[test]
-    fn test_format_result_excerpt_strips_control_chars() {
-        let r = make_search_result("s1", "/proj", "clean\x1b[31mANSI\x1b[0mhere\x07bell");
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(
-            !output.contains('\x1b') && !output.contains('\x07'),
-            "control characters must be stripped from the excerpt, got: {output:?}"
-        );
-        assert!(
-            output.contains("> cleanANSIherebell"),
-            "the cleaned excerpt text must render, got: {output:?}"
-        );
-    }
-
-    #[test]
-    fn test_format_result_empty_excerpt() {
-        let r = make_search_result("s1", "/proj", "");
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(!output.contains("> "));
-    }
-
-    #[test]
-    fn test_search_idle_message_only_when_unindexed() {
-        // `recall search` no longer auto-indexes, so an empty DB must surface guidance.
-        assert_eq!(
-            search_idle_message(0),
-            Some("No sessions indexed. Run `recall index` first.")
-        );
-        assert_eq!(search_idle_message(5), None);
-    }
-
-    // #293 audit M: 「query か --file のどちらかは必須」を clap 層でも宣言的に
-    // 弾く（defense-in-depth）。runtime 側の同じ検証は file_list_outcome が持つ
-    // （直接呼び出しのテスト経路が clap を通らないため二重化が必要）。空 DB では
-    // idle 短絡が runtime の usage error より先に出るので、CLI 層で弾かないと
-    // 両方 None が「index を実行せよ」の案内にすり替わる。
-    #[test]
-    fn test_search_requires_query_or_file_at_parse_time() {
-        assert!(Cli::try_parse_from(["recall", "search"]).is_err());
-        assert!(Cli::try_parse_from(["recall", "search", "--file", "a.rs"]).is_ok());
-        assert!(Cli::try_parse_from(["recall", "search", "auth"]).is_ok());
-    }
-
-    #[test]
-    fn test_rebuild_is_a_distinct_subcommand() {
-        let cli = Cli::try_parse_from(["recall", "rebuild"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Rebuild { .. }));
-    }
-
-    #[test]
-    fn test_index_no_longer_accepts_force_flag() {
-        assert!(Cli::try_parse_from(["recall", "index", "--force"]).is_err());
-        let cli = Cli::try_parse_from(["recall", "index"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Index { .. }));
-    }
-
-    // T-004: --token-budget は既定上限 256_000 にクランプされる
-    // given: --token-budget 500000（256_000 超）
-    // when: Index の clap 解析を通す
-    // then: 値が 256_000 にクランプされる
-    #[test]
-    fn index_token_budget_flag_clamps_above_256000_ceiling_down() {
-        let cli = Cli::try_parse_from(["recall", "index", "--token-budget", "500000"]).unwrap();
-        let Some(Command::Index { embed_flags }) = cli.command else {
-            panic!("expected Command::Index with a token_budget field");
-        };
-        assert_eq!(
-            embed_flags.token_budget,
-            Some(256_000),
-            "500_000 exceeds the 256_000 ceiling and must clamp down, never up"
-        );
-    }
-
-    #[test]
-    fn test_rebuild_recognized_by_shorthand_expansion() {
-        // Without `rebuild` in KNOWN_SUBCOMMANDS, `recall rebuild` would be
-        // rewritten to `search rebuild` by shorthand expansion.
-        let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
-        assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
-    }
-
-    // `doctor` must be in KNOWN_SUBCOMMANDS, else shorthand expansion rewrites
-    // `recall doctor` to `search doctor` (it did before the fix) and the diagnostic
-    // command becomes unreachable. Guards the enum/KNOWN_SUBCOMMANDS sync the
-    // comment above the list demands.
-    #[test]
-    fn doctor_recognized_by_shorthand_expansion() {
-        let args: Vec<OsString> = ["recall", "doctor"].iter().map(OsString::from).collect();
-        assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
-        let cli = Cli::try_parse_from(["recall", "doctor"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Doctor { fix: false }));
-    }
-
-    // `recall doctor --fix` parses the repair flag; the bare form leaves it false
-    // (asserted above). Guards the read-only default — fix must be opt-in so a
-    // plain diagnostic never mutates the index.
-    #[test]
-    fn doctor_fix_flag_parses() {
-        let cli = Cli::try_parse_from(["recall", "doctor", "--fix"]).unwrap();
-        assert_matches!(cli.command, Some(Command::Doctor { fix: true }));
-    }
-
-    // T-005 (FR-005): with `embed` dropped from KNOWN_SUBCOMMANDS, `recall embed`
-    // is not a subcommand — shorthand expansion rewrites it to `search embed`.
-    // The inverse of test_rebuild_recognized_by_shorthand_expansion.
-    #[test]
-    fn embed_token_shorthand_expands_to_search() {
-        let args: Vec<OsString> = ["recall", "embed"].iter().map(OsString::from).collect();
-        assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_some());
-    }
-
-    // KNOWN_SUBCOMMANDS must cover every real subcommand clap parses, else
-    // shorthand expansion rewrites the uncovered one to a `search <name>` query
-    // and the command is unreachable. The list was kept in sync by a comment
-    // alone, yet `recall doctor` shipped as `search doctor` regardless; this test
-    // is the enforcement the comment could not be. Adding a `Command` variant
-    // without listing its name here fails the assertion. clap auto-generates the
-    // `help` subcommand, which is already in the list.
-    #[test]
-    fn known_subcommands_covers_every_clap_subcommand() {
-        use clap::CommandFactory;
-        for sub in Cli::command().get_subcommands() {
-            let name = sub.get_name();
-            assert!(
-                KNOWN_SUBCOMMANDS.contains(&name),
-                "clap subcommand `{name}` is missing from KNOWN_SUBCOMMANDS; \
-                 shorthand expansion will rewrite `recall {name}` to a search query"
-            );
-        }
-    }
-
-    // T-007 (FR-008): the user-facing READMEs must describe index-time embedding,
-    // not the retired post-search/progressive model. OUTCOME.md carries the same
-    // revision but is git-ignored, so this committed test targets the committed
-    // artifacts. The banned tokens are architecture/flag terms (substring-safe —
-    // "recall embed" is excluded because it is a substring of "embeds"); the
-    // embed-at-index rewrite removed all three, so re-adding any must fail here.
-    #[test]
-    fn readme_describes_index_time_embedding_not_post_search_growth() {
-        let en = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
-            .expect("README.md must exist at the crate root");
-        let ja = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.ja.md"))
-            .expect("README.ja.md must exist at the crate root");
-        for (name, doc) in [("README.md", en.as_str()), ("README.ja.md", ja.as_str())] {
-            for banned in [
-                "post-search embedding",
-                "Progressive embedding",
-                "--no-embed",
-            ] {
-                assert!(
-                    !doc.contains(banned),
-                    "{name} still references the retired model: {banned:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_subagent_file_path_shows_parent_session() {
-        let r = search::SearchResult {
-            session: parser::SessionData {
-                session_id: "agent-a58c408".to_owned(),
-                source: parser::Source::Claude,
-                file_path: "/home/.claude/projects/proj/abc-def-123/subagents/agent-a58c408.jsonl"
-                    .to_owned(),
-                project: "/proj".to_owned(),
-                slug: "agent-slug".to_owned(),
-                timestamp: Some(1709251200000),
-            },
-            excerpt: "some text".to_owned(),
-            chunk_id: None,
-        };
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("abc-def-123"));
-    }
-
-    #[test]
-    fn test_normal_session_path_shows_no_parent() {
-        let r = make_search_result("s1", "/home/me/project", "excerpt");
-        let mut buf = Vec::new();
-        format_result(&mut buf, 0, &r).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(!output.contains("Parent:"));
-    }
-
-    fn setup_show_db() -> (tempfile::TempDir, Connection) {
-        let (dir, conn) = db::setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('abc-123', 'user', 'hello world')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('abc-123', 'assistant', 'hi there')",
-            [],
-        )
-        .unwrap();
-        (dir, conn)
-    }
-
-    #[test]
-    fn test_show_session_exact_match() {
-        let (_dir, conn) = setup_show_db();
-        let out = show_session(&conn, "abc-123", false).unwrap();
-        assert!(out.markdown.contains("# my-slug"));
-        assert!(out.markdown.contains("- session_id: abc-123"));
-        assert!(out.markdown.contains("- date: 2024-03-01"));
-        assert!(out.markdown.contains("## [user]\nhello world"));
-        assert!(out.markdown.contains("## [assistant]\nhi there"));
-        // The `--json` payload carries the same session, machine-readable (#67 Phase 2).
-        assert_eq!(out.data["session_id"], "abc-123");
-        assert_eq!(out.data["messages"][0]["role"], "user");
-        assert_eq!(out.data["messages"][0]["text"], "hello world");
-    }
-
-    #[test]
-    fn test_show_session_prefix_match() {
-        let (_dir, conn) = setup_show_db();
-        let out = show_session(&conn, "abc-1", false).unwrap();
-        assert!(out.markdown.contains("- session_id: abc-123"));
-    }
-
-    #[test]
-    fn test_show_session_ambiguous_prefix() {
-        let (_dir, conn) = setup_show_db();
-        let err = show_session(&conn, "abc", false).unwrap_err();
-        assert!(err.to_string().contains("Multiple sessions match"));
-    }
-
-    #[test]
-    fn test_show_session_not_found() {
-        let (_dir, conn) = setup_show_db();
-        let err = show_session(&conn, "zzz", false).unwrap_err();
-        assert!(err.to_string().contains("No session found matching"));
-    }
-
-    #[test]
-    fn test_show_session_verbose_includes_file() {
-        let (_dir, conn) = setup_show_db();
-        let out = show_session(&conn, "abc-123", true).unwrap();
-        assert!(out.markdown.contains("- file: /path/f.jsonl"));
-    }
-
-    #[test]
-    fn test_show_session_message_order() {
-        let (_dir, conn) = setup_show_db();
-        let out = show_session(&conn, "abc-123", false).unwrap();
-        let user_pos = out.markdown.find("## [user]").unwrap();
-        let assistant_pos = out.markdown.find("## [assistant]").unwrap();
-        assert!(
-            user_pos < assistant_pos,
-            "user message should come before assistant"
-        );
-    }
-
-    // A row stored with a source outside the known set ('claude'/'codex') must
-    // not abort show: Source::from_db returns None and the row falls back to
-    // Claude (with a warn) so the session still renders. Covers the
-    // unknown-source guard in show_session's query_map closure.
-    #[test]
-    fn show_session_unknown_source_falls_back_to_claude() {
-        let (_dir, conn) = db::setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0)",
-            [],
-        )
-        .unwrap();
-        let out = show_session(&conn, "xyz-1", false).unwrap();
-        assert!(
-            out.markdown.contains("- source: claude"),
-            "an unknown stored source must fall back to claude, got: {}",
-            out.markdown
-        );
-    }
-
-    // T-001 "window は同一セッションの前後 N メッセージのみ返す" (verbatim scenario name;
-    // Rust identifiers cannot contain spaces / `N`-with-spaces, so the fn name below is
-    // the descriptive-name equivalent required by the repo's test-naming convention).
-    //
-    // Two sessions are indexed consecutively so the single shared fts5 `messages`
-    // table interleaves their global rowids (r1=sessA, r2=sessB, ...). Anchored on a
-    // sessA chunk with --window 2, show must return sessA's body range plus 2
-    // same-session neighbors each side and nothing else: not the 3rd neighbor on
-    // either side (before/after cap) and never a sessB row (no cross-session leak).
-    #[test]
-    fn window_returns_only_same_session_neighbors_within_n() {
-        let (_dir, conn) = db::setup_test_db();
-        db::seed_session(&conn, "sessA");
-        db::seed_session(&conn, "sessB");
-        for (sess, text) in [
-            ("sessA", "AMSG0"),
-            ("sessB", "BMSG0"),
-            ("sessA", "AMSG1"),
-            ("sessB", "BMSG1"),
-            ("sessA", "AMSG2"),
-            ("sessB", "BMSG2"),
-            ("sessA", "AMSG3_BODY"),
-            ("sessB", "BMSG3"),
-            ("sessA", "AMSG4"),
-            ("sessB", "BMSG4"),
-            ("sessA", "AMSG5"),
-            ("sessB", "BMSG5"),
-            ("sessA", "AMSG6"),
-            ("sessB", "BMSG6"),
-        ] {
-            conn.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES (?1, 'user', ?2)",
-                rusqlite::params![sess, text],
-            )
-            .unwrap();
-        }
-        // The chunk body is one sessA message; anchor the window on it by its rowid.
-        let body: i64 = conn
-            .query_row(
-                "SELECT rowid FROM messages WHERE session_id='sessA' AND text='AMSG3_BODY'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (100, 'sessA', 'AMSG3_BODY', 0, ?1, ?1)",
-            [body],
-        )
-        .unwrap();
-
-        let out = show_session_windowed(&conn, "sessA", false, Some(100), 2).unwrap();
-
-        for included in ["AMSG1", "AMSG2", "AMSG3_BODY", "AMSG4", "AMSG5"] {
-            assert!(
-                out.markdown.contains(included),
-                "window=2 must include same-session {included}, got: {}",
-                out.markdown
-            );
-        }
-        assert!(
-            !out.markdown.contains("AMSG0"),
-            "before-cap: the 3rd-earlier same-session message must be excluded, got: {}",
-            out.markdown
-        );
-        assert!(
-            !out.markdown.contains("AMSG6"),
-            "after-cap: the 3rd-later same-session message must be excluded, got: {}",
-            out.markdown
-        );
-        assert!(
-            !out.markdown.contains("BMSG"),
-            "must not cross into the adjacent session sharing interleaved rowids, got: {}",
-            out.markdown
-        );
-    }
-
-    // T-002 "src_rowid NULL の chunk は本文 + 全文誘導へ fallback する" (verbatim scenario
-    // name; the descriptive fn name below satisfies the repo's identifier-safe convention).
-    //
-    // A pre-#192 legacy chunk has NULL src_rowid_lo/hi, so it has no message-range
-    // anchor to window on. show must not error: it renders the chunk body and steers
-    // the reader to the full `recall show` for the whole conversation.
-    #[test]
-    fn null_src_rowid_chunk_falls_back_to_body_plus_full_show_hint() {
-        let (_dir, conn) = db::setup_test_db();
-        db::seed_session(&conn, "s1");
-        // seed_chunk inserts a chunk into s1 leaving src_rowid_lo/hi NULL — the exact
-        // legacy shape produced by ALTER ... ADD COLUMN on a pre-#192 DB.
-        db::seed_chunk(&conn, 200, "legacy chunk body TEXTMARK");
-
-        let out = show_session_windowed(&conn, "s1", false, Some(200), 3).unwrap();
-
-        assert!(
-            out.markdown.contains("legacy chunk body TEXTMARK"),
-            "the legacy chunk's own body must be shown, got: {}",
-            out.markdown
-        );
-        assert!(
-            out.markdown.contains("recall show"),
-            "must steer to the full `recall show` for the whole conversation, got: {}",
-            out.markdown
-        );
-    }
-
-    // T-003 "--chunk 無指定の show は全文のまま" (verbatim scenario name; the descriptive
-    // fn name below satisfies the repo's identifier-safe convention).
-    //
-    // chunk = None is the no-`--chunk` invocation: the dispatcher must preserve the
-    // pre-feature behavior and render every message of the session (backward compat).
-    #[test]
-    fn show_without_chunk_renders_full_session() {
-        let (_dir, conn) = setup_show_db();
-
-        let out = show_session_windowed(&conn, "abc-123", false, None, 3).unwrap();
-
-        assert!(
-            out.markdown.contains("hello world"),
-            "full render lost the user turn"
-        );
-        assert!(
-            out.markdown.contains("hi there"),
-            "full render lost the assistant turn"
-        );
-        assert!(out.markdown.contains("## [user]"));
-        assert!(out.markdown.contains("## [assistant]"));
-    }
-
-    /// Seed session `w1` with `count` sequential user messages (text `M0..M{count-1}`,
-    /// rowids 1..count since w1 is the only session), for the window guard tests.
-    fn seed_window_db(count: i64) -> (tempfile::TempDir, Connection) {
-        let (dir, conn) = db::setup_test_db();
-        db::seed_session(&conn, "w1");
-        for i in 0..count {
-            conn.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES ('w1', 'user', ?1)",
-                [format!("M{i}")],
-            )
-            .unwrap();
-        }
-        (dir, conn)
-    }
-
-    // A `--chunk` id that matches no qa_chunks row is a usage error, not an empty
-    // render: the anchor cannot be resolved so there is no range to window on.
-    #[test]
-    fn windowed_show_errors_when_chunk_id_is_absent() {
-        let (_dir, conn) = seed_window_db(3);
-        let err = show_session_windowed(&conn, "w1", false, Some(999), 2).unwrap_err();
-        assert!(
-            err.to_string().contains("No chunk found with id 999"),
-            "got: {err}"
-        );
-    }
-
-    // `messages` is one shared fts5 table, so a chunk's session must match the show
-    // target; `--chunk` pointing at another session's chunk is a usage error rather
-    // than a cross-session window.
-    #[test]
-    fn windowed_show_errors_when_chunk_belongs_to_another_session() {
-        let (_dir, conn) = seed_window_db(3);
-        db::seed_session(&conn, "w2");
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (50, 'w2', 'body', 0, 1, 1)",
-            [],
-        )
-        .unwrap();
-
-        let err = show_session_windowed(&conn, "w1", false, Some(50), 2).unwrap_err();
-
-        assert!(
-            err.to_string().contains("belongs to session 'w2'"),
-            "cross-session --chunk must name the mismatched session, got: {err}"
-        );
-    }
-
-    // A single message longer than MAX_MSG_CHARS is truncated with an ellipsis so the
-    // windowed output stays bounded (contract: 1 メッセージ表示長に cap).
-    #[test]
-    fn windowed_show_truncates_a_message_longer_than_the_cap() {
-        let (_dir, conn) = db::setup_test_db();
-        db::seed_session(&conn, "w1");
-        let long = "X".repeat(MAX_MSG_CHARS + 1);
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('w1', 'user', ?1)",
-            [&long],
-        )
-        .unwrap();
-        let rowid: i64 = conn
-            .query_row(
-                "SELECT rowid FROM messages WHERE session_id='w1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (60, 'w1', 'body', 0, ?1, ?1)",
-            [rowid],
-        )
-        .unwrap();
-
-        let out = show_session_windowed(&conn, "w1", false, Some(60), 0).unwrap();
-
-        assert!(
-            out.markdown.contains('…'),
-            "an over-cap message must be marked truncated"
-        );
-        assert!(
-            !out.markdown.contains(&long),
-            "the full over-cap message must not be rendered verbatim"
-        );
-    }
-
-    // A chunk whose src_rowid range lands outside every current message rowid (e.g.
-    // its messages were deleted) yields an empty window: the metadata header still
-    // renders, but no message body does.
-    #[test]
-    fn windowed_show_renders_metadata_only_when_range_matches_no_message() {
-        let (_dir, conn) = seed_window_db(2);
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (70, 'w1', 'orphan-range', 0, 100000, 100001)",
-            [],
-        )
-        .unwrap();
-
-        let out = show_session_windowed(&conn, "w1", false, Some(70), 2).unwrap();
-
-        assert!(
-            out.markdown.contains("- chunk: 70"),
-            "metadata header must still render, got: {}",
-            out.markdown
-        );
-        assert!(
-            !out.markdown.contains("## ["),
-            "no message body should render for an out-of-range chunk, got: {}",
-            out.markdown
-        );
-    }
-
-    // The `--json` payload mirrors the windowed text: it carries the anchor chunk,
-    // the effective window, and each message flagged by whether it is inside the
-    // chunk's own range (contract: text / --json 両対応).
-    #[test]
-    fn windowed_show_json_payload_lists_anchored_messages_with_in_chunk_flag() {
-        let (_dir, conn) = seed_window_db(5);
-        // Anchor on M2 (rowid 3) with window 1 -> M1, M2, M3.
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (80, 'w1', 'M2', 0, 3, 3)",
-            [],
-        )
-        .unwrap();
-
-        let out = show_session_windowed(&conn, "w1", false, Some(80), 1).unwrap();
-
-        assert_eq!(out.data["chunk"], 80);
-        assert_eq!(out.data["window"], 1);
-        let msgs = out.data["messages"].as_array().unwrap();
-        assert_eq!(
-            msgs.len(),
-            3,
-            "window=1 around a one-message body yields 3 messages"
-        );
-        assert_eq!(msgs[1]["text"], "M2");
-        assert_eq!(
-            msgs[1]["in_chunk"], true,
-            "the body message must be flagged in_chunk"
-        );
-        assert_eq!(
-            msgs[0]["in_chunk"], false,
-            "a neighbor must not be flagged in_chunk"
-        );
-        assert_eq!(msgs[2]["in_chunk"], false);
-    }
-
-    // Drive the whole `recall show --chunk --window` path through run_show against a
-    // real on-disk DB (resolve_db_path -> readonly open -> schema gate -> windowed
-    // render). verbose=true also exercises the `- file:` line the range render emits.
-    #[test]
-    fn run_show_windowed_reads_a_real_db_and_includes_file_when_verbose() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        for text in ["m0", "m1", "m2"] {
-            conn.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
-                [text],
-            )
-            .unwrap();
-        }
-        let rowid: i64 = conn
-            .query_row("SELECT rowid FROM messages WHERE text='m1'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (1, 's1', 'm1', 0, ?1, ?1)",
-            [rowid],
-        )
-        .unwrap();
-        drop(conn);
-
-        let out = run_show("s1", true, Some(1), 1, &Some(db_path)).unwrap();
-
-        assert!(out.markdown.contains("- chunk: 1"));
-        assert!(
-            out.markdown.contains("- file: /f"),
-            "verbose windowed show must include the file path, got: {}",
-            out.markdown
-        );
-        for m in ["m0", "m1", "m2"] {
-            assert!(out.markdown.contains(m), "window=1 must include {m}");
-        }
-    }
-
-    // The NULL-src_rowid fallback also honors verbose, emitting the `- file:` line.
-    #[test]
-    fn windowed_show_fallback_includes_file_when_verbose() {
-        let (_dir, conn) = db::setup_test_db();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 300, "legacy body");
-
-        let out = show_session_windowed(&conn, "s1", true, Some(300), 3).unwrap();
-
-        assert!(
-            out.markdown.contains("- file: /f"),
-            "verbose fallback must include the file path, got: {}",
-            out.markdown
-        );
-    }
-
-    /// Seed an 'auto' session (first user turn is a slash-command wrapper) and a
-    /// 'human' session (normal turn), both unclassified — the classify tests' fixture.
-    fn seed_classify_db() -> (tempfile::TempDir, Connection) {
-        let (dir, conn) = db::setup_test_db();
-        // 'auto': first user turn is a slash-command wrapper; 'human': a normal
-        // turn. Both start unclassified (session_type NULL).
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('auto', 'claude', '/f', '/p', 'a', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('auto', 'user', '<command-message>clear</command-message>')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('human', 'user', 'how do I implement auth')",
-            [],
-        )
-        .unwrap();
-        (dir, conn)
-    }
-
-    fn session_type_of(conn: &Connection, sid: &str) -> Option<String> {
-        conn.query_row(
-            "SELECT session_type FROM sessions WHERE session_id = ?1",
-            [sid],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    // T-010 (#24/FR-008): `recall classify --all` re-classifies existing sessions
-    // from their first user turn and writes session_type.
-    #[test]
-    fn test_010_reclassify_all_tags_sessions() {
-        let (_dir, mut conn) = seed_classify_db();
-        let outcomes = reclassify_sessions(&mut conn, true, false).unwrap();
-        assert_eq!(session_type_of(&conn, "auto").as_deref(), Some("automated"));
-        assert_eq!(
-            session_type_of(&conn, "human").as_deref(),
-            Some("interactive")
-        );
-        assert_eq!(
-            outcomes.len(),
-            2,
-            "both sessions with a user turn are classified"
-        );
-    }
-
-    // T-012 (#24/FR-008): without --all, only unclassified (NULL) sessions are
-    // (re)classified; an already-tagged session is left untouched.
-    #[test]
-    fn reclassify_incremental_skips_already_tagged() {
-        let (_dir, mut conn) = db::setup_test_db();
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('fresh', 'user', '<command-message>clear</command-message>')",
-            [],
-        )
-        .unwrap();
-        // 'tagged' carries an automated first turn but was already tagged interactive;
-        // without --all it must stay interactive (not re-evaluated).
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('tagged', 'claude', '/f', '/p', 't', 0, 0.0, 'interactive')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('tagged', 'user', '<command-message>clear</command-message>')",
-            [],
-        )
-        .unwrap();
-
-        let outcomes = reclassify_sessions(&mut conn, false, false).unwrap();
-
-        assert_eq!(
-            session_type_of(&conn, "fresh").as_deref(),
-            Some("automated"),
-            "an unclassified session is classified"
-        );
-        assert_eq!(
-            session_type_of(&conn, "tagged").as_deref(),
-            Some("interactive"),
-            "an already-tagged session is untouched without --all"
-        );
-        assert_eq!(
-            outcomes.len(),
-            1,
-            "only the unclassified session is processed"
-        );
-    }
-
-    // -- #73 段階2 Phase 1: index に full embed を統合 (FR-002 / FR-003 / FR-007) --
-    //
-    // index_and_report_with is the loader-injection seam the SOW/Spec define
-    // (AC-2 #3). These drive it in-process with MockEmbedder so the index-time
-    // embed path is covered on a CI runner that has no MLX model (the spawn path
-    // would degrade to FTS-only and never exercise embed).
-    //
-    // Seam shape under test: index_and_report_with(db_path, &IndexOptions, loader).
-    // The source dirs MUST be injectable, not only db_path: rebuild (force=true)
-    // wipes qa_chunks/sessions/messages then re-scans the source dirs, so T-008
-    // cannot stage an FTS term without a per-test claude_dir. set_var is not an
-    // option here — Cargo.toml denies unsafe_code and edition-2024 makes
-    // std::env::set_var an unsafe fn — so the dir must arrive as an argument.
-    // IndexOptions already bundles {force, claude_dir, codex_dir} (indexer.rs:48)
-    // and mirrors index_from_dirs(conn, &IndexOptions), keeping the seam at 3 args.
-
-    /// Count chunks with no embedding (the pending set: qa_chunks rows absent
-    /// from vec_chunks). The Spec's definition of "fully embedded" is this == 0.
-    fn pending_embed_count(conn: &Connection) -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM qa_chunks c \
-             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap()
-    }
-
-    fn vec_chunk_count(conn: &Connection) -> i64 {
-        conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-            .unwrap()
-    }
-
-    /// A loader that hands the index pipeline a deterministic in-memory embedder.
-    /// `FnOnce` matches the seam's bound; the mock returns 768-dim vectors derived
-    /// from text bytes, so no model download or network is touched.
-    fn mock_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
-        Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
-    }
-
-    /// Recovery seam asserting it never runs: passed to `run_doctor_with` in every
-    /// test where the model is healthy or `--fix` is absent, so a stray re-fetch
-    /// (which would re-download the real model) panics instead of passing silently.
-    fn no_recover() -> Result<(), RecallError> {
-        panic!("model recovery must not run")
-    }
-
-    /// Two temp dirs that do not exist on disk. `collect_sources` gates session
-    /// scanning on `is_dir()` (indexer.rs:269), so `index_from_dirs` scans no
-    /// files — but its orphan cleanup still deletes any hand-seeded session
-    /// whose file_path has no on-disk source, chunks included. Use only where
-    /// sessions come from a real source dir (or none); embed-step tests call
-    /// `embed_all_pending` directly instead.
-    fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
-        (root.join("no_claude"), root.join("no_codex"))
-    }
-
-    // T-001 (FR-002): embed_all_pending embeds every pending chunk when a model
-    // is present. Given 3 directly-seeded un-embedded chunks, the run embeds all
-    // 3 (vec_chunks gains 3 rows; the NOT EXISTS pending set empties). Calls
-    // embed_all_pending directly: the embed step is the unit under test, and
-    // index_from_dirs' orphan cleanup deletes hand-seeded sessions (no on-disk
-    // source), which would silently empty the pending set before embedding.
-    // Perspective: equivalence (the "model present, pending > 0" class).
-    #[test]
-    fn embed_all_pending_embeds_every_pending_chunk() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        for i in 1..=3 {
-            db::seed_chunk(&conn, i, &format!("pending content {i}"));
-        }
-
-        let result = embed_all_pending(
-            &mut conn,
-            &embedder::MockEmbedder::new(),
-            &embedder::EmbedOptions::default(),
-        )
-        .unwrap();
-
-        assert_eq!(result.embedded, 3, "every pending chunk embeds");
-        assert_eq!(result.failed_count, 0, "a working embedder fails nothing");
-        assert_eq!(pending_embed_count(&conn), 0, "the pending set empties");
-        assert_eq!(vec_chunk_count(&conn), 3, "each chunk gains a vec row");
-    }
-
-    // T-010 (FR-002, FR-004): a partial embed failure flows through
-    // embed_all_pending — it tallies the failed batch, runs
-    // warn_if_batches_failed (the tracing-warn path), and stays Ok so the index
-    // is non-fatal. Given 3 pending chunks where 'x' poisons their single batch,
-    // the run reports embedded=0, failed_count=3, carries the first batch error
-    // for the --json note, and leaves the batch pending for the next run.
-    // Perspective: error (the failing-embedder arm) + state (EmbedResult tally).
-    #[test]
-    fn embed_all_pending_partial_failure_reports_failed_count() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 1, "x");
-        for i in 2..=3 {
-            db::seed_chunk(&conn, i, &format!("pending content {i}"));
-        }
-
-        let result = embed_all_pending(
-            &mut conn,
-            &embedder::MockEmbedder::failing_on_text("x"),
-            &embedder::EmbedOptions::default(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            result.embedded, 0,
-            "the poisoned single batch embeds nothing"
-        );
-        assert_eq!(
-            result.failed_count, 3,
-            "the whole 3-chunk batch is reported failed"
-        );
-        let err = result.first_error.as_deref().unwrap_or_default();
-        assert!(
-            err == "batch inference failed",
-            "the first batch error is carried up for the --json note, got: {err:?}"
-        );
-        assert_eq!(
-            pending_embed_count(&conn),
-            3,
-            "the failed batch stays pending for the next run"
-        );
-    }
-
-    // T-002 (FR-003): embedding is incremental — a second run re-embeds nothing.
-    // Given 1 already-embedded chunk and 1 new pending chunk, the first
-    // embed_all_pending embeds exactly the pending one (vec 1→2); the second
-    // leaves the count unchanged (the NOT EXISTS gate skips both).
-    // Perspective: hazard (re-run idempotence) + boundary (the already-embedded
-    // vs pending split).
-    #[test]
-    fn embed_all_pending_reembeds_nothing_on_second_run() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        // chunk 1 pre-embedded, chunk 2 pending.
-        for (id, content) in [(1, "already embedded"), (2, "new pending")] {
-            db::seed_chunk(&conn, id, content);
-        }
-        let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-            [embedder::f32_as_bytes(&emb)],
-        )
-        .unwrap();
-
-        let first = embed_all_pending(
-            &mut conn,
-            &embedder::MockEmbedder::new(),
-            &embedder::EmbedOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            first.embedded, 1,
-            "the first run embeds only the pending chunk"
-        );
-        assert_eq!(vec_chunk_count(&conn), 2, "vec gains exactly the new chunk");
-
-        let second = embed_all_pending(
-            &mut conn,
-            &embedder::MockEmbedder::new(),
-            &embedder::EmbedOptions::default(),
-        )
-        .unwrap();
-        assert_eq!(second.embedded, 0, "the second run re-embeds nothing");
-        assert_eq!(
-            vec_chunk_count(&conn),
-            2,
-            "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
-        );
-    }
-
-    // T-005: index フラグが EmbedOptions として forward される
-    // given: --token-budget 2048 --forward-pause-ms 700 と options を捕捉する
-    //        MockEmbedder
-    // when: 本番の index 経路が入力会話から pending を作り埋め込む
-    // then: EmbedOptions{token_budget:Some(2048), forward_pause:Some(700ms)} が
-    //       forward される
-    #[test]
-    fn index_and_report_forwards_index_flags_as_embed_options() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let claude_dir = db_dir.path().join("claude");
-        let codex_dir = db_dir.path().join("codex");
-        seed_claude_source(&claude_dir);
-        fs::create_dir(&codex_dir).unwrap();
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-
-        let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
-        let options = embedder::EmbedOptions {
-            token_budget: Some(2048),
-            forward_pause: Some(Duration::from_millis(700)),
-        };
-
-        let result =
-            index_and_report_with_options(&Some(db_path), &opts, || Ok(embedder.clone()), options)
-                .unwrap();
-
-        assert_eq!(result.embedded, 1);
-        assert_eq!(
-            embedder.captured_options(),
-            Some(options),
-            "--token-budget 2048 --forward-pause-ms 700 must forward as \
-             EmbedOptions{{token_budget:Some(2048), forward_pause:Some(700ms)}}"
-        );
-    }
-
-    // T-006: フラグ未指定時は default EmbedOptions が forward され現行挙動が
-    //        保たれる
-    // given: フラグ未指定と MockEmbedder
-    // when: index を実行
-    // then: EmbedOptions default（None/None）が forward される
-    #[test]
-    fn index_and_report_forwards_default_embed_options_when_flags_unset() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let claude_dir = db_dir.path().join("claude");
-        let codex_dir = db_dir.path().join("codex");
-        seed_claude_source(&claude_dir);
-        fs::create_dir(&codex_dir).unwrap();
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-
-        let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
-
-        let result = index_and_report_with(&Some(db_path), &opts, || Ok(embedder.clone())).unwrap();
-
-        assert_eq!(
-            result.embedded, 1,
-            "default EmbedOptions must preserve current embed behavior"
-        );
-        assert_eq!(
-            embedder.captured_options(),
-            Some(embedder::EmbedOptions::default()),
-            "default EmbedOptions (None/None) must forward when no flags are set"
-        );
-    }
-
-    // #163: status reports embedded *chunks*, not vec_chunks rows. One qa_chunk
-    // whose embedder output split into 2 sub-embeddings owns 2 vec_chunks rows
-    // (sub_idx 0,1). COUNT(*) would report embedded=2 > qa_chunks=1; the
-    // chunk-level coverage (DISTINCT chunk_id) must report 1, matching the
-    // pending-embedding semantics agents rely on to decide if index is complete.
-    // Perspective: hazard (sub-embedding overcount) + boundary (embedded vs the
-    // qa_chunks denominator never exceeds it).
-    #[test]
-    fn run_status_counts_distinct_embedded_chunks_not_subembedding_rows() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 1, "one chunk, two sub-embeddings");
-        let emb = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
-        for sub_idx in 0..2 {
-            conn.execute(
-                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, ?2)",
-                rusqlite::params![embedder::f32_as_bytes(&emb), sub_idx],
-            )
-            .unwrap();
-        }
-        drop(conn);
-
-        let out = run_status(false, &Some(db_path)).unwrap();
-
-        assert_eq!(
-            out.data["embedded"], 1,
-            "one qa_chunk with two sub-embedding rows is one embedded chunk, not two"
-        );
-        assert_eq!(out.data["qa_chunks"], 1);
-        assert!(
-            out.markdown.contains("Embedded: 1/1"),
-            "human output must not overstate coverage past the qa_chunks total, got: {}",
-            out.markdown
-        );
-    }
-
-    /// A test-only embedder whose `embed_query` returns a vector of the given
-    /// width, so the doctor model probe's dimension-mismatch branch is reachable
-    /// without an MLX load. Only `embed_query` is exercised; the document methods
-    /// are unreachable in the probe path.
-    struct WidthEmbedder(usize);
-
-    impl Embed for WidthEmbedder {
-        fn embed_query(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
-            Ok(vec![0.0; self.0])
-        }
-        fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-            unreachable!("doctor probe only calls embed_query")
-        }
-        fn embed_documents_batch(
-            &self,
-            _texts: &[&str],
-        ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-            unreachable!("doctor probe only calls embed_query")
-        }
-        fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
-            unreachable!("doctor probe only calls embed_query")
-        }
-    }
-
-    /// A test-only embedder that loads fine but whose `embed_query` returns an
-    /// error, so the doctor model probe's embed-failure branch (distinct from a
-    /// load failure and from a wrong-width result) is reachable without MLX.
-    struct FailingEmbedder;
-
-    impl Embed for FailingEmbedder {
-        fn embed_query(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
-            Err(EmbedError::EmptySequence)
-        }
-        fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-            unreachable!("doctor probe only calls embed_query")
-        }
-        fn embed_documents_batch(
-            &self,
-            _texts: &[&str],
-        ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-            unreachable!("doctor probe only calls embed_query")
-        }
-        fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
-            unreachable!("doctor probe only calls embed_query")
-        }
-    }
-
-    /// Seed a valid embedded index for `s1`: one session, one qa_chunk, one
-    /// vec_chunks row linked by chunk_id. The baseline every doctor check passes
-    /// against, so a single seeded fault is the only thing a failure test changes.
-    fn seed_healthy_index(conn: &Connection) {
-        db::seed_session(conn, "s1");
-        db::seed_chunk(conn, 1, "healthy chunk");
-        let emb = embedder::MockEmbedder::deterministic_vector("healthy chunk");
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-            rusqlite::params![embedder::f32_as_bytes(&emb)],
-        )
-        .unwrap();
-    }
-
-    // doctor reports healthy when the DB passes quick_check, has no orphan rows,
-    // and the model loads and embeds at the expected width. Perspective: the
-    // all-pass baseline — degraded must be false and no remedy notes emitted, so a
-    // later single-fault test isolates exactly one failing check.
-    #[test]
-    fn doctor_reports_healthy_on_intact_index_and_loadable_model() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        assert_eq!(out.data["healthy"], true);
-        assert!(!out.degraded, "an intact index must not be degraded");
-        assert!(
-            out.notes.is_empty(),
-            "no failing check means no remedy notes"
-        );
-        assert!(
-            out.markdown.contains("Health: healthy"),
-            "got: {}",
-            out.markdown
-        );
-    }
-
-    // doctor flags an embedding whose chunk_id no longer resolves to a qa_chunk.
-    // This also proves the `NOT IN` orphan scan runs against the vec0 virtual
-    // table (the aux chunk_id column is queryable outside a MATCH). Perspective:
-    // hazard (phantom vector hit) + the load-bearing SQL-form verification.
-    #[test]
-    fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        // A vec_chunks row whose chunk_id (999) has no qa_chunks row.
-        let emb = embedder::MockEmbedder::deterministic_vector("orphan");
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-            rusqlite::params![embedder::f32_as_bytes(&emb)],
-        )
-        .unwrap();
-        drop(conn);
-
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        assert_eq!(out.data["healthy"], false);
-        assert!(out.degraded);
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "orphan_embeddings")
-            .unwrap();
-        assert_eq!(check["ok"], false);
-        assert!(
-            out.notes.iter().any(|n| n.contains("recall doctor --fix")),
-            "remedy note must point at the --fix repair, got: {:?}",
-            out.notes
-        );
-    }
-
-    // T-216a: fix_orphan_embeddings deletes exactly the dangling rows and leaves
-    // the linked ones. Seed one healthy vec row (chunk_id 1, present) plus one
-    // orphan (chunk_id 999, absent); the delete must return 1 and leave the
-    // healthy row, so vec_chunks holds 1 row. Perspective: the load-bearing
-    // delete predicate matches the COUNT predicate — no over-deletion of live rows.
-    #[test]
-    fn fix_orphan_embeddings_deletes_only_dangling_rows() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
-        seed_healthy_index(&conn);
-        let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-            rusqlite::params![embedder::f32_as_bytes(&orphan)],
-        )
-        .unwrap();
-
-        let deleted = fix_orphan_embeddings(&conn).unwrap();
-
-        assert_eq!(deleted, 1, "only the dangling chunk_id=999 row is deleted");
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(remaining, 1, "the linked chunk_id=1 row must survive");
-    }
-
-    // T-216b: fix_orphan_embeddings is a no-op on a clean index. No orphan rows
-    // means the NOT IN predicate matches nothing, so it returns 0 and touches
-    // nothing. Perspective: boundary (zero orphans) — repair must be safe to run
-    // on a healthy DB.
-    #[test]
-    fn fix_orphan_embeddings_is_noop_when_clean() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
-        seed_healthy_index(&conn);
-
-        let deleted = fix_orphan_embeddings(&conn).unwrap();
-
-        assert_eq!(deleted, 0, "a clean index has nothing to repair");
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(remaining, 1, "the linked row must be untouched");
-    }
-
-    // T-216c: fix_orphan_embeddings propagates the delete error when vec_chunks is
-    // absent, mirroring check_orphan_embeddings_errors_when_table_missing. Covers
-    // the `?` Err region the delete sits behind. Perspective: error (query against
-    // a missing table).
-    #[test]
-    fn fix_orphan_embeddings_errors_when_table_missing() {
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(fix_orphan_embeddings(&conn).is_err());
-    }
-
-    // T-216d: doctor --fix repairs the orphan_embeddings fault and re-runs the
-    // checks, so the verdict reflects the post-repair state. Given a DB that fails
-    // orphan_embeddings, a --fix run must report healthy, mark that check ok, and
-    // expose repaired=1 in --json. Perspective: hazard (fix-then-recheck ordering)
-    // — without re-running checks after the delete the user repairs yet still sees
-    // the pre-fix FAIL.
-    #[test]
-    fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-            rusqlite::params![embedder::f32_as_bytes(&orphan)],
-        )
-        .unwrap();
-        drop(conn);
-
-        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        assert_eq!(out.data["healthy"], true, "got: {}", out.data);
-        assert!(!out.degraded, "repaired index must not be degraded");
-        assert_eq!(
-            out.data["repaired"]["orphan_embeddings"], 1,
-            "the name-keyed breakdown must report 1 row repaired, got: {}",
-            out.data
-        );
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "orphan_embeddings")
-            .unwrap();
-        assert_eq!(check["ok"], true, "orphan check must pass post-repair");
-        assert!(
-            out.markdown
-                .contains("Repaired orphan_embeddings: 1 row(s)"),
-            "got: {}",
-            out.markdown
-        );
-    }
-
-    // T-216e: render_doctor_report keeps a repair *error* visible. A failed delete
-    // (rare I/O fault) is the one case the orphan check can't fully explain — it
-    // re-emits the symptom (orphans remain) but not the cause. The report must
-    // print the cause and add it to notes so a --json consumer sees why --fix did
-    // not take. Perspective: silent-failure (a swallowed repair error) on the
-    // I/O-fault path that can't be staged on an open DB.
-    #[test]
-    fn render_doctor_report_surfaces_repair_error() {
-        let path = PathBuf::from("/tmp/recall-test.db");
-        let checks = vec![DoctorCheck::fail(
-            "orphan_embeddings",
-            "1 embedding(s) reference a missing chunk".to_owned(),
-            "recall doctor --fix",
-        )];
-        let repairs = Some(vec![RepairOutcome {
-            name: "orphan_embeddings",
-            result: Err(anyhow::anyhow!("disk I/O error")),
-        }]);
-
-        let out = render_doctor_report(false, &path, &checks, &repairs, &ModelRecovery::Skipped);
-
-        assert!(
-            out.markdown
-                .contains("Repair failed orphan_embeddings: disk I/O error"),
-            "the repair cause must appear in human output, got: {}",
-            out.markdown
-        );
-        assert!(
-            out.notes.iter().any(|n| n.contains("repair failed")),
-            "the repair cause must appear in notes, got: {:?}",
-            out.notes
-        );
-        assert_eq!(
-            out.data["repaired"]["orphan_embeddings"],
-            serde_json::Value::Null,
-            "a failed repair reports a null value under its name, got: {}",
-            out.data
-        );
-    }
-
-    // doctor flags a chunk whose session_id no longer resolves to a sessions row,
-    // because the hit cannot be rendered without session metadata. Perspective:
-    // hazard (unrenderable hit) — the chunk side of the orphan invariant.
-    #[test]
-    fn doctor_flags_orphan_chunk_referencing_missing_session() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        // A qa_chunk for a session that was never inserted.
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 'ghost', 'x', 0)",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "orphan_chunks")
-            .unwrap();
-        assert_eq!(check["ok"], false);
-        assert_eq!(out.data["healthy"], false);
-    }
-
-    // #222: a fault outside REPAIRS is left in place by --fix. orphan_chunks is
-    // remedy-only (a blind DELETE here is the data-loss tier — `rebuild` re-stages
-    // the source JSONL and can restore the link doctor cannot). So a --fix run
-    // against an orphan_chunks fault must still FAIL that check, re-emit its
-    // `recall rebuild` remedy, and omit it from the repaired breakdown. Perspective:
-    // hazard (a fixable dispatch must not silently destroy un-repairable data).
-    #[test]
-    fn doctor_fix_leaves_unrepairable_orphan_chunk_in_place() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        // A qa_chunk for a session that was never inserted — orphan_chunks fault.
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 'ghost', 'x', 0)",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
-        let out =
-            run_doctor_with(false, true, &Some(db_path.clone()), mock_loader, no_recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "orphan_chunks")
-            .unwrap();
-        assert_eq!(
-            check["ok"], false,
-            "--fix must not repair orphan_chunks, got: {}",
-            out.data
-        );
-        assert_eq!(
-            out.data["healthy"], false,
-            "unrepaired fault stays degraded"
-        );
-        assert!(
-            out.notes.iter().any(|n| n.contains("recall rebuild")),
-            "the orphan_chunks remedy must still surface, got: {:?}",
-            out.notes
-        );
-        assert!(
-            out.data["repaired"].get("orphan_chunks").is_none(),
-            "orphan_chunks is not a repair, so the breakdown must omit it, got: {}",
-            out.data
-        );
-        // The chunk row must survive: --fix only deletes what REPAIRS covers.
-        let conn = open_or_create_db(&db_path).unwrap();
-        let remaining: i64 = conn
-            .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            remaining, 1,
-            "the orphan chunk must not be deleted by --fix"
-        );
-    }
-
-    // #222: with `--fix` the repaired breakdown carries one entry per REPAIRS action
-    // even when nothing needed repair. A clean DB run reports orphan_embeddings=0
-    // (ran, deleted nothing), pinning the name-keyed envelope shape a --json consumer
-    // reads. Perspective: contract freeze (the --fix `repaired` object key set) +
-    // boundary (zero rows repaired).
-    #[test]
-    fn doctor_fix_breakdown_lists_every_repair_even_when_clean() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        assert_eq!(out.data["healthy"], true, "got: {}", out.data);
-        let repaired = out.data["repaired"]
-            .as_object()
-            .unwrap_or_else(|| panic!("--fix must report an object breakdown, got: {}", out.data));
-        assert_eq!(
-            repaired.keys().collect::<Vec<_>>(),
-            vec!["orphan_embeddings"],
-            "the breakdown freezes exactly the REPAIRS names, got: {}",
-            out.data
-        );
-        assert_eq!(
-            repaired["orphan_embeddings"], 0,
-            "a clean DB repairs zero rows, got: {}",
-            out.data
-        );
-    }
-
-    // doctor flags a model that the cache reports present but that fails to load,
-    // catching the gap status's cache-presence check misses. Perspective: error
-    // (load failure path) — remedy must be the model re-fetch.
-    #[test]
-    fn doctor_flags_model_that_fails_to_load() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let failing_loader = || Err(DegradedReason::ProbeFailed);
-        let out =
-            run_doctor_with(false, false, &Some(db_path), failing_loader, no_recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "model")
-            .unwrap();
-        assert_eq!(check["ok"], false);
-        assert_eq!(out.data["healthy"], false);
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("recall model download")),
-            "got: {:?}",
-            out.notes
-        );
-    }
-
-    // doctor flags a model that loads but embeds at the wrong width, catching a
-    // dimension drift that would silently degrade search to FTS-only. Perspective:
-    // boundary (output width != EMBEDDING_DIMS) — the probe must embed, not just load.
-    #[test]
-    fn doctor_flags_model_dimension_mismatch() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let wrong_width = || Ok(Arc::new(WidthEmbedder(EMBEDDING_DIMS - 1)) as Arc<dyn Embed>);
-        let out = run_doctor_with(false, false, &Some(db_path), wrong_width, no_recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "model")
-            .unwrap();
-        assert_eq!(
-            check["ok"], false,
-            "wrong embedding width must fail the probe"
-        );
-        assert_eq!(out.data["healthy"], false);
-    }
-
-    // doctor treats a not-installed model as info, not a fault: search runs
-    // FTS-only (a supported mode), so the model check stays ok, `healthy` stays
-    // true, and no `recall model download` remedy is emitted. This keeps doctor
-    // agreeing with status, which also reports no-model as a state, not breakage.
-    // Perspective: branch (NotInstalled vs other load errors) — only the latter fails.
-    #[test]
-    fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let not_installed = || Err(DegradedReason::NotInstalled);
-        let out = run_doctor_with(false, false, &Some(db_path), not_installed, no_recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "model")
-            .unwrap();
-        assert_eq!(
-            check["ok"], true,
-            "a not-installed model is FTS-only, not a broken index"
-        );
-        assert_eq!(check["remedy"], serde_json::Value::Null);
-        assert_eq!(out.data["healthy"], true);
-        assert!(
-            !out.notes
-                .iter()
-                .any(|n| n.contains("recall model download")),
-            "info-level no-model must not emit the download remedy, got: {:?}",
-            out.notes
-        );
-    }
-
-    // doctor --fix re-fetches a not-installed model and re-probes: the model
-    // column flips from the not-installed info note to a clean pass, `healthy`
-    // stays true, `model_recovered` is true, and the human output names the
-    // re-fetch. The loader is stateful (not-installed first, loadable after) to
-    // mirror a real recovery, and is asserted to be called twice — the second call
-    // is the post-recovery re-probe. Perspective: state (degraded -> recovered).
-    #[test]
-    fn doctor_fix_recovers_not_installed_model_to_healthy() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let calls = Cell::new(0u32);
-        let loader = || {
-            let n = calls.get();
-            calls.set(n + 1);
-            if n == 0 {
-                Err(DegradedReason::NotInstalled)
-            } else {
-                Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
-            }
-        };
-        let recover = || Ok(());
-        let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "model")
-            .unwrap();
-        assert_eq!(check["ok"], true, "post-recovery probe must pass");
-        assert_eq!(
-            check["detail"],
-            serde_json::Value::Null,
-            "a recovered model is a clean pass, not the not-installed note"
-        );
-        assert_eq!(out.data["model_recovered"], true);
-        assert_eq!(out.data["healthy"], true);
-        assert!(
-            out.markdown.contains("Recovered model"),
-            "human output must report the re-fetch, got: {}",
-            out.markdown
-        );
-        assert_eq!(
-            calls.get(),
-            2,
-            "recovery must trigger a second, re-probe load"
-        );
-    }
-
-    // doctor --fix on an unloadable model (a fault, ok=false) that recovers: the
-    // model column flips from FAIL to pass, so `healthy` flips false -> true and
-    // `model_recovered` is true. Distinct from the not-installed case because here
-    // the pre-recovery state is a hard fault, proving recovery is gated on
-    // "not fully usable", not specifically on the not-installed note. Perspective:
-    // branch (fault path vs not-installed path both reaching recovery).
-    #[test]
-    fn doctor_fix_recovers_unloadable_model_flipping_healthy() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let calls = Cell::new(0u32);
-        let loader = || {
-            let n = calls.get();
-            calls.set(n + 1);
-            if n == 0 {
-                Err(DegradedReason::ProbeFailed)
-            } else {
-                Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
-            }
-        };
-        let recover = || Ok(());
-        let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
-
-        assert_eq!(out.data["model_recovered"], true);
-        assert_eq!(
-            out.data["healthy"], true,
-            "a recovered fault must clear the degraded flag"
-        );
-    }
-
-    // doctor --fix whose model re-fetch fails: a not-installed model that can't be
-    // re-fetched stays FTS-only (the info note, so `healthy` stays true), but the
-    // failure cause must not vanish — `model_recovered` is false, the cause is in
-    // both the human output and notes so a --json consumer sees why --fix did not
-    // take. Perspective: silent-failure (a swallowed recovery error).
-    #[test]
-    fn doctor_fix_surfaces_model_recovery_failure() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let not_installed = || Err(DegradedReason::NotInstalled);
-        let recover = || Err(RecallError::Internal("MLX backend unavailable".to_owned()));
-        let out = run_doctor_with(false, true, &Some(db_path), not_installed, recover).unwrap();
-
-        assert_eq!(out.data["model_recovered"], false);
-        // `Internal` is a permanent fault, so retrying `--fix` cannot help: the
-        // JSON must say so, not leave the agent to parse the note text.
-        assert_eq!(out.data["model_recovery_retryable"], false);
-        assert!(
-            out.markdown
-                .contains("Model recovery failed: MLX backend unavailable"),
-            "human output must name the recovery failure, got: {}",
-            out.markdown
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("fix: model: recovery failed: MLX backend unavailable")),
-            "recovery failure must reach notes, got: {:?}",
-            out.notes
-        );
-        // #249 RC-004: a not-installed model reports `ok` (FTS-only is supported), so
-        // every check is `ok` and `healthy` is true. Without folding the recovery
-        // verdict into the degraded flag, the envelope would say `degraded:false` over
-        // a `--fix` that did not take. The failed recovery must flip it.
-        assert!(
-            out.degraded,
-            "a failed --fix recovery must mark the envelope degraded even when every check is ok (#249 RC-004)"
-        );
-    }
-
-    // doctor --fix on a hard fault whose re-fetch fails transiently: the model
-    // stays unloadable (a re-probe still faults), so `healthy` stays false, and
-    // because the recovery error is a `TempFailure`, `model_recovery_retryable`
-    // is true — an agent reading `model_recovered: false` learns retrying `--fix`
-    // may yet succeed. Pairs with the `Internal` case above to cover both
-    // retryability branches. Perspective: condition (retryable true vs false).
-    #[test]
-    fn doctor_fix_failure_marks_transient_recovery_retryable() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let failing = || Err(DegradedReason::ProbeFailed);
-        let recover = || Err(RecallError::TempFailure("download interrupted".to_owned()));
-        let out = run_doctor_with(false, true, &Some(db_path), failing, recover).unwrap();
-
-        assert_eq!(out.data["model_recovered"], false);
-        assert_eq!(out.data["model_recovery_retryable"], true);
-        assert_eq!(
-            out.data["healthy"], false,
-            "a model that stays unloadable keeps the degraded flag"
-        );
-        assert!(
-            out.markdown
-                .contains("Model recovery failed: download interrupted"),
-            "human output must name the recovery failure, got: {}",
-            out.markdown
-        );
-    }
-
-    // doctor --fix whose re-fetch returns Ok but the re-probe still faults: the
-    // download "succeeded" yet the model is still unusable, so reporting
-    // `model_recovered: true` beside `healthy: false` would tell an agent the
-    // model is usable when it is not. Recovery must register as failed instead:
-    // `model_recovered` false, and because a verify-passing re-fetch that still
-    // fails the probe is deterministic (a retry re-runs the same download → same
-    // fault), `model_recovery_retryable` is false. Perspective: hazard
-    // (success+failure contradiction in the same envelope).
-    #[test]
-    fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let calls = Cell::new(0u32);
-        let loader = || {
-            calls.set(calls.get() + 1);
-            Err(DegradedReason::ProbeFailed)
-        };
-        let recover = || Ok(());
-        let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
-
-        assert_eq!(
-            out.data["model_recovered"], false,
-            "a re-fetch that leaves the probe failing did not recover the model"
-        );
-        assert_eq!(
-            out.data["model_recovery_retryable"], false,
-            "a deterministic post-verify probe failure will not clear on retry"
-        );
-        assert_eq!(
-            out.data["healthy"], false,
-            "the model is still unloadable, so the index stays degraded"
-        );
-        assert_eq!(
-            calls.get(),
-            2,
-            "recovery must trigger a second, re-probe load even when it still faults"
-        );
-        assert!(
-            out.markdown
-                .contains("Model recovery failed: re-fetched model still fails its probe"),
-            "human output must name the still-faulting re-probe as a failure, got: {}",
-            out.markdown
-        );
-        assert!(
-            out.notes.iter().any(|n| n
-                .contains("fix: model: recovery failed: re-fetched model still fails its probe")),
-            "the still-faulting re-probe must reach notes, got: {:?}",
-            out.notes
-        );
-    }
-
-    // Without --fix, a degraded model is never re-fetched: `model_recovered` is
-    // null (no re-fetch ran) and `no_recover` would panic if it were called.
-    // Perspective: boundary (--fix off) — diagnosing stays read-only of the model.
-    #[test]
-    fn doctor_without_fix_leaves_model_recovered_null() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let failing = || Err(DegradedReason::ProbeFailed);
-        let out = run_doctor_with(false, false, &Some(db_path), failing, no_recover).unwrap();
-
-        assert_eq!(out.data["model_recovered"], serde_json::Value::Null);
-        assert_eq!(out.data["healthy"], false, "an unloadable model is a fault");
-    }
-
-    // doctor on a missing database reports unhealthy with the index remedy rather
-    // than auto-creating a DB (mirrors status's read-only no-DB path). Perspective:
-    // boundary (no index yet) — diagnosing must not have the side effect of creating one.
-    #[test]
-    fn doctor_reports_unhealthy_and_does_not_create_db_when_absent() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("missing.db");
-
-        let out = run_doctor_with(
-            false,
-            false,
-            &Some(db_path.clone()),
-            mock_loader,
-            no_recover,
-        )
-        .unwrap();
-
-        assert_eq!(out.data["healthy"], false);
-        assert!(out.degraded);
-        // The no-index path emits the same `repaired` key every other doctor path
-        // does (null here — no DB to repair), so the --json envelope key set the
-        // freeze test pins stays identical across paths.
-        assert!(
-            out.data
-                .get("repaired")
-                .is_some_and(serde_json::Value::is_null),
-            "got: {:?}",
-            out.data
-        );
-        assert!(
-            out.notes.iter().any(|n| n.contains("recall index")),
-            "got: {:?}",
-            out.notes
-        );
-        assert!(
-            !db_path.exists(),
-            "doctor must not create the database while diagnosing"
-        );
-    }
-
-    // status on a missing database reports zero counts without creating the DB,
-    // the read-only guarantee doctor's no-DB path mirrors. It rests on run_status
-    // computing model readiness before the `!path.exists()` early return, so the
-    // no-DB branch never calls open_or_create_db. Perspective: boundary (no index
-    // yet) — reporting status must not have the side effect of creating one.
-    #[test]
-    fn run_status_does_not_create_db_when_absent() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("missing.db");
-
-        let out = run_status(false, &Some(db_path.clone())).unwrap();
-
-        assert_eq!(out.data["sessions"], 0);
-        assert_eq!(out.data["qa_chunks"], 0);
-        assert_eq!(out.data["embedded"], 0);
-        assert!(
-            !db_path.exists(),
-            "status must not create the database while reporting"
-        );
-    }
-
-    // doctor reports rather than crashes when the DB file is corrupt enough that
-    // open fails: open_or_create_db runs WAL + schema migrations before any check,
-    // so a header-level corruption aborts at open, not at a check query. The open
-    // failure must become the integrity verdict (not propagate as an Err), keeping
-    // the model probe (DB-free) running. Perspective: error (unopenable DB) — the
-    // crash-vs-report boundary the RS1∪RS5 merge exists to hold.
-    #[test]
-    fn doctor_reports_unhealthy_on_unopenable_database() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        // Garbage bytes: not a valid SQLite header, so open_db fails before any check.
-        fs::write(&db_path, b"this is not a sqlite database").unwrap();
-
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        assert_eq!(out.data["healthy"], false);
-        assert!(out.degraded);
-        let integrity = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "integrity")
-            .unwrap();
-        assert_eq!(integrity["ok"], false);
-        assert!(
-            integrity["detail"]
-                .as_str()
-                .unwrap()
-                .contains("cannot open database"),
-            "got: {integrity}"
-        );
-        assert!(
-            out.notes.iter().any(|n| n.contains("recall index")),
-            "remedy must point at re-indexing a removed DB, got: {:?}",
-            out.notes
-        );
-    }
-
-    // doctor flags a model that loads but whose embed call fails, the third model
-    // failure mode distinct from a load failure and a wrong-width result. The probe
-    // must exercise embed_query, not stop at a successful load. Perspective: error
-    // (embed-time failure) — remedy is the model re-fetch.
-    #[test]
-    fn doctor_flags_model_that_fails_to_embed() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let failing_embed = || Ok(Arc::new(FailingEmbedder) as Arc<dyn Embed>);
-        let out = run_doctor_with(false, false, &Some(db_path), failing_embed, no_recover).unwrap();
-
-        let check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "model")
-            .unwrap();
-        assert_eq!(check["ok"], false);
-        assert!(
-            check["detail"]
-                .as_str()
-                .unwrap()
-                .contains("model embed failed"),
-            "got: {check}"
-        );
-        assert_eq!(out.data["healthy"], false);
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("recall model download")),
-            "got: {:?}",
-            out.notes
-        );
-    }
-
-    // run_db_check turns an error from the check query itself (the DB opened but a
-    // scan failed, e.g. a corrupt b-tree page) into a fail verdict rather than
-    // propagating. This is the RS5 half of the open-vs-scan split: T1 covers the
-    // open failure, this covers the scan failure, and only both together make the
-    // check exhaustive. Perspective: error (check query Err) — the data-loss-tier
-    // branch must report, not abort.
-    #[test]
-    fn run_db_check_converts_query_error_into_fail_verdict() {
-        let check = run_db_check("integrity", || Err(anyhow::anyhow!("disk I/O error")));
-
-        assert!(!check.ok);
-        assert!(
-            check
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("check could not run"),
-            "got: {:?}",
-            check.detail
-        );
-        assert_eq!(check.remedy, Some(CORRUPT_DB_REMEDY));
-    }
-
-    // check_orphan_embeddings propagates the scan error when the table it queries
-    // is absent, instead of silently reporting zero orphans. run_db_check is what
-    // turns this Err into a fail verdict; here we pin the Err itself so the wrapper
-    // has something to convert. Perspective: error (query against a schemaless DB).
-    #[test]
-    fn check_orphan_embeddings_errors_when_table_missing() {
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(check_orphan_embeddings(&conn).is_err());
-    }
-
-    // check_orphan_chunks propagates the scan error when its table is absent,
-    // mirroring check_orphan_embeddings. Perspective: error (query against a
-    // schemaless DB).
-    #[test]
-    fn check_orphan_chunks_errors_when_table_missing() {
-        let conn = Connection::open_in_memory().unwrap();
-        assert!(check_orphan_chunks(&conn).is_err());
-    }
-
-    // run_doctor (the thin wrapper over run_doctor_with that binds the real cached
-    // loader) returns an Ok envelope on a seeded healthy DB, and verbose=true adds
-    // the DB-path line to the human output. The model verdict is left unasserted:
-    // try_load_embedder_cached loads the real model when present and reports
-    // not-installed (info, still healthy) when absent, so this test stays robust
-    // across environments. Perspective: dispatch wiring + verbose branch.
-    #[test]
-    fn run_doctor_wrapper_reports_on_healthy_db_with_verbose_output() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let conn = open_or_create_db(&db_path).unwrap();
-        seed_healthy_index(&conn);
-        drop(conn);
-
-        let out = run_doctor(true, false, &Some(db_path.clone())).unwrap();
-
-        assert!(out.data["healthy"].is_boolean(), "got: {}", out.data);
-        assert!(
-            out.markdown.contains(&db_path.display().to_string()),
-            "verbose output must show the DB path, got: {}",
-            out.markdown
-        );
-    }
-
-    // A DB file that exists but was never indexed (no `sessions` table) is unusable,
-    // so doctor must report `healthy: false` with an actionable `index` verdict —
-    // matching the missing-DB path. The pre-fix Empty branch emitted no checks, which
-    // rendered `healthy: true` for an index that cannot answer a single query.
-    #[test]
-    fn run_doctor_reports_unhealthy_on_never_indexed_db() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        // A bare connection creates a valid but empty SQLite file (no schema).
-        drop(rusqlite::Connection::open(&db_path).unwrap());
-
-        let out = run_doctor(false, false, &Some(db_path.clone())).unwrap();
-
-        assert_eq!(
-            out.data["healthy"], false,
-            "never-indexed DB must be unhealthy, got: {}",
-            out.data
-        );
-        let index_check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "index");
-        assert!(
-            index_check.is_some_and(|c| c["ok"] == false),
-            "expected a failing `index` check, got: {}",
-            out.data
-        );
-    }
-
-    /// A DB file that exists but was never indexed: a bare SQLite file with no
-    /// `sessions` table (`SchemaState::Empty`). The read commands treat this as the
-    /// idle pre-index state, distinct from a missing file (guarded earlier by
-    /// `path.exists()`). Perspective: boundary (existing-but-empty DB).
-    fn bare_empty_db(dir: &Path) -> PathBuf {
-        let db_path = dir.join("recall.db");
-        drop(rusqlite::Connection::open(&db_path).unwrap());
-        db_path
-    }
-
-    // search against an existing-but-never-indexed DB returns the idle envelope
-    // (empty results, exit-0 semantics), not a stale or not-found error: the
-    // `SchemaState::Empty` arm of run_search.
-    #[test]
-    fn run_search_on_existing_empty_db_returns_idle() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = bare_empty_db(db_dir.path());
-
-        let out = run_search_with(search_command("anything"), &Some(db_path), mock_loader).unwrap();
-
-        assert_eq!(
-            out.data["results"].as_array().unwrap().len(),
-            0,
-            "an empty DB search must return zero results, got: {}",
-            out.data
-        );
-    }
-
-    // show against an existing-but-never-indexed DB is a Usage error identical to
-    // the missing-file path: the `SchemaState::Empty` arm of run_show.
-    #[test]
-    fn run_show_on_existing_empty_db_is_not_found_usage_error() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = bare_empty_db(db_dir.path());
-
-        let err = run_show("deadbeef", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
-
-        assert!(
-            err.to_string().contains("Database not found"),
-            "empty DB show must report not-found, got: {err}"
-        );
-    }
-
-    // status against an existing-but-never-indexed DB reports zero counts, same as
-    // a missing file: the `SchemaState::Empty` arm of run_status.
-    #[test]
-    fn run_status_on_existing_empty_db_reports_zero_counts() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = bare_empty_db(db_dir.path());
-
-        let out = run_status(false, &Some(db_path)).unwrap();
-
-        assert_eq!(out.data["sessions"], 0);
-        assert_eq!(out.data["qa_chunks"], 0);
-        assert_eq!(out.data["embedded"], 0);
-    }
-
-    // doctor (read-only, no --fix) on a stale on-disk schema emits a dedicated
-    // non-destructive `schema` verdict pointing at `recall rebuild`, not the
-    // data-loss CORRUPT_DB_REMEDY: the `SchemaState::Stale` arm of run_doctor.
-    // A lone `sessions` table (no `messages`) is the minimal stale shape.
-    #[test]
-    fn run_doctor_reports_schema_out_of_date_on_stale_db() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = rusqlite::Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, session_type TEXT);",
-            )
-            .unwrap();
-        }
-
-        let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        let schema = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "schema")
-            .unwrap_or_else(|| panic!("expected a `schema` check, got: {}", out.data));
-        assert_eq!(schema["ok"], false);
-        assert!(
-            schema["detail"].as_str().unwrap().contains("out of date"),
-            "got: {schema}"
-        );
-        assert_eq!(out.data["healthy"], false);
-    }
-
-    // doctor on an existing bare SQLite DB (never indexed, `SchemaState::Empty`)
-    // emits an `index` FAIL whose detail carries a caveat that recall cannot
-    // confirm the file was created by recall, names the resolved path so the
-    // "verify the path" instruction is followable in both the default human
-    // output and `--json` (both render the same check detail), and keeps the
-    // existing `recall index` remedy — src/main.rs:1508.
-    #[test]
-    fn doctor_on_an_existing_bare_sqlite_db_emits_an_index_fail_with_the_unconfirmed_origin_caveat()
-    {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = bare_empty_db(db_dir.path());
-
-        let out = run_doctor_with(
-            false,
-            false,
-            &Some(db_path.clone()),
-            mock_loader,
-            no_recover,
-        )
-        .unwrap();
-
-        assert_eq!(out.data["healthy"], false);
-        let index_check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "index")
-            .unwrap_or_else(|| panic!("expected an `index` check, got: {}", out.data));
-        assert_eq!(index_check["ok"], false);
-        let detail = index_check["detail"].as_str().unwrap();
-        assert!(detail.contains("cannot confirm"), "got: {detail}");
-        assert!(
-            detail.contains(&db_path.display().to_string()),
-            "caveat detail must name the resolved DB path to verify; got: {detail}"
-        );
-        assert_eq!(index_check["remedy"], "run `recall index`");
-    }
-
-    // F10: `doctor --fix` on an existing-but-empty foreign SQLite file must NOT
-    // silently graft recall's tables (via open_or_create_db -> create_schema). It
-    // must emit the same unconfirmed-origin caveat the read-only path gives and
-    // leave the file untouched (still `SchemaState::Empty`), so the mutating path
-    // is no less protected than the read-only one. Perspective: hazard (silent
-    // schema graft into a DB recall cannot confirm it owns).
-    #[test]
-    fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = bare_empty_db(db_dir.path());
-
-        let out =
-            run_doctor_with(false, true, &Some(db_path.clone()), mock_loader, no_recover).unwrap();
-
-        // Same unconfirmed-origin caveat as the read-only path, not a healthy graft.
-        assert_eq!(out.data["healthy"], false);
-        let index_check = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "index")
-            .unwrap_or_else(|| panic!("expected an `index` check, got: {}", out.data));
-        assert_eq!(index_check["ok"], false);
-        assert!(
-            index_check["detail"]
-                .as_str()
-                .unwrap()
-                .contains("cannot confirm"),
-            "got: {index_check}"
-        );
-        // No repair ran (nothing to repair; the graft was refused).
-        assert_eq!(out.data["repaired"], serde_json::Value::Null);
-        // The foreign file still has no recall `sessions` table: no graft happened.
-        let (conn, _) = db::open_db_readonly(&db_path).unwrap();
-        assert!(
-            matches!(db::schema_state(&conn), Ok(db::SchemaState::Empty)),
-            "expected the foreign DB to stay Empty (ungrafted)"
-        );
-    }
-
-    // doctor --fix on an unopenable (corrupt-header) DB: the writing
-    // open_or_create_db path fails, and the failure becomes the integrity verdict
-    // rather than propagating — the `--fix` open-failure arm of run_doctor.
-    #[test]
-    fn run_doctor_fix_reports_open_failure_on_unopenable_db() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        fs::write(&db_path, b"this is not a sqlite database").unwrap();
-
-        let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
-
-        let integrity = out.data["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|c| c["name"] == "integrity")
-            .unwrap();
-        assert_eq!(integrity["ok"], false);
-        assert!(
-            integrity["detail"]
-                .as_str()
-                .unwrap()
-                .contains("cannot open database"),
-            "got: {integrity}"
-        );
-    }
-
-    /// Seed a one-session Claude JSONL under `claude_dir` so a rebuild that
-    /// re-scans the source re-stages the session and its FTS terms. Mirrors the
-    /// integration `seed_indexed_session` fixture (cli_integration.rs:186); the
-    /// unique token `quokka` is the FTS round-trip probe for T-008.
-    fn seed_claude_source(claude_dir: &Path) {
-        fs::create_dir_all(claude_dir).unwrap();
-        fs::write(
-            claude_dir.join("s1.jsonl"),
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"quokka rebuild probe"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-    }
-
-    // T-008 (FR-007): rebuild re-embeds every chunk AND rebuilds the FTS index.
-    // Given an already-embedded index built from a seeded source, a force=true
-    // rebuild wipes then re-scans the source: afterward the pending set is empty
-    // (all re-embedded) and the seeded term still matches via FTS search. Two
-    // assertions guard both halves FR-007 names (re-embed + FTS reconstruction),
-    // so neither half can silently regress. Perspective: state (rebuild is a
-    // full-reset transition) + hazard (a destructive rebuild that fails to
-    // repopulate FTS would pass an embed-only check).
-    #[test]
-    fn rebuild_reembeds_all_and_rebuilds_fts_index() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        // Precondition: an already-embedded index (force=false index + embed).
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            assert_eq!(
-                pending_embed_count(&conn),
-                0,
-                "precondition: initial index must leave nothing pending"
-            );
-        }
-
-        // rebuild: force=true re-parses every present session and replaces its
-        // chunks/embeddings; missing source roots keep their existing index.
-        let rebuild_opts = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            pending_embed_count(&conn),
-            0,
-            "rebuild must re-embed every chunk (pending=0 after full reset)"
-        );
-
-        let opts = search::SearchOptions::default();
-        let hits = search::search(&conn, "quokka", &opts).unwrap();
-        assert_eq!(
-            hits.len(),
-            1,
-            "rebuild must reconstruct FTS: the seeded term must return its session"
-        );
-    }
-
-    // T-192i (#192, FR-6): the backfill pass is wired into the `recall index`
-    // path, not only callable in isolation. A first index links every chunk's
-    // rowid range; nulling lo/hi simulates a pre-#192 row, and a second index
-    // (the same source, force=false) must repopulate it via backfill_rowid_ranges
-    // — index_chunks skips the session because its qa_chunks already exist
-    // (indexer.rs:645), so only backfill can restore the link. Perspective: state
-    // (legacy NULL → populated through the index command) + hazard (a backfill
-    // call dropped from index_and_report_with would leave old rows on the instr
-    // fallback forever, undetected by the isolated T-192e unit test).
-    #[test]
-    fn index_and_report_with_backfills_legacy_null_rowid_ranges() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        // Simulate a pre-#192 row: clear the rowid link the first index wrote.
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            let cleared = conn
-                .execute(
-                    "UPDATE qa_chunks SET src_rowid_lo = NULL, src_rowid_hi = NULL",
-                    [],
-                )
-                .unwrap();
-            assert_eq!(cleared, 1, "precondition: one chunk to un-link");
-        }
-
-        // Second index over the unchanged source: index_chunks skips the already
-        // chunked session, so backfill is the only thing that can re-link it.
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        let (lo, hi): (Option<i64>, Option<i64>) = conn
-            .query_row(
-                "SELECT src_rowid_lo, src_rowid_hi FROM qa_chunks",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert!(
-            lo.is_some() && hi.is_some(),
-            "the index-path backfill must repopulate the legacy NULL rowid range, got lo={lo:?} hi={hi:?}"
-        );
-    }
-
-    // -- U-003 (#283): session_files backfill wired into the `recall index` path.
-    // Sessions needing path backfill have files_scanned NULL and no session_files
-    // rows. These fixtures retain matching mtime/size stamps to isolate backfill
-    // from body ingestion; migration of missing sizes is covered in indexer tests.
-    // A path-only backfill pass must fill
-    // session_files from the write-target tool_use without touching the body
-    // index or embeddings, mark files_scanned, and never re-read a marked
-    // session. The two tests below exercise that end to end through
-    // `index_and_report_with`, the same seam T-192i uses for backfill_rowid_ranges.
-
-    /// One-session Claude JSONL: a user turn, plus an assistant `Edit` tool_use
-    /// targeting `edit_path` when `Some` (a write-target the session_files
-    /// backfill must extract). `None` yields a zero-touch session — no
-    /// write-target tool_use — whose only backfill effect is the marker.
-    /// Returns the written file's path. Built via serde_json so the JSON is
-    /// well-formed without brace-escaping.
-    fn write_backfill_session(
-        dir: &Path,
-        file: &str,
-        user_text: &str,
-        edit_path: Option<&str>,
-    ) -> PathBuf {
-        fs::create_dir_all(dir).unwrap();
-        let user = serde_json::json!({
-            "type": "user",
-            "cwd": "/proj",
-            "message": {"role": "user", "content": user_text},
-            "timestamp": "2026-03-01T00:00:00Z"
-        });
-        let mut content = serde_json::to_string(&user).unwrap();
-        if let Some(path) = edit_path {
-            let assistant = serde_json::json!({
-                "type": "assistant",
-                "cwd": "/proj",
-                "message": {"role": "assistant", "content": [
-                    {"type": "text", "text": "editing"},
-                    {"type": "tool_use", "id": "t1", "name": "Edit",
-                     "input": {"file_path": path, "old_string": "x", "new_string": "y"}}
-                ]},
-                "timestamp": "2026-03-01T00:00:01Z"
-            });
-            content.push('\n');
-            content.push_str(&serde_json::to_string(&assistant).unwrap());
-        }
-        let full = dir.join(file);
-        fs::write(&full, content).unwrap();
-        full
-    }
-
-    /// Collect a single-i64-column query into a Vec, ordered by the query.
-    fn collect_i64(conn: &Connection, sql: &str) -> Vec<i64> {
-        let mut stmt = conn.prepare(sql).unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0)).unwrap();
-        rows.map(Result::unwrap).collect()
-    }
-
-    /// Row counts + id sets of the searchable body: messages (fts5 rowid),
-    /// qa_chunks (id), vec_chunks (chunk_id). Sorted, so equality captures both
-    /// the row count (Vec length) and the id set (Vec contents).
-    fn body_snapshot(conn: &Connection) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
-        (
-            collect_i64(conn, "SELECT rowid FROM messages ORDER BY rowid"),
-            collect_i64(conn, "SELECT id FROM qa_chunks ORDER BY id"),
-            collect_i64(conn, "SELECT chunk_id FROM vec_chunks ORDER BY chunk_id"),
-        )
-    }
-
-    /// All session_files paths, sorted.
-    fn session_file_paths(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn
-            .prepare("SELECT path FROM session_files ORDER BY path")
-            .unwrap();
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-        rows.map(Result::unwrap).collect()
-    }
-
-    /// Reset only the path-backfill state: `files_scanned` NULL and no
-    /// `session_files` rows, with body and freshness stamps left intact.
-    fn reset_to_legacy_state(conn: &Connection) {
-        conn.execute("UPDATE sessions SET files_scanned = NULL", [])
-            .unwrap();
-        conn.execute("DELETE FROM session_files", []).unwrap();
-    }
-
-    // T-004 (U-003): backfill が本文 index と embedding を変えない
-    // (given: index 済みで files_scanned 未設定のセッション群（vec_chunks に
-    //  embedding あり）/ when: recall index を実行 / then: session_files が埋まり、
-    //  messages / qa_chunks / vec_chunks の行数と id 集合が実行前と一致する)
-    //
-    // Simulates missing path-backfill state: index + embed two write-target sessions,
-    // then wipe files_scanned to NULL and clear session_files WITHOUT touching
-    // the on-disk JSONL. The stored mtime and size still match the file, so the
-    // freshness check skips the body re-parse — only a path-only backfill pass
-    // can repopulate session_files. Perspective: state (legacy NULL → populated
-    // through the index command) + hazard (a backfill that re-inserts messages
-    // or re-embeds would shift the body snapshot). RED (no backfill) leaves
-    // session_files empty; the body snapshot is unchanged either way, so the
-    // test fails on the populate assertion for exactly the intended reason.
-    #[test]
-    fn backfill_が本文_index_と_embedding_を変えない() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        let partial = write_backfill_session(
-            &claude_dir,
-            "a.jsonl",
-            "session a probe",
-            Some("/proj/marker_a.rs"),
-        );
-        write_backfill_session(
-            &claude_dir,
-            "b.jsonl",
-            "session b probe",
-            Some("/proj/marker_b.rs"),
-        );
-
-        // Partial input must also survive the loaded-model outcome branch.
-        let body = fs::read_to_string(&partial).unwrap();
-        fs::write(&partial, format!("{body}\ninvalid JSON\n")).unwrap();
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-
-        // given: an indexed + embedded DB, then reset its path-backfill state,
-        // leaving the body and freshness stamps intact.
-        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        assert_eq!(
-            index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
-            1
-        );
-        let before = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            reset_to_legacy_state(&conn);
-            // Model an old partial body with no recorded diagnostics. Only the
-            // path backfill reads this unchanged file during the next command.
-            conn.execute("DELETE FROM parse_diagnostics", []).unwrap();
-            assert!(
-                !collect_i64(&conn, "SELECT chunk_id FROM vec_chunks").is_empty(),
-                "precondition: the legacy DB must hold embeddings, or the invariant is vacuous"
-            );
-            body_snapshot(&conn)
-        };
-
-        // when: recall index runs again over the mtime-unchanged source.
-        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        assert_eq!(
-            index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
-            1
-        );
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        // then: the searchable body and embeddings are stable across the backfill.
-        assert_eq!(
-            body_snapshot(&conn),
-            before,
-            "backfill must not change messages / qa_chunks / vec_chunks row counts or id sets"
-        );
-        // then: session_files is populated from the path-only re-read.
-        assert_eq!(
-            session_file_paths(&conn),
-            vec![
-                "/proj/marker_a.rs".to_owned(),
-                "/proj/marker_b.rs".to_owned(),
-            ],
-            "the backfill must fill session_files from the write-target tool_use paths"
-        );
-    }
-
-    // T-005 (U-003): 2 回目の index で backfill が再実行されない
-    // (given: T-004 実行後の DB（zero-touch セッション含む）/ when: recall index を
-    //  もう一度実行 / then: 全セッションの files_scanned が立っており、JSONL の
-    //  path-only 再読が発生しない)
-    //
-    // Missing path-backfill state for a write-target and a zero-touch session (no
-    // write-target tool_use). One backfill index marks files_scanned on both and
-    // fills session_files for the write session (the "T-004 execution"). A canary
-    // write-target path of equal byte length replaces the original in the JSONL,
-    // with mtime pinned to the original value, so the body freshness check still
-    // skips a re-parse. A second index must NOT re-read the JSONL: files_scanned
-    // gates the session out of the backfill, so the canary never reaches
-    // session_files. Perspective: state (marked → skipped) + hazard (an ungated
-    // backfill re-reads every session every run, resurfacing the canary). RED
-    // (no backfill) leaves files_scanned NULL, so the "all marked" assertion
-    // fails for exactly the intended reason. Clearing the marker at the end must
-    // expose the canary, proving this fixture detects a path-only re-read.
-    #[test]
-    fn 二回目の_index_で_backfill_が再実行されない() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        let write_path = write_backfill_session(
-            &claude_dir,
-            "write.jsonl",
-            "write session probe",
-            Some("/proj/orig_marker.rs"),
-        );
-        write_backfill_session(&claude_dir, "zero.jsonl", "zero touch probe", None);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-
-        // given: an indexed + embedded DB with its path-backfill state reset,
-        // then the first backfill index (the "T-004 execution").
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            reset_to_legacy_state(&conn);
-        }
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        // Keep both freshness inputs equal to isolate the path-only backfill.
-        // Size changes must trigger body ingestion even with pinned mtime (#321).
-        let original = fs::metadata(&write_path).unwrap();
-        let pinned = original.modified().unwrap();
-        write_backfill_session(
-            &claude_dir,
-            "write.jsonl",
-            "write session probe",
-            Some("/proj/next_marker.rs"),
-        );
-        let f = OpenOptions::new().write(true).open(&write_path).unwrap();
-        f.set_modified(pinned).unwrap();
-        drop(f);
-        let replaced = fs::metadata(&write_path).unwrap();
-        assert_eq!(replaced.len(), original.len(), "canary must preserve size");
-        assert_eq!(replaced.modified().unwrap(), pinned);
-
-        // when: recall index runs a second time.
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        // then: every session carries the files_scanned marker — the zero-touch
-        // session included — so none is re-read on a later index.
-        let unmarked: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            unmarked, 0,
-            "every session (write-target and zero-touch) must carry files_scanned after the backfill"
-        );
-        // then: the second index did not re-read the JSONL — the canary injected
-        // after the first backfill never reached session_files.
-        assert!(
-            !session_file_paths(&conn)
-                .iter()
-                .any(|p| p == "/proj/next_marker.rs"),
-            "a marked session must not be re-read: the canary path must not appear in session_files"
-        );
-
-        // Positive control: the same file becomes visible to backfill when its
-        // marker is absent, without changing mtime or size.
-        conn.execute("DELETE FROM session_files WHERE session_id = 'write'", [])
-            .unwrap();
-        conn.execute(
-            "UPDATE sessions SET files_scanned = NULL WHERE session_id = 'write'",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert!(session_file_paths(&conn).contains(&"/proj/next_marker.rs".to_owned()));
-    }
-
-    // #165 follow-up (SF4-JSON, end-to-end): a source root that vanishes between
-    // runs preserves its existing session AND threads the skipped root into the
-    // returned IndexOutcome, so index_command_output can surface it on the --json
-    // path (the stderr warning loop runs as the human-path side effect). Given a DB
-    // seeded from a claude source, a second index pointed at a now-missing claude
-    // dir returns skipped_roots naming claude with its one preserved session.
-    // Perspective: state (a present→missing root transition) + hazard (a root
-    // outage dropped from the outcome would hide the masked deletions #165 names).
-    #[test]
-    fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        // Second run: the claude root has vanished. Its session must be preserved
-        // and reported, not deleted.
-        let gone_claude = src.path().join("claude_gone");
-        let missing_opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &gone_claude,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path), &missing_opts, mock_loader).unwrap();
-
-        assert_eq!(
-            outcome.skipped_roots.len(),
-            1,
-            "the missing claude root must be threaded into the outcome"
-        );
-        assert_eq!(outcome.skipped_roots[0].source, parser::Source::Claude);
-        assert_eq!(
-            outcome.skipped_roots[0].preserved_sessions, 1,
-            "the one preserved claude session must be counted"
-        );
-    }
-
-    // -- Phase 2 (AC-4): model-less index degrades, never aborts (FR-004a/004b) --
-    //
-    // index_and_report_with returns Result<IndexOutcome> carrying the degraded note
-    // rather than emitting it, so the note is verifiable in-process without a 4th
-    // reporter arg — mirroring search_degraded_state, which returns (degraded,
-    // notes). run_index/run_rebuild surface the note, then map to Ok(()).
-
-    // T-004a (FR-004a): a model-less index completes full-text indexing and
-    // succeeds (exit 0). Given a seeded source and a loader that returns
-    // Err(DegradedReason::NotInstalled), index_and_report_with returns Ok AND the
-    // seeded FTS term still returns its session — the FTS index is built even
-    // though embedding was skipped. Perspective: branch (the loader Err arm, the
-    // sole path a model-less CI runner takes) + hazard (a degraded path that
-    // aborted, or that skipped FTS along with embed, would strand search).
-    #[test]
-    fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-            Err(DegradedReason::NotInstalled)
-        });
-        assert!(
-            outcome.is_ok(),
-            "a model-less index must complete FTS and exit 0, not abort"
-        );
-        let outcome = outcome.unwrap();
-        let counts = &outcome.observations["counts"];
-        assert_eq!(counts["chunks_pending_snapshot"], 1);
-        assert_eq!(counts["chunks_unattempted"], 1);
-        assert_eq!(counts["chunks_remaining_snapshot"], 1);
-        for key in [
-            "chunks_saved",
-            "chunks_failed",
-            "chunks_stale",
-            "chunks_save_failed",
-        ] {
-            assert_eq!(counts[key], 0);
-        }
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        let search_opts = search::SearchOptions::default();
-        let hits = search::search(&conn, "quokka", &search_opts).unwrap();
-        assert_eq!(
-            hits.len(),
-            1,
-            "the FTS index must be complete after a degraded index: the seeded term returns its session"
-        );
-    }
-
-    // T-004b (FR-004b): a model-less index emits a degraded note that names
-    // `recall model download`. Given the same Err(NotInstalled) loader, the
-    // returned IndexOutcome carries a note string containing that command, so the
-    // user is told how to enable embedding. Perspective: error (the model-absent
-    // path surfaces an actionable message, not a silent skip).
-    #[test]
-    fn index_and_report_with_degraded_loader_emits_model_download_note() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .expect("a degraded index must succeed");
-
-        let note = outcome
-            .degraded_note
-            .expect("a model-less index must carry a degraded note");
-        assert!(
-            note.contains("recall model download"),
-            "the degraded note must name `recall model download` to guide the user, got: {note}"
-        );
-    }
-
-    // D5 (#130): the index context was only tested with NotInstalled; pin the
-    // other loader-failure variants. BackendUnavailable and ProbeFailed share
-    // one equivalence class (amici's user_note renders both as "unavailable",
-    // re-downloading would not help), so both must carry that note and skip
-    // embedding. The `record_degraded` half of D5 is covered by the loader's
-    // own test (try_load_embedder_cached_records_degraded_non_install_failure);
-    // production wires that loader in via index_and_report.
-    #[test]
-    fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
-        for reason in [
-            DegradedReason::BackendUnavailable,
-            DegradedReason::ProbeFailed,
-        ] {
-            let src = tempfile::TempDir::new().unwrap();
-            let claude_dir = src.path().join("claude");
-            let (_, codex_dir) = absent_source_dirs(src.path());
-            seed_claude_source(&claude_dir);
-
-            let db_dir = tempfile::TempDir::new().unwrap();
-            let db_path = db_dir.path().join("recall.db");
-
-            let opts = indexer::IndexOptions {
-                force: false,
-                claude_dir: &claude_dir,
-                codex_dir: &codex_dir,
-            };
-            let outcome = index_and_report_with(&Some(db_path), &opts, || Err(reason))
-                .expect("a degraded index must succeed");
-
-            let note = outcome
-                .degraded_note
-                .unwrap_or_else(|| panic!("{reason:?} must carry a degraded note"));
-            assert!(
-                note.contains("unavailable"),
-                "{reason:?} must report unavailability (not a download hint), got: {note}"
-            );
-            assert!(
-                !note.to_lowercase().contains("download"),
-                "{reason:?} is not repaired by re-downloading, so the note must not \
-                 suggest it (that hint belongs to NotInstalled), got: {note}"
-            );
-            assert_eq!(outcome.embedded, 0, "{reason:?} skips embedding");
-            assert_eq!(outcome.failed_count, 0, "{reason:?} fails no batches");
-        }
-    }
-
-    // D6 (#130): Err(Disabled) yields the same IndexOutcome as a no-op success
-    // (degraded_note=None, all counters zero) — a caller-level opt-out is not a
-    // degradation, matching the search channel's contract (search_degraded_state
-    // returns (false, []) for Disabled). Production never constructs Disabled
-    // today (amici's loaders never return it and recall has no opt-out switch);
-    // this pin makes the collision explicit for whoever adds that switch.
-    #[test]
-    fn index_and_report_with_disabled_loader_is_indistinguishable_from_success() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome =
-            index_and_report_with(&Some(db_path), &opts, || Err(DegradedReason::Disabled))
-                .expect("a disabled-embedder index must succeed");
-
-        assert_eq!(
-            outcome.degraded_note, None,
-            "opt-out is not a degradation: no note is carried"
-        );
-        assert_eq!(outcome.embedded, 0, "a disabled embedder embeds nothing");
-        assert_eq!(
-            outcome.failed_count, 0,
-            "a disabled embedder fails no batches"
-        );
-        let envelope = index_command_output(&outcome);
-        assert!(
-            !envelope.degraded,
-            "the --json envelope reports a disabled embedder as non-degraded"
-        );
-    }
-
-    // T-1 (#215, FR-1, hazard): a model-absent rebuild must preserve the
-    // embeddings of sessions it re-indexes, not destroy them. Given an embedded
-    // index, a force=true rebuild whose loader returns Err(NotInstalled) must
-    // leave vec_chunks intact — the destructive pre-#215 path deleted them before
-    // the embed gate ran, dropping semantic search to degraded with no recovery
-    // until a manual re-download + re-index. Perspective: hazard (data-loss path)
-    // + state (rebuild transition under the model-absent precondition).
-    #[test]
-    fn model_absent_rebuild_preserves_existing_embeddings() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        // Precondition: an embedded index (model present).
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        let before = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
-        assert!(
-            before > 0,
-            "precondition: the initial index must embed at least one chunk"
-        );
-
-        // Model-absent rebuild: force=true re-indexes the seeded session, but the
-        // loader is Err so the embeddings cannot be rebuilt this run.
-        let rebuild = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            vec_chunk_count(&conn),
-            before,
-            "a model-absent rebuild must preserve existing embeddings, not destroy them"
-        );
-    }
-
-    // T-230 (#230, hazard + state): a model that loads OK but fails inference must
-    // not enter the destructive rebuild path. The production load probe only
-    // constructs the model (rurico dispatch.rs: `Embedder::new().map(|_| ())`); it
-    // runs no forward pass, so a corrupt-weights model that errors during real
-    // embedding still returns load-Ok. Pre-fix, `embed_capable = is_ok()` was true,
-    // so a force rebuild deleted the existing embeddings before the embed step
-    // failed — destroying what #215 preserves. The fix runs a minimal inference
-    // probe up front and demotes inference failure to degraded, so the preserve
-    // path runs. Perspective: hazard (data-loss path) + state (rebuild under a
-    // load-OK-but-inference-fails precondition).
-    #[test]
-    fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        // Precondition: an embedded index (model present, inference healthy).
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        let before = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
-        assert!(
-            before > 0,
-            "precondition: the initial index must embed at least one chunk"
-        );
-
-        // Load-OK-but-inference-fails rebuild: the loader returns Ok, but every
-        // embed call errors (a corrupt model that passes the construction probe).
-        let rebuild = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-            Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
-        })
-        .unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            vec_chunk_count(&conn),
-            before,
-            "a load-OK-but-inference-fails rebuild must preserve existing embeddings, not destroy them"
-        );
-        assert!(
-            outcome.preserved_embedded > 0,
-            "the preserved-embedding count must ride the degraded arm"
-        );
-        assert!(
-            outcome.degraded_note.is_some(),
-            "an inference-incapable model must report a degraded note"
-        );
-    }
-
-    // T-221a (#221, hazard + state): a model-present rebuild self-heals a true
-    // orphan vec row — one whose chunk_id resolves to no qa_chunks row, which the
-    // id/session_id-scoped index deletes never reach. Seed an embedded index,
-    // inject a dangling vec row at a sentinel id above any regenerated qa id, force
-    // a rebuild, then assert that exact row is gone (not merely count==0, so the
-    // assertion can't pass trivially). Perspective: hazard (orphan accumulation) +
-    // state (force rebuild transition).
-    #[test]
-    fn model_present_rebuild_heals_orphan_vec_rows() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        const ORPHAN_ID: i64 = 9_999_999;
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
-            conn.execute(
-                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, 0)",
-                rusqlite::params![embedder::f32_as_bytes(&orphan), ORPHAN_ID],
-            )
-            .unwrap();
-        }
-
-        let rebuild = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &rebuild, mock_loader).unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        let orphan_remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id = ?1",
-                [ORPHAN_ID],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            orphan_remaining, 0,
-            "a model-present rebuild must delete the pre-existing orphan vec row"
-        );
-    }
-
-    // T-221b (#221, AC#2, hazard + state): the self-heal also runs on the
-    // model-absent rebuild arm, and it deletes only the true orphan. The preserved
-    // embeddings keep their stable qa_chunks ids, so the NOT IN predicate can't
-    // reach them. Seed an embedded index, inject one orphan vec row, run a
-    // model-absent force rebuild: the orphan is gone and the preserved rows survive
-    // (final count returns to the pre-orphan baseline). This fixes that the #215
-    // preserve and the #221 cleanup coexist without the cleanup eating live rows.
-    #[test]
-    fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        let before = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
-        assert!(
-            before > 0,
-            "precondition: the initial index embedded chunks"
-        );
-
-        const ORPHAN_ID: i64 = 9_999_999;
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
-            conn.execute(
-                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, 0)",
-                rusqlite::params![embedder::f32_as_bytes(&orphan), ORPHAN_ID],
-            )
-            .unwrap();
-        }
-
-        let rebuild = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        let orphan_remaining: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id = ?1",
-                [ORPHAN_ID],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            orphan_remaining, 0,
-            "the orphan vec row must be deleted on the model-absent rebuild arm"
-        );
-        assert_eq!(
-            vec_chunk_count(&conn),
-            before,
-            "preserved embeddings (stable qa ids) survive; only the orphan is removed"
-        );
-    }
-
-    // T-2 (#215, FR-5, state): a model-absent rebuild that preserves embeddings
-    // must report the count, not silently skip. The IndexOutcome carries
-    // preserved_embedded > 0; the --json envelope splits the two facts across two
-    // notes — the preserve note names the count, and the degraded note carries
-    // `recall model download` (the remedy lives there because it applies only to a
-    // not-installed model, not a corrupt one; #230). An agent and a human learn
-    // both what happened and how to refresh. Perspective: state (the preserve
-    // transition's visible output) + error (the actionable remedy reaches both
-    // channels).
-    #[test]
-    fn model_absent_rebuild_surfaces_preserved_count_and_note() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-        let rebuild = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-
-        assert!(
-            outcome.preserved_embedded > 0,
-            "the outcome must report the preserved session count, got {}",
-            outcome.preserved_embedded
-        );
-
-        let out = index_command_output(&outcome);
-        assert!(
-            out.degraded,
-            "a model-absent run with preservation degrades"
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains(&outcome.preserved_embedded.to_string())),
-            "the preserve note must name the preserved count, got: {:?}",
-            out.notes
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("recall model download")),
-            "the degraded note must carry the download remedy for a not-installed model, got: {:?}",
-            out.notes
-        );
-        assert_eq!(
-            out.data["preserved_embedded"], outcome.preserved_embedded,
-            "the --json payload carries the preserved magnitude for an agent"
-        );
-    }
-
-    // T-3 (#215, FR-3, branch): with the model absent, a new session must still
-    // be indexed FTS-only while the existing embedded session is preserved. Given
-    // an embedded index, adding a second source file and indexing with an Err
-    // loader leaves the new session's term FTS-searchable and the original
-    // embeddings intact. Perspective: branch (new vs preserved session split
-    // under one model-absent run) + hazard (a coarse model-absent abort would
-    // have skipped the new session entirely).
-    #[test]
-    fn model_absent_index_adds_new_session_and_preserves_embeddings() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        let before = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
-        assert!(before > 0, "precondition: the first session was embedded");
-
-        // A new, never-embedded session arrives while the model is absent. Force a
-        // rebuild so s1's re-index is actually due (the preserve guard only fires
-        // for sessions check_freshness decides to re-index; an unchanged-mtime
-        // incremental skips s1 as Unchanged, which protects embeddings without
-        // counting as Preserved).
-        fs::write(
-            claude_dir.join("s2.jsonl"),
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"platypus newcomer"},"timestamp":"2026-03-02T00:00:00Z"}"#,
-        )
-        .unwrap();
-        let rebuild_opts = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            vec_chunk_count(&conn),
-            before,
-            "the original session's embeddings must be preserved, not destroyed"
-        );
-        assert_eq!(
-            outcome.preserved_embedded, 1,
-            "only the one embedded session is preserved; the new one is indexed"
-        );
-        let search_opts = search::SearchOptions::default();
-        let hits = search::search(&conn, "platypus", &search_opts).unwrap();
-        assert_eq!(
-            hits.len(),
-            1,
-            "the new session must be FTS-indexed even with the model absent"
-        );
-    }
-
-    // T-5 (#215, FR-1, hazard/regression lock): preserve fires only for sessions
-    // that actually hold embeddings. A cached session indexed while the model was
-    // absent has FTS rows but no embeddings; a later model-absent rebuild must
-    // re-index it (its content changed), NOT preserve it — preserving an
-    // unembedded session would freeze stale FTS content forever. Without this
-    // test, an implementation that preserved every cached session would pass T-1
-    // through T-3. Perspective: hazard (the over-preserve failure mode) + state
-    // (cached-unembedded is a distinct precondition from cached-embedded).
-    #[test]
-    fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        fs::create_dir_all(&claude_dir).unwrap();
-        let session = claude_dir.join("s1.jsonl");
-        fs::write(
-            &session,
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"alphaword original"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        // Index with the model absent from the start: FTS rows exist, no embeddings.
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            assert_eq!(
-                vec_chunk_count(&conn),
-                0,
-                "precondition: a model-absent index embeds nothing"
-            );
-        }
-
-        // The session's content changes; a model-absent rebuild must re-index it
-        // because it has no embeddings to protect.
-        fs::write(
-            &session,
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"betaword replaced"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-        let rebuild = indexer::IndexOptions {
-            force: true,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-
-        assert_eq!(
-            outcome.preserved_embedded, 0,
-            "a cached session without embeddings must not be preserved"
-        );
-        let conn = open_or_create_db(&db_path).unwrap();
-        let search_opts = search::SearchOptions::default();
-        assert_eq!(
-            search::search(&conn, "betaword", &search_opts)
-                .unwrap()
-                .len(),
-            1,
-            "the rebuild must re-index the new content, not freeze the old"
-        );
-        assert_eq!(
-            search::search(&conn, "alphaword", &search_opts)
-                .unwrap()
-                .len(),
-            0,
-            "the stale content must be gone, proving a real re-index occurred"
-        );
-    }
-
-    // T-6 (#215, FR-1/FR-3, branch/hazard): the incremental `recall index` path.
-    // #215 names both `recall index` and `rebuild`; T-1..T-5 reach the preserve
-    // guard via force=true, but the incremental dispatch reaches it differently —
-    // force=false + a changed mtime makes check_freshness return Some, so an
-    // embedded session whose file was edited while the model is absent is
-    // preserved (delete + re-parse skipped), not destroyed. The appended turn
-    // stays invisible to FTS until the model returns (parse is skipped); that is
-    // the FR-2 stale-FTS trade-off, asserted here so it reads as intended, not a
-    // regression. mtime is pushed forward explicitly: a same-second rewrite leaves
-    // mtime unchanged → Unchanged path → preserved_embedded==0 (the trap that
-    // first broke T-3).
-    #[test]
-    fn model_absent_incremental_index_preserves_edited_embedded_session() {
-        use std::time::{Duration, SystemTime};
-
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-        };
-        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-        let before = {
-            let conn = open_or_create_db(&db_path).unwrap();
-            vec_chunk_count(&conn)
-        };
-        assert!(before > 0, "precondition: the session was embedded");
-
-        // The embedded session's file is edited while the model is absent. Append a
-        // turn and push mtime clearly past the freshness epsilon so check_freshness
-        // marks it for re-index (the incremental dispatch into the preserve guard).
-        let session = claude_dir.join("s1.jsonl");
-        let mut all = fs::read_to_string(&session).unwrap();
-        all.push('\n');
-        all.push_str(
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"echidna appended"},"timestamp":"2026-03-01T00:00:01Z"}"#,
-        );
-        fs::write(&session, all).unwrap();
-        let f = fs::OpenOptions::new().append(true).open(&session).unwrap();
-        f.set_modified(SystemTime::now() + Duration::from_secs(10))
-            .unwrap();
-        drop(f);
-
-        let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-            Err(DegradedReason::NotInstalled)
-        })
-        .unwrap();
-
-        assert_eq!(
-            outcome.preserved_embedded, 1,
-            "the edited embedded session is preserved, not destroyed, on `recall index`"
-        );
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            vec_chunk_count(&conn),
-            before,
-            "the embeddings survive the incremental re-index"
-        );
-        let search_opts = search::SearchOptions::default();
-        assert_eq!(
-            search::search(&conn, "quokka", &search_opts).unwrap().len(),
-            1,
-            "the preserved session's original FTS rows remain searchable"
-        );
-        assert_eq!(
-            search::search(&conn, "echidna", &search_opts)
-                .unwrap()
-                .len(),
-            0,
-            "the appended turn stays out of FTS until the model returns (FR-2 trade-off)"
-        );
-    }
-
-    // -- Phase 2 (D2, AC-4..7): index_command_output builds the --json envelope --
-    //
-    // index_command_output(&IndexOutcome) -> CommandOutput is the pure seam the Spec
-    // defines (FR-005): the dispatch maps run_index's IndexOutcome through it instead
-    // of no_payload(), so degradation reaches the --json envelope. Testing the pure
-    // function directly needs no DB, loader, or process env — every branch is driven
-    // by an IndexOutcome literal. The two degradations are exclusive (Spec排他):
-    // embed-stop has degraded_note=None + failed_count>0; model-absent has
-    // degraded_note=Some + failed_count=0.
-
-    /// An embed-stop outcome: the model loaded and embedded some chunks, but a batch
-    /// failed, so failed_count>0 and there is a first_error but no degraded_note.
-    fn embed_stop_outcome() -> IndexOutcome {
-        IndexOutcome {
-            degraded_note: None,
-            embedded: 5,
-            failed_count: 3,
-            first_error: Some("batch: mock failure".to_owned()),
-            skipped_roots: Vec::new(),
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        }
-    }
-
-    /// A model-absent outcome: embedding was skipped, so failed_count=0 and the
-    /// degraded_note names `recall model download`.
-    fn model_absent_outcome() -> IndexOutcome {
-        IndexOutcome {
-            degraded_note: Some("note: run `recall model download` to enable.".to_owned()),
-            embedded: 0,
-            failed_count: 0,
-            first_error: None,
-            skipped_roots: Vec::new(),
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        }
-    }
-
-    /// A fully successful outcome: the model loaded and every chunk embedded, so no
-    /// degraded_note, no failures, no error.
-    fn success_outcome() -> IndexOutcome {
-        IndexOutcome {
-            degraded_note: None,
-            embedded: 8,
-            failed_count: 0,
-            first_error: None,
-            skipped_roots: Vec::new(),
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        }
-    }
-
-    // T-003 (FR-005, FR-006, FR-008): an embed-stop index surfaces degraded:true with
-    // a note naming the failure and the retry command, and carries both magnitudes
-    // in the payload. Given failed_count>0 + degraded_note=None,
-    // index_command_output sets degraded:true, notes[0] names the failed chunk
-    // count, the first batch error, and `recall index` (retry guidance), and the
-    // payload reports failed_count and embedded (what did land before the stop).
-    // Perspective: branch (the embed-stop arm) + error (a partial failure must be
-    // visible, not reported as success).
-    #[test]
-    fn index_command_output_surfaces_embed_stop_with_failed_count_and_retry() {
-        let out = index_command_output(&embed_stop_outcome());
-
-        assert!(
-            out.degraded,
-            "an embed-stop index is degraded: --json must not report it as a clean success"
-        );
-        assert!(
-            out.notes[0].contains("3 chunk"),
-            "the note must name how many chunks failed, got: {:?}",
-            out.notes
-        );
-        assert!(
-            out.notes[0].contains("recall index"),
-            "the note must guide the agent to retry via `recall index`, got: {:?}",
-            out.notes
-        );
-        assert!(
-            out.notes[0].contains("mock failure"),
-            "the note carries the first batch error, not the unknown-error fallback, got: {:?}",
-            out.notes
-        );
-        assert_eq!(
-            out.data["failed_count"], 3,
-            "the payload carries the failure magnitude, not just a bool"
-        );
-        assert_eq!(
-            out.data["embedded"], 5,
-            "the payload reports how many chunks did embed despite the stop"
-        );
-    }
-
-    // T-004 (FR-007): a model-absent index surfaces degraded:true with the
-    // model-download note in --json (previously stderr-only). Given
-    // degraded_note=Some(model download) + failed_count=0, index_command_output sets
-    // degraded:true and a note naming `recall model download`.
-    // Perspective: branch (the model-absent arm, exclusive with embed-stop).
-    #[test]
-    fn index_command_output_surfaces_model_absent_download_note() {
-        let out = index_command_output(&model_absent_outcome());
-
-        assert!(
-            out.degraded,
-            "a model-absent index is degraded: embedding was skipped"
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("recall model download")),
-            "the model-absent note must reach --json (not stderr only), got: {:?}",
-            out.notes
-        );
-    }
-
-    // T-005 (FR-006, FR-008, FR-009, FR-010): a fully successful index is not
-    // degraded and carries failed_count=0. Given embedded>0 + failed_count=0 +
-    // degraded_note=None, index_command_output sets degraded:false, notes:[], and
-    // data.failed_count==0.
-    // Perspective: branch (the success arm) + boundary (failed_count at its zero edge).
-    #[test]
-    fn index_command_output_clean_success_is_not_degraded() {
-        let out = index_command_output(&success_outcome());
-
-        assert!(!out.degraded, "a fully embedded index is not degraded");
-        assert!(
-            out.notes.is_empty(),
-            "a clean success carries no notes, got: {:?}",
-            out.notes
-        );
-        assert_eq!(
-            out.data["failed_count"], 0,
-            "the payload reports zero failures on success"
-        );
-        assert_eq!(
-            out.data["embedded"], 8,
-            "the payload reports how many chunks were embedded on success"
-        );
-    }
-
-    // T-006 (FR-009): degraded co-varies with notes across every outcome —
-    // degraded:true ⟺ notes non-empty — replicating search_degraded_state's
-    // invariant so the bool and the text never disagree. Checked over all three
-    // outcomes (embed-stop, model-absent, success).
-    // Perspective: combination (the (degraded, notes_empty) decision table: the
-    // (true, empty) and (false, non-empty) rows are the contradictions this forbids).
-    #[test]
-    fn index_command_output_degraded_covaries_with_notes() {
-        for outcome in [
-            embed_stop_outcome(),
-            model_absent_outcome(),
-            success_outcome(),
-        ] {
-            let out = index_command_output(&outcome);
-            assert_eq!(
-                out.degraded,
-                !out.notes.is_empty(),
-                "degraded must equal notes-non-empty (degraded={}, notes={:?})",
-                out.degraded,
-                out.notes
-            );
-        }
-    }
-
-    #[test]
-    fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons() {
-        for mut outcome in [
-            success_outcome(),
-            model_absent_outcome(),
-            embed_stop_outcome(),
-        ] {
-            let existing_notes = index_command_output(&outcome).notes;
-            outcome
-                .parse_diagnostics
-                .push(indexer::FileParseDiagnostics {
-                    file_path: format!("/logs/\x1b[31mfile\n\t{}", "界".repeat(300)).into(),
-                    source: parser::Source::Claude,
-                    lines: parser::LineDiagnostics {
-                        invalid_json_lines: 2,
-                        invalid_utf8_lines: 1,
-                        incomplete_tail_lines: 1,
-                    },
-                    read_error: true,
-                });
-            let without_root = index_command_output(&outcome);
-            assert!(without_root.degraded);
-            assert_eq!(without_root.notes.len(), existing_notes.len() + 3);
-            outcome.skipped_roots.push(indexer::SkippedRoot {
-                source: parser::Source::Codex,
-                preserved_sessions: 1,
-                reason: indexer::SkippedReason::MissingRoot,
-            });
-            let out = index_command_output(&outcome);
-            assert!(out.degraded);
-            for note in existing_notes {
-                assert!(out.notes.contains(&note));
-            }
-            assert!(out.notes.iter().any(|n| n.contains("root unavailable")));
-            let d = &out.data["parse_diagnostics"][0];
-            let path = d["file_path"].as_str().unwrap();
-            assert_eq!(path.chars().count(), 240);
-            assert!(path.starts_with("/logs/file"));
-            assert!(!path.chars().any(char::is_control));
-            assert_eq!(d["invalid_json_lines"], 2);
-            assert_eq!(d["invalid_utf8_lines"], 1);
-            assert_eq!(d["incomplete_tail_lines"], 1);
-            assert_eq!(d["read_error"], true);
-            for note in &out.notes {
-                assert!(!note.chars().any(char::is_control));
-                assert!(note.chars().count() < 500);
-            }
-        }
-    }
-
-    // T-009 (FR-006): the embed-stop note sanitizes and bounds first_error — control
-    // chars are stripped (matching every other envelope-bound string) and the error
-    // is capped so a verbose MLX error cannot bloat the note. The retry guidance
-    // must survive the capping.
-    // Perspective: boundary (an error far over the cap) + hazard (ANSI escapes
-    // forwarded raw into an agent-parsed channel).
-    #[test]
-    fn index_command_output_sanitizes_and_bounds_first_error_in_note() {
-        let outcome = IndexOutcome {
-            degraded_note: None,
-            embedded: 0,
-            failed_count: 2,
-            first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
-            skipped_roots: Vec::new(),
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        };
-
-        let out = index_command_output(&outcome);
-
-        assert!(
-            !out.notes[0].contains('\x1b'),
-            "control chars are stripped from the note, got: {:?}",
-            out.notes
-        );
-        assert!(
-            out.notes[0].len() < 200,
-            "a verbose error is capped, got len {}",
-            out.notes[0].len()
-        );
-        assert!(
-            out.notes[0].contains("rerun `recall index`"),
-            "the retry guidance survives the capping, got: {:?}",
-            out.notes
-        );
-    }
-
-    // #165 follow-up (SF4-JSON): a skipped source root reaches the --json envelope,
-    // not just the human stderr warning. Given skipped_roots non-empty,
-    // index_command_output sets degraded:true (co-varying with notes), emits a note
-    // naming the source and preserved count, and carries the structured magnitude in
-    // data.skipped_roots so an agent reads it without parsing prose.
-    // Perspective: branch (the skipped-root arm) + hazard (a root outage masking real
-    // deletions must be visible on the machine path #165 names as its audience).
-    #[test]
-    fn index_command_output_surfaces_skipped_root_in_json() {
-        let outcome = IndexOutcome {
-            degraded_note: None,
-            embedded: 4,
-            failed_count: 0,
-            first_error: None,
-            skipped_roots: vec![indexer::SkippedRoot {
-                source: parser::Source::Codex,
-                preserved_sessions: 2,
-                reason: indexer::SkippedReason::IncompleteEnumeration,
-            }],
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        };
-
-        let out = index_command_output(&outcome);
-
-        assert!(
-            out.degraded,
-            "a skipped root is a degradation: --json must not report it as a clean success"
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("codex") && n.contains("2") && n.contains("recall index")),
-            "the note must name the source, the preserved count, and the reconcile command, got: {:?}",
-            out.notes
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("permissions and access")),
-            "an incomplete-enumeration root must surface the access remedy, not the missing-root wording, got: {:?}",
-            out.notes
-        );
-        assert_eq!(
-            out.data["skipped_roots"][0]["source"], "codex",
-            "the payload carries the skipped source, not just prose"
-        );
-        assert_eq!(
-            out.data["skipped_roots"][0]["preserved_sessions"], 2,
-            "the payload carries the preserved magnitude an agent can act on"
-        );
-        assert_eq!(
-            out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
-            "the payload carries the machine-readable skip cause so an agent picks the right remedy"
-        );
-    }
-
-    // #185 T-185-4: with nothing preserved, the structured note channel (the
-    // `notes` rendering, separate from the warn! log) must carry the missing-
-    // sessions wording and drop the reconcile-deletions framing.
-    #[test]
-    fn index_command_note_for_zero_preserved_incomplete_root_omits_reconcile() {
-        let outcome = IndexOutcome {
-            degraded_note: None,
-            embedded: 0,
-            failed_count: 0,
-            first_error: None,
-            skipped_roots: vec![indexer::SkippedRoot {
-                source: parser::Source::Claude,
-                preserved_sessions: 0,
-                reason: indexer::SkippedReason::IncompleteEnumeration,
-            }],
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        };
-
-        let out = index_command_output(&outcome);
-
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("claude") && n.contains("some sessions may be missing")),
-            "a zero-preserved incomplete root must warn that sessions may be missing, got: {:?}",
-            out.notes
-        );
-        assert!(
-            !out.notes
-                .iter()
-                .any(|n| n.contains("reconcile any real deletions")),
-            "with nothing preserved the note must not promise to reconcile deletions, got: {:?}",
-            out.notes
-        );
-        assert_eq!(
-            out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
-            "the payload still carries the machine-readable cause at zero preserved"
-        );
-    }
-
-    // -- Phase 3 (AC-1): search is read-only — it embeds nothing (FR-001) --
-    //
-    // Seam choice: model-less, try_load_embedder_cached returns Err(NotInstalled)
-    // so the embed branch is skipped anyway, making a seam-less vec_chunks-count
-    // test vacuous (0 before and after regardless). Injecting a loaded embedder via
-    // run_search_with is the only non-vacuous, CI-robust way to prove the read-only
-    // search path adds no vectors.
-
-    /// A `Command::Search` for `query` with production defaults: every
-    /// `--*-current` flag off and automated sessions excluded. Used by T-003 to
-    /// drive `run_search_with` on the read-only search path.
-    fn search_command(query: &str) -> Command {
-        Command::Search {
-            query: Some(query.to_owned()),
-            project: None,
-            days: None,
-            source: None,
-            file: None,
-            limit: 10,
-            exclude_current: false,
-            include_current: false,
-            only_current: false,
-            include_automated: false,
-        }
-    }
-
-    // T-003 (FR-001): search embeds nothing — vec_chunks is unchanged across a
-    // search. Given one session with one pending (un-embedded) chunk and an
-    // embedder injected via the loader seam (so the embed branch is reachable on a
-    // model-less CI runner), run_search_with leaves vec_chunks empty: the search
-    // path reads the pre-built index and never embeds. Asserting count == 0 with the
-    // embedder PRESENT proves the absence is the deleted embed call, not a missing
-    // model. Perspective: hazard (embedding cost leaking onto the search path) +
-    // branch (the embedder-present arm, the only arm that could embed).
-    #[test]
-    fn run_search_with_embedder_present_embeds_nothing() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            // A session is required so search_idle_message does not short-circuit
-            // before run_search_with reaches the embedder branch under test.
-            db::seed_session(&conn, "s1");
-            // One pending chunk: the removed post-search embed warmed the most-recent
-            // pending chunks regardless of which results matched, so a retained embed
-            // call would push vec_chunks to 1. Asserting 0 proves the call is gone.
-            db::seed_chunk(&conn, 1, "pending content");
-        }
-
-        run_search_with(
-            search_command("anything"),
-            &Some(db_path.clone()),
-            mock_loader,
-        )
-        .unwrap();
-
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            vec_chunk_count(&conn),
-            0,
-            "search must not embed: vec_chunks stays empty even with an embedder present"
-        );
-    }
-
-    #[test]
-    fn read_commands_use_pre_generation_index_without_migrating_it() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("recall.db");
-        let conn = open_or_create_db(&path).unwrap();
-        // Restore the pre-#319 shape, retaining an otherwise readable index.
-        conn.execute_batch(
-            "DROP TRIGGER qa_chunks_insert_generation;
-             DROP TRIGGER qa_chunks_update_generation;
-             DROP TABLE qa_chunk_generation;
-             ALTER TABLE qa_chunks DROP COLUMN generation;",
-        )
-        .unwrap();
-        db::seed_session(&conn, "s1");
-        let content = "synthetic legacy content";
-        db::seed_chunk(&conn, 1, content);
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
-            [content],
-        )
-        .unwrap();
-        let vector = embedder::MockEmbedder::deterministic_vector(content);
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-            [embedder::f32_as_bytes(&vector)],
-        )
-        .unwrap();
-        let schema_version: i64 = conn
-            .query_row("PRAGMA schema_version", [], |r| r.get(0))
-            .unwrap();
-        drop(conn);
-
-        let db_path = Some(path.clone());
-        let status = run_status(false, &db_path).unwrap();
-        assert_eq!(status.data["sessions"], 1);
-        assert_eq!(status.data["qa_chunks"], 1);
-        assert_eq!(status.data["embedded"], 1);
-        let show = run_show("s1", false, None, DEFAULT_WINDOW, &db_path).unwrap();
-        assert!(show.markdown.contains(content));
-        let search = run_search_with(search_command(content), &db_path, mock_loader).unwrap();
-        assert!(!search.degraded);
-        let results = search.data["results"].as_array().unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["session_id"], "s1");
-        assert!(search.markdown.contains(content));
-
-        let (conn, _) = db::open_db_readonly(&path).unwrap();
-        let after: i64 = conn
-            .query_row("PRAGMA schema_version", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            after, schema_version,
-            "read commands must not migrate the DB"
-        );
-        assert_eq!(vec_chunk_count(&conn), 1);
-        let saved: Vec<u8> = conn
-            .query_row("SELECT embedding FROM vec_chunks", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(saved, embedder::f32_as_bytes(&vector));
-    }
-
-    /// A loader that hands `run_search_with` an embedder which loads cleanly but
-    /// errors at query time. This reproduces the #204 runtime degradation: the
-    /// load-time degraded state is false, yet `vec_search` fails mid-run.
-    fn runtime_failing_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
-        Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
-    }
-
-    /// Loader seam asserting it never runs: passed where the search path must not
-    /// touch the model at all (the query-less `--file` list), so a stray load —
-    /// which on a real install costs model weights + a probe forward pass —
-    /// panics instead of passing silently (same pattern as `no_recover`).
-    fn no_load() -> Result<Arc<dyn Embed>, DegradedReason> {
-        panic!("query-less --file must not load the embedder")
-    }
-
-    // polish P2 (PR #293): a query-less `--file` list never runs the semantic leg
-    // (search_with_embedder routes to file_list_outcome, which bypasses MATCH
-    // entirely), so the embedder must not be loaded and a model-less install must
-    // NOT stamp degraded:true / a semantic-search note on a complete file list —
-    // a false flag trains agent consumers to discount the honest-degraded
-    // contract (#249). The panicking loader pins the no-load half; the envelope
-    // asserts pin the honesty half. Perspective: hazard (false degradation on a
-    // complete result) + branch (the query-none arm of the embedder gate).
-    #[test]
-    fn run_search_query_less_file_list_skips_embedder_and_stays_nominal() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            db::seed_session(&conn, "s1");
-            db::seed_session_file(&conn, "s1", "/proj/a.rs");
-        }
-
-        let out = run_search_with(
-            Command::Search {
-                query: None,
-                project: None,
-                days: None,
-                source: None,
-                file: Some("/proj/a.rs".to_owned()),
-                limit: 10,
-                exclude_current: false,
-                include_current: false,
-                only_current: false,
-                include_automated: false,
-            },
-            &Some(db_path),
-            no_load,
-        )
-        .unwrap();
-
-        assert_eq!(
-            out.data["results"].as_array().unwrap().len(),
-            1,
-            "the file list itself must succeed, got: {}",
-            out.data
-        );
-        assert!(
-            !out.degraded,
-            "a complete query-less file list must not be marked degraded"
-        );
-        assert!(
-            out.notes
-                .iter()
-                .all(|n| !n.contains("semantic search unavailable")),
-            "no semantic-search note may appear on the MATCH-free path, got: {:?}",
-            out.notes
-        );
-    }
-
-    // #204: a loaded embedder whose query-time embedding fails degrades the search
-    // to FTS-only mid-run. The `--json` envelope must report degraded:true with a
-    // runtime note instead of presenting the text-only result as complete. Driven
-    // through run_search_with so the load-time/runtime degraded merge in run_search
-    // is the code under test, not just the search-layer signal.
-    // Perspective: hazard (a silent runtime fallback misread as a complete result)
-    // + branch (the vec_degraded=true merge arm).
-    #[test]
-    fn run_search_reports_degraded_when_vector_search_fails_at_runtime() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        {
-            let mut conn = open_or_create_db(&db_path).unwrap();
-            db::seed_session(&conn, "s1");
-            db::seed_chunk(&conn, 1, "authentication flow");
-            // Embed the chunk so vec_chunks is non-empty: has_vec_data() is then
-            // true and search takes the hybrid (vector) branch where the runtime
-            // failure occurs. The embed itself uses a healthy mock.
-            embed_all_pending(
-                &mut conn,
-                &embedder::MockEmbedder::new(),
-                &embedder::EmbedOptions::default(),
-            )
-            .unwrap();
-        }
-
-        let out = run_search_with(
-            search_command("authentication"),
-            &Some(db_path),
-            runtime_failing_loader,
-        )
-        .unwrap();
-
-        assert!(
-            out.degraded,
-            "a runtime vector-search failure must mark the envelope degraded"
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("vector query failed at runtime")),
-            "the runtime degradation note must surface for the agent channel, got: {:?}",
-            out.notes
-        );
-    }
-
-    // #249 RC-002/RC-003: the FTS leg silently dropped a matched session (here an
-    // unknown-source row pruned by fetch_session_metadata), so the result is a subset
-    // of the true matches. run_search must forward search's `results_incomplete` to a
-    // degraded envelope with an agent-facing note, not present the thinned set as
-    // complete. Driven through run_search_with so the envelope wiring is the code
-    // under test. Perspective: hazard (a silent prune misread as complete) + branch
-    // (the results_incomplete merge arm).
-    #[test]
-    fn run_search_reports_degraded_when_results_incomplete() {
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-        {
-            let mut conn = open_or_create_db(&db_path).unwrap();
-            // A surviving claude session keeps the result non-empty.
-            db::seed_session(&conn, "s1");
-            db::seed_chunk(&conn, 1, "authentication flow");
-            // An unknown-source session that matches but gets pruned for its source.
-            conn.execute(
-                "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES ('weird', 'user', 'authentication retry')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (2, 'weird', 'authentication retry', 0)",
-                [],
-            )
-            .unwrap();
-            // Embed both chunks so has_vec_data() is true and the hybrid path (with the
-            // metadata prune) runs.
-            embed_all_pending(
-                &mut conn,
-                &embedder::MockEmbedder::new(),
-                &embedder::EmbedOptions::default(),
-            )
-            .unwrap();
-        }
-
-        let out = run_search_with(
-            search_command("authentication"),
-            &Some(db_path),
-            mock_loader,
-        )
-        .unwrap();
-
-        assert!(
-            out.degraded,
-            "a silently pruned match must mark the envelope degraded"
-        );
-        assert!(
-            out.notes
-                .iter()
-                .any(|n| n.contains("results may be incomplete")),
-            "the incompleteness note must surface for the agent channel, got: {:?}",
-            out.notes
-        );
-    }
-
-    // -- ADR-0001 Confirmation: the `--json` data payload is a frozen contract -----
-    //
-    // These golden tests pin the EXACT top-level key set (not mere presence) of each
-    // command's `data` payload, so a key added or removed fails loudly. Both the
-    // empty and populated branches of search/status are pinned, locking the invariant
-    // that the key set is branch-independent.
-
-    /// Sorted top-level object keys of a `--json` payload. Panics if `v` is not a
-    /// JSON object, which itself guards the envelope's object-at-root shape.
-    fn payload_keys(v: &serde_json::Value) -> Vec<String> {
-        let mut keys: Vec<String> = v
-            .as_object()
-            .expect("payload must be a JSON object")
-            .keys()
-            .cloned()
-            .collect();
-        keys.sort();
-        keys
-    }
-
-    #[test]
-    fn freeze_index_payload_key_set() {
-        let outcome = IndexOutcome {
-            degraded_note: None,
-            embedded: 4,
-            failed_count: 0,
-            first_error: None,
-            skipped_roots: vec![indexer::SkippedRoot {
-                source: parser::Source::Codex,
-                preserved_sessions: 2,
-                reason: indexer::SkippedReason::IncompleteEnumeration,
-            }],
-            preserved_embedded: 0,
-            parse_diagnostics: Vec::new(),
-            observations: serde_json::Value::Null,
-        };
-
-        let out = index_command_output(&outcome);
-
-        assert_eq!(
-            payload_keys(&out.data),
-            [
-                "embedded",
-                "failed_count",
-                "observations",
-                "parse_diagnostics",
-                "preserved_embedded",
-                "skipped_roots"
-            ],
-            "index --json top-level keys are frozen"
-        );
-        assert_eq!(
-            payload_keys(&out.data["skipped_roots"][0]),
-            ["preserved_sessions", "reason", "source"],
-            "index --json skipped_roots element keys are frozen"
-        );
-    }
-
-    #[test]
-    fn freeze_status_payload_key_set_both_branches() {
-        let frozen = ["embedded", "model_ready", "qa_chunks", "sessions"];
-
-        // No-database branch: the path does not exist.
-        let missing = tempfile::TempDir::new().unwrap();
-        let no_db = run_status(false, &Some(missing.path().join("absent.db"))).unwrap();
-        assert_eq!(
-            payload_keys(&no_db.data),
-            frozen,
-            "status --json keys are frozen on the no-database branch"
-        );
-
-        // With-database branch.
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            db::seed_session(&conn, "s1");
-        }
-        let with_db = run_status(false, &Some(db_path)).unwrap();
-        assert_eq!(
-            payload_keys(&with_db.data),
-            frozen,
-            "status --json keys are frozen on the with-database branch"
-        );
-    }
-
-    #[test]
-    fn freeze_search_payload_key_set_both_branches() {
-        // Empty branch: no sessions, so search short-circuits to {results: []}.
-        let empty_dir = tempfile::TempDir::new().unwrap();
-        let empty_path = empty_dir.path().join("empty.db");
-        open_or_create_db(&empty_path).unwrap();
-        let empty = run_search(search_command("anything"), &Some(empty_path)).unwrap();
-        assert_eq!(
-            payload_keys(&empty.data),
-            ["results"],
-            "search --json top-level keys are frozen on the empty branch"
-        );
-        assert_eq!(
-            empty.data["results"].as_array().unwrap().len(),
-            0,
-            "the empty branch emits an empty results array"
-        );
-
-        // Populated branch: one session with a matching message yields a hit, so the
-        // result element shape (result_to_json) is exercised on the live path.
-        let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("recall.db");
-        {
-            let conn = open_or_create_db(&db_path).unwrap();
-            db::seed_session(&conn, "s1");
-            conn.execute(
-                "INSERT INTO messages (session_id, role, text) \
-                 VALUES ('s1', 'user', 'frozen envelope contract')",
-                [],
-            )
-            .unwrap();
-        }
-        let populated = run_search(search_command("frozen"), &Some(db_path)).unwrap();
-        assert_eq!(
-            payload_keys(&populated.data),
-            ["results"],
-            "search --json top-level keys are frozen on the populated branch"
-        );
-        let results = populated.data["results"].as_array().unwrap();
-        assert!(
-            !results.is_empty(),
-            "the populated branch must return at least one hit, got: {}",
-            populated.data
-        );
-        assert_eq!(
-            payload_keys(&results[0]),
-            [
-                "chunk",
-                "excerpt",
-                "inspect",
-                "project",
-                "session_id",
-                "slug",
-                "source",
-                "timestamp"
-            ],
-            "search --json result element keys are frozen"
-        );
-    }
-
-    // ADR-0001 Confirmation: SearchResult and SessionData stay non-Serialize so the
-    // public `--json` schema is built explicitly (result_to_json / json! payloads)
-    // and never coupled to these internal structs. Per the ADR's literal "grep
-    // check", this guards against either gaining `derive(Serialize)`. It scans the
-    // whole leading attribute/doc block — from the previous item's `}`/`;` up to the
-    // declaration — so a rustfmt-wrapped multi-line `derive(...)` or a comment placed
-    // between the derive and the struct cannot create a silent pass. It asserts the
-    // declaration is present first, so a rename surfaces as a panic. The scan can only
-    // over-match (a doc comment above the struct literally writing "Serialize" → a
-    // safe-side false failure), never under-match.
-    #[test]
-    fn search_result_and_session_data_stay_non_serialize() {
-        fn leading_block_mentions_serialize(src: &str, decl: &str) -> bool {
-            let pos = src.find(decl).unwrap_or_else(|| {
-                panic!("{decl} not found — the Serialize guard is reading the wrong source")
-            });
-            let block_start = src[..pos].rfind(['}', ';']).map(|i| i + 1).unwrap_or(0);
-            src[block_start..pos].contains("Serialize")
-        }
-
-        assert!(
-            !leading_block_mentions_serialize(include_str!("search.rs"), "pub struct SearchResult"),
-            "SearchResult must not derive Serialize (ADR-0001): the --json schema is built explicitly"
-        );
-        assert!(
-            !leading_block_mentions_serialize(
-                include_str!("parser/mod.rs"),
-                "pub struct SessionData"
-            ),
-            "SessionData must not derive Serialize (ADR-0001): the --json schema is built explicitly"
-        );
-    }
-
-    // T-002 (FR-003): a stale on-disk schema hard-fails the non-doctor read
-    // commands with an actionable DataError, since a read-only open cannot migrate.
-    #[test]
-    fn require_current_schema_stale_is_data_error_naming_rebuild() {
-        let err = require_current_schema(db::SchemaState::Stale).unwrap_err();
-        assert!(
-            matches!(err, RecallError::DataError(_)),
-            "stale schema must be a DataError, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("recall rebuild"),
-            "message must name the fix: {err}"
-        );
-        // DataError maps to sysexits DATA_ERROR (65) at the CLI boundary.
-        assert_eq!(err.error_code().code(), 65);
-    }
-
-    #[test]
-    fn require_current_schema_current_is_ok() {
-        assert!(require_current_schema(db::SchemaState::Current).is_ok());
-    }
-
-    // T-004 (Empty branch): an existing-but-never-indexed DB (no `sessions` table)
-    // is readable-as-idle, not a hard-fail; read commands return empty output.
-    #[test]
-    fn require_current_schema_empty_is_ok() {
-        assert!(require_current_schema(db::SchemaState::Empty).is_ok());
-    }
-
-    // ---- U-002 (#282): search hits expose a chunk-id anchor + drill-down guidance ----
-    //
-    // Each test drives a real `search` so the hit's provenance (FTS rowid-tier /
-    // vec-tier / snippet-tier) is genuine, then renders the hit with
-    // `result_to_json` and asserts on the `--json` payload. Asserting on the
-    // rendered `Value` (never on a not-yet-existent `SearchResult.chunk_id` field)
-    // keeps the Red a runtime failure rather than a crate-wide build break.
-    //
-    // The `chunk` field name is pinned to the `render_windowed` / `resolve_chunk`
-    // precedent (`"chunk": qa_chunks.id`); the guidance is checked as a substring of
-    // the serialized JSON so the hint field's name stays free for the implementer.
-    //
-    // Rust identifiers cannot hold the scenario names verbatim (spaces / `--` / `/`),
-    // so each verbatim scenario name is preserved in the comment above its test, per
-    // this file's existing T-NNN comment convention.
-
-    // T-004: FTS 由来 hit の --json に chunk id と導線が含まれる
-    #[test]
-    fn u002_fts_hit_json_carries_chunk_id_and_inspect_guidance() {
-        let (_dir, conn) = db::setup_test_db();
-        // A full session_id (not a prefix): the guidance must print it un-shortened.
-        let sid = "a1b2c3d4-e5f6-7890-1234-567890abcdef";
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
-             VALUES (?1, 'claude', '', '/proj', ?1, 1709251200000, 0.0)",
-            [sid],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) \
-             VALUES (?1, 'user', 'how to implement authentication')",
-            [sid],
-        )
-        .unwrap();
-        // rowid-tier chunk (src_rowid_lo NOT NULL) whose [lo, hi] brackets the sole
-        // message rowid, so `fetch_chunks` resolves this exact chunk (id 42) via the
-        // rowid join — the primary FTS tier the contract extends to return the id.
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (42, ?1, 'how to implement authentication — use JWT access tokens', 1709251200000, 1, 1000000)",
-            [sid],
-        )
-        .unwrap();
-
-        let results =
-            search::search(&conn, "authentication", &search::SearchOptions::default()).unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "setup guard: the FTS query must return the one session"
-        );
-
-        let json = result_to_json(&results[0]);
-        assert_eq!(
-            json["chunk"],
-            serde_json::json!(42),
-            "an FTS rowid-tier hit must expose its resolved chunk id as the drill-down anchor, got: {json}"
-        );
-        let payload = json.to_string();
-        assert!(
-            payload.contains(&format!("recall show {sid} --chunk 42 --window 3")),
-            "the hit must carry the inspect guidance line with the full (un-shortened) session_id, got: {payload}"
-        );
-    }
-
-    // T-005: vector 由来 hit でも chunk id と導線が含まれる
-    #[test]
-    fn u002_vector_hit_json_carries_chunk_id_and_inspect_guidance() {
-        let (_dir, conn) = db::setup_test_db();
-        let now_ms = 1_750_000_000_000_i64;
-        let sid = "0f9e8d7c-6b5a-4321-fedc-ba9876543210";
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
-             VALUES (?1, 'claude', '', '/proj', ?1, ?2, 0.0)",
-            rusqlite::params![sid, now_ms],
-        )
-        .unwrap();
-        // The message holds no "authentication" term, so FTS cannot match; the hit
-        // can only come from the vector leg.
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) \
-             VALUES (?1, 'user', 'gardening and weather notes')",
-            [sid],
-        )
-        .unwrap();
-        // vec-tier chunk (id 7): content equals the query so the MockEmbedder vector
-        // is an exact match and this chunk is the closest for a vector-only hit.
-        let embedding = embedder::MockEmbedder::deterministic_vector("authentication");
-        let embedding_bytes: &[u8] = embedder::f32_as_bytes(&embedding);
-        conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (7, ?1, 'authentication', ?2)",
-            rusqlite::params![sid, now_ms],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (7, ?1)",
-            rusqlite::params![embedding_bytes],
-        )
-        .unwrap();
-
-        let mock = embedder::MockEmbedder::new();
-        let opts = search::SearchOptions {
-            now_ms: Some(now_ms),
-            ..Default::default()
-        };
-        let outcome =
-            search::search_with_embedder(&conn, "authentication", &opts, Some(&mock)).unwrap();
-        let hit = outcome
-            .results
-            .iter()
-            .find(|r| r.session.session_id == sid)
-            .expect("setup guard: the vector leg must surface the session");
-
-        let json = result_to_json(hit);
-        assert_eq!(
-            json["chunk"],
-            serde_json::json!(7),
-            "a vector-tier hit must expose its closest chunk id as the drill-down anchor, got: {json}"
-        );
-        let payload = json.to_string();
-        assert!(
-            payload.contains(&format!("recall show {sid} --chunk 7 --window 3")),
-            "the vector hit must carry the inspect guidance line with the full (un-shortened) session_id, got: {payload}"
-        );
-    }
-
-    // T-006: snippet-tier hit は導線なしで全文 show を案内する
-    #[test]
-    fn u002_snippet_hit_json_guides_full_show_without_inspect_line() {
-        let (_dir, conn) = db::setup_test_db();
-        let sid = "deadbeef-0000-1111-2222-333344445555";
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
-             VALUES (?1, 'claude', '', '/proj', ?1, 1709251200000, 0.0)",
-            [sid],
-        )
-        .unwrap();
-        // FTS matches the message, but the session has NO qa_chunk, so `fetch_chunks`
-        // falls through to the 20-token snippet tier: no chunk anchor exists.
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) \
-             VALUES (?1, 'user', 'authentication flow discussion')",
-            [sid],
-        )
-        .unwrap();
-
-        let results =
-            search::search(&conn, "authentication", &search::SearchOptions::default()).unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "setup guard: the FTS query must return the one session"
-        );
-        assert!(
-            results[0].excerpt.contains("**"),
-            "setup guard: the hit must be snippet-tier (** highlight markers), got: {:?}",
-            results[0].excerpt
-        );
-
-        let json = result_to_json(&results[0]);
-        let payload = json.to_string();
-        // Load-bearing Red: a chunk-less hit must still guide the agent to the whole
-        // conversation via `recall show <session_id>` (no --chunk anchor).
-        assert!(
-            payload.contains(&format!("recall show {sid}")),
-            "a snippet-tier hit must guide to the full-conversation show, got: {payload}"
-        );
-        // Guards: no chunk anchor and no per-chunk inspect line for a snippet-tier hit.
-        assert!(
-            json["chunk"].is_null(),
-            "a snippet-tier hit has no chunk anchor, got: {json}"
-        );
-        assert!(
-            !payload.contains("--chunk"),
-            "a snippet-tier hit must not emit a --chunk inspect line, got: {payload}"
-        );
-    }
-}
+#[path = "main/tests.rs"]
+mod tests;

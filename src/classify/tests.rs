@@ -1,7 +1,5 @@
 use super::*;
 
-// T-001 (#24/FR-001): XML-wrapper markers classify as automated, even with the
-// leading newline + indent that tooling injects before the tag.
 #[test]
 fn test_xml_wrapper_with_leading_whitespace_is_automated() {
     for turn in [
@@ -18,7 +16,6 @@ fn test_xml_wrapper_with_leading_whitespace_is_automated() {
     }
 }
 
-// T-002 (#24/FR-001): the compaction continuation opener classifies as automated.
 #[test]
 fn test_continuation_marker_is_automated() {
     let turn =
@@ -26,9 +23,6 @@ fn test_continuation_marker_is_automated() {
     assert_eq!(classify_first_turn(turn), SessionType::Automated);
 }
 
-// T-003 (#24/FR-002, FR-010): a normal human turn and an empty/whitespace turn
-// (a session with no user turn) both classify as interactive, so they are never
-// hidden from default search.
 #[test]
 fn test_human_and_empty_turn_is_interactive() {
     for turn in ["how do I implement authentication?", "", "   \n  "] {

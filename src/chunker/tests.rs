@@ -7,11 +7,6 @@ fn msg(role: Role, text: &str) -> Message {
     }
 }
 
-/// Pairs each message with a synthetic rowid. `chunk_messages` now takes
-/// `&[(i64, Message)]` so the chunker can stamp each chunk's source rowid range
-/// (lo = user rowid, hi = adjacent assistant rowid). Callers in production read
-/// `SELECT rowid, role, text ... ORDER BY rowid`; these helpers mirror that by
-/// numbering messages from `start` in slice order.
 fn rowed(messages: Vec<Message>) -> Vec<(i64, Message)> {
     rowed_from(1, messages)
 }
@@ -71,8 +66,8 @@ fn test_mixed_sequence() {
     let messages = rowed(vec![
         msg(Role::User, "Q1"),
         msg(Role::Assistant, "A1"),
-        msg(Role::Assistant, "extra A"), // merges into the Q1/A1 chunk (#229)
-        msg(Role::User, "Q2"),           // user-only (next is user)
+        msg(Role::Assistant, "extra A"),
+        msg(Role::User, "Q2"),
         msg(Role::User, "Q3"),
         msg(Role::Assistant, "A3"),
     ]);
@@ -90,15 +85,8 @@ fn test_mixed_sequence() {
     assert!(chunks[2].content.contains("A3"));
 }
 
-// T-229 (#229): when the parser drops tool_result-only user turns, the source
-// session leaves consecutive assistant messages. They must all merge into the
-// preceding user's chunk so the trailing answer reaches the embedding path, and
-// the chunk's rowid range must extend to the last assistant so fetch_chunks can
-// resolve an FTS hit on any of them. Perspective: Equivalence (multi-part answer)
-// + Boundary (hi spans to the last consecutive assistant rowid).
 #[test]
 fn test_229_consecutive_assistants_merge_into_one_chunk() {
-    // rowid 1 user, rowid 2/3 consecutive assistants.
     let messages = rowed(vec![
         msg(Role::User, "how do I configure retries"),
         msg(Role::Assistant, "first set the base interval"),
@@ -125,16 +113,8 @@ fn test_229_consecutive_assistants_merge_into_one_chunk() {
     );
 }
 
-// T-229b (#229): an empty-text assistant interleaved in the run is dropped from
-// the content (the `if !text.is_empty()` filter) but its rowid is still consumed,
-// so `hi` advances past it. This pins the invariant that `hi` tracks consumed
-// rowids independently of empty-filtering — a regression that moved the `hi`
-// assignment inside the filter would silently pass every other test. Perspective:
-// Combination (empty hole × rowid stamping) + Hazard (a leading empty must not
-// inject a stray newline into the join).
 #[test]
 fn test_229_empty_assistant_in_run_drops_text_but_advances_hi() {
-    // Trailing empty: real answer then an empty assistant turn.
     let trailing = rowed(vec![
         msg(Role::User, "Q"),
         msg(Role::Assistant, "real answer"),
@@ -151,7 +131,6 @@ fn test_229_empty_assistant_in_run_drops_text_but_advances_hi() {
         "hi advances to the consumed empty assistant's rowid, not the last non-empty one"
     );
 
-    // Leading empty: empty assistant turn before the real answer.
     let leading = rowed(vec![
         msg(Role::User, "Q"),
         msg(Role::Assistant, ""),
@@ -166,10 +145,6 @@ fn test_229_empty_assistant_in_run_drops_text_but_advances_hi() {
     assert_eq!(chunks[0].src_rowid_hi, 3);
 }
 
-// T-229c (#229): three consecutive assistants is the boundary that distinguishes
-// the merge `while` loop from the old single-`if`. The join order across all
-// three and `hi` reaching the third rowid are the loop's third-iteration
-// behavior. Perspective: Boundary (run length 3 > the old max of 1 consumed).
 #[test]
 fn test_229_three_consecutive_assistants_merge_in_order() {
     let messages = rowed(vec![
@@ -190,11 +165,6 @@ fn test_229_three_consecutive_assistants_merge_in_order() {
     );
 }
 
-// T-229d (#229): an all-empty assistant run yields a user-only chunk (content has
-// no assistant text), yet `hi` has advanced past `lo`. This "user-only content
-// but hi != lo" state is unreachable by test_005 (which keeps hi == lo) and
-// guards the `merged_assistant` None branch when every part was filtered out.
-// Perspective: Combination (all-empty filter × rowid advance).
 #[test]
 fn test_229_all_empty_assistant_run_is_user_only_with_advanced_hi() {
     let messages = rowed(vec![
@@ -215,14 +185,9 @@ fn test_229_all_empty_assistant_run_is_user_only_with_advanced_hi() {
     );
 }
 
-// T-229e (#229): merging two assistants that each fit under MAX_CHUNK_BYTES but
-// whose `\n`-join exceeds it forces the split path on the *merged* string. Every
-// sub-chunk must carry the user prefix and share one [lo, hi] range that now
-// spans the merged run. Perspective: Combination (merge × split) + Hazard (a
-// per-sub-chunk rowid would mis-scope the search JOIN across the merged range).
 #[test]
 fn test_229_merged_run_over_limit_splits_sharing_one_range() {
-    let half = "line\n".repeat(2000); // ~10,000 bytes each; joined > MAX_CHUNK_BYTES
+    let half = "line\n".repeat(2000);
     let messages = rowed(vec![
         msg(Role::User, "質問"),
         msg(Role::Assistant, &half),
@@ -261,7 +226,7 @@ fn test_empty_user_text_skipped() {
 
 #[test]
 fn test_long_assistant_splits_into_sub_chunks() {
-    let long_text = "line\n".repeat(5000); // ~25,000 bytes > MAX_CHUNK_BYTES
+    let long_text = "line\n".repeat(5000);
     let messages = rowed(vec![
         msg(Role::User, "質問"),
         msg(Role::Assistant, &long_text),
@@ -285,7 +250,6 @@ fn test_long_assistant_splits_into_sub_chunks() {
             "chunk[{i}] should contain user question for search context"
         );
     }
-    // All assistant text should be preserved across sub-chunks
     let total_content: usize = chunks.iter().map(|c| c.content.len()).sum();
     assert!(total_content > long_text.len(), "no content should be lost");
 }
@@ -302,12 +266,8 @@ fn test_short_content_not_split() {
 
 #[test]
 fn test_user_near_limit_multibyte_assistant_terminates() {
-    // Regression: user_text within 1-3 bytes of MAX_CHUNK_BYTES leaves `available` < 4.
-    // When assistant text leads with a multibyte char wider than `available`,
-    // find_split_boundary returns 0, so the sub-chunk loop never advances —
-    // an infinite loop that also pushes a ~16KB header every iteration (OOM).
-    let user = "a".repeat(15998); // header = 15999 bytes → available = 1
-    let assistant = "こんにちは世界"; // 3-byte CJK lead char > available
+    let user = "a".repeat(15998);
+    let assistant = "こんにちは世界";
     let messages = rowed(vec![
         msg(Role::User, &user),
         msg(Role::Assistant, assistant),
@@ -329,11 +289,8 @@ fn test_user_near_limit_multibyte_assistant_terminates() {
 
 #[test]
 fn test_available_4_takes_sub_chunk_path() {
-    // Boundary: available == 4 is the smallest value that enters the sub-chunk
-    // branch (>= 4), where each chunk carries user_text as a prefix. One byte less
-    // (available == 3) falls to the independent-split branch instead.
-    let user = "a".repeat(15995); // header = 15996 bytes → available = 4
-    let assistant = "日本語のテキスト"; // exceeds available → forces a split
+    let user = "a".repeat(15995);
+    let assistant = "日本語のテキスト";
     let messages = rowed(vec![
         msg(Role::User, &user),
         msg(Role::Assistant, assistant),
@@ -354,13 +311,8 @@ fn test_available_4_takes_sub_chunk_path() {
     }
 }
 
-// FR-1/FR-2 (#192), acceptance "chunker の lo/hi 付与 (user-only) を chunker
-// 単体テストで pin". A user message with no adjacent assistant gets a chunk
-// whose source rowid range collapses to a point: lo == hi == the user message's
-// own rowid. Perspective: Boundary (the degenerate single-row range).
 #[test]
 fn test_192_chunk_user_only_lo_eq_hi_eq_user_rowid() {
-    // rowid 7 user, rowid 8 user → first is user-only (next message is a user).
     let messages = rowed_from(
         7,
         vec![msg(Role::User, "standalone"), msg(Role::User, "next")],
@@ -377,18 +329,12 @@ fn test_192_chunk_user_only_lo_eq_hi_eq_user_rowid() {
         chunks[0].src_rowid_hi, 7,
         "user-only chunk hi collapses to the user message rowid (no assistant)"
     );
-    // The second user-only chunk takes its own rowid.
     assert_eq!(chunks[1].src_rowid_lo, 8);
     assert_eq!(chunks[1].src_rowid_hi, 8);
 }
 
-// FR-1/FR-2 (#192), acceptance "chunker の lo/hi 付与 (user+assistant)". A user
-// message followed by an adjacent assistant forms one chunk spanning both rowids:
-// lo = user rowid, hi = assistant rowid. Perspective: Equivalence (the common
-// Q&A pair) + Boundary (lo < hi span).
 #[test]
 fn test_192_chunk_user_assistant_spans_user_lo_to_assistant_hi() {
-    // rowid 3 user, rowid 4 assistant → one chunk with range [3, 4].
     let messages = rowed_from(
         3,
         vec![
@@ -406,15 +352,9 @@ fn test_192_chunk_user_assistant_spans_user_lo_to_assistant_hi() {
     );
 }
 
-// FR-2 (#192), acceptance "chunker の lo/hi 付与 (split)". When one user+assistant
-// pair is split into N sub-chunks (oversized assistant), every sibling chunk
-// shares the same [lo, hi] range — the whole group originates from the same two
-// message rowids. Perspective: Combination (split path × rowid stamping) +
-// Hazard (a per-sub-chunk rowid would mis-scope the search JOIN).
 #[test]
 fn test_192_split_chunks_share_one_lo_hi_range() {
-    let long_text = "line\n".repeat(5000); // forces a multi-sub-chunk split
-    // rowid 10 user, rowid 11 assistant.
+    let long_text = "line\n".repeat(5000);
     let messages = rowed_from(
         10,
         vec![msg(Role::User, "質問"), msg(Role::Assistant, &long_text)],

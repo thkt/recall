@@ -15,7 +15,6 @@ struct ClaudeParseState {
     project: String,
     slug: String,
     earliest_ts: Option<i64>,
-    /// Distinct write-target paths seen across the session, in first-seen order.
     scanned_files: Vec<String>,
 }
 
@@ -68,8 +67,6 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
         _ => entry.get("content"),
     };
 
-    // Collect write-target paths before the empty-text early return: an assistant
-    // turn that is only tool_use (no text block) still carries scanned files.
     if let Some(Value::Array(blocks)) = msg_content {
         for block in blocks {
             if let Some(path) = extract_tool_use_path(block)
@@ -88,7 +85,6 @@ fn process_claude_entry(entry: &Value, state: &mut ClaudeParseState) -> Option<M
     Some(Message { role, text })
 }
 
-/// Retain empty reads and their diagnostics for ingestion and path backfill.
 pub fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
     let Some(session_id) = session_id_from_path(path) else {
         return Ok(None);

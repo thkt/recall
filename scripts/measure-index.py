@@ -83,8 +83,6 @@ def main():
     })
 
     def stored_data(db):
-        # Native tables + built-in FTS5 only: no Python sqlite-vec dependency.
-        # Normalize rowids to message positions so rebuild can allocate new IDs.
         with closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
             messages = list(conn.execute("SELECT rowid, session_id, role, text FROM messages ORDER BY session_id, rowid"))
             positions = {}
@@ -123,7 +121,6 @@ def main():
                         if interrupt and not interrupted and last_counts["chunks_saved"] > 0 and last_counts["chunks_remaining_snapshot"] > 0:
                             process.terminate()
                             interrupted = True
-                # Reap this exact child, not cumulative RUSAGE_CHILDREN across cases.
                 _, status, usage = os.wait4(process.pid, 0)
                 code = os.waitstatus_to_exitcode(status)
                 process.returncode = code
@@ -159,10 +156,6 @@ def main():
                         raise RuntimeError("multiple pages were not exercised")
                     summary["pending_body_bytes_peak"] = peak
                 else:
-                    # #326's unmodified baseline loads every missing body and
-                    # embeds globally shortest-first. In these single-writer,
-                    # all-success fixtures, resume leaves the longest suffix.
-                    # Equal-length tie order cannot change its byte sum.
                     summary["baseline_pending_body_bytes_derived"] = sum(lengths[-pending:])
                     summary["baseline_body_derivation"] = "all-body baseline only; snapshot count and longest remaining suffix after interruption"
             if envelope["degraded"]:
@@ -204,7 +197,6 @@ def main():
         if rebuilt["stored"]["body_sha256"] != appended["stored"]["body_sha256"]:
             raise RuntimeError("incremental stored bodies or source links differ from full rebuild")
     if not args.baseline:
-        # Fresh DB plus the same corpus; stop after a confirmed partial save.
         resume_db = output / "resume.db"
         results.append(run("interrupted", resume_db, interrupt=True))
         results.append(run("resume", resume_db))
