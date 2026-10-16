@@ -69,7 +69,6 @@ fn test_codex_date_slug_from_path() {
         Some("2026-01-18".to_owned())
     );
     assert_eq!(extract_date_from_path("/some/other/path/file.jsonl"), None);
-    // Windows-style backslash path
     assert_eq!(
         extract_date_from_path("C:\\Users\\me\\.codex\\sessions\\2026\\01\\18\\rollout-xxx.jsonl"),
         Some("2026-01-18".to_owned())
@@ -189,8 +188,6 @@ fn provenance_accepts_known_wire_shapes_and_fails_open_on_unknown_or_malformed_v
     );
 }
 
-// Reuse the existing format corpus and its independent expected values for both
-// readers, so a fast path cannot silently omit a format or identity check.
 fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
     let parsed = super::parse_codex_session(path)?;
     if let Some(full) = &parsed {

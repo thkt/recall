@@ -3,7 +3,7 @@ rules:
     ignore:
       # release.yml: "Checkout homebrew-tap" step in update-homebrew job.
       # HOMEBREW_TAP_TOKEN must persist for the subsequent git push to homebrew-tap.
-      - release.yml:110
+      - release.yml:104
   cache-poisoning:
     ignore:
       # release.yml: "Cache Cargo" step in build job.
@@ -14,4 +14,4 @@ rules:
     ignore:
       # release.yml: "Create Release" step (softprops/action-gh-release).
       # Retained for the generate_release_notes feature; gh CLI lacks an equivalent.
-      - release.yml:97
+      - release.yml:90

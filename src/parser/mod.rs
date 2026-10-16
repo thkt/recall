@@ -72,13 +72,10 @@ pub struct SessionData {
     pub source: Source,
     pub file_path: String,
     pub project: String,
-    /// Short display name for the session (slug from Claude, date+uuid from Codex).
     pub slug: String,
-    /// Epoch milliseconds (UTC). `None` means unknown.
     pub timestamp: Option<i64>,
 }
 
-/// Tool calls and system messages are excluded.
 pub struct Message {
     pub role: Role,
     pub text: String,
@@ -87,21 +84,15 @@ pub struct Message {
 pub struct ParseResult {
     pub metadata: SessionData,
     pub messages: Vec<Message>,
-    /// Distinct filesystem paths this session edited, extracted from write-type
-    /// tool_use blocks (Edit / Write / MultiEdit / NotebookEdit). Never routed
-    /// into `messages` / `qa_chunks`; the indexer persists them to `session_files`.
     pub scanned_files: Vec<String>,
     pub diagnostics: LineDiagnostics,
     pub origin: provenance::SessionOrigin,
 }
 
-/// Counts only malformed input; valid excluded events and blank lines are not errors.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct LineDiagnostics {
     pub invalid_json_lines: i64,
     pub invalid_utf8_lines: i64,
-    /// Unterminated last line with a JSON EOF or truncated UTF-8 sequence.
-    /// This is evidence of a possible write in progress, not proof of one.
     pub incomplete_tail_lines: i64,
 }
 
@@ -121,8 +112,6 @@ pub(crate) fn parse_session_including_empty(
     }
 }
 
-/// Classification needs no message bodies, tool targets, or display metadata.
-/// Still visit every JSONL record: later identity conflicts and diagnostics matter.
 pub(crate) struct ClassificationRead {
     pub session_id: String,
     pub origin: provenance::SessionOrigin,
@@ -161,19 +150,10 @@ pub(crate) fn parse_classification(
 
 const TEXT_BLOCK_TYPES: &[&str] = &["text", "input_text", "output_text"];
 
-/// Claude Code tools whose `input` names a file that the assistant wrote to.
-/// Read / Grep / Bash carry no such target, so they are excluded (contract U-002).
 const PATH_TOOL_NAMES: &[&str] = &["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
-/// Longest path value kept as a scanned file. Beyond this the value is not a real
-/// filesystem path (PATH_MAX is 1024 on macOS, 4096 on Linux), so it is dropped by
-/// the validity filter rather than stored.
 const MAX_SCANNED_PATH_LEN: usize = 4096;
 
-/// Extract the target path from one message content block when it is a write-type
-/// tool_use (`Edit` / `Write` / `MultiEdit` use `file_path`, `NotebookEdit` uses
-/// `notebook_path`). Returns `None` for any other block, so text / thinking /
-/// tool_result blocks and non-write tools (Read / Grep / Bash) contribute nothing.
 pub(super) fn extract_tool_use_path(block: &Value) -> Option<&str> {
     if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
         return None;
@@ -189,20 +169,10 @@ pub(super) fn extract_tool_use_path(block: &Value) -> Option<&str> {
         .and_then(|v| v.as_str())
 }
 
-/// Whether a tool_use path value is a plausible filesystem path worth recording.
-/// Three independent checks mirror the three invalid shapes the contract filters:
-/// non-empty (path shape), no embedded newline, and within the length cap.
 pub(super) fn is_valid_scanned_path(path: &str) -> bool {
     !path.is_empty() && !path.contains(['\n', '\r']) && path.len() <= MAX_SCANNED_PATH_LEN
 }
 
-/// Remove noise tags from text while preserving valuable tags like `<local-command-stdout>`.
-///
-/// Noise tags are Claude Code system-injected XML markers with no search value.
-/// Review when upstream changes tag vocabulary (check Claude Code release notes).
-/// See also: `codex.rs` `CODEX_SKIP_MARKERS` for message-level boilerplate filtering.
-///
-/// Unclosed tags are left intact (safe skip).
 pub fn strip_noise_tags(mut result: String) -> String {
     const NOISE_TAGS: &[(&str, &str)] = &[
         ("<command-name>", "</command-name>"),
@@ -213,7 +183,7 @@ pub fn strip_noise_tags(mut result: String) -> String {
     for (open, close) in NOISE_TAGS {
         while let Some(start) = result.find(open) {
             let Some(end_offset) = result[start..].find(close) else {
-                break; // unclosed tag — leave intact
+                break;
             };
             let end = start + end_offset + close.len();
             result.replace_range(start..end, "");
@@ -250,9 +220,7 @@ pub(super) fn extract_text(content: Option<&Value>) -> String {
     strip_noise_tags(raw)
 }
 
-/// Byte offset where seconds end in `YYYY-MM-DDTHH:MM:SS` (position of '.' or tz).
 const ISO_SECONDS_END: usize = 19;
-/// Byte offset where fractional digits begin (after the '.').
 const ISO_FRAC_START: usize = 20;
 
 fn parse_fractional_millis(s: &str, b: &[u8]) -> i64 {
@@ -272,7 +240,6 @@ fn parse_fractional_millis(s: &str, b: &[u8]) -> i64 {
     }
 }
 
-/// Parse `HH:MM` or `HHMM` into (hours, minutes). Returns `None` if too short.
 fn parse_hhmm(s: &str) -> Option<(i64, i64)> {
     let b = s.as_bytes();
     if s.len() >= 5 && b[2] == b':' {
@@ -284,8 +251,6 @@ fn parse_hhmm(s: &str) -> Option<(i64, i64)> {
     }
 }
 
-/// Parse timezone offset (e.g. `Z`, `+09:00`, `-0530`) and return offset in milliseconds.
-/// Positive offset means local time is ahead of UTC (subtract to get UTC).
 fn parse_tz_offset_ms(s: &str, b: &[u8]) -> i64 {
     let tz_start = if s.len() > ISO_SECONDS_END && b[ISO_SECONDS_END] == b'.' {
         s[ISO_FRAC_START..]

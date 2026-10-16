@@ -76,12 +76,6 @@ fn process_codex_entry(
         }
         "event_msg" | "turn_context" => None,
         _ => {
-            // Legacy fallback for pre-session_meta rollouts: untyped entries with
-            // a top-level `role` that inline cwd in an <environment_context> block.
-            // Modern files carry cwd in the session_meta payload (the first line),
-            // so `project` is already set before any response_item is reached and
-            // the response_item arm needs no cwd extraction. Verified in issue #232:
-            // 925/925 audit-corpus files had session_meta.cwd populated.
             match entry.get("role").and_then(|v| v.as_str()) {
                 Some("user" | "assistant") => {}
                 _ => return None,
@@ -96,7 +90,6 @@ fn process_codex_entry(
     }
 }
 
-/// Retain empty reads and their diagnostics for ingestion and path backfill.
 pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
     let Some(initial_session_id) = session_id_from_path(path) else {
         return Ok(None);
@@ -137,7 +130,6 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
             timestamp: state.earliest_ts,
         },
         messages,
-        // Codex rollouts carry no Claude Code write-tool metadata (contract U-002).
         scanned_files: Vec::new(),
         diagnostics,
         origin,

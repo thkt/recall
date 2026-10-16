@@ -1,0 +1,2 @@
+# Preserve upstream source bytes, including grammar-file whitespace.
+vendor/** -whitespace linguist-vendored

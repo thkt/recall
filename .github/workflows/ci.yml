@@ -21,9 +21,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -40,21 +41,12 @@ jobs:
           tool: cargo-nextest
 
       - name: Test
-        run: cargo nextest run --profile ci
+        run: cargo nextest run --profile ci --locked
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   coverage:
-    # Diff coverage gate: fail when coverage of the lines this PR adds or
-    # changes drops below the threshold, so new uncovered code (pub fn /
-    # branches) cannot merge untested. No overall-percent floor (which would
-    # flag existing unreachable code); no base-vs-PR double measurement.
-    # Rationale: ported from yomu (Issue #223), THRESHOLDS.md "Coverage".
-    # Runs on macos like the test job: the rurico dependency pulls mlx-sys
-    # (MLX FFI), which needs BLAS + Apple silicon and cannot build on Linux.
-    # Mirrors the test job's default feature set so coverage matches what
-    # the tests exercise.
     runs-on: macos-latest
     timeout-minutes: 30
     if: github.event_name == 'pull_request'
@@ -65,10 +57,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
           fetch-depth: 0
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
           components: llvm-tools-preview
@@ -81,13 +74,37 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Generate lcov coverage
-        run: cargo llvm-cov --lcov --output-path lcov.info
+      - name: Measure standard tests
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --locked --no-report
+
+      - name: Stage checksum-pinned public Gemma artifacts
+        run: |
+          target/llvm-cov-target/debug/recall model manifest > "$RUNNER_TEMP/gemma-manifest.json"
+          python3 scripts/fetch-gemma-test-artifacts.py \
+            "$RUNNER_TEMP/gemma-manifest.json" "$RUNNER_TEMP/gemma-public-model"
+
+      - name: Measure public model inference contracts
+        env:
+          RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
+          RECALL_MODEL_DIR: ${{ runner.temp }}/gemma-public-model
+        run: |
+          cargo llvm-cov --locked --no-report --bin recall -- \
+            --ignored public_model_contract --test-threads=1
+
+      - name: Measure public model CLI and probe contracts
+        env:
+          RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
+        run: |
+          cargo llvm-cov --locked --no-report --test gemma_cli -- \
+            --ignored public_model_cli_contract --test-threads=1 --nocapture
+
+      - name: Generate combined lcov coverage
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Test coverage filter script
         run: |
-          # The cfg(test) filter gates coverage; a brace-counting regression
-          # could silently strip production lines, so test it before use.
           python3 -m venv /tmp/pytest-venv
           /tmp/pytest-venv/bin/pip install --quiet pytest
           /tmp/pytest-venv/bin/python -m pytest .github/scripts/test_filter_lcov_cfg_test.py -q
@@ -102,8 +119,6 @@ jobs:
       - name: Diff coverage gate (changed lines >= 95%)
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          # diff-cover is a Python tool; isolate it in a venv to avoid PEP 668
-          # (externally-managed environments) regardless of the runner's Python.
           python3 -m venv /tmp/diff-cover-venv
           /tmp/diff-cover-venv/bin/pip install --quiet diff-cover
           /tmp/diff-cover-venv/bin/diff-cover lcov.filtered.info \
@@ -120,6 +135,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install cargo-deny and cargo-audit
         uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26

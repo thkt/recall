@@ -1,5 +1,7 @@
 # index の観測とホスト計測
 
+Gemma移行後の現行pipelineはversion 2です。以下の過去の時間・メモリ計測は実行当時のRuri構成の記録であり、Gemmaの性能値としては扱いません。モデルと索引の更新・切戻しは [Gemma手順](gemma-model-updates.md) を参照してください。
+
 `index` と `rebuild` は、長い処理に入る前に `index: <段階>: started` をstderrへ出す。TTY・非TTYで同じ段階名を使用する。単一のモデルロードや推論の内部進捗は取得しないため、その間は開始表示が現在の段階を示す。解析とFTS書込みはファイルごとに交互に実行する `parse_fts` 段階である。進捗だけの精密な総数取得を繰り返さず、列挙結果・選択結果・処理中のカウンターを利用する。
 
 正常終了時の `--json` はstdoutに1個の既存envelopeを出し、`data.observations` に `seconds` と `counts` を追加する。人向けの段階・件数・最後の観測値はstderrへ出す。通常のエラー終了では完了していない段階を `unfinished` と表示し、得られた観測値をstderrへ残す。SIGKILLや既定のSIGTERMなど、Rustの後処理が走らない中断では最後のcommit通知までを確認済みの保存範囲とする。通知直前にcommitした内容が残る可能性もある。観測値に本文・パス・モデルの生エラー・認証情報を含めない。既存の解析診断のパス表示は別の契約である。
@@ -68,7 +70,7 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-
 
 [Issue #325](https://github.com/thkt/recall/issues/325) の合意に従い、全イベントの追記パーサーや新世代への一括切替は導入しない。変更ファイルは全体を解析し、完了済みでチャンクを持つ会話だけ、FTS transaction内で内容照合する。新規・空・無効化された会話は #320 のまとめ読みを使う。保存済みの本文自体を照合に使い、chunk_hash、vectorの複製、別の再開台帳は追加しない。再利用後のID順は会話順と一致するとは限らないため、全チャンクのsource範囲を同じtransaction内で確定し、ID順で照合するlegacy backfillの対象に残さない。追加費用は会話単位の旧本文mapと埋め込み済みID集合、新チャンク生成、rowid更新、vec0の削除・件数取得である。モデル利用可能時の各照合は、埋め込み済みIDの取得でvec0を1回走査する。モデル不在・probe失敗時は、同じwriter lock内で取得した保護対象からベクトル不在が確定した会話だけを更新し、照合時のID取得を省く。不一致チャンクに既存vectorがある場合だけ削除でもvec0を走査する。この判断には同じwriter lock内で取得済みの埋め込み済みID集合を使い、追加のDB読取りは行わない。vectorがない不一致チャンクも削除し、除去件数に含める。大きなDBで多数の会話を変更する費用も比較する。無変更ファイルは照合しない。
 
-完了マーカー `sessions.chunks_indexed` は完了した処理の版を兼ねる。現在の `INDEX_RULES_VERSION=1` は既存の #320 完了値と互換であり、rurico `7b2b256` の既定モデル `cl-nagoya/ruri-v3-310m`、固定revision `18b60fb8c2b9df296fb4212bb7d23ef94e579cd3` を前提とする。パーサーの意味、グループ化・分割、モデル・tokenizer・poolingの変更では版を上げる。チャンク化を後段へ残す本文解析のcommit時に負の版（現行は `-1`）を保存し、チャンク化のcommit時に、現行版で解析済みの会話だけを正の完了版へ進める。`NULL` は解析版不明のチャンク未完了状態である。解析版不明または旧版の未完了本文もroot不在時にチャンク化できるが、その完了値は `0` とし、同じ本文の重複チャンク化を避けつつ再読取りの必要性を残す。保存済み完了版が異なる会話と未完了の会話は、metadataが同じでも再読取りし、既存チャンクを再利用しない。root復帰後も同じ条件を適用し、モデル不在・probe失敗時にベクトルを持つ会話は、モデル復旧まで更新を保留する。現在のCLIにモデル選択機能はない。手動のモデルファイル変更や既存索引の出自が不明な場合は、正常な固定モデルを用意して `recall rebuild` を使う。過去に保存された本文/vector不一致の検出は #319 と同様に範囲外である。
+完了マーカー `sessions.chunks_indexed` は完了した処理の版を兼ねます。現行の `INDEX_RULES_VERSION=2` はGemmaへの切替を表し、旧Ruriはversion 1でした。モデル・tokenizer・prefix・pooling・backendの組み合わせはさらにmanifestのfingerprintで索引ごとに固定し、異なるfingerprintは再利用しません。本文解析のcommit時に負の版（現行は `-2`）、チャンク化完了時に正の版（`2`）を保存します。`NULL` は解析版不明で、root不在時に旧本文からチャンク化できても完了値を `0` として再読取りの必要性を残します。保存版が異なる会話はmetadataが同じでも再読取りし、チャンクを再利用しません。モデル不在・probe失敗時にvectorを持つ会話は更新を保留します。`--model-manifest` でモデルを選びますが、異なるモデルの既存索引への書込みはmigration前に拒否します。古い索引は保持して別索引を構築してください。内容とvectorの過去の不一致を全件検出する機能は含みません。
 
 新しい観測値は次の意味を持つ。
 
@@ -115,7 +117,7 @@ PRの測定記録にはハードウェア・モデル・件数・変更量、推
 
 その他の主なmemoryは、照合中の埋め込み済みID集合 O(E)、未処理一覧 O(P)、1ページ分の本文オブジェクト、最大128入力のモデル出力である。Eは埋め込み済みの異なるchunk ID数、Pはsnapshotの未処理数である。64-bit環境の一覧要素はID・世代・長さで24 bytes、Vecのcapacity分を確保する。HashSetの余白、SQLiteの一行の評価用memoryは別途必要となる。全件照合 O(V + Q)、metadataのソート O(P log P)、本文の主キー検索 O(P log Q) が残る（Vはvector行数、Qはchunk行数）。既存の保存時のvec0 IN-deleteはバッチにつき1回の走査のままであり、全処理を線形と保証するものではない。
 
-ページの内部も最大128件ずつ推論する。snapshot全体の長さ順を維持するので、timestamp順の局所ページだけで長短が混ざることを避ける。byte上限によるページ末尾では128件未満のバッチが増える可能性がある。`--token-budget` と `--forward-pause-ms` は各呼出しへ従来どおり転送し、forwardの分割とpauseはruricoが行う。取得単位はGPUのtoken budgetとは別である。
+ページの内部も最大128件ずつ推論する。snapshot全体の長さ順を維持するので、timestamp順の局所ページだけで長短が混ざることを避ける。byte上限によるページ末尾では128件未満のバッチが増える可能性がある。`--token-budget` と `--forward-pause-ms` は各呼出しへ従来どおり転送し、windowのpackingとpauseはGemma native backendが行う。単一attention windowはatomicなので、小さいpacking budgetより大きい場合も切り詰めず単独で処理する。取得単位はGPUのtoken budgetとは別である。
 
 有限のID一覧を一方向へ進むため、推論・保存が失敗したページを同じ実行で取り直さない。本文取得時にも世代を照合し、変更・削除済みの行は本文をロードせず `chunks_stale` に数える。取得後の競合は #319 の保存transaction内の本文・世代照合で拒否する。同じ世代の並行保存では検証済みIDだけを置換し、重複vectorを作らない。snapshot後の新規ID・新世代は次のindex対象となる。失敗・破棄・未試行と保存数はページをまたいで累積する。
 

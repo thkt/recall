@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Measure Issue #342 with the pinned pre-change reader and transaction code.
 
-Build a temporary copy, never modify the working sources or verification config.
-The normal product build/MLX prerequisites must already be available on the host.
-"""
 import hashlib
 import json
 import os
@@ -27,7 +23,7 @@ def replace_once(text, old, new):
 
 
 def install_baseline(root, dest):
-    """Inject the exact handoff parser and reclassification function for control."""
+
     paths = git(root, "ls-tree", "-r", "--name-only", BASELINE, "src/parser").decode().splitlines()
     for path in paths:
         target = dest / "src/classify/baseline_parser" / Path(path).relative_to("src/parser")
