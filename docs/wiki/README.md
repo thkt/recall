@@ -7,3 +7,11 @@
 ## 育て方
 
 `/scribe` スキルまたは定期巡回の scribe が、closed になった PR/issue から自動で抽出する。初回は全履歴を読んで基礎化し、以降は前回の scribe PR マージ以降に closed になった分から増分更新する。追加 / 修正はPRで提案されるので、レビューしてマージする。マージが承認になる。手動追記も可。
+
+## 現行の手順
+
+- [リリース](release-procedure.md)
+- [FTS・vectorのフィルタ対称性](fts-vec-two-leg-symmetry.md)
+- [Gemmaの検証・モデル更新・切戻し](../gemma-model-updates.md)
+
+旧amici/ruricoのrev lockstep手順は依存の撤去に伴い削除した。過去の更新理由はGit履歴で参照できる。

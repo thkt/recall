@@ -34,14 +34,16 @@ recall "authentication"
       authentication with nonce...
 ```
 
-6,000+ sessions, 27,000+ Q&A pairs — searched in under 2 seconds.
-
 ## Quick start
 
+EmbeddingGemma 2 BF16 is included from v0.14.0. Versions up to v0.13.0 use the
+previous Ruri backend; keep the old binary and index when [upgrading](#model).
+Requires Apple Silicon. For source builds, see [Development](#development).
+
 ```sh
-# Install
+# Install (or upgrade an existing installation)
 brew install thkt/tap/recall
-# or: cargo install --path .
+# brew upgrade recall
 
 # Download the embedding model once (~558 MB plus tokenizer), then index your sessions
 recall model download
@@ -57,7 +59,7 @@ recall indexes every session into keyword search (FTS5) and, in the same pass, e
 
 ```
 recall index:   Parse + FTS5 + embed every new chunk (needs the model)
-recall search:  Hybrid ranking — FTS5 keyword + vector similarity (RRF), instant
+recall search:  Embed the query → FTS5 + vector similarity → RRF ranking
 Over time:      More sessions indexed → broader semantic coverage
 ```
 
@@ -132,16 +134,31 @@ RECALL_TOKEN_BUDGET=2048 RECALL_FORWARD_PAUSE_MS=700 recall index
 
 `--token-budget` (`RECALL_TOKEN_BUDGET`) controls packing of document windows into a forward pass; the Gemma backend caps actual packing at 8192 tokens and 32 sequences. A single bidirectional window remains atomic, so it may exceed a smaller requested packing budget. Documents are never silently shortened to satisfy it. `--forward-pause-ms` (`RECALL_FORWARD_PAUSE_MS`) pauses after each forward pass. The CLI retains its existing 256000 upper input clamp; values above the Gemma packing cap have the same effective packing budget.
 
-The default index is `~/.local/share/recall/indexes/<manifest-sha256>/recall.db` (or under absolute `XDG_DATA_HOME`). `--db-path` / `RECALL_DB` overrides the location but never bypasses model identity checks. The old Ruri index is kept in place. Build a separate Gemma index; a nonempty legacy vector index without model identity is read with FTS-only degradation and refuses writes rather than being silently relabeled.
-
-See [independent validation, model updates and rollback](docs/gemma-model-updates.md). Archive `recall model manifest` with the matching artifacts and index; select a supported newer or older pinned manifest with `--model-manifest` / `RECALL_MODEL_MANIFEST`. Different manifests use different default index namespaces. Model downloads and model updates are explicit.
+Model-specific index paths and upgrading from Ruri are covered under [Model](#model).
 
 ### Model
 
 ```sh
-recall model download   # download pinned artifacts and verify in an isolated probe
-recall model manifest   # save this manifest with its model and index for rollback
+recall model download                       # download and verify the pinned artifacts
+recall model manifest > gemma-manifest.json   # archive with the matching model and index
 ```
+
+The model and tokenizer are verified by SHA-256 before loading. Downloads and
+updates are explicit; search and index never download a model automatically.
+`RECALL_MODEL_DIR` can select a directory containing `model.gguf` and `tokenizer.json`.
+
+The default index is `~/.local/share/recall/indexes/<manifest-sha256>/recall.db`
+(or under absolute `XDG_DATA_HOME`). `--db-path` / `RECALL_DB` overrides the path,
+while model identity checks still apply. Different manifests use separate default indexes.
+
+When upgrading from Ruri, keep the old binary and `~/.local/share/recall/recall.db`
+for rollback. Remove any old `RECALL_DB` override or choose a new `--db-path`, then
+run `recall model download` and `recall index` to build the Gemma index from your
+session logs. Old vectors are not converted: an unidentified nonempty vector
+index allows FTS-only reads with a degraded note and refuses writes.
+
+See [model validation, updates and rollback](docs/gemma-model-updates.md) for
+`--model-manifest` / `RECALL_MODEL_MANIFEST` and independent test indexes.
 
 ### Show
 
@@ -231,11 +248,14 @@ Add to `~/.claude/settings.json`:
 
 ```text
 src/
-├── main.rs       CLI subcommands (index, search, show, status)
+├── main.rs       CLI commands, output, classification, status and doctor
 ├── parser/       JSONL parsers for Claude Code and Codex formats
 ├── indexer.rs    Incremental indexer with mtime/size tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
+├── model.rs      Pinned manifests, artifact verification, isolated probe and index identity
+├── native.rs     EmbeddingGemma encoder via llama.cpp/Metal
+├── embedding.rs  Shared embedding types and options
 ├── embedder.rs   Index-time embedding orchestration (generation-checked chunk batches)
 ├── chunker.rs    Q&A pair chunker with size splitting (exact-content reuse in indexer)
 ├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
@@ -246,7 +266,7 @@ Single binary. SQLite, llama.cpp, and sqlite-vec are statically linked.
 
 ## Performance
 
-Gemma product latency and indexing throughput depend on corpus, hardware, checksum verification and the isolated probe. Earlier Ruri/MLX timings are not Gemma benchmarks. The pinned BF16 model is 557,950,176 bytes, plus its tokenizer. See the independent-validation report for measured conditions; no instant-search or throughput guarantee is made.
+Gemma product latency and indexing throughput depend on corpus, hardware, checksum verification and the isolated probe. Earlier Ruri/MLX timings are not Gemma benchmarks. The pinned BF16 model is 557,950,176 bytes, plus its tokenizer. See the [migration validation record](docs/audit/2026-10-16-gemma-validation.json) for scope and the [index measurement procedure](docs/index-observability.md) for timing conditions.
 
 ## Limitations
 
@@ -275,7 +295,18 @@ recall uses sysexits-style exit codes instead of a generic `1`/`2` split.
 
 ### Setup
 
-Run once after cloning:
+Use Apple Silicon, the Rust version required by `Cargo.toml` or newer, CMake and
+the Xcode command-line tools. Initialize the pinned native source before building:
+
+```sh
+git submodule update --init --recursive
+cargo build --release --locked
+```
+
+The [vendored backend notes](vendor/README.md) describe the pinned bindings and
+llama.cpp pairing. No separate Metal library or embedding service is installed.
+
+Run once after cloning to enable commit checks:
 
 ```sh
 git config --local core.hooksPath .githooks
@@ -286,10 +317,14 @@ This installs a pre-commit hook that runs `cargo fmt --check` and `cargo clippy 
 ### Common commands
 
 ```sh
-cargo nextest run                                         # all tests (install: cargo install cargo-nextest --locked)
-cargo clippy --all-targets --all-features -- -D warnings  # lint (matches CI)
+cargo nextest run --profile ci --locked                   # standard tests (install cargo-nextest first)
+cargo clippy --locked --all-targets --all-features -- -D warnings  # lint (matches CI)
 cargo fmt -- --check                                      # format check
 ```
+
+Public-model inference and CLI tests are opt-in locally and run in CI's coverage
+job. See [verification and measurement scripts](scripts/README.md) for their
+artifact setup, independent-index validation and synthetic benchmarks.
 
 ## Acknowledgements
 
@@ -298,5 +333,3 @@ This project was inspired by [arjunkmrm/recall](https://github.com/arjunkmrm/rec
 ## License
 
 MIT
-
-Build from source with `git submodule update --init --recursive` followed by `cargo build --release --locked`. The evaluated llama.cpp backend is pinned; amici and rurico are not runtime or build dependencies.

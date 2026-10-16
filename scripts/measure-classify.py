@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+"""Measure synthetic classification against a pinned parser baseline.
+
+Run from a full checkout with initialized native submodules; see scripts/README.md.
+The staged build uses the current Gemma backend, not the baseline's old model.
+"""
 
 import hashlib
 import json
@@ -48,8 +53,8 @@ use super::Metrics;
     bench = dest / "src/classify/benchmark.rs"
     code = bench.read_text()
     code = replace_once(code, "use crate::parser::{self, Source};", "use baseline_parser::{self as parser, Source};")
-    start = code.index("// Baseline is installed")
-    end = code.index("struct Corpus", start)
+    start = code.index("    fn legacy(")
+    end = code.index("    struct Corpus", start)
     code = code[:start] + """#[path = "__BASELINE_PARSER__"]
 mod baseline_parser;
 #[path = "__BASELINE__"]
@@ -76,8 +81,8 @@ def main():
     root = Path(__file__).resolve().parents[1]
     with tempfile.TemporaryDirectory(prefix="recall-classify-measure-") as directory:
         dest = Path(directory)
-        for name in ["src", "tests", ".config"]:
-            shutil.copytree(root / name, dest / name)
+        for name in ["src", "tests", ".config", "vendor"]:
+            shutil.copytree(root / name, dest / name, ignore=shutil.ignore_patterns(".git"))
         for name in ["Cargo.toml", "Cargo.lock", "README.md", "README.ja.md"]:
             shutil.copy(root / name, dest / name)
         current_sources = ["src/main.rs", "src/classify/benchmark.rs", "src/parser/mod.rs",
