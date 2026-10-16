@@ -2,6 +2,7 @@
 use crate::{
     embedding::Embed,
     native::{Gemma, gpu_available},
+    runtime::home_dir,
 };
 use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
@@ -9,7 +10,9 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    env, fmt, fs,
+    env,
+    fmt::{self, Write as _},
+    fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
@@ -95,12 +98,20 @@ impl ModelSpec {
         Ok(())
     }
     pub fn identity(&self) -> String {
-        format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(self).expect("model spec is serializable"))
-        )
+        digest_hex(&Sha256::digest(
+            serde_json::to_vec(self).expect("model spec is serializable"),
+        ))
     }
 }
+
+fn digest_hex(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to String is infallible");
+    }
+    hex
+}
+
 static SELECTED: OnceLock<ModelSpec> = OnceLock::new();
 pub fn selected() -> &'static ModelSpec {
     SELECTED.get_or_init(ModelSpec::default)
@@ -128,7 +139,7 @@ pub fn hash_file(path: &Path) -> Result<String> {
         }
         h.update(&buf[..n]);
     }
-    Ok(format!("{:x}", h.finalize()))
+    Ok(digest_hex(&h.finalize()))
 }
 pub fn cache_dir() -> PathBuf {
     if let Some(p) = env::var_os("RECALL_MODEL_DIR") {
@@ -143,7 +154,7 @@ pub fn cache_dir() -> PathBuf {
                 .filter(|p| p.is_absolute())
                 .map(|p| p.join("recall"))
         })
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache/recall"));
+        .unwrap_or_else(|| home_dir().unwrap_or_default().join(".cache/recall"));
     base.join("models").join(selected().identity())
 }
 pub struct ModelId;
@@ -424,6 +435,35 @@ pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn checksum_format_and_persisted_identity_survive_digest_updates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("artifact");
+        // Independent known digests include leading zero nibbles and a file
+        // crossing hash_file's 1 MiB read boundary.
+        for (bytes, expected) in [
+            (
+                Vec::new(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".to_vec(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                vec![b'a'; 1024 * 1024 + 1],
+                "4a3f0c0c213adea174f9a3d4c13177315b588bdb2e9c1012d3d0bf0453ca0f6a",
+            ),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(hash_file(&path).unwrap(), expected);
+        }
+        assert_eq!(
+            ModelSpec::default().identity(),
+            "2af2d2da81d827b88831ac2c7a9a52438d9d917daa4b99f5f45b4005867d265e"
+        );
+    }
+
+    #[test]
     fn process_model_selection_is_idempotent_and_cannot_change_mid_run() {
         let original = selected().clone();
         select(None).unwrap();
@@ -507,7 +547,7 @@ mod tests {
         let dest = dir.path().join("model.gguf");
         fs::write(&dest, b"old").unwrap();
         let bytes = b"new verified weights";
-        let digest = format!("{:x}", Sha256::digest(bytes));
+        let digest = digest_hex(&Sha256::digest(bytes));
         install_artifact(dir.path(), "model.gguf", &digest, &mut bytes.as_slice()).unwrap();
         assert_eq!(fs::read(dest).unwrap(), bytes);
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);

@@ -1129,7 +1129,8 @@ fn main() {
         }
     }
 
-    if cfg!(feature = "cuda") && !build_shared_libs {
+    #[cfg(feature = "cuda")]
+    if !build_shared_libs {
         // Re-run build script if CUDA_PATH environment variable changes
         println!("cargo:rerun-if-env-changed=CUDA_PATH");
 

@@ -7,25 +7,23 @@ description = "Full-text search CLI for past Claude Code and Codex sessions"
 license = "MIT"
 repository = "https://github.com/thkt/recall"
 
-[features]
-test-support = []
-
 [dependencies]
 anyhow = "1.0.102"
 bytemuck = "1"
 clap = { version = "4.6.1", features = ["derive", "env"] }
-dirs = "7.0.0"
 llama-cpp-2 = { path = "vendor/llama-cpp-2", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 sqlite-vec = "=0.1.9"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
-sha2 = "0.10"
+sha2 = { version = "0.11.1", default-features = false }
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 unicode-normalization = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.13", features = ["blocking"] }
+# Artifact downloads stream bytes; charset decoding is unnecessary. Retain the
+# existing TLS, HTTP/2 and system proxy support.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "system-proxy"] }
 thiserror = "2"
 
 [dev-dependencies]

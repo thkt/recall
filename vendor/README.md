@@ -5,6 +5,12 @@ Cargo workspace inheritance and upstream example targets are adjusted. The one
 Rust source compatibility patch initializes the two added performance-counter
 fields (`n_reallocs_diff` and `n_reallocs_same`) to zero in `LlamaTimings::new`.
 The same patch was present in the evaluated backend; it does not change inference.
+Build-only dependency adjustments disable bindgen's unused logging and
+Prettyplease formatter features (the builder keeps its default Rustfmt formatter)
+and make the CUDA discovery helper conditional on the existing CUDA feature.
+The helper's build-script block uses `#[cfg]` rather than `cfg!` so a Metal-only
+build does not compile or resolve CUDA discovery. Upstream inference wrappers and
+the pinned llama.cpp source remain unchanged by these dependency adjustments.
 Upstream public vocabulary/grammar test fixtures are retained. The adopted Gemma
 weights, private corpus, and evaluation vectors are not included in this directory.
 
