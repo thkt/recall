@@ -10,15 +10,16 @@ pub(crate) struct QAChunk {
 
 const MAX_CHUNK_BYTES: usize = 16_000;
 
-fn split_text(text: &str, max_bytes: usize) -> Vec<String> {
+/// `max_bytes` budgets the body; callers reserve the prefix bytes separately.
+fn split_text(text: &str, max_bytes: usize, prefix: &str) -> Vec<String> {
     if text.len() <= max_bytes {
-        return vec![text.to_owned()];
+        return vec![format!("{prefix}{text}")];
     }
     let mut chunks = Vec::new();
     let mut remaining = text;
     while !remaining.is_empty() {
         let split_at = find_split_boundary(remaining, max_bytes);
-        chunks.push(remaining[..split_at].to_string());
+        chunks.push(format!("{prefix}{}", &remaining[..split_at]));
         remaining = &remaining[split_at..];
         remaining = remaining.trim_start_matches('\n');
     }
@@ -27,7 +28,7 @@ fn split_text(text: &str, max_bytes: usize) -> Vec<String> {
 
 fn build_content(user_text: &str, assistant_text: Option<&str>) -> Vec<String> {
     match assistant_text {
-        None => split_text(user_text, MAX_CHUNK_BYTES),
+        None => split_text(user_text, MAX_CHUNK_BYTES, ""),
         Some(a) => {
             let header = format!("{user_text}\n");
             if header.len() + a.len() <= MAX_CHUNK_BYTES {
@@ -35,18 +36,10 @@ fn build_content(user_text: &str, assistant_text: Option<&str>) -> Vec<String> {
             }
             let available = MAX_CHUNK_BYTES.saturating_sub(header.len());
             if available >= 4 {
-                let mut chunks = Vec::new();
-                let mut remaining = a;
-                while !remaining.is_empty() {
-                    let split_at = find_split_boundary(remaining, available);
-                    chunks.push(format!("{header}{}", &remaining[..split_at]));
-                    remaining = &remaining[split_at..];
-                    remaining = remaining.trim_start_matches('\n');
-                }
-                return chunks;
+                return split_text(a, available, &header);
             }
-            let mut chunks = split_text(user_text, MAX_CHUNK_BYTES);
-            chunks.extend(split_text(a, MAX_CHUNK_BYTES));
+            let mut chunks = split_text(user_text, MAX_CHUNK_BYTES, "");
+            chunks.extend(split_text(a, MAX_CHUNK_BYTES, ""));
             chunks
         }
     }

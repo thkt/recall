@@ -14,13 +14,11 @@ use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
+use crate::date::MS_PER_DAY;
 use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
-use crate::hybrid::rrf_merge_strings;
-
-use crate::date::MS_PER_DAY;
-use crate::hybrid::{self, RECENCY_BOOST_WEIGHT};
+use crate::hybrid::{self, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
 use crate::parser::{SessionData, Source};
 
 const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
@@ -81,7 +79,7 @@ impl Default for SearchOptions {
     }
 }
 
-fn append_session_filter(
+fn append_search_filters(
     sql: &mut String,
     params: &mut Vec<Box<dyn ToSql>>,
     column: &'static str,
@@ -113,6 +111,8 @@ fn append_session_filter(
         suffix.push_str(&escape_like(file));
         params.push(Box::new(suffix));
     }
+    append_current_session_filter(sql, params, column, &opts.current);
+    append_automated_filter(sql, column, opts.include_automated);
 }
 
 fn append_current_session_filter(
@@ -152,9 +152,7 @@ fn build_fts_candidate_query(
     let mut sql =
         "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
-    append_session_filter(&mut sql, &mut params, "session_id", opts, now_ms);
-    append_current_session_filter(&mut sql, &mut params, "session_id", &opts.current);
-    append_automated_filter(&mut sql, "session_id", opts.include_automated);
+    append_search_filters(&mut sql, &mut params, "session_id", opts, now_ms);
     sql.push_str(" GROUP BY session_id ORDER BY best_rank LIMIT ?");
     let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
     params.push(Box::new(candidate_limit as i64));
@@ -418,9 +416,7 @@ fn vec_search(
          WHERE 1 = 1",
     );
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
-    append_session_filter(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
-    append_current_session_filter(&mut sql, &mut filter_params, "c.session_id", &opts.current);
-    append_automated_filter(&mut sql, "c.session_id", opts.include_automated);
+    append_search_filters(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
     sql.push_str(" GROUP BY c.session_id ORDER BY d");
 
     let limit_i64 = limit as i64;
@@ -576,11 +572,6 @@ pub fn search_with_embedder<'q>(
 
     let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
 
-    let fts_hits: Vec<(String, f64)> = fts_ranked
-        .iter()
-        .map(|(sid, _)| (sid.clone(), 0.0))
-        .collect();
-
     let (vec_hits, vec_degraded) =
         match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
             Ok(hits) => (hits, false),
@@ -591,10 +582,10 @@ pub fn search_with_embedder<'q>(
         };
 
     let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
-    let vec_for_rrf: Vec<(String, f64)> =
-        vec_hits.iter().map(|(sid, _)| (sid.clone(), 0.0)).collect();
-
-    let mut merged = rrf_merge_strings(&fts_hits, &vec_for_rrf);
+    let mut merged = rrf_merge_sessions(
+        fts_ranked.iter().map(|(sid, _)| sid.as_str()),
+        vec_hits.iter().map(|(sid, _)| sid.as_str()),
+    );
 
     if merged.is_empty() {
         return Ok(SearchOutcome {
@@ -674,9 +665,7 @@ fn file_list_outcome(
                    FROM sessions s WHERE 1 = 1"
         .to_owned();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
-    append_session_filter(&mut sql, &mut params, "s.session_id", opts, now_ms);
-    append_current_session_filter(&mut sql, &mut params, "s.session_id", &opts.current);
-    append_automated_filter(&mut sql, "s.session_id", opts.include_automated);
+    append_search_filters(&mut sql, &mut params, "s.session_id", opts, now_ms);
     sql.push_str(" ORDER BY s.timestamp DESC");
     debug_assert_eq!(
         params.len(),

@@ -99,9 +99,9 @@ fn error_envelope_wraps_payload_under_error_key() {
 #[test]
 fn success_envelope_serializes_required_fields() {
     let env = SuccessEnvelope {
-        data: serde_json::json!({"results": []}),
+        data: &serde_json::json!({"results": []}),
         degraded: false,
-        notes: vec![],
+        notes: &[],
     };
     let json = serde_json::to_string(&env).unwrap();
     assert!(
@@ -121,9 +121,9 @@ fn success_envelope_serializes_required_fields() {
 #[test]
 fn success_envelope_surfaces_degradation_with_notes() {
     let env = SuccessEnvelope {
-        data: serde_json::json!({"results": []}),
+        data: &serde_json::json!({"results": []}),
         degraded: true,
-        notes: vec!["semantic search unavailable, falling back to FTS".into()],
+        notes: &["semantic search unavailable, falling back to FTS".into()],
     };
     let json = serde_json::to_string(&env).unwrap();
     assert!(

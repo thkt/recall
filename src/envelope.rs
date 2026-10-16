@@ -36,10 +36,10 @@ impl CommandOutput {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct SuccessEnvelope {
-    pub data: serde_json::Value,
+pub(crate) struct SuccessEnvelope<'a> {
+    pub data: &'a serde_json::Value,
     pub degraded: bool,
-    pub notes: Vec<String>,
+    pub notes: &'a [String],
 }
 
 #[derive(Debug, Serialize)]
@@ -60,9 +60,9 @@ pub(crate) struct ErrorPayload {
 
 pub(crate) fn render_json_success(out: &CommandOutput) -> String {
     let env = SuccessEnvelope {
-        data: out.data.clone(),
+        data: &out.data,
         degraded: out.degraded,
-        notes: out.notes.clone(),
+        notes: &out.notes,
     };
     serde_json::to_string(&env).expect("SuccessEnvelope is always serializable")
 }

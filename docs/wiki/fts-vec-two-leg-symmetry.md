@@ -6,7 +6,7 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 
 ## 定型手順
 
-1. フィルタ条件は `append_session_filter` 群(共有 helper)に追加し、FTS 候補クエリ・vec 検索・file-list の全経路が同じ helper を通ることを確認する
+1. フィルタ条件は `append_search_filters` (共有 helper)に追加し、FTS 候補クエリ・vec 検索・file-list の全経路が同じ helper を通ることを確認する
 2. 「フィルタ指定なしなら早期 return」等のガード条件も新しい軸に合わせて更新する
 3. `crate::compat::assert_filter_symmetric` で vec-only 回帰テストを併設する(FTS 経路のみのテストで済ませない。既存フィルタ project / days / source には全て併設済み)
 4. 候補数の倍率などの定数は共有 const に置き、FTS 側と vec 側で独立に再計算しない
@@ -24,4 +24,4 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 - #122 automated filter を FTS・vec 両候補クエリに適用
 - #283 新規 `--file` 軸の設計要件として「共有 helper 経由で FTS / vec 両 leg が継承する」を明記
 - #293 `--file` テストが FTS leg のみだった gap を audit が検出し `assert_filter_symmetric` を追加
-- 現行コード: `src/search.rs:138`(`append_session_filter`)、`src/search.rs:229-231` / `571-573` / `926-928`(3 経路への適用)、`src/search/tests.rs:2114` 以降(`assert_filter_symmetric` による対称性固定)
+- 現行コード: `src/search.rs` の `append_search_filters` (全フィルタの適用)、`build_fts_candidate_query` / `vec_search` / `file_list_outcome` (3 経路からの呼び出し)、`src/search/tests.rs` の `combined_filters_apply_to_fts_hybrid_and_file_list` と `assert_filter_symmetric` を用いたテスト (対称性固定)
