@@ -34,17 +34,14 @@ recall search "authentication"
 
 ## クイックスタート
 
-このREADMEはEmbeddingGemma 2 BF16を使う `main` の説明です。2026-10-16時点の
-[最新リリースv0.13.0](https://github.com/thkt/recall/releases/tag/v0.13.0)と
-`brew install thkt/tap/recall` は旧Ruri backendのままです。次のリリース前にGemmaを使う場合は、
-Apple Silicon上でRust・CMake・Xcode command-line toolsを用意し、このcheckoutからbuildしてください。
+EmbeddingGemma 2 BF16はv0.14.0から採用しています。v0.13.0以前は旧Ruri backendです。
+[切替時は旧バイナリと索引を保持](#モデル)してください。Apple Siliconが必要です。
+ソースからのbuildは[開発](#開発)を参照してください。
 
 ```sh
-# 固定llama.cppソースと一緒にmainを取得してインストール
-git clone --recurse-submodules https://github.com/thkt/recall.git
-cd recall
-cargo install --path . --locked
-export PATH="$HOME/.cargo/bin:$PATH"  # Homebrew版もある場合、このbuildを選ぶ
+# インストール（既存のインストールを更新する場合はupgrade）
+brew install thkt/tap/recall
+# brew upgrade recall
 
 # モデルを一度ダウンロード（約558MB＋tokenizer）してからインデックス作成
 recall model download

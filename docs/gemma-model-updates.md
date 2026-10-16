@@ -18,12 +18,10 @@ processes; it is not a measured end-to-end product CLI improvement.
 
 ## Migration status
 
-The Gemma backend is merged into `main`; amici, rurico and MLX are no longer
-runtime or build dependencies. The [migration validation record](audit/2026-10-16-gemma-validation.json)
-is a dated report, not the current test count or evidence that a user's index
-has been promoted. The latest published release on 2026-10-16 is still
-[v0.13.0](https://github.com/thkt/recall/releases/tag/v0.13.0), with the old backend.
-Build `main` from source until a Gemma release is published.
+The Gemma backend is included from v0.14.0; amici, rurico and MLX are no longer
+runtime or build dependencies. Releases up to v0.13.0 use the previous Ruri backend.
+The [migration validation record](audit/2026-10-16-gemma-validation.json) is a dated
+report, not the current test count or evidence that a user's index has been promoted.
 
 To switch your own sessions, use the Gemma binary, download its model, and index
 into its new default namespace. Remove an old `RECALL_DB` override or select a

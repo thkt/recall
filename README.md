@@ -36,18 +36,14 @@ recall "authentication"
 
 ## Quick start
 
-This README describes `main`, which uses EmbeddingGemma 2 BF16. As of 2026-10-16,
-[the latest release, v0.13.0](https://github.com/thkt/recall/releases/tag/v0.13.0),
-and `brew install thkt/tap/recall` still use the previous Ruri backend. To use
-Gemma before the next release, build from this checkout on Apple Silicon with
-Rust, CMake and the Xcode command-line tools (see [Development](#development)):
+EmbeddingGemma 2 BF16 is included from v0.14.0. Versions up to v0.13.0 use the
+previous Ruri backend; keep the old binary and index when [upgrading](#model).
+Requires Apple Silicon. For source builds, see [Development](#development).
 
 ```sh
-# Install main, including the pinned llama.cpp source
-git clone --recurse-submodules https://github.com/thkt/recall.git
-cd recall
-cargo install --path . --locked
-export PATH="$HOME/.cargo/bin:$PATH"  # select this build if Homebrew is also installed
+# Install (or upgrade an existing installation)
+brew install thkt/tap/recall
+# brew upgrade recall
 
 # Download the embedding model once (~558 MB plus tokenizer), then index your sessions
 recall model download
