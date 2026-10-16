@@ -136,8 +136,8 @@ jobs:
 
           SHA_AARCH64_DARWIN=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
 
-          tar tzf "$ARCHIVE" | grep -q mlx.metallib \
-            || { echo "::error::mlx.metallib missing from macOS archive"; exit 1; }
+          tar tzf "$ARCHIVE" | grep -qx recall \
+            || { echo "::error::recall binary missing from macOS archive"; exit 1; }
 
           mkdir -p Formula
           cat > Formula/recall.rb << FORMULA
@@ -155,8 +155,7 @@ jobs:
             end
 
             def install
-              libexec.install "recall", "mlx.metallib"
-              bin.install_symlink libexec/"recall"
+              bin.install "recall"
             end
 
             test do
