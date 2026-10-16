@@ -1,28 +1,13 @@
-//! CLI exit-code contract (recall ADR-0006, extending scout ADR-0066 Group 2; #82). Spawns the real binary and
-//! pins the sysexits codes agents branch on, exercising the parse / dispatch /
-//! error-classification glue that unit tests cannot reach in-process.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
-// U-003: shared root-bypass probe (tests/support/root_skip.rs), the same
-// helper src/db/tests.rs's U-001/U-002 unified onto. `tests/support/` is a
-// subdirectory, so Cargo does not compile it as its own integration-test
-// binary; `#[path]` pulls it into this binary's module tree instead.
 #[cfg(unix)]
 #[path = "support/root_skip.rs"]
 mod root_skip;
 
-/// A `recall` invocation isolated from the developer's real sessions and DB.
-/// `RECALL_DB` points at a path inside `dir`; the source dirs point nowhere so
-/// indexing never touches `~/.claude` or `~/.codex`. `CLAUDE_CODE_SESSION_ID` is
-/// cleared so a suite run from inside a live Claude Code session does not inherit
-/// the invoking session id — `search` now excludes that session by default, so
-/// inheritance would leak the runner's environment into results. Tests that
-/// exercise the exclusion set the variable explicitly.
 fn recall(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_recall"));
     cmd.env("RECALL_DB", dir.join("recall.db"))
@@ -42,39 +27,30 @@ fn exit_code(cmd: &mut Command) -> i32 {
         .expect("process returned an exit code")
 }
 
-// T-CLI001: an unknown flag is a usage error (clap parse → USAGE 64).
 #[test]
 fn unknown_flag_exits_usage() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).arg("--no-such-flag")), 64);
 }
 
-// T-CLI002: no subcommand prints the "search query required" usage error (64).
 #[test]
 fn no_subcommand_exits_usage() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(&mut recall(dir.path())), 64);
 }
 
-// T-CLI003: --help is not a failure; clap writes help to stdout and exits 0.
 #[test]
 fn help_exits_success() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).arg("--help")), 0);
 }
 
-// T-CLI004: `show` against a database that was never created is a usage error
-// (run `recall index` first), not a crash.
 #[test]
 fn show_without_database_exits_usage() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).args(["show", "deadbeef"])), 64);
 }
 
-// T-CLI005 / T-006 (missing-DB, FR-003): searching before any index exists is a
-// success that prints the "no sessions indexed" guidance (exit 0) AND must not
-// create the DB file — search guards on `path.exists()` and returns idle output,
-// modeling the pre-index state without writing.
 #[test]
 fn search_empty_index_exits_success() {
     let dir = TempDir::new().unwrap();
@@ -88,34 +64,22 @@ fn search_empty_index_exits_success() {
     );
 }
 
-// T-CLI007: a bare query with no subcommand is shorthand-expanded to `search`,
-// exercising the shorthand-expansion parse branch. Empty index → success (0).
 #[test]
 fn bare_query_shorthand_expands_to_search() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).args(["someword"])), 0);
 }
 
-// T-CLI006: `show` of an unknown id against an existing index resolves to no
-// match → usage error (64). Creating the index first (via search) makes the DB
-// exist, so this exercises the "No session found" path, not "Database not found".
 #[test]
 fn show_unknown_id_in_existing_index_exits_usage() {
     let dir = TempDir::new().unwrap();
-    // `index` creates the (empty) database without needing the embedding model.
     assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
     assert_eq!(exit_code(recall(dir.path()).args(["show", "deadbeef"])), 64);
 }
 
-// T-CLI008: `status` against a created index prints the stats to stdout and
-// exits 0. Regression guard for #67 Phase 1: the status output now routes
-// through `output::write_result` (a closed pipe stops cleanly) instead of bare
-// `println!`, so this pins that the reroute preserves the visible output and the
-// success exit code.
 #[test]
 fn status_prints_stats_and_exits_success() {
     let dir = TempDir::new().unwrap();
-    // `index` creates the (empty) database so `status` reports counts.
     assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
     let out = recall(dir.path())
         .arg("status")
@@ -129,8 +93,6 @@ fn status_prints_stats_and_exits_success() {
     );
 }
 
-// T-CLI009: `status --verbose` adds the DB path line and still exits 0. Covers
-// the verbose branch of the status output that the non-verbose T-CLI008 skips.
 #[test]
 fn status_verbose_includes_db_path() {
     let dir = TempDir::new().unwrap();
@@ -147,11 +109,6 @@ fn status_verbose_includes_db_path() {
     );
 }
 
-// T-CLI010: searching an index that contains a matching session prints the
-// "Found N sessions" listing and exits 0. The core OUTCOME path (search returns
-// results) end to end: seed a Claude session JSONL, index it, then search a term
-// it contains. Exercises the result-rendering path that the empty-index tests
-// (which short-circuit on the "no sessions indexed" guidance) never reach.
 #[test]
 fn search_with_matching_index_lists_results() {
     let dir = TempDir::new().unwrap();
@@ -162,7 +119,6 @@ fn search_with_matching_index_lists_results() {
         r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#,
     )
     .unwrap();
-    // Only `index` reads the source dir; search then reads the built DB.
     assert_eq!(
         exit_code(
             recall(dir.path())
@@ -183,19 +139,6 @@ fn search_with_matching_index_lists_results() {
     );
 }
 
-// -- #67 Phase 2: global `--json` envelope (T-CLI011..T-CLI017) --
-//
-// These spawn the real binary with the global `--json` flag and pin the wire
-// envelope an agent consumes. Several assert on the response body, not the exit
-// code alone: a usage error (T-CLI012) exits 64, but a plain-text rejection
-// would too, so the `{"error":{"code":"USAGE_ERROR",...}}` body is what proves
-// the envelope path ran. The contract keys (`results`, `session_id`, `excerpt`,
-// `messages`, `sessions`, `qa_chunks`, `embedded`, `degraded`, `notes`) are the
-// public surface; assert them verbatim.
-
-/// Seed a one-session Claude index in `dir` so `--json` search has a hit to
-/// emit. Mirrors the T-CLI010 fixture (JSONL seed → `index` builds the DB);
-/// only `index` reads the source dir, so search then reads the built DB.
 fn seed_indexed_session(dir: &Path) {
     let claude_dir = dir.join("claude");
     fs::create_dir_all(&claude_dir).unwrap();
@@ -215,12 +158,6 @@ fn seed_indexed_session(dir: &Path) {
     );
 }
 
-// T-CLI011: `search <q> --json` against a matching index prints the success
-// envelope to stdout and exits 0. The machine path of the core OUTCOME (search
-// returns results): parses the envelope and asserts data.results carries the hit
-// (session_id + excerpt), and that degraded co-varies with notes — asserting the
-// invariant, not a fixed value, keeps it portable across machines that have or
-// lack the cached embedding model. Perspective: normal (the JSON happy path).
 #[test]
 fn search_json_emits_success_envelope_with_results() {
     let dir = TempDir::new().unwrap();
@@ -245,10 +182,6 @@ fn search_json_emits_success_envelope_with_results() {
         results[0]["session_id"].is_string() && results[0]["excerpt"].is_string(),
         "each result row should carry session_id and excerpt, got: {stdout}"
     );
-    // degraded and notes co-vary: search sets degraded=true with an FTS-fallback
-    // note exactly when the embedding model is absent. Asserting the invariant
-    // (not a fixed value) keeps the test portable across machines that have or
-    // lack the cached model.
     let degraded = v["degraded"]
         .as_bool()
         .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));
@@ -262,11 +195,6 @@ fn search_json_emits_success_envelope_with_results() {
     );
 }
 
-// T-CLI012: `--json` with no subcommand prints the usage error as a JSON
-// envelope on stderr and exits 64. Assert on the body, not the exit code alone:
-// today clap rejects the unknown `--json` flag with exit 64 too, so an exit-only
-// check would pass against plain-text stderr (a false green). The body must be
-// `{"error":{"code":"USAGE_ERROR",...}}` with a next_step. Perspective: error.
 #[test]
 fn no_subcommand_json_emits_error_envelope_on_stderr() {
     let dir = TempDir::new().unwrap();
@@ -290,15 +218,9 @@ fn no_subcommand_json_emits_error_envelope_on_stderr() {
     );
 }
 
-// T-CLI013: `status --json` against a created index prints the stats as a
-// success envelope on stdout and exits 0. The data payload carries the
-// machine-readable counters (`sessions`, `qa_chunks`, `embedded`) — the
-// snake_case keys, not the human "Sessions:" / "QA chunks:" labels.
-// Perspective: normal.
 #[test]
 fn status_json_emits_stats_envelope() {
     let dir = TempDir::new().unwrap();
-    // `index` creates the (empty) DB so `status` has counts to report.
     assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
     let out = recall(dir.path())
         .args(["status", "--json"])
@@ -318,11 +240,6 @@ fn status_json_emits_stats_envelope() {
     );
 }
 
-// T-CLI014: `--json` does not change the exit code of an empty-index search.
-// Searching an empty (but created) index is a success (exit 0) with or without
-// `--json` — the flag selects the output format, never the exit class.
-// Perspective: boundary (empty index, the zero-result edge) + regression (exit
-// code invariant across the flag). Pairs with T-CLI005 (the `--json`-less twin).
 #[test]
 fn search_empty_index_json_exit_code_matches_human() {
     let human = TempDir::new().unwrap();
@@ -340,10 +257,6 @@ fn search_empty_index_json_exit_code_matches_human() {
     );
 }
 
-// T-CLI015: without `--json`, search still prints the human-readable listing and
-// exits 0 — the Phase-2 envelope work must not regress the default output that
-// T-CLI010 pins. Regression guard: the same matching-index fixture must yield
-// the "Found N sessions:" text (not JSON) when `--json` is absent.
 #[test]
 fn search_without_json_keeps_human_output() {
     let dir = TempDir::new().unwrap();
@@ -364,10 +277,6 @@ fn search_without_json_keeps_human_output() {
     );
 }
 
-// T-CLI016: `show <id> --json` against a matching index prints the success
-// envelope to stdout and exits 0. The data payload carries the session identity
-// (`session_id`) and the conversation as `messages` (each a role/text object) —
-// the machine path of `show`. Perspective: normal (the JSON happy path).
 #[test]
 fn show_json_emits_session_envelope() {
     let dir = TempDir::new().unwrap();
@@ -390,10 +299,6 @@ fn show_json_emits_session_envelope() {
     );
 }
 
-// T-CLI017: without `--json`, `show` prints the human-readable markdown and
-// exits 0 — the envelope work must not regress the default `show` output. The
-// markdown carries the slug header and the role-tagged message body, and must
-// not emit the JSON envelope. Perspective: regression. Pairs with T-CLI016.
 #[test]
 fn show_without_json_keeps_human_output() {
     let dir = TempDir::new().unwrap();
@@ -414,13 +319,6 @@ fn show_without_json_keeps_human_output() {
     );
 }
 
-// T-CLI018 (#130 D2/FR-008): `index --json` emits a structured embed summary —
-// `data` carries `{ embedded, failed_count }` (no longer null) so an agent reads
-// how much embedding happened, and exits 0. An empty index embeds nothing and
-// fails nothing regardless of whether the model is present, so the counts are a
-// deterministic 0/0; the degraded flag and notes depend on model presence and are
-// covered deterministically by the `index_command_output` unit tests (T-003..006).
-// Progress spinners go to stderr, so stdout is exactly the one envelope.
 #[test]
 fn index_json_emits_structured_embed_summary() {
     let dir = TempDir::new().unwrap();
@@ -459,10 +357,6 @@ fn index_json_emits_structured_embed_summary() {
     assert_eq!(v["data"]["observations"]["counts"]["files_discovered"], 0);
 }
 
-// T-CLI027: `rebuild --json` mirrors the index envelope contract through the
-// rebuild dispatch arm (run_rebuild → index_command_output). On an empty index
-// the wipe-and-rebuild embeds nothing and fails nothing, so the counts are a
-// deterministic 0/0 regardless of model presence, and the exit is 0.
 #[test]
 fn rebuild_json_emits_structured_embed_summary() {
     let dir = TempDir::new().unwrap();
@@ -486,17 +380,6 @@ fn rebuild_json_emits_structured_embed_summary() {
     );
 }
 
-// T-CLI028 (ADR-0001, #211): `doctor --json` against a built index freezes the
-// diagnostic envelope an agent consumes. The `data` payload pins the top keys
-// `healthy` / `checks`, each check object's `name` / `ok` / `detail` / `remedy`,
-// and the four check `name` tokens (`integrity` / `orphan_embeddings` /
-// `orphan_chunks` / `model`) an agent pattern-matches. A valid seeded DB always
-// takes the four-check arm (open succeeds), so the name set is deterministic; the
-// model check's verdict still varies by host, so this asserts the envelope
-// invariant `degraded == !healthy` rather than a fixed `healthy` value, keeping
-// the test portable. Exit is 0 because a successful command maps to SUCCESS
-// regardless of the degraded flag (exit_code_for_write). Perspective: contract
-// freeze (key set) + invariant (degraded co-varies with healthy).
 #[test]
 fn doctor_json_freezes_diagnostic_envelope_key_set() {
     let dir = TempDir::new().unwrap();
@@ -555,11 +438,6 @@ fn doctor_json_freezes_diagnostic_envelope_key_set() {
     );
 }
 
-// T-CLI019: `status --json` against a never-created index reports zero counters
-// as a success envelope, exit 0 — the no-database branch of run_status. With
-// HF_HOME pointed at an empty cache the model is not installed, so model_ready is
-// false here; T-CLI020 covers the same branch when the model IS cached. Pairs
-// with T-CLI013, which runs `index` first (the live path).
 #[test]
 fn status_json_without_index_reports_zero_counts() {
     let dir = TempDir::new().unwrap();
@@ -589,8 +467,6 @@ fn status_json_without_index_reports_zero_counts() {
     );
 }
 
-/// An explicit fixture manifest verifies exact artifacts without claiming that
-/// synthetic bytes can pass the separate live model probe.
 fn setup_cached_default_model(root: &Path) -> PathBuf {
     let output = recall(root).args(["model", "manifest"]).output().unwrap();
     assert!(output.status.success());
@@ -617,12 +493,6 @@ fn setup_cached_default_model(root: &Path) -> PathBuf {
     path
 }
 
-// T-CLI020: `status --json` reports model_ready:true when the model artifacts are
-// cached but no index DB exists (#166). The no-database branch must reflect the
-// real HF cache state, not a hard-coded false — an agent can `recall model
-// download` before its first `recall index`. Counts stay zero (no DB). Pairs with
-// T-CLI019 (empty cache → false) and exercises the regression directly.
-// Perspective: hazard (model installed before index) + branch (no-DB true path).
 #[test]
 fn status_json_without_index_reports_model_ready_when_cached() {
     let dir = TempDir::new().unwrap();
@@ -652,9 +522,6 @@ fn status_json_without_index_reports_model_ready_when_cached() {
     );
 }
 
-/// Seed a two-session Claude index (s1, s2) that both match "hello", then index
-/// it. The current-session tests differ only in the flag and env they pass next,
-/// so the seed lives here once.
 fn seed_two_matching_sessions(dir: &Path) {
     let claude_dir = dir.join("claude");
     fs::create_dir_all(&claude_dir).unwrap();
@@ -676,18 +543,11 @@ fn seed_two_matching_sessions(dir: &Path) {
     );
 }
 
-// T-CLI020: CLAUDE_CODE_SESSION_ID excludes the invoking session by default (#77).
-// Two sessions (s1, s2) both match the query. With the env var set to s1 and no
-// flag, the default drops s1 and keeps s2 — proving the binary reads the env var
-// and threads it into SearchOptions.current, the glue the in-process resolve unit
-// test cannot reach. The baseline (env cleared by the helper) lists both, so the
-// assertion cannot pass vacuously by returning nothing.
 #[test]
 fn search_excludes_current_session_by_env_default() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    // Baseline: no invoking session (helper clears the env) → both are candidates.
     let baseline = recall(dir.path())
         .args(["search", "hello"])
         .output()
@@ -698,7 +558,6 @@ fn search_excludes_current_session_by_env_default() {
         "baseline (no env) should list both sessions, got: {baseline_out}"
     );
 
-    // CLAUDE_CODE_SESSION_ID=s1 → s1 is the invoking session, excluded by default.
     let out = recall(dir.path())
         .args(["search", "hello"])
         .env("CLAUDE_CODE_SESSION_ID", "s1")
@@ -716,9 +575,6 @@ fn search_excludes_current_session_by_env_default() {
     );
 }
 
-// T-CLI022: --include-current overrides the default exclusion (#77). With
-// CLAUDE_CODE_SESSION_ID=s1 the flag keeps s1, so both s1 and s2 appear — the
-// end-to-end path for the Ignore mode that the default/exclude tests never reach.
 #[test]
 fn search_include_current_keeps_invoking_session() {
     let dir = TempDir::new().unwrap();
@@ -737,9 +593,6 @@ fn search_include_current_keeps_invoking_session() {
     );
 }
 
-// T-CLI023: --only-current restricts results to the invoking session (#77). With
-// CLAUDE_CODE_SESSION_ID=s1, only s1 appears even though s2 also matches — the
-// positive end-to-end path that T-CLI021 (the env-absent usage error) omits.
 #[test]
 fn search_only_current_restricts_to_invoking_session() {
     let dir = TempDir::new().unwrap();
@@ -762,11 +615,6 @@ fn search_only_current_restricts_to_invoking_session() {
     );
 }
 
-// T-CLI021: --only-current without CLAUDE_CODE_SESSION_ID is a usage error (64).
-// resolve_current_session has nothing to filter to, so it returns
-// RecallError::Usage; this pins that it classifies to the sysexits USAGE code end
-// to end (not a crash or a silently empty result). resolve runs before the DB is
-// opened, so no index is needed.
 #[test]
 fn only_current_without_env_exits_usage() {
     let dir = TempDir::new().unwrap();
@@ -776,9 +624,6 @@ fn only_current_without_env_exits_usage() {
     );
 }
 
-// T-CLI024 (#24 Phase 3): `recall classify` reports outcomes end to end, and
-// --dry-run previews without persisting. The session's first user turn is a
-// slash-command wrapper, so it classifies automated.
 #[test]
 fn classify_reports_and_dry_run_previews() {
     let dir = TempDir::new().unwrap();
@@ -850,8 +695,6 @@ fn classify_preview_of_missing_database_keeps_the_path_absent() {
     }
 }
 
-// T-CLI025 (#24 audit/N): a default search surfaces a note that automated sessions
-// are excluded, so an AI-agent consumer can discover --include-automated.
 #[test]
 fn search_notes_automated_exclusion() {
     let dir = TempDir::new().unwrap();
@@ -888,8 +731,6 @@ fn search_notes_automated_exclusion() {
     );
 }
 
-// T-CLI026 (#24 audit/N): when the index has no automated sessions, the search
-// output carries no exclusion note (the hint does not appear spuriously).
 #[test]
 fn search_omits_automated_note_when_none_excluded() {
     let dir = TempDir::new().unwrap();
@@ -921,21 +762,6 @@ fn search_omits_automated_note_when_none_excluded() {
     );
 }
 
-// -- #73 段階2 Phase 4 (AC-3): --no-embed retired (FR-006) --
-//
-// FR-005 (the retired `embed` subcommand) is verified by a main.rs unit test
-// (embed_token_shorthand_expands_to_search): with "embed" dropped from
-// KNOWN_SUBCOMMANDS, `recall embed` shorthand-expands to a search instead of
-// erroring, so the observable is subcommand membership, not an exit code.
-
-// T-006 (FR-006): `recall search <q> --no-embed` is a usage error (64). With the
-// --no-embed arg definition removed, the flag is unknown: clap fails to parse, and
-// handle_parse_error (main.rs:1051) maps every non-help clap error to the sysexits
-// USAGE code (64) — the same mapping T-CLI001 pins for `--no-such-flag`. A bare
-// query is supplied so the failure is the unknown flag, not a missing positional.
-// This spawns the real binary because the parse/dispatch/exit glue is reachable
-// only end to end. Perspective: error (the retired flag must fail, not be silently
-// ignored).
 #[test]
 fn search_no_embed_flag_is_retired_exits_usage() {
     let dir = TempDir::new().unwrap();
@@ -945,10 +771,6 @@ fn search_no_embed_flag_is_retired_exits_usage() {
     );
 }
 
-// T-001 (AC-1): the read commands open an already-indexed DB in a directory the
-// process cannot write to, without emitting SQLite "Error code 14" and without
-// creating any `-wal` / `-shm` sidecar. A read-only directory forces the two-tier
-// open's immutable (tier-2) fallback, so this exercises it end to end.
 #[cfg(unix)]
 #[test]
 fn read_commands_work_in_readonly_directory() {
@@ -958,9 +780,6 @@ fn read_commands_work_in_readonly_directory() {
     seed_indexed_session(dir.path());
 
     let db = dir.path().join("recall.db");
-    // Make the sidecar state deterministic: drop `-wal` / `-shm` so tier 2
-    // (immutable) is exercised rather than an accidental tier-1 success via a
-    // surviving readable `-shm`.
     for suffix in ["-wal", "-shm"] {
         let _ = fs::remove_file(db.with_file_name(format!("recall.db{suffix}")));
     }
@@ -970,8 +789,6 @@ fn read_commands_work_in_readonly_directory() {
     };
     set_mode(0o555);
 
-    // Root bypasses directory permission bits, so the read-only condition cannot
-    // be reproduced; skip the body when skip_if_root detects that.
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -989,7 +806,6 @@ fn read_commands_work_in_readonly_directory() {
         .output()
         .expect("spawn recall binary");
 
-    // Restore before any assertion can panic: a read-only dir breaks TempDir drop.
     set_mode(0o755);
 
     for (name, out) in [
@@ -1009,7 +825,6 @@ fn read_commands_work_in_readonly_directory() {
         );
     }
 
-    // The read-only opens must not have created a sidecar in the directory.
     for suffix in ["-wal", "-shm"] {
         let side = db.with_file_name(format!("recall.db{suffix}"));
         assert!(
@@ -1019,12 +834,6 @@ fn read_commands_work_in_readonly_directory() {
     }
 }
 
-// T-008 (FR-007, AC-5): on the immutable (tier-2) open with a non-empty `-wal`,
-// `search`, `status`, and `doctor` must carry `degraded: true` plus the stale-WAL
-// note in-band. A read-only directory (no `-shm`) forces tier 2, and a non-empty
-// `-wal` triggers `stale_wal_note`; immutable=1 tells SQLite to ignore the `-wal`
-// entirely, so a synthetic (never-parsed) `-wal` is a valid stand-in for
-// un-checkpointed changes the read cannot see.
 #[cfg(unix)]
 #[test]
 fn immutable_open_with_stale_wal_surfaces_degraded_note() {
@@ -1034,9 +843,6 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
     seed_indexed_session(dir.path());
 
     let db = dir.path().join("recall.db");
-    // Deterministic tier-2: drop `-shm` (its absence forces the immutable fallback
-    // in a read-only dir) and replace `-wal` with non-empty bytes so `stale_wal_note`
-    // fires. immutable=1 never reads the `-wal`, so the content need not be valid.
     let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
     fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
 
@@ -1045,7 +851,6 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
     };
     set_mode(0o555);
 
-    // Root bypasses directory permission bits, so tier 2 cannot be forced; skip.
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1075,10 +880,8 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
         .output()
         .expect("spawn recall binary");
 
-    // Restore before any assertion can panic: a read-only dir breaks TempDir drop.
     set_mode(0o755);
 
-    // A preview must not present counts from a snapshot that omits the WAL.
     assert_eq!(
         classify_out.status.code(),
         Some(65),
@@ -1113,10 +916,6 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
             "{name} notes must carry the stale write-ahead-log warning, got: {stdout}"
         );
 
-        // T-003: on a read-only dir the remedy must steer toward copying the DB
-        // together with its -wal/-shm sidecars elsewhere
-        // (`recall index --db-path <copy>`), never a bare `recall index` that
-        // cannot write into the read-only directory.
         let remedy = notes
             .iter()
             .find_map(|n| n.as_str().filter(|s| s.contains("write-ahead log")))
@@ -1127,14 +926,6 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
     }
 }
 
-// ---- U-003: inline root-bypass probes (974-979 / 1043-1048 above) unified
-// onto the shared root_skip::skip_if_root (tests/support/root_skip.rs),
-// mirroring src/db/tests.rs's U-001/U-002, plus an integration-side canary ----
-
-// T-006: the probe-file literal must live only inside root_skip::skip_if_root's
-// own definition (tests/support/root_skip.rs), not duplicated inline in this
-// file. The two permission-bit-dependent tests above already exercise
-// root_skip::skip_if_root as their own #[test]s.
 #[cfg(unix)]
 #[test]
 fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
@@ -1144,7 +935,6 @@ fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
     );
 }
 
-// T-005
 #[cfg(unix)]
 #[test]
 fn integration_canary_は非_root_で_green_root_では_panic_で赤化する() {
@@ -1174,7 +964,6 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
             .output()
             .unwrap()
     };
-    // Repeated index and force rebuild must all report the same unresolved loss.
     for command in ["index", "index", "rebuild"] {
         let out = run(&[command, "--json"]);
         assert_eq!(out.status.code(), Some(0));
@@ -1222,7 +1011,6 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     assert!(human.contains("1 invalid JSON") && human.contains("1 invalid UTF-8"));
     assert!(human.contains("1 incomplete final line") && human.contains("next append"));
     assert!(!human.contains("secret-"));
-    // Repairing the source clears all line loss and makes the replacement searchable.
     fs::write(
         &path,
         [

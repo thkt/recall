@@ -52,7 +52,6 @@ jobs:
         run: |
           cp "target/$TARGET/release/recall" recall
           chmod +x recall
-          # llama.cpp embeds its Metal library in the statically linked backend.
           tar czf "$NAME.tar.gz" recall
 
       - name: Upload artifact
@@ -118,22 +117,16 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
           TAG: ${{ github.ref_name }}
         run: |
-          # Validate version format again
           if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
             echo "::error::Invalid version format: $VERSION"
             exit 1
           fi
 
-          # Validate TAG matches VERSION
           if [[ "$TAG" != "v$VERSION" ]]; then
             echo "::error::TAG ($TAG) does not match VERSION (v$VERSION)"
             exit 1
           fi
 
-          # Locate the archive without assuming the extraction layout:
-          # upload-artifact v7 x download-artifact v8 changed it and broke the
-          # previous hard-coded artifacts/<name>/<name>.tar.gz path (v0.8.0,
-          # run 26935402876), while the release job's glob kept working.
           ARCHIVE=$(find artifacts -name 'recall-aarch64-apple-darwin.tar.gz' -type f | head -1)
           if [ -z "$ARCHIVE" ]; then
             echo "::error::recall-aarch64-apple-darwin.tar.gz not found under artifacts/"
@@ -141,14 +134,11 @@ jobs:
             exit 1
           fi
 
-          # Calculate checksum (Apple Silicon only; mlx backend requires Metal)
           SHA_AARCH64_DARWIN=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
 
-          # Verify macOS archive contains mlx.metallib
-          tar tzf "$ARCHIVE" | grep -q mlx.metallib \
-            || { echo "::error::mlx.metallib missing from macOS archive"; exit 1; }
+          tar tzf "$ARCHIVE" | grep -qx recall \
+            || { echo "::error::recall binary missing from macOS archive"; exit 1; }
 
-          # Generate Formula inline (self-contained; no tap-side template dependency)
           mkdir -p Formula
           cat > Formula/recall.rb << FORMULA
           class Recall < Formula
@@ -165,8 +155,7 @@ jobs:
             end
 
             def install
-              libexec.install "recall", "mlx.metallib"
-              bin.install_symlink libexec/"recall"
+              bin.install "recall"
             end
 
             test do
@@ -175,7 +164,6 @@ jobs:
           end
           FORMULA
 
-          # Remove leading whitespace from heredoc
           sed -i 's/^          //' Formula/recall.rb
 
       - name: Commit and push

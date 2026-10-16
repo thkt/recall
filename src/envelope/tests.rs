@@ -2,9 +2,6 @@ use super::{CommandOutput, ErrorEnvelope, ErrorPayload, SuccessEnvelope};
 use super::{render_json_error, render_json_success};
 use crate::error::ErrorCode;
 
-// T-EN001: error_payload_omits_optional_next_step_when_none
-// Perspective: boundary (None is the empty/min case for the optional field).
-// next_step=None must not emit the key, keeping the envelope compact.
 #[test]
 fn error_payload_omits_optional_next_step_when_none() {
     let payload = ErrorPayload {
@@ -21,9 +18,6 @@ fn error_payload_omits_optional_next_step_when_none() {
     );
 }
 
-// T-EN002: error_payload_omits_candidates_when_empty
-// Perspective: boundary (empty Vec is the min case). An empty candidates list
-// must not emit the key.
 #[test]
 fn error_payload_omits_candidates_when_empty() {
     let payload = ErrorPayload {
@@ -40,10 +34,6 @@ fn error_payload_omits_candidates_when_empty() {
     );
 }
 
-// T-EN003: error_payload_serializes_present_optional_fields
-// Perspective: equivalence (the "guidance present" class — both optional
-// fields populated). next_step=Some and a non-empty candidates list both
-// appear with their values.
 #[test]
 fn error_payload_serializes_present_optional_fields() {
     let payload = ErrorPayload {
@@ -64,11 +54,6 @@ fn error_payload_serializes_present_optional_fields() {
     );
 }
 
-// T-EN004: error_payload_renders_code_in_context
-// Perspective: equivalence (the code field renders the enum to its
-// SCREAMING_SNAKE_CASE string when nested in a payload). The exhaustive
-// variant table lives in error.rs (T-ERR002); this pins the in-context
-// rendering this module owns, plus the retryable=true class.
 #[test]
 fn error_payload_renders_code_in_context() {
     let payload = ErrorPayload {
@@ -89,9 +74,6 @@ fn error_payload_renders_code_in_context() {
     );
 }
 
-// T-EN005: error_envelope_wraps_payload_under_error_key
-// Perspective: equivalence (the wrap shape). The envelope is a single object
-// whose only key is `error`, and the nested payload carries the code.
 #[test]
 fn error_envelope_wraps_payload_under_error_key() {
     let env = ErrorEnvelope {
@@ -114,9 +96,6 @@ fn error_envelope_wraps_payload_under_error_key() {
     );
 }
 
-// T-EN006: success_envelope_serializes_required_fields
-// Perspective: equivalence (the ideal-path shape — not degraded, no notes).
-// data, degraded, and notes are always present, even when notes is empty.
 #[test]
 fn success_envelope_serializes_required_fields() {
     let env = SuccessEnvelope {
@@ -139,9 +118,6 @@ fn success_envelope_serializes_required_fields() {
     );
 }
 
-// T-EN007: success_envelope_surfaces_degradation_with_notes
-// Perspective: equivalence (the degraded class — semantic search unavailable,
-// FTS fallback taken). degraded=true plus a populated note both surface.
 #[test]
 fn success_envelope_surfaces_degradation_with_notes() {
     let env = SuccessEnvelope {
@@ -160,10 +136,6 @@ fn success_envelope_surfaces_degradation_with_notes() {
     );
 }
 
-// T-EN008: render_json_success_serializes_command_output
-// Perspective: equivalence (the renderer maps a non-degraded CommandOutput to
-// the success wire shape). The data payload, degraded=false, and empty notes
-// all round-trip through the renderer.
 #[test]
 fn render_json_success_serializes_command_output() {
     let out = CommandOutput::ok(
@@ -185,9 +157,6 @@ fn render_json_success_serializes_command_output() {
     );
 }
 
-// T-EN009: render_json_success_surfaces_notes
-// Perspective: equivalence (the renderer carries degradation through). A
-// with_notes CommandOutput surfaces degraded=true and the note text.
 #[test]
 fn render_json_success_surfaces_notes() {
     let out = CommandOutput::with_notes(
@@ -207,10 +176,6 @@ fn render_json_success_surfaces_notes() {
     );
 }
 
-// T-EN010: render_json_error_wraps_payload
-// Perspective: equivalence (the error renderer maps a prepared envelope to the
-// wire shape). The `{"error":...}` wrap, the code string, and retryable=true
-// all survive serialization.
 #[test]
 fn render_json_error_wraps_payload() {
     let env = ErrorEnvelope {
@@ -237,10 +202,6 @@ fn render_json_error_wraps_payload() {
     );
 }
 
-// T-EN011: render_json_error_marks_non_retryable
-// Perspective: condition (the false side of retryable). A usage error renders
-// retryable=false — the complement of T-EN010's true case, so the field is
-// proven to vary, not hard-coded.
 #[test]
 fn render_json_error_marks_non_retryable() {
     let env = ErrorEnvelope {

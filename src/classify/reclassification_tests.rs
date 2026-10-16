@@ -60,8 +60,6 @@ fn assert_retryable(error: &anyhow::Error) {
 
 #[test]
 fn database_commits_invalidate_the_whole_attempt_even_when_values_return_to_the_snapshot() {
-    // Each case commits through another connection at a controlled boundary.
-    // Restored values catch implementations that compare only current row fields.
     for mutation in [
         "label",
         "source_path",
@@ -140,8 +138,6 @@ fn an_insert_after_an_empty_snapshot_is_included_on_retry() {
 fn source_changes_during_read_and_before_apply_discard_old_candidates() {
     for boundary in ["before_read", "after_read", "before_apply"] {
         for mutation in ["append", "replace", "delete", "recover", "permissions"] {
-            // Only replacement/deletion distinguish retaining the opened file
-            // from reopening its path; other mutations use the existing hooks.
             if boundary == "before_read" && !matches!(mutation, "replace" | "delete") {
                 continue;
             }
@@ -178,7 +174,6 @@ fn source_changes_during_read_and_before_apply_discard_old_candidates() {
                 }
                 _ => unreachable!(),
             };
-            // RefCell coordinates two deterministic hooks without sleeps/threads.
             let mutate_once = RefCell::new(|| {
                 if !changed {
                     mutate();
@@ -199,8 +194,6 @@ fn source_changes_during_read_and_before_apply_discard_old_candidates() {
                         && retries.get() == 0
                         && matches!(mutation, "replace" | "delete")
                     {
-                        // The already-open input remains readable after the path
-                        // changes; reopening here would read another file or fail.
                         assert_eq!(origin, Ok(true));
                     }
                     if boundary == "after_read" {

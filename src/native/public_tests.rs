@@ -1,4 +1,3 @@
-//! Public, synthetic inputs only. CI stages the checksum-pinned artifacts.
 use super::*;
 use crate::model::hash_file;
 use std::{env, time::Duration};
@@ -43,13 +42,8 @@ fn public_model_contract() {
         "short inputs must not load the offset tokenizer"
     );
 
-    // Sequence ownership must survive both the 32-sequence and token-budget
-    // packing boundaries. Distinct alternating inputs catch swapped owners or
-    // attention leaking between documents in the same native batch.
     let texts: Vec<_> = (0..33).map(|i| samples[i % samples.len()]).collect();
     for budget in [None, Some(1)] {
-        // The sequence-limit case needs 33 inputs; three distinct owners are
-        // sufficient for repeated flushes with a one-token packing budget.
         let inputs = if budget.is_some() {
             &texts[..3]
         } else {
@@ -105,12 +99,8 @@ fn public_model_contract() {
             if target > MAX_TOKENS {
                 assert_eq!(tokens.last(), Some(&model.vocab().eos()));
             }
-            // Exercise growing native contexts without a quadratic 8192-token
-            // inference on CI's CPU fallback. Full-length inference was also
-            // measured against the private frozen vectors on Apple M3.
-            // Short query/document inference already uses the initial 512
-            // context above; one 513-token encode checks actual growth.
             if target == 513 {
+                // Full-length inference is measured on M3; avoid quadratic work on CPU CI.
                 unit_vector(
                     &Gemma::encode(&model, &[tokens], &EmbedOptions::default()).unwrap()[0],
                 );
@@ -137,8 +127,6 @@ fn public_model_contract() {
         assert_eq!(end, long.len());
     }
     assert!(gemma.tokenizer.get().unwrap().is_ok());
-    // A missing tokenizer is harmless for short inputs but must fail closed
-    // when a long input needs offsets; never silently truncate the document.
     let broken = Gemma {
         model: gemma.model,
         tokenizer: OnceLock::new(),

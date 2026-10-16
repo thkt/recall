@@ -13,44 +13,20 @@ use tracing::warn;
 
 const FTS_TOKENIZER: &str = "trigram";
 
-/// Which open strategy `open_db_readonly` succeeded with. `Direct` reads a live
-/// `-wal` fresh via the existing `-shm`; `Immutable` was forced by a read-only
-/// directory and cannot see un-checkpointed `-wal` changes (see `stale_wal_note`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenTier {
     Direct,
+    // Immutable reads ignore WAL sidecars; callers must report stale snapshots.
     Immutable,
 }
 
-/// On-disk schema compatibility with read commands, derived from `sqlite_master`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaState {
-    /// No `sessions` table: recall never indexed this DB.
     Empty,
-    /// Current shape: usable by the read commands as-is.
     Current,
-    /// Present but incompatible with read commands; a read-only open cannot
-    /// migrate it, so the read commands hard-fail (see main.rs).
     Stale,
 }
 
-/// Open the index without changing persistent DB/WAL contents or schema.
-/// SQLite may create sidecars and update `-shm` for reader coordination in a
-/// writable directory. This is the read-command counterpart to [`open_db`]; the write
-/// path is left untouched (SOW NFR-001). The failed-open diagnosis path may
-/// create and remove a transient `.recall-write-probe-<pid>` file in the DB's
-/// parent directory (see [`dir_write_probe_fails`]); the DB itself stays untouched.
-///
-/// Tier 1 opens with `SQLITE_OPEN_READ_ONLY`, which in a writable directory reads
-/// a live `-wal` fresh via the existing `-shm`. `open_with_flags` is lazy (it does
-/// not touch the DB file until the first query), so a read-only directory does not
-/// fail at open: a WAL-mode DB needs to create the `-shm`/`-wal` sidecars on the
-/// first read and fails there with `SQLITE_READONLY_DIRECTORY`. We therefore probe
-/// with a `sqlite_master` read and, only on that read-only-directory error, fall back
-/// to tier 2: an `immutable=1` URI that tells SQLite the DB and its `-wal` will not
-/// change, so it reads without any sidecar. Any other error (missing/unreadable file,
-/// EMFILE, TOCTOU deletion, corruption) propagates unchanged rather than being masked
-/// by a doomed second open.
 pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {
     ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
@@ -72,29 +48,10 @@ pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {
     }
 }
 
-/// Force the pager to touch the DB file: reading `sqlite_master` opens page 1,
-/// which for a WAL-mode DB requires the `-shm`/`-wal` sidecars and thus surfaces a
-/// read-only-directory failure that lazy `open_with_flags` hid.
 fn probe_readable(conn: &Connection) -> rusqlite::Result<()> {
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
 }
 
-/// True only when a WAL-mode read failed *because its directory is read-only*, the sole
-/// cause that justifies the tier-2 `immutable=1` fallback (which disables change
-/// detection). A read-only directory blocks sidecar creation, surfacing as either
-/// `CannotOpen` (a missing `-shm` cannot be created; extended code 14) or `ReadOnly`
-/// (a needed rollback journal / `-wal` cannot be created; includes
-/// `SQLITE_READONLY_DIRECTORY` 1544). Those primary codes are ambiguous on their own,
-/// so we additionally require the directory to be genuinely unwritable: a missing or
-/// unreadable DB file, an fd exhaustion (EMFILE), or a TOCTOU deletion also surface as
-/// `CannotOpen`/`ReadOnly` but occur in a *writable* directory, where `immutable=1`
-/// cannot help and would either mask a real error or read a still-mutating DB as frozen.
-/// Corruption (`SQLITE_CORRUPT` -> `DatabaseCorrupt`) is a different primary code and
-/// never matches, so it always propagates.
-///
-/// Directory writability is judged by [`dir_is_unwritable`]; see its doc for the two
-/// signals (mode bits, then an empirical write probe) and the treated-as-writable
-/// ambiguous cases.
 fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
     let sidecar_failure = matches!(
         e.sqlite_error_code(),
@@ -103,14 +60,6 @@ fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
     sidecar_failure && dir_is_unwritable(db_path)
 }
 
-/// True when the DB file's parent directory is unwritable, checked via two signals in
-/// order. First, permission mode bits (e.g. `chmod 0o555`), which is independent of the
-/// effective uid (a root process still sees `0o555` as read-only) and never touches the
-/// filesystem's write path. Only when those bits still look writable does it fall back
-/// to [`dir_write_probe_fails`], an empirical write attempt that also catches a genuine
-/// read-only mount (DMG, network share, most external media) whose directory bits still
-/// read `0o755`. A missing parent or unreadable metadata is treated as writable, so an
-/// ambiguous error propagates instead of being masked by the `immutable=1` fallback.
 fn dir_is_unwritable(db_path: &Path) -> bool {
     let Some(dir) = db_path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return false;
@@ -121,19 +70,6 @@ fn dir_is_unwritable(db_path: &Path) -> bool {
     meta.permissions().readonly() || dir_write_probe_fails(dir)
 }
 
-/// True when `dir` rejects file creation (read-only mount, or write bits
-/// cleared as in `chmod 0o555`), determined empirically rather than from
-/// permission mode bits (unlike [`dir_is_unwritable`]): a `.recall-write-probe-<pid>`
-/// file is created with `create_new` (so it never collides with or clobbers an
-/// existing file) and immediately removed on success. Returns `true` only for
-/// `PermissionDenied` / `ReadOnlyFilesystem`; any other failure (e.g. `NotFound`
-/// from a missing directory, or an uncategorized error such as EMFILE) returns
-/// `false` so the caller falls back to propagating the original error instead of
-/// misreporting an ambiguous failure as a read-only directory.
-///
-/// Called from [`dir_is_unwritable`] only when the mode-bits check finds the
-/// directory writable, to also catch a read-only mount whose directory bits
-/// still read `0o755`.
 fn dir_write_probe_fails(dir: &Path) -> bool {
     let probe = dir.join(format!(".recall-write-probe-{}", process::id()));
     match fs::OpenOptions::new()
@@ -152,15 +88,12 @@ fn dir_write_probe_fails(dir: &Path) -> bool {
     }
 }
 
-/// Remove the transient write-probe file, warning instead of failing the read
-/// when the cleanup cannot complete and the probe file litters the directory.
 fn remove_write_probe(probe: &Path) {
     if let Err(e) = fs::remove_file(probe) {
         warn!(probe = %probe.display(), error = %e, "failed to remove write probe");
     }
 }
 
-/// Tier 2: reopen via an `immutable=1` URI, which reads without any sidecar.
 fn open_immutable(path: &Path, flags: OpenFlags) -> Result<(Connection, OpenTier)> {
     let uri = format!("file:{}?immutable=1", encode_uri_path(path));
     let conn = Connection::open_with_flags(uri, flags)?;
@@ -168,10 +101,6 @@ fn open_immutable(path: &Path, flags: OpenFlags) -> Result<(Connection, OpenTier
     Ok((conn, OpenTier::Immutable))
 }
 
-/// Percent-encode a filesystem path for use in a `file:` URI. Every byte outside
-/// the RFC 3986 unreserved set is escaped; `/` is kept as the path separator.
-/// Hand-rolled (no new dependency) since the only caller is the immutable-open
-/// fallback and the input is an absolute local path.
 fn encode_uri_path(path: &Path) -> String {
     let mut out = String::new();
     for &b in path.as_os_str().as_encoded_bytes() {
@@ -185,30 +114,21 @@ fn encode_uri_path(path: &Path) -> String {
     out
 }
 
-/// The `-wal` sidecar path for a DB file (`<path>-wal`).
 fn wal_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push("-wal");
     PathBuf::from(s)
 }
 
-/// Check read compatibility using `sqlite_master` only (never writes).
-/// Write-only migrations, such as chunk generation tracking, do not make a
-/// readable index stale; [`open_db`] applies them before writing.
 pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
     let Some(sessions_sql) = table_def(conn, "sessions")? else {
         return Ok(SchemaState::Empty);
     };
 
-    // A core table missing while `sessions` exists is a crash artifact: it would
-    // pass every "nothing to migrate" sniff yet leak a raw `no such table` error
-    // to the caller, so treat it as stale (needs a rebuild).
     let (Some(messages_sql), Some(qa_sql), Some(vec_sql), Some(_)) = (
         table_def(conn, "messages")?,
         table_def(conn, "qa_chunks")?,
         table_def(conn, "vec_chunks")?,
-        // Presence-only: `search` hard-requires this fts5vocab table but its DDL
-        // has no versioned shape to sniff, so a missing one is a crash artifact.
         table_def(conn, "messages_vocab")?,
     ) else {
         return Ok(SchemaState::Stale);
@@ -227,12 +147,6 @@ pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
     })
 }
 
-/// A warning when the immutable (tier-2) open cannot see un-checkpointed `-wal`
-/// changes. Returns `None` on the `Direct` tier (SQLite reads the `-wal` fresh
-/// there, so a note would be a false positive), when `<path>-wal` is absent or
-/// empty, and when its stat fails (e.g. EACCES — suppressing the advice on an
-/// ambiguous error is the safe default). No checkpoint is performed
-/// (byte-for-byte constraint, SOW assumption 3).
 pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
     if tier != OpenTier::Immutable {
         return None;
@@ -256,10 +170,6 @@ pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
 pub fn open_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
     let mut conn = Connection::open(path)?;
-    // 30s, not 5s: the FTS index pass holds one write tx for 3-12s on a full
-    // tree (#130 D3, measured at 38k chunks), so concurrent SessionEnd hooks
-    // lost their run to SQLITE_BUSY at 5s. 30s absorbs the longest observed
-    // window; hooks run in the background, so the wait is invisible.
     conn.busy_timeout(Duration::from_secs(30))?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
@@ -294,9 +204,6 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     migrate_files_scanned_if_needed(conn)?;
     migrate_file_size_if_needed(conn)?;
 
-    // embedded_chunk_ids (a removed ledger) was dropped inside two separate
-    // migrations; collapse those into one unconditional drop so every pre-cleanup
-    // DB ends up without it after open_db.
     conn.execute_batch("DROP TABLE IF EXISTS embedded_chunk_ids;")?;
 
     conn.execute_batch(
@@ -359,8 +266,6 @@ fn migrate_parse_diagnostics_if_needed(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
         return Ok(());
     }
-    // File-scoped rather than session-scoped: even a file with no usable
-    // messages can have unresolved loss. CREATE also upgrades older indexes.
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS parse_diagnostics (
             file_path TEXT PRIMARY KEY,
@@ -372,16 +277,11 @@ fn migrate_parse_diagnostics_if_needed(conn: &mut Connection) -> Result<()> {
         );",
     )?;
 
-    // Older runs recorded no line-loss state. Re-read once to establish it;
-    // embedded sessions still use the ordinary preserve-until-model gate.
     tx.execute("UPDATE sessions SET mtime = NULL", [])?;
     tx.commit()?;
     Ok(())
 }
 
-/// NULL means the stored body has no known size, so it must be re-read before
-/// freshness can skip it. Do not backfill from today's file metadata: that could
-/// acknowledge an append that the legacy body never included.
 fn migrate_file_size_if_needed(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if !table_def(&tx, "sessions")?.is_some_and(|sql| sql.contains("file_size")) {
@@ -391,13 +291,8 @@ fn migrate_file_size_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// A persistent counter prevents ABA (delete/reinsert or old/new/old updates),
-/// including equal-text replacements. Triggers cover every INSERT and input
-/// UPDATE, while rowid-link backfills leave the generation alone. Legacy rows
-/// can share generation 0: validation also checks their ID and exact content.
-/// No chunks or embeddings are discarded. Check the shape under a writer lock
-/// so two processes upgrading the same old DB cannot both ADD the column.
 fn migrate_qa_chunk_generation_if_needed(conn: &mut Connection) -> Result<()> {
+    // Global generations distinguish deleted/reused chunk IDs from old inference snapshots.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if !table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("generation")) {
         tx.execute_batch(
@@ -427,11 +322,6 @@ fn migrate_qa_chunk_generation_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Fetch a table's stored `CREATE` SQL from `sqlite_master`, or `None` if it
-/// does not exist. Virtual tables (fts5, vec0) are stored with `type='table'`,
-/// so this resolves regular and virtual tables alike. `pub(crate)` so schema
-/// introspection stays in this module (search's `--file` legacy-DB gate probes
-/// through it instead of hand-rolling a second sqlite_master query).
 pub(crate) fn table_def(conn: &Connection, name: &str) -> Result<Option<String>> {
     match conn.query_row(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
@@ -444,12 +334,6 @@ pub(crate) fn table_def(conn: &Connection, name: &str) -> Result<Option<String>>
     }
 }
 
-/// Embeddings live only in this vec0 table, so a `DROP` here discards them and
-/// the next `recall index` re-embeds the whole corpus (minutes to hours on MLX).
-/// The legacy pre-sub_idx drop below predates that understanding and is kept
-/// as-is; any FUTURE vec_chunks schema migration must instead carry the
-/// embedding blobs across (stage `SELECT rowid, embedding, chunk_id, sub_idx`
-/// into a temp table, recreate vec_chunks, re-insert) rather than drop them.
 fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "vec_chunks")? else {
         return Ok(());
@@ -465,10 +349,6 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Drop the write-only columns (chunk_hash / user_text / assistant_text) from
-/// pre-cleanup databases. ALTER ... DROP COLUMN keeps content / id and the
-/// vec_chunks linkage by chunk_id intact, so existing embeddings survive without
-/// a re-index. The removed embedded_chunk_ids ledger is dropped in create_schema.
 fn migrate_qa_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "qa_chunks")? else {
         return Ok(());
@@ -488,11 +368,6 @@ fn migrate_qa_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add src_rowid_lo/hi to pre-#192 databases. ALTER ... ADD COLUMN keeps every
-/// existing row with the two columns NULL, so legacy chunks route through the
-/// instr fallback in fetch_chunks. qa_chunks.id is unchanged, so vec_chunks
-/// embeddings survive without a re-embed. `backfill_rowid_ranges` (indexer)
-/// populates the NULL rows on the next `recall index`.
 fn migrate_qa_chunk_rowid_link_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "qa_chunks")? else {
         return Ok(());
@@ -510,10 +385,6 @@ fn migrate_qa_chunk_rowid_link_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add session_type to pre-classification databases. ALTER ... ADD COLUMN keeps
-/// every existing row (the new column is NULL, treated as interactive by the
-/// search filter), so no re-index is forced — retroactive tagging is the explicit
-/// `recall classify` command's job (#24).
 fn migrate_session_type_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "sessions")? else {
         return Ok(());
@@ -528,10 +399,6 @@ fn migrate_session_type_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Add files_scanned to pre-session_files databases. ALTER ... ADD COLUMN keeps
-/// every existing row (the new column is NULL, meaning the session's scanned-file
-/// set has not been recorded yet), so no re-index is forced — the marker is
-/// populated on the next `recall index` alongside the session_files rows.
 fn migrate_files_scanned_if_needed(conn: &mut Connection) -> Result<()> {
     let Some(sql) = table_def(conn, "sessions")? else {
         return Ok(());
@@ -546,10 +413,6 @@ fn migrate_files_scanned_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Existing chunks were committed atomically by index_chunks, including legacy
-/// NULL-range chunks. Preserve their ids/embeddings; only sessions without chunks
-/// need a first pass. The column and backfill commit together, so interrupted
-/// upgrades cannot leave existing chunks marked pending and duplicate them.
 fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction()?;
     if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("chunks_indexed")) {
@@ -592,8 +455,6 @@ pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
     (dir, conn)
 }
 
-/// Seeds the minimal valid session row used across test modules. Centralizes
-/// the named-column INSERT so new nullable columns use their defaults.
 #[cfg(test)]
 pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     conn.execute(
@@ -603,8 +464,6 @@ pub(crate) fn seed_session(conn: &Connection, session_id: &str) {
     .unwrap();
 }
 
-/// Seeds one `session_files` row. Centralizes the INSERT like `seed_session`,
-/// so a session_files schema change breaks one helper, not every fixture.
 #[cfg(test)]
 pub(crate) fn seed_session_file(conn: &Connection, session_id: &str, path: &str) {
     conn.execute(
@@ -614,8 +473,6 @@ pub(crate) fn seed_session_file(conn: &Connection, session_id: &str, path: &str)
     .unwrap();
 }
 
-/// Seeds one qa_chunk for the default test session `s1` with timestamp 0.
-/// Sites that need another session or a real timestamp keep their inline INSERT.
 #[cfg(test)]
 pub(crate) fn seed_chunk(conn: &Connection, id: i64, content: &str) {
     conn.execute(
