@@ -118,6 +118,26 @@ fn cache_child() {
             let app = env::var("__MODEL_CACHE_TEST_APP").unwrap();
             download_artifacts(&app, &spec, &cache_dir(&app, &spec)).unwrap();
         }
+        "public-reuse" => {
+            let spec = ModelSpec::default();
+            let root = cache_dir("recall", &spec);
+            let legacy = home.join(".cache/sae/models/existing-model");
+            assert!(
+                !root.exists(),
+                "the public-model fixture must start without a shared cache"
+            );
+            for app in ["recall", "sae"] {
+                assert_eq!(cache_dir(app, &spec), root);
+                assert_eq!(
+                    cached_artifacts(app, &spec, &cache_dir(app, &spec)).unwrap(),
+                    Some(root.clone())
+                );
+            }
+            #[cfg(unix)]
+            for (name, _, _) in artifacts(&spec) {
+                same_file(&legacy.join(name), &root.join(name));
+            }
+        }
         "exit-with-lock" => {
             let _lock = lock_cache(&shared).unwrap();
             process::exit(0);
@@ -333,24 +353,32 @@ fn cache_lock_survives_process_exit_without_stale_locking() {
 }
 
 #[test]
-#[ignore = "requires explicitly staged public model artifacts in a fixture HOME"]
+#[ignore = "requires explicitly staged public model artifacts"]
 fn public_existing_model_is_reused_without_network_or_inference() {
-    let spec = ModelSpec::default();
-    let root = cache_dir("recall", &spec);
-    let legacy = legacy_dirs();
-    assert!(!legacy.is_empty(), "stage an old sae or recall cache first");
-    assert_eq!(
-        cached_artifacts("recall", &spec, &root).unwrap(),
-        Some(root.clone())
-    );
-    assert_eq!(
-        cached_artifacts("sae", &spec, &cache_dir("sae", &spec)).unwrap(),
-        Some(root.clone())
-    );
-    #[cfg(unix)]
-    for (name, _, _) in artifacts(&spec) {
-        same_file(&legacy[0].join(name), &root.join(name));
+    let source = [
+        "SAE_MODEL_DIR",
+        "RECALL_MODEL_DIR",
+        "RECALL_GEMMA_TEST_ARTIFACT_DIR",
+    ]
+    .into_iter()
+    .find_map(env::var_os)
+    .map(PathBuf::from)
+    .expect("stage pinned artifacts in SAE_MODEL_DIR or RECALL_MODEL_DIR");
+    let home = tempfile::tempdir().unwrap();
+    let legacy = home.path().join(".cache/sae/models/existing-model");
+    fs::create_dir_all(&legacy).unwrap();
+    for (name, _, _) in artifacts(&ModelSpec::default()) {
+        if fs::hard_link(source.join(name), legacy.join(name)).is_err() {
+            fs::copy(source.join(name), legacy.join(name)).unwrap();
+        }
     }
+    // The child removes explicit model overrides, just like the normal default-cache path.
+    assert!(
+        child(home.path(), "public-reuse")
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]
