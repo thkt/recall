@@ -132,7 +132,13 @@ recall model manifest > gemma-manifest.json   # 対応するモデル・索引�
 ```
 
 重みとtokenizerはロード前にSHA-256を検証します。取得・更新は明示操作で、searchやindexから
-自動downloadはしません。`RECALL_MODEL_DIR` で `model.gguf` と `tokenizer.json` のあるディレクトリを指定できます。
+自動downloadはしません。既定の保存先はsaeと共通の `~/.cache/embedding-models/<artifact-sha256>/` です。
+基点は `HF_HOME`、絶対パスの `XDG_CACHE_HOME`、`~/.cache` の順に選びます。
+共通キーはモデルとtokenizerのSHA-256をこの順に改行で区切り、末尾にも改行を付けた文字列のSHA-256です。
+旧 `recall/models/`・`sae/models/` 配下のファイルはchecksum確認後に自動で再利用します。
+同じファイルシステムではハードリンクで容量を増やさず共有し、ハードリンクを作れない場合は検証付きコピーを使います。
+旧ファイルは旧版用に残し、同時取得はファイルロックで直列化します。
+`RECALL_MODEL_DIR` で `model.gguf` と `tokenizer.json` のあるディレクトリを明示すると、そちらを優先し、旧キャッシュの自動取込みは行いません。
 
 既定の索引は `~/.local/share/recall/indexes/<manifest-sha256>/recall.db` です
 （絶対パスの `XDG_DATA_HOME` があればその配下）。`--db-path` / `RECALL_DB` で変更できますが、
