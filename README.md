@@ -145,7 +145,16 @@ recall model manifest > gemma-manifest.json   # archive with the matching model 
 
 The model and tokenizer are verified by SHA-256 before loading. Downloads and
 updates are explicit; search and index never download a model automatically.
-`RECALL_MODEL_DIR` can select a directory containing `model.gguf` and `tokenizer.json`.
+The default cache is `~/.cache/embedding-models/<artifact-sha256>/`, shared with sae.
+`HF_HOME` takes precedence over absolute `XDG_CACHE_HOME` as the cache base. The key
+is SHA-256 of the model checksum, a newline, the tokenizer checksum, and a final
+newline; app-specific index identities do not affect it. Both CLIs automatically
+reuse checksum-verified files from their old `recall/models/` and `sae/models/`
+caches. Reuse creates hard links without duplicating bytes on the same filesystem;
+a verified copy is used if hard links are unavailable. Old files stay available for
+older binaries. Concurrent installs share a process-safe lock.
+`RECALL_MODEL_DIR` still selects an explicit directory containing `model.gguf` and
+`tokenizer.json`; it takes precedence and disables automatic legacy import.
 
 The default index is `~/.local/share/recall/indexes/<manifest-sha256>/recall.db`
 (or under absolute `XDG_DATA_HOME`). `--db-path` / `RECALL_DB` overrides the path,

@@ -1,10 +1,8 @@
 use crate::{
     embedding::Embed,
     native::{Gemma, gpu_available},
-    runtime::home_dir,
 };
 use anyhow::{Context, Result, ensure};
-use reqwest::blocking::Client;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +17,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[path = "model/cache.rs"]
+mod cache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,35 +148,10 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(digest_hex(&h.finalize()))
 }
 pub fn cache_dir() -> PathBuf {
-    if let Some(p) = env::var_os("RECALL_MODEL_DIR") {
-        return p.into();
-    }
-    let base = env::var_os("HF_HOME")
-        .map(PathBuf::from)
-        .map(|p| p.join("recall"))
-        .or_else(|| {
-            env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|p| p.join("recall"))
-        })
-        .unwrap_or_else(|| home_dir().unwrap_or_default().join(".cache/recall"));
-    base.join("models").join(selected().identity())
+    cache::cache_dir("recall", selected())
 }
 pub fn cached_artifacts() -> Result<Option<PathBuf>> {
-    let root = cache_dir();
-    if !root.join("model.gguf").is_file() || !root.join("tokenizer.json").is_file() {
-        return Ok(None);
-    }
-    ensure!(
-        hash_file(&root.join("model.gguf"))? == selected().model_sha256,
-        "model checksum mismatch"
-    );
-    ensure!(
-        hash_file(&root.join("tokenizer.json"))? == selected().tokenizer_sha256,
-        "tokenizer checksum mismatch"
-    );
-    Ok(Some(root))
+    cache::cached_artifacts("recall", selected(), &cache_dir())
 }
 fn load_verified() -> Result<Arc<dyn Embed>> {
     let root = cached_artifacts()?.context("model not installed")?;
@@ -345,38 +321,8 @@ fn install_artifact(root: &Path, name: &str, expected: &str, reader: &mut impl R
     result
 }
 pub fn download_and_verify_model() -> Result<(), ModelDownloadError> {
-    let install = (|| -> Result<()> {
-        let root = cache_dir();
-        fs::create_dir_all(&root)?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(600))
-            .build()?;
-        for (name, url, expected) in [
-            (
-                "model.gguf",
-                &selected().model_url,
-                &selected().model_sha256,
-            ),
-            (
-                "tokenizer.json",
-                &selected().tokenizer_url,
-                &selected().tokenizer_sha256,
-            ),
-        ] {
-            let dest = root.join(name);
-            if dest.exists() && hash_file(&dest)? == *expected {
-                continue;
-            }
-            install_artifact(
-                &root,
-                name,
-                expected,
-                &mut client.get(url).send()?.error_for_status()?,
-            )?;
-        }
-        Ok(())
-    })();
-    install.map_err(|e| ModelDownloadError::DownloadFailed(e.to_string()))?;
+    cache::download_artifacts("recall", selected(), &cache_dir())
+        .map_err(|e| ModelDownloadError::DownloadFailed(e.to_string()))?;
     match probe() {
         Ok(true) => Ok(()),
         Ok(false) => Err(ModelDownloadError::BackendUnavailable),

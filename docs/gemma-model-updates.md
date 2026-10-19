@@ -48,7 +48,12 @@ recall --model-manifest gemma-current.json --db-path /absolute/test/gemma.db sea
 ```
 
 `recall model download` installs only the selected manifest's pinned HTTPS
-artifacts. Downloads are verified before atomic replacement and a separate child
+artifacts. Both sae and recall use `~/.cache/embedding-models/<artifact-sha256>/`
+(or under `HF_HOME`, then absolute `XDG_CACHE_HOME`) for the same model/tokenizer
+bytes. Verified existing app caches are imported automatically with hard links
+where possible; old paths and app-specific index fingerprints stay intact.
+Explicit `RECALL_MODEL_DIR` selects its own directory and bypasses legacy import.
+Downloads are serialized with a shared file lock and verified before atomic replacement; a separate child
 process probes the model before normal loading. A timeout kills and reaps that child.
 There are no automatic model downloads on search/index and no automatic updates.
 
