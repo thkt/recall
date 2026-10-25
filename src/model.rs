@@ -150,16 +150,23 @@ pub fn hash_file(path: &Path) -> Result<String> {
 pub fn cache_dir() -> PathBuf {
     cache::cache_dir("recall", selected())
 }
-pub fn cached_artifacts() -> Result<Option<PathBuf>> {
-    cache::cached_artifacts("recall", selected(), &cache_dir())
+pub struct VerifiedArtifacts {
+    root: PathBuf,
 }
-fn load_verified() -> Result<Arc<dyn Embed>> {
-    let root = cached_artifacts()?.context("model not installed")?;
-    Ok(Arc::new(Gemma::load(
-        &root.join("model.gguf"),
-        &root.join("tokenizer.json"),
-        selected().clone(),
-    )?))
+
+impl VerifiedArtifacts {
+    fn load(&self) -> Result<Arc<dyn Embed>> {
+        Ok(Arc::new(Gemma::load(
+            &self.root.join("model.gguf"),
+            &self.root.join("tokenizer.json"),
+            selected().clone(),
+        )?))
+    }
+}
+
+pub fn cached_artifacts() -> Result<Option<VerifiedArtifacts>> {
+    Ok(cache::cached_artifacts("recall", selected(), &cache_dir())?
+        .map(|root| VerifiedArtifacts { root }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +233,8 @@ pub fn handle_probe_if_needed() {
         if !gpu_available()? {
             process::exit(2);
         }
-        let model = load_verified()?;
+        let artifacts = cached_artifacts()?.context("model not installed")?;
+        let model = artifacts.load()?;
         let v = model.embed_query("model probe")?;
         ensure!(
             v.len() == 768 && v.iter().all(|x| x.is_finite()),
@@ -268,19 +276,19 @@ fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
     }
 }
 pub fn try_load_embedder_default_logging() -> Result<Arc<dyn Embed>, DegradedReason> {
-    match cached_artifacts() {
+    let artifacts = match cached_artifacts() {
         Ok(None) => return Err(DegradedReason::NotInstalled),
         Err(error) => {
             tracing::warn!(%error,"model artifact validation failed");
             return Err(DegradedReason::ProbeFailed);
         }
-        Ok(Some(_)) => {}
-    }
+        Ok(Some(artifacts)) => artifacts,
+    };
     match probe() {
         Ok(false) => Err(DegradedReason::BackendUnavailable),
-        Ok(true) => {
-            load_verified().map_err(degrade_with_warn("model load", DegradedReason::ProbeFailed))
-        }
+        Ok(true) => artifacts
+            .load()
+            .map_err(degrade_with_warn("model load", DegradedReason::ProbeFailed)),
         Err(error) => Err(degrade_with_warn(
             "model probe",
             DegradedReason::ProbeFailed,

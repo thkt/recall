@@ -287,6 +287,38 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
     }
 }
 
+#[test]
+fn mixed_record_shapes_preserve_role_precedence_and_boolean_metadata() {
+    let tmp = write_jsonl(&[
+        "null",
+        r#"{"type":"progress","cwd":"/project","slug":"from-progress","timestamp":100}"#,
+        r#"{"type":"assistant","role":"user","isMeta":"true","isSidechain":"true","message":"question"}"#,
+        r#"{"type":"human","role":"assistant","message":{"content":"follow-up"}}"#,
+        r#"{"role":"assistant","content":[{"type":"text","text":"answer"}]}"#,
+        r#"{"type":"user","isMeta":true,"cwd":"/ignored","timestamp":1,"message":"meta"}"#,
+    ]);
+    let parsed = parse_claude_session(tmp.path()).unwrap().unwrap();
+    let messages: Vec<_> = parsed
+        .messages
+        .iter()
+        .map(|m| (m.role, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            (Role::User, "question"),
+            (Role::User, "follow-up"),
+            (Role::Assistant, "answer")
+        ]
+    );
+    assert_eq!(parsed.metadata.project, "/project");
+    assert_eq!(parsed.metadata.slug, "from-progress");
+    assert_eq!(parsed.metadata.timestamp, Some(100));
+    assert!(parsed.origin.has_records);
+    assert!(!parsed.origin.automated);
+    assert!(parsed.diagnostics.is_empty());
+}
+
 fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
     let parsed = super::parse_claude_session(path)?;
     if let Some(full) = &parsed {

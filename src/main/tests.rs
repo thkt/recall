@@ -1601,7 +1601,7 @@ fn doctor_fix_breakdown_lists_every_repair_even_when_clean() {
     assert_eq!(
         repaired.keys().collect::<Vec<_>>(),
         vec!["orphan_embeddings"],
-        "the breakdown freezes exactly the REPAIRS names, got: {}",
+        "the breakdown includes only the orphan_embeddings repair, got: {}",
         out.data
     );
     assert_eq!(
