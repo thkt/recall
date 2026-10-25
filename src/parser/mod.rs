@@ -130,13 +130,17 @@ pub(crate) fn parse_classification(
     let (session_id, origin, diagnostics) = match source {
         Source::Claude => {
             let mut origin = ClaudeOrigin::new(path, &session_id);
-            let diagnostics = scan_jsonl_reader(file, |entry| origin.observe(entry))?;
+            let diagnostics = scan_jsonl_reader(file, |entry| {
+                origin.observe(&claude::ClaudeEntry::from_json(entry));
+            })?;
             let origin = origin.finish();
             (session_id, origin, diagnostics)
         }
         Source::Codex => {
             let mut origin = CodexOrigin::new(session_id);
-            let diagnostics = scan_jsonl_reader(file, |entry| origin.observe(entry))?;
+            let diagnostics = scan_jsonl_reader(file, |entry| {
+                origin.observe(&codex::CodexEntry::from_json(entry));
+            })?;
             let (session_id, origin) = origin.finish();
             (session_id, origin, diagnostics)
         }
@@ -167,10 +171,9 @@ pub(super) fn extract_tool_use_path(block: &Value) -> Option<&str> {
         .get("file_path")
         .or_else(|| input.get("notebook_path"))
         .and_then(|v| v.as_str())
-}
-
-pub(super) fn is_valid_scanned_path(path: &str) -> bool {
-    !path.is_empty() && !path.contains(['\n', '\r']) && path.len() <= MAX_SCANNED_PATH_LEN
+        .filter(|path| {
+            !path.is_empty() && !path.contains(['\n', '\r']) && path.len() <= MAX_SCANNED_PATH_LEN
+        })
 }
 
 pub fn strip_noise_tags(mut result: String) -> String {
@@ -313,18 +316,14 @@ pub(super) fn parse_jsonl_entries(
     path: &Path,
     mut process: impl FnMut(&Value) -> Option<Message>,
 ) -> Result<(Vec<Message>, LineDiagnostics)> {
+    let file = File::open(path).context("Failed to open session file")?;
     let mut messages = Vec::new();
-    let diagnostics = scan_jsonl_entries(path, |entry| {
+    let diagnostics = scan_jsonl_reader(file, |entry| {
         if let Some(message) = process(entry) {
             messages.push(message);
         }
     })?;
     Ok((messages, diagnostics))
-}
-
-fn scan_jsonl_entries(path: &Path, process: impl FnMut(&Value)) -> Result<LineDiagnostics> {
-    let file = File::open(path).context("Failed to open session file")?;
-    scan_jsonl_reader(file, process)
 }
 
 fn scan_jsonl_reader(file: File, mut process: impl FnMut(&Value)) -> Result<LineDiagnostics> {

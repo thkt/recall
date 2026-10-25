@@ -2,6 +2,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::claude::ClaudeEntry;
+use super::codex::CodexEntry;
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SessionOrigin {
     pub automated: bool,
@@ -105,30 +108,22 @@ impl<'a> ClaudeOrigin<'a> {
         }
     }
 
-    pub fn observe(&mut self, entry: &Value) {
-        if !matches!(
-            entry.get("type").and_then(Value::as_str),
-            Some("user" | "human" | "assistant")
-        ) && !matches!(
-            entry.get("role").and_then(Value::as_str),
-            Some("user" | "assistant")
-        ) {
+    pub fn observe(&mut self, entry: &ClaudeEntry<'_>) {
+        if entry.role.is_none() {
             return;
         }
-        let is_meta = entry.get("isMeta").and_then(Value::as_bool) == Some(true);
-        let sidechain = entry.get("isSidechain").and_then(Value::as_bool) == Some(true);
-        if !is_meta {
+        if !entry.is_meta {
             self.origin.has_records = true;
-            self.origin.automated |= sidechain;
+            self.origin.automated |= entry.sidechain;
         }
-        let id = entry.get("sessionId").and_then(Value::as_str);
+        let id = entry.session_id;
         if let Some(id) = id {
             self.origin.identity_conflict |= id != self.session_id && Some(id) != self.parent;
         }
         self.legacy_identity_matches = self.legacy_identity_matches
-            && !is_meta
-            && sidechain
-            && entry.get("agentId").and_then(Value::as_str) == self.agent_id
+            && !entry.is_meta
+            && entry.sidechain
+            && entry.agent_id == self.agent_id
             && id.is_some_and(is_uuid);
         if self.legacy_identity_matches
             && let Some(id) = id
@@ -160,39 +155,24 @@ impl CodexOrigin {
         }
     }
 
-    pub fn observe(&mut self, entry: &Value) {
-        match entry.get("type").and_then(Value::as_str).unwrap_or("") {
-            "session_meta" => {
-                let payload = entry.get("payload").unwrap_or(&Value::Null);
-                if let Some(id) = payload.get("id").and_then(Value::as_str)
-                    && !id.is_empty()
-                {
-                    self.origin.has_records = true;
-                    self.origin.automated |= codex_automated(payload);
-                    self.origin.identity_conflict |=
-                        self.metadata_id.as_deref().is_some_and(|prev| prev != id);
-                    self.metadata_id = Some(id.to_owned());
-                    if self.session_id.starts_with("rollout-") {
-                        self.session_id = id.to_owned();
-                    }
+    pub fn observe(&mut self, entry: &CodexEntry<'_>) {
+        match entry {
+            CodexEntry::Metadata {
+                id: Some(id),
+                automated,
+                ..
+            } => {
+                self.origin.has_records = true;
+                self.origin.automated |= automated;
+                self.origin.identity_conflict |=
+                    self.metadata_id.as_deref().is_some_and(|prev| prev != *id);
+                self.metadata_id = Some((*id).to_owned());
+                if self.session_id.starts_with("rollout-") {
+                    self.session_id = (*id).to_owned();
                 }
             }
-            "response_item" => {
-                self.origin.has_records |= matches!(
-                    entry
-                        .get("payload")
-                        .and_then(|p| p.get("role"))
-                        .and_then(Value::as_str),
-                    Some("user" | "assistant")
-                );
-            }
-            "event_msg" | "turn_context" => {}
-            _ => {
-                self.origin.has_records |= matches!(
-                    entry.get("role").and_then(Value::as_str),
-                    Some("user" | "assistant")
-                );
-            }
+            CodexEntry::Message { .. } => self.origin.has_records = true,
+            _ => {}
         }
     }
 

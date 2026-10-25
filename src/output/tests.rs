@@ -1,6 +1,6 @@
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Write};
 
-use super::{WriteOutcome, classify_write, write_output, write_result};
+use super::{WriteOutcome, write_output, write_result};
 
 #[test]
 fn write_output_appends_newline_when_missing() {
@@ -23,21 +23,34 @@ fn write_output_preserves_trailing_blank_line() {
     assert_eq!(&buf, b"hello\n\n");
 }
 
-#[test]
-fn classify_write_maps_ok_to_written() {
-    assert_eq!(classify_write(Ok(())).unwrap(), WriteOutcome::Written);
+struct FailingWriter(ErrorKind);
+
+impl Write for FailingWriter {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from(self.0))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
-fn classify_write_maps_broken_pipe_to_pipe_closed() {
-    let result = Err(io::Error::from(ErrorKind::BrokenPipe));
-    assert_eq!(classify_write(result).unwrap(), WriteOutcome::PipeClosed);
+fn write_result_maps_broken_pipe_to_pipe_closed() {
+    assert_eq!(
+        write_result(&mut FailingWriter(ErrorKind::BrokenPipe), "hi").unwrap(),
+        WriteOutcome::PipeClosed
+    );
 }
 
 #[test]
-fn classify_write_propagates_other_error() {
-    let result = Err(io::Error::other("disk full"));
-    assert_eq!(classify_write(result).unwrap_err().kind(), ErrorKind::Other);
+fn write_result_propagates_other_error() {
+    assert_eq!(
+        write_result(&mut FailingWriter(ErrorKind::Other), "hi")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Other
+    );
 }
 
 #[test]

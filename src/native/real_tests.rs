@@ -56,21 +56,23 @@ fn real_model_boundaries_coverage_and_frozen_query_parity() {
         assert!(windows.len() > 1);
         let mut end = 0;
         for w in &windows {
-            assert!(w.byte_start <= end && w.byte_end > w.byte_start);
-            assert!(doc.is_char_boundary(w.byte_start) && doc.is_char_boundary(w.byte_end));
+            assert!(w.byte_range.start <= end && !w.byte_range.is_empty());
+            assert!(
+                doc.is_char_boundary(w.byte_range.start) && doc.is_char_boundary(w.byte_range.end)
+            );
             assert!(w.tokens.len() <= MAX_TOKENS);
             let exact = model.vocab().tokenize(
                 format!(
                     "{}{}",
                     gemma.spec.document_prefix,
-                    &doc[w.byte_start..w.byte_end]
+                    &doc[w.byte_range.clone()]
                 )
                 .as_bytes(),
                 true,
                 false,
             );
             assert_eq!(w.tokens, exact);
-            end = end.max(w.byte_end);
+            end = end.max(w.byte_range.end);
         }
         assert_eq!(end, doc.len());
         checks.push(serde_json::json!({"long_document_UTF8_bytes":doc.len(),"windows":windows.len(),"all_bytes_covered":true,"all_retokenized_within_8192":true}));

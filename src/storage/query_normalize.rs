@@ -49,13 +49,9 @@ pub fn normalize_for_fts(text: &str, config: &QueryNormalizationConfig) -> Strin
         buf.make_ascii_lowercase();
     }
     if config.collapse_whitespace {
-        buf = collapse_whitespace(&buf);
+        buf = buf.split_whitespace().collect::<Vec<_>>().join(" ");
     }
     buf
-}
-
-fn collapse_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
