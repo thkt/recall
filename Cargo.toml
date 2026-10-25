@@ -1,6 +1,6 @@
 [package]
 name = "recall"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 rust-version = "1.99.1"
 description = "Full-text search CLI for past Claude Code and Codex sessions"
