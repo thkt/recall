@@ -91,9 +91,9 @@ fn probe_distinguishes_success_unavailable_failure_and_reaps_timeouts() {
 #[ignore = "requires explicitly staged public model artifacts"]
 fn public_model_contract_cache_and_loader() {
     assert!(env::var_os("RECALL_MODEL_DIR").is_some());
-    let root = cached_artifacts().unwrap().unwrap();
-    assert!(root.join("model.gguf").is_file());
-    let model = load_verified().unwrap();
+    let artifacts = cached_artifacts().unwrap().unwrap();
+    assert!(artifacts.root.join("model.gguf").is_file());
+    let model = artifacts.load().unwrap();
     assert_eq!(
         model
             .embed_query("public cache verification")

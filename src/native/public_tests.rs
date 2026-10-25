@@ -111,8 +111,8 @@ fn public_model_contract() {
         assert!(windows.len() > 1);
         let mut end = 0;
         for window in windows {
-            assert!(window.byte_start <= end && window.byte_end > window.byte_start);
-            let text = long.get(window.byte_start..window.byte_end).unwrap();
+            assert!(window.byte_range.start <= end && !window.byte_range.is_empty());
+            let text = long.get(window.byte_range.clone()).unwrap();
             assert_eq!(
                 window.tokens,
                 model.vocab().tokenize(
@@ -122,7 +122,7 @@ fn public_model_contract() {
                 )
             );
             assert!(window.tokens.len() <= MAX_TOKENS);
-            end = end.max(window.byte_end);
+            end = end.max(window.byte_range.end);
         }
         assert_eq!(end, long.len());
     }

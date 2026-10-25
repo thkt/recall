@@ -10,6 +10,8 @@ use llama_cpp_2::{
     model::{LlamaModel, params::LlamaModelParams},
     token::LlamaToken,
 };
+#[cfg(test)]
+use std::ops::Range;
 use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
@@ -53,8 +55,8 @@ pub struct Gemma {
 }
 struct DocumentWindow {
     tokens: Vec<LlamaToken>,
-    byte_start: usize,
-    byte_end: usize,
+    #[cfg(test)]
+    byte_range: Range<usize>,
 }
 impl Gemma {
     pub fn load(path: &Path, tokenizer: &Path, spec: ModelSpec) -> Result<Self> {
@@ -161,8 +163,8 @@ impl Gemma {
             ensure!(!full.is_empty(), "empty token sequence");
             return Ok(vec![DocumentWindow {
                 tokens: full,
-                byte_start: 0,
-                byte_end: text.len(),
+                #[cfg(test)]
+                byte_range: 0..text.len(),
             }]);
         }
         let raw = self
@@ -184,7 +186,7 @@ impl Gemma {
         while start < count {
             let mut end = (start + budget).min(count);
             let lo = if start == 0 { 0 } else { offsets[start].0 };
-            let (hi, tokens) = loop {
+            let window = loop {
                 ensure!(end > start, "document cannot fit");
                 let hi = if end == count {
                     text.len()
@@ -196,15 +198,15 @@ impl Gemma {
                     .context("tokenizer offset is not UTF-8 aligned")?;
                 let t = tokenize(slice);
                 if t.len() <= MAX_TOKENS {
-                    break (hi, t);
+                    break DocumentWindow {
+                        tokens: t,
+                        #[cfg(test)]
+                        byte_range: lo..hi,
+                    };
                 }
                 end -= 1;
             };
-            result.push(DocumentWindow {
-                tokens,
-                byte_start: lo,
-                byte_end: hi,
-            });
+            result.push(window);
             if end == count {
                 break;
             }
@@ -266,8 +268,6 @@ impl Embed for Gemma {
         };
         for (i, text) in texts.iter().enumerate() {
             for window in self.document_tokens(&m, text)? {
-                text.get(window.byte_start..window.byte_end)
-                    .context("invalid window coverage")?;
                 let tokens = window.tokens;
                 if !batch.is_empty() && (batch.len() == 32 || count + tokens.len() > budget) {
                     flush(&mut batch, &mut owners, &mut out)?;
