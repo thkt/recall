@@ -111,37 +111,25 @@ fn append_search_filters(
         suffix.push_str(&escape_like(file));
         params.push(Box::new(suffix));
     }
-    append_current_session_filter(sql, params, column, &opts.current);
-    append_automated_filter(sql, column, opts.include_automated);
-}
-
-fn append_current_session_filter(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn ToSql>>,
-    column: &'static str,
-    current: &CurrentSession,
-) {
-    let (op, id) = match current {
-        CurrentSession::Ignore => return,
-        CurrentSession::Exclude(id) => (" <> ?", id),
-        CurrentSession::Only(id) => (" = ?", id),
+    let current = match &opts.current {
+        CurrentSession::Ignore => None,
+        CurrentSession::Exclude(id) => Some((" <> ?", id)),
+        CurrentSession::Only(id) => Some((" = ?", id)),
     };
-    sql.push_str(" AND ");
-    sql.push_str(column);
-    sql.push_str(op);
-    params.push(Box::new(id.clone()));
-}
-
-fn append_automated_filter(sql: &mut String, column: &'static str, include_automated: bool) {
-    if include_automated {
-        return;
+    if let Some((op, id)) = current {
+        sql.push_str(" AND ");
+        sql.push_str(column);
+        sql.push_str(op);
+        params.push(Box::new(id.clone()));
     }
-    sql.push_str(" AND ");
-    sql.push_str(column);
-    sql.push_str(
-        " IN (SELECT s3.session_id FROM sessions s3 \
-         WHERE COALESCE(s3.session_type, 'interactive') <> 'automated')",
-    );
+    if !opts.include_automated {
+        sql.push_str(" AND ");
+        sql.push_str(column);
+        sql.push_str(
+            " IN (SELECT s3.session_id FROM sessions s3 \
+             WHERE COALESCE(s3.session_type, 'interactive') <> 'automated')",
+        );
+    }
 }
 
 fn build_fts_candidate_query(
@@ -399,9 +387,7 @@ fn vec_search(
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<(String, i64)>> {
-    let embedding = embedder
-        .embed_query(query)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let embedding = embedder.embed_query(query)?;
     let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
 
     let mut sql = String::from(

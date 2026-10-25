@@ -188,6 +188,35 @@ fn provenance_accepts_known_wire_shapes_and_fails_open_on_unknown_or_malformed_v
     );
 }
 
+#[test]
+fn mixed_record_shapes_keep_payload_roles_and_legacy_project_context() {
+    let tmp = write_jsonl(&[
+        "null",
+        r#"{"type":"session_meta","payload":{"id":17,"thread_source":"subagent"}}"#,
+        r#"{"type":"event_msg","role":"user","content":"ignored event"}"#,
+        r#"{"type":"turn_context","role":"assistant","content":"ignored context"}"#,
+        r#"{"type":"response_item","role":"user","payload":{"role":"developer","content":"ignored developer"}}"#,
+        r#"{"type":"response_item","payload":{"role":17,"content":"ignored malformed role"}}"#,
+        r#"{"type":"legacy","role":"user","content":[{"type":"input_text","text":"<environment_context>\nCurrent working directory: /legacy\n</environment_context>"}]}"#,
+        r#"{"type":"response_item","role":"assistant","payload":{"role":"user","content":"question"}}"#,
+        r#"{"role":"assistant","content":"answer"}"#,
+    ]);
+    let parsed = parse_codex_session(tmp.path()).unwrap().unwrap();
+    let messages: Vec<_> = parsed
+        .messages
+        .iter()
+        .map(|m| (m.role, m.text.as_str()))
+        .collect();
+    assert_eq!(
+        messages,
+        [(Role::User, "question"), (Role::Assistant, "answer")]
+    );
+    assert_eq!(parsed.metadata.project, "/legacy");
+    assert!(parsed.origin.has_records);
+    assert!(!parsed.origin.automated);
+    assert!(parsed.diagnostics.is_empty());
+}
+
 fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
     let parsed = super::parse_codex_session(path)?;
     if let Some(full) = &parsed {

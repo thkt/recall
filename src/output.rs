@@ -15,11 +15,7 @@ pub enum WriteOutcome {
 }
 
 pub fn write_result<W: Write>(w: &mut W, output: &str) -> io::Result<WriteOutcome> {
-    classify_write(write_output(w, output))
-}
-
-fn classify_write(result: io::Result<()>) -> io::Result<WriteOutcome> {
-    match result {
+    match write_output(w, output) {
         Ok(()) => Ok(WriteOutcome::Written),
         Err(e) if e.kind() == ErrorKind::BrokenPipe => Ok(WriteOutcome::PipeClosed),
         Err(e) => Err(e),

@@ -337,30 +337,6 @@ fn parse_token_budget(s: &str) -> Result<usize, ParseIntError> {
     Ok(value.min(embedder::TOKEN_BUDGET_CEILING))
 }
 
-fn run_index(
-    db_path: &Option<PathBuf>,
-    token_budget: Option<usize>,
-    forward_pause_ms: Option<u64>,
-) -> Result<IndexOutcome> {
-    index_and_report(
-        db_path,
-        false,
-        embed_options_from_flags(token_budget, forward_pause_ms),
-    )
-}
-
-fn run_rebuild(
-    db_path: &Option<PathBuf>,
-    token_budget: Option<usize>,
-    forward_pause_ms: Option<u64>,
-) -> Result<IndexOutcome> {
-    index_and_report(
-        db_path,
-        true,
-        embed_options_from_flags(token_budget, forward_pause_ms),
-    )
-}
-
 fn embed_options_from_flags(
     token_budget: Option<usize>,
     forward_pause_ms: Option<u64>,
@@ -619,7 +595,7 @@ where
     }
 
     let preserved_embedded = stats.preserved_embedded;
-    let outcome: Result<IndexOutcome> = match load_result {
+    let mut outcome = match load_result {
         Ok(embedder) => {
             let result = embedder::embed_pending_observed(
                 &mut conn,
@@ -629,7 +605,7 @@ where
                 observer,
             )?;
             result.warn_if_batches_failed();
-            Ok(IndexOutcome {
+            IndexOutcome {
                 degraded_note: None,
                 embedded: result.embedded,
                 failed_count: result.failed_count,
@@ -638,24 +614,23 @@ where
                 preserved_embedded,
                 parse_diagnostics,
                 observations: serde_json::Value::Null,
-            })
+            }
         }
         Err(reason) => {
             let extraction = observer.stage("pending_extraction");
             let pending_total = embedder::pending_count(&conn)?;
             extraction.finish("complete");
             observer.start_embedding(pending_total);
-            Ok(IndexOutcome {
+            IndexOutcome {
                 degraded_note: search_degraded_note(reason),
                 skipped_roots,
                 preserved_embedded,
                 parse_diagnostics,
                 ..IndexOutcome::default()
-            })
+            }
         }
     };
     pipeline.finish("complete; see counts for deferred or failed work");
-    let mut outcome: IndexOutcome = outcome?;
     outcome.observations = observer.snapshot();
     Ok(outcome)
 }
@@ -675,10 +650,6 @@ fn embed_all_pending(
     )?;
     result.warn_if_batches_failed();
     Ok(result)
-}
-
-fn run_model_download() -> Result<()> {
-    download_and_verify_model().map_err(|e| download_error(&e).into())
 }
 
 fn search_idle_message(session_count: i64) -> Option<&'static str> {
@@ -1339,29 +1310,9 @@ fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
     Ok(deleted)
 }
 
-struct Repair {
-    name: &'static str,
-    action: fn(&Connection) -> Result<usize>,
-}
-
 struct RepairOutcome {
     name: &'static str,
     result: Result<usize>,
-}
-
-const REPAIRS: &[Repair] = &[Repair {
-    name: "orphan_embeddings",
-    action: fix_orphan_embeddings,
-}];
-
-fn run_repairs(conn: &Connection) -> Vec<RepairOutcome> {
-    REPAIRS
-        .iter()
-        .map(|r| RepairOutcome {
-            name: r.name,
-            result: (r.action)(conn),
-        })
-        .collect()
 }
 
 fn check_orphan_chunks(conn: &Connection) -> Result<DoctorCheck> {
@@ -1491,7 +1442,10 @@ where
         } else {
             match open_or_create_db(&path) {
                 Ok(conn) => {
-                    repairs = Some(run_repairs(&conn));
+                    repairs = Some(vec![RepairOutcome {
+                        name: "orphan_embeddings",
+                        result: fix_orphan_embeddings(&conn),
+                    }]);
                     vec![
                         run_db_check("integrity", || check_integrity(&conn)),
                         run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
@@ -2093,19 +2047,22 @@ fn run(cli: Cli) -> Result<CommandOutput> {
     init_subscriber(default_filter);
 
     match cli.command {
-        Some(Command::Index { embed_flags }) => run_index(
+        Some(Command::Index { embed_flags }) => index_and_report(
             &cli.db_path,
-            embed_flags.token_budget,
-            embed_flags.forward_pause_ms,
+            false,
+            embed_options_from_flags(embed_flags.token_budget, embed_flags.forward_pause_ms),
         )
         .map(|o| index_command_output(&o)),
-        Some(Command::Rebuild { embed_flags }) => run_rebuild(
+        Some(Command::Rebuild { embed_flags }) => index_and_report(
             &cli.db_path,
-            embed_flags.token_budget,
-            embed_flags.forward_pause_ms,
+            true,
+            embed_options_from_flags(embed_flags.token_budget, embed_flags.forward_pause_ms),
         )
         .map(|o| index_command_output(&o)),
-        Some(Command::Model(ModelCommand::Download)) => run_model_download().map(|()| no_payload()),
+        Some(Command::Model(ModelCommand::Download)) => {
+            download_and_verify_model().map_err(|e| download_error(&e))?;
+            Ok(no_payload())
+        }
         Some(Command::Model(ModelCommand::Manifest)) => {
             let data = serde_json::to_value(model::selected())?;
             Ok(CommandOutput::ok(

@@ -28,7 +28,7 @@ pub enum SchemaState {
 }
 
 pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {
-    ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
+    ensure_sqlite_vec()?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
 
     match Connection::open_with_flags(path, flags) {
@@ -168,7 +168,7 @@ pub fn stale_wal_note(path: &Path, tier: OpenTier) -> Option<String> {
 }
 
 pub fn open_db(path: &Path) -> Result<Connection> {
-    ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e))?;
+    ensure_sqlite_vec()?;
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(30))?;
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
