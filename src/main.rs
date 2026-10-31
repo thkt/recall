@@ -33,7 +33,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::embedding::Embed;
-use crate::model::cached_artifacts;
 use crate::model::handle_probe_if_needed;
 use crate::model::{
     DegradedReason, EmbedderDegraded, download_and_verify_model, record_degraded,
@@ -269,80 +268,6 @@ fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
             "database schema is out of date; run `recall rebuild` to migrate it".to_owned(),
         )),
     }
-}
-
-fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    let path = resolve_db_path(db_path)?;
-
-    let model_ok = cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false);
-
-    if !path.exists() {
-        cli_info(&format!("database not found at {}", path.display()));
-        cli_info("run `recall index` to create the index.");
-        return Ok(CommandOutput::ok(
-            String::new(),
-            serde_json::json!({
-                "sessions": 0,
-                "qa_chunks": 0,
-                "embedded": 0,
-                "model_ready": model_ok,
-            }),
-        ));
-    }
-
-    let (conn, tier) = db::open_db_readonly(&path)?;
-
-    let (sessions, chunks, embedded) = match db::schema_state(&conn)? {
-        db::SchemaState::Empty => (0, 0, 0),
-        state => {
-            require_current_schema(state)?;
-            let sessions: i64 =
-                conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-            let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
-            let embedded: i64 =
-                conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
-                    r.get(0)
-                })?;
-            (sessions, chunks, embedded)
-        }
-    };
-
-    let mut buf = Vec::new();
-    let _ = writeln!(buf, "Sessions: {sessions}");
-    let _ = writeln!(buf, "QA chunks: {chunks}");
-    let _ = writeln!(buf, "Embedded: {embedded}/{chunks}");
-    let _ = writeln!(
-        buf,
-        "Model: {}",
-        if model_ok {
-            "ready"
-        } else {
-            "not installed (run `recall model download`)"
-        }
-    );
-    if verbose {
-        let _ = writeln!(buf, "DB: {}", path.display());
-    }
-    let markdown = String::from_utf8_lossy(&buf).into_owned();
-    let data = serde_json::json!({
-        "sessions": sessions,
-        "qa_chunks": chunks,
-        "embedded": embedded,
-        "model_ready": model_ok,
-    });
-
-    let mut notes: Vec<_> = db::stale_wal_note(&path, tier).into_iter().collect();
-    if let Err(error) = model::check_index(&conn, model::selected()) {
-        notes.push(format!(
-            "semantic search unavailable: {error}; results are text-only"
-        ));
-    }
-    Ok(CommandOutput::with_notes(
-        markdown,
-        data,
-        !notes.is_empty(),
-        notes,
-    ))
 }
 
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
@@ -717,7 +642,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
             window,
         }) => commands::show::run_show(&session_id, cli.verbose, chunk, window, &cli.db_path),
         Some(Command::Classify { all, dry_run }) => run_classify(all, dry_run, &cli.db_path),
-        Some(Command::Status) => run_status(cli.verbose, &cli.db_path),
+        Some(Command::Status) => commands::status::run_status(cli.verbose, &cli.db_path),
         Some(Command::Doctor { fix }) => {
             commands::doctor::run_doctor(cli.verbose, fix, &cli.db_path)
         }
