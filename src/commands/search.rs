@@ -84,14 +84,8 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
     }
 }
 
-fn search_idle_message(session_count: i64) -> Option<&'static str> {
-    (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
-}
-
 fn search_idle_output() -> CommandOutput {
-    if let Some(msg) = search_idle_message(0) {
-        done(msg);
-    }
+    done("No sessions indexed. Run `recall index` first.");
     CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
 }
 
@@ -179,7 +173,7 @@ where
     let wal_note = db::stale_wal_note(&path, tier);
 
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-    if search_idle_message(session_count).is_some() {
+    if session_count == 0 {
         return Ok(search_idle_output());
     }
 

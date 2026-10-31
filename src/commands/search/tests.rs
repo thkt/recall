@@ -203,15 +203,6 @@ fn test_format_result_empty_excerpt() {
 }
 
 #[test]
-fn test_search_idle_message_only_when_unindexed() {
-    assert_eq!(
-        search_idle_message(0),
-        Some("No sessions indexed. Run `recall index` first.")
-    );
-    assert_eq!(search_idle_message(5), None);
-}
-
-#[test]
 fn test_subagent_file_path_shows_parent_session() {
     let r = search::SearchResult {
         session: parser::SessionData {
@@ -254,6 +245,25 @@ fn run_search_on_existing_empty_db_returns_idle() {
         "an empty DB search must return zero results, got: {}",
         out.data
     );
+}
+
+#[test]
+fn search_on_indexed_db_without_sessions_returns_idle_without_loading_model() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    drop(open_or_create_db(&db_path).unwrap());
+
+    let out = run_search_with(
+        search_command("anything"),
+        &Some(db_path),
+        || -> Result<Arc<dyn Embed>, DegradedReason> {
+            panic!("a DB with no sessions must short-circuit before loading the model")
+        },
+    )
+    .unwrap();
+
+    assert_eq!(out.data, serde_json::json!({ "results": [] }));
+    assert!(!out.degraded, "an idle search is not degraded");
 }
 
 #[test]
