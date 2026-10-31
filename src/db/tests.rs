@@ -2,6 +2,10 @@ use super::*;
 use crate::embedder::f32_as_bytes;
 use tempfile::NamedTempFile;
 
+use crate::embedder;
+use crate::open_or_create_db;
+use crate::tests::seed_healthy_index;
+
 #[test]
 fn test_open_db_creates_schema() {
     let tmp = NamedTempFile::new().unwrap();
@@ -1088,4 +1092,46 @@ fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
         .unwrap(),
         2
     );
+}
+
+#[test]
+fn fix_orphan_embeddings_deletes_only_dangling_rows() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
+    seed_healthy_index(&conn);
+    let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
+        rusqlite::params![embedder::f32_as_bytes(&orphan)],
+    )
+    .unwrap();
+
+    let deleted = fix_orphan_embeddings(&conn).unwrap();
+
+    assert_eq!(deleted, 1, "only the dangling chunk_id=999 row is deleted");
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 1, "the linked chunk_id=1 row must survive");
+}
+
+#[test]
+fn fix_orphan_embeddings_is_noop_when_clean() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
+    seed_healthy_index(&conn);
+
+    let deleted = fix_orphan_embeddings(&conn).unwrap();
+
+    assert_eq!(deleted, 0, "a clean index has nothing to repair");
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 1, "the linked row must be untouched");
+}
+
+#[test]
+fn fix_orphan_embeddings_errors_when_table_missing() {
+    let conn = Connection::open_in_memory().unwrap();
+    assert!(fix_orphan_embeddings(&conn).is_err());
 }

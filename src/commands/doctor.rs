@@ -7,12 +7,13 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::db;
+use crate::db::fix_orphan_embeddings;
 use crate::embedding::{EMBEDDING_DIMS, Embed};
 use crate::envelope::CommandOutput;
 use crate::error::{RecallError, download_error};
 use crate::model::{self, DegradedReason, download_and_verify_model};
 use crate::runtime::info as cli_info;
-use crate::{fix_orphan_embeddings, open_or_create_db, resolve_db_path, try_load_embedder_cached};
+use crate::{open_or_create_db, resolve_db_path, try_load_embedder_cached};
 
 struct DoctorCheck {
     name: &'static str,
