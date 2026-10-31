@@ -3,7 +3,7 @@ use std::assert_matches;
 use std::fs;
 
 use super::*;
-use crate::commands::search::run_search_with;
+use crate::commands::search::{SearchArgs, run_search_with};
 
 #[cfg(unix)]
 #[test]
@@ -897,8 +897,8 @@ fn run_status_on_existing_empty_db_reports_zero_counts() {
     assert_eq!(out.data["embedded"], 0);
 }
 
-pub(crate) fn search_command(query: &str) -> Command {
-    Command::Search {
+pub(crate) fn search_command(query: &str) -> SearchArgs {
+    SearchArgs {
         query: Some(query.to_owned()),
         project: None,
         days: None,

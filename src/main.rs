@@ -97,55 +97,7 @@ enum Command {
     #[command(subcommand)]
     Model(ModelCommand),
     /// Search indexed sessions (default when query is provided)
-    Search {
-        /// Search query. Optional when `--file` is given: a query-less
-        /// `--file <path>` lists the sessions that touched the path, newest
-        /// first. A call with neither a query nor `--file` is a usage error —
-        /// rejected declaratively here, with `file_list_outcome` keeping the
-        /// same guard for direct (non-CLI) callers.
-        #[arg(required_unless_present = "file")]
-        query: Option<String>,
-
-        /// Filter by project path (prefix match)
-        #[arg(long)]
-        project: Option<String>,
-
-        /// Only sessions from last N days
-        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
-        days: Option<i64>,
-
-        /// Filter by source
-        #[arg(long, value_enum)]
-        source: Option<Source>,
-
-        /// Restrict to sessions that touched this file (exact path, or a
-        /// basename / tail sub-path suffix). While Codex file extraction is
-        /// unsupported, Codex sessions record no files and are never matched.
-        #[arg(long)]
-        file: Option<String>,
-
-        /// Max results (1..=100)
-        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
-        limit: u16,
-
-        /// Exclude the invoking Claude Code session from results. Default when
-        /// CLAUDE_CODE_SESSION_ID is set (recall run from inside a session).
-        #[arg(long, conflicts_with_all = ["include_current", "only_current"])]
-        exclude_current: bool,
-
-        /// Include the invoking session even when CLAUDE_CODE_SESSION_ID is set.
-        #[arg(long, conflicts_with_all = ["exclude_current", "only_current"])]
-        include_current: bool,
-
-        /// Return only the invoking session (requires CLAUDE_CODE_SESSION_ID).
-        #[arg(long, conflicts_with_all = ["exclude_current", "include_current"])]
-        only_current: bool,
-
-        /// Include sessions classified automated (hook/script/agent-generated).
-        /// Default excludes them.
-        #[arg(long)]
-        include_automated: bool,
-    },
+    Search(commands::search::SearchArgs),
     /// Show full conversation of a session
     Show {
         /// Session ID (prefix match supported)
@@ -1044,7 +996,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
                 data,
             ))
         }
-        Some(cmd @ Command::Search { .. }) => commands::search::run_search(cmd, &cli.db_path),
+        Some(Command::Search(args)) => commands::search::run_search(args, &cli.db_path),
         Some(Command::Show {
             session_id,
             chunk,

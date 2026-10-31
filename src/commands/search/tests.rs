@@ -300,7 +300,7 @@ fn run_search_query_less_file_list_skips_embedder_and_stays_nominal() {
     }
 
     let out = run_search_with(
-        Command::Search {
+        SearchArgs {
             query: None,
             project: None,
             days: None,

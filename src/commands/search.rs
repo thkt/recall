@@ -4,15 +4,68 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
+use clap::Args;
 use tracing::warn;
 
 use crate::embedding::Embed;
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::model::{self, DegradedReason, EmbedderDegraded};
+use crate::parser::Source;
 use crate::runtime::done;
-use crate::{Command, ansi, db, search};
+use crate::{ansi, db, search};
 use crate::{format_timestamp, require_current_schema, resolve_db_path, try_load_embedder_cached};
+
+#[derive(Debug, Args)]
+pub(crate) struct SearchArgs {
+    /// Search query. Optional when `--file` is given: a query-less
+    /// `--file <path>` lists the sessions that touched the path, newest
+    /// first. A call with neither a query nor `--file` is a usage error —
+    /// rejected declaratively here, with `file_list_outcome` keeping the
+    /// same guard for direct (non-CLI) callers.
+    #[arg(required_unless_present = "file")]
+    pub(crate) query: Option<String>,
+
+    /// Filter by project path (prefix match)
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+
+    /// Only sessions from last N days
+    #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
+    pub(crate) days: Option<i64>,
+
+    /// Filter by source
+    #[arg(long, value_enum)]
+    pub(crate) source: Option<Source>,
+
+    /// Restrict to sessions that touched this file (exact path, or a
+    /// basename / tail sub-path suffix). While Codex file extraction is
+    /// unsupported, Codex sessions record no files and are never matched.
+    #[arg(long)]
+    pub(crate) file: Option<String>,
+
+    /// Max results (1..=100)
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
+    pub(crate) limit: u16,
+
+    /// Exclude the invoking Claude Code session from results. Default when
+    /// CLAUDE_CODE_SESSION_ID is set (recall run from inside a session).
+    #[arg(long, conflicts_with_all = ["include_current", "only_current"])]
+    pub(crate) exclude_current: bool,
+
+    /// Include the invoking session even when CLAUDE_CODE_SESSION_ID is set.
+    #[arg(long, conflicts_with_all = ["exclude_current", "only_current"])]
+    pub(crate) include_current: bool,
+
+    /// Return only the invoking session (requires CLAUDE_CODE_SESSION_ID).
+    #[arg(long, conflicts_with_all = ["exclude_current", "include_current"])]
+    pub(crate) only_current: bool,
+
+    /// Include sessions classified automated (hook/script/agent-generated).
+    /// Default excludes them.
+    #[arg(long)]
+    pub(crate) include_automated: bool,
+}
 
 fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
     EmbedderDegraded(reason)
@@ -78,19 +131,19 @@ fn resolve_current_session(
     }
 }
 
-pub(crate) fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    run_search_with(cmd, db_path, try_load_embedder_cached)
+pub(crate) fn run_search(args: SearchArgs, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    run_search_with(args, db_path, try_load_embedder_cached)
 }
 
 pub(crate) fn run_search_with<F>(
-    cmd: Command,
+    args: SearchArgs,
     db_path: &Option<PathBuf>,
     load_embedder: F,
 ) -> Result<CommandOutput>
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
-    let Command::Search {
+    let SearchArgs {
         query,
         project,
         days,
@@ -101,10 +154,7 @@ where
         include_current,
         only_current,
         include_automated,
-    } = cmd
-    else {
-        unreachable!()
-    };
+    } = args;
 
     let current = resolve_current_session(
         CurrentSessionFlags {
