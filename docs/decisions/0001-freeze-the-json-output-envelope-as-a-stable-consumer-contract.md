@@ -8,7 +8,7 @@ decision-makers: thkt
 
 ## Context and Problem Statement
 
-Under `--json`, recall emits `SuccessEnvelope` (`data` / `degraded` / `notes`) to stdout and `ErrorEnvelope` (`error.code` / `message` / `next_step` / `candidates` / `retryable`) to stderr (envelope.rs). Agents parse these keys. The code decouples the wire schema from internal types via a `serde_json::json!` seam and keeps `SearchResult` / `SessionData` non-`Serialize`, but no document states that the envelope keys are a frozen public contract, nor that every string field reaching stdout must be control-char sanitized (`format_result` strips each field at main.rs:1342-1374, the error-note path at main.rs:401). A future contributor could break agent consumers by renaming a key or surfacing a raw field.
+Under `--json`, recall emits `SuccessEnvelope` (`data` / `degraded` / `notes`) to stdout and `ErrorEnvelope` (`error.code` / `message` / `next_step` / `candidates` / `retryable`) to stderr (envelope.rs). Agents parse these keys. The code decouples the wire schema from internal types via a `serde_json::json!` seam and keeps `SearchResult` / `SessionData` non-`Serialize`, but no document states that the envelope keys are a frozen public contract, nor that every string field reaching stdout must be control-char sanitized (`format_result` in src/commands/search.rs strips each field, as does the error-note path in `index_command_output` in src/commands/index.rs). A future contributor could break agent consumers by renaming a key or surfacing a raw field.
 
 ## Decision Drivers
 
@@ -47,7 +47,7 @@ This freeze fixed the envelope KEY `degraded`, not the conditions that set it. T
 
 For `search`, `degraded:true` means semantic (vector) coverage was lost relative to a fully-loaded run; the search still returns its FTS-only results rather than failing. Two sources feed it, and they co-vary with the same boolean so the bool and the notes never disagree:
 
-- Load-time: the embedder could not load (model-less or a probe/backend failure), derived by `search_degraded_state` (main.rs:305). A caller-disabled model is intentional and stays non-degraded.
+- Load-time: the embedder could not load (model-less or a probe/backend failure), derived by `search_degraded_state` in src/commands/search.rs. A caller-disabled model is intentional and stays non-degraded.
 - Runtime: a loaded embedder's `embed_query` / `vec_search` fails at query time (e.g. memory pressure) and is swallowed to FTS-only, carried by `SearchOutcome::vec_degraded` (search.rs:39-57, 676-683). It is the runtime counterpart to the load-time path.
 
 The no-model state is reported on two different axes by design, and this asymmetry is intentional, not a contract violation:

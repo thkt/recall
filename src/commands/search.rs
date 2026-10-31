@@ -1,0 +1,306 @@
+use std::env;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::Result;
+use tracing::warn;
+
+use crate::embedding::Embed;
+use crate::envelope::CommandOutput;
+use crate::error::RecallError;
+use crate::model::{self, DegradedReason, EmbedderDegraded};
+use crate::runtime::done;
+use crate::{Command, ansi, db, search};
+use crate::{format_timestamp, require_current_schema, resolve_db_path, try_load_embedder_cached};
+
+fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
+    EmbedderDegraded(reason)
+        .user_note("recall model download")
+        .map(|note| vec![format!("semantic search unavailable: {note}")])
+        .unwrap_or_default()
+}
+
+fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool, Vec<String>) {
+    match load {
+        Ok(_) => (false, Vec::new()),
+        Err(reason) => {
+            let notes = search_fallback_notes(*reason);
+            (!notes.is_empty(), notes)
+        }
+    }
+}
+
+fn search_idle_message(session_count: i64) -> Option<&'static str> {
+    (session_count == 0).then_some("No sessions indexed. Run `recall index` first.")
+}
+
+fn search_idle_output() -> CommandOutput {
+    if let Some(msg) = search_idle_message(0) {
+        done(msg);
+    }
+    CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CurrentSessionFlags {
+    exclude: bool,
+    include: bool,
+    only: bool,
+}
+
+fn resolve_current_session(
+    flags: CurrentSessionFlags,
+    env_session_id: Option<String>,
+) -> Result<search::CurrentSession, RecallError> {
+    use search::CurrentSession;
+    let env_session_id = env_session_id.filter(|s| !s.trim().is_empty());
+    if flags.only {
+        return match env_session_id {
+            Some(id) => Ok(CurrentSession::Only(id)),
+            None => Err(RecallError::Usage(
+                "--only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session"
+                    .to_owned(),
+            )),
+        };
+    }
+    if flags.include {
+        return Ok(CurrentSession::Ignore);
+    }
+    match env_session_id {
+        Some(id) => Ok(CurrentSession::Exclude(id)),
+        None => {
+            if flags.exclude {
+                warn!("--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set");
+            }
+            Ok(CurrentSession::Ignore)
+        }
+    }
+}
+
+pub(crate) fn run_search(cmd: Command, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    run_search_with(cmd, db_path, try_load_embedder_cached)
+}
+
+pub(crate) fn run_search_with<F>(
+    cmd: Command,
+    db_path: &Option<PathBuf>,
+    load_embedder: F,
+) -> Result<CommandOutput>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    let Command::Search {
+        query,
+        project,
+        days,
+        source,
+        file,
+        limit,
+        exclude_current,
+        include_current,
+        only_current,
+        include_automated,
+    } = cmd
+    else {
+        unreachable!()
+    };
+
+    let current = resolve_current_session(
+        CurrentSessionFlags {
+            exclude: exclude_current,
+            include: include_current,
+            only: only_current,
+        },
+        env::var("CLAUDE_CODE_SESSION_ID").ok(),
+    )?;
+
+    let path = resolve_db_path(db_path)?;
+
+    if !path.exists() {
+        return Ok(search_idle_output());
+    }
+
+    let (conn, tier) = db::open_db_readonly(&path)?;
+    match db::schema_state(&conn)? {
+        db::SchemaState::Empty => return Ok(search_idle_output()),
+        state => require_current_schema(state)?,
+    }
+    let wal_note = db::stale_wal_note(&path, tier);
+
+    let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+    if search_idle_message(session_count).is_some() {
+        return Ok(search_idle_output());
+    }
+
+    let identity_error = if query.is_some() {
+        model::check_index(&conn, model::selected()).err()
+    } else {
+        None
+    };
+    let (mut degraded, mut notes, embedder) = if let Some(error) = identity_error {
+        (
+            true,
+            vec![format!(
+                "semantic search unavailable: {error}; results are text-only"
+            )],
+            None,
+        )
+    } else if query.is_some() {
+        let embedder = load_embedder();
+        let (degraded, notes) = search_degraded_state(&embedder);
+        (degraded, notes, embedder.ok())
+    } else {
+        (false, Vec::new(), None)
+    };
+
+    let outcome = search::search_with_embedder(
+        &conn,
+        query.as_deref(),
+        &search::SearchOptions {
+            project,
+            days,
+            source,
+            file,
+            limit: limit.into(),
+            current,
+            include_automated,
+            now_ms: None,
+        },
+        embedder.as_deref(),
+    )?;
+    let results = outcome.results;
+
+    if outcome.vec_degraded {
+        degraded = true;
+        notes.push(
+            "semantic search unavailable: vector query failed at runtime; results are text-only"
+                .to_owned(),
+        );
+    }
+
+    if outcome.results_incomplete {
+        degraded = true;
+        notes.push(
+            "results may be incomplete: some matched sessions were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
+                .to_owned(),
+        );
+    }
+
+    if !include_automated {
+        let automated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE session_type = 'automated'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if automated > 0 {
+            notes.push(format!(
+                "{automated} automated session(s) excluded by default; use --include-automated to include them"
+            ));
+        }
+    }
+
+    let markdown = render_results(&results);
+    let data = serde_json::json!({
+        "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
+    });
+
+    if let Some(note) = wal_note {
+        degraded = true;
+        notes.push(note);
+    }
+
+    Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
+}
+
+fn extract_parent_session(file_path: &str) -> Option<&str> {
+    let idx = file_path.find("/subagents/")?;
+    let prefix = &file_path[..idx];
+    let parent = prefix.rsplit('/').next()?;
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent)
+    }
+}
+
+fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::Result<()> {
+    let s = &r.session;
+    let date = format_timestamp(s.timestamp);
+    let proj_name = if s.project.is_empty() {
+        "unknown"
+    } else {
+        Path::new(&s.project)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+    };
+    let slug = ansi::strip_control_chars(&s.slug);
+    let project = ansi::strip_control_chars(&s.project);
+    writeln!(
+        w,
+        "[{}] {} | {} | {} [{}]",
+        i + 1,
+        date,
+        slug,
+        proj_name,
+        s.source
+    )?;
+    if !project.is_empty() {
+        writeln!(w, "    {project}")?;
+    }
+    let session_id = ansi::strip_control_chars(&s.session_id);
+    writeln!(w, "    ID: {session_id}")?;
+    let file_path = ansi::strip_control_chars(&s.file_path);
+    if let Some(parent) = extract_parent_session(&file_path) {
+        writeln!(w, "    Parent: {parent}")?;
+    }
+    if !r.excerpt.is_empty() {
+        let excerpt = ansi::strip_control_chars(&r.excerpt);
+        for line in excerpt.trim().lines() {
+            writeln!(w, "    > {line}")?;
+        }
+    }
+    writeln!(w, "    inspect: {}", inspect_hint(&session_id, r.chunk_id))?;
+    writeln!(w)?;
+    Ok(())
+}
+
+fn render_results(results: &[search::SearchResult]) -> String {
+    if results.is_empty() {
+        return "No matching sessions found.".to_owned();
+    }
+
+    let mut buf = Vec::new();
+    let _ = writeln!(buf, "Found {} sessions:\n", results.len());
+    for (i, r) in results.iter().enumerate() {
+        let _ = format_result(&mut buf, i, r);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn inspect_hint(session_id: &str, chunk_id: Option<i64>) -> String {
+    match chunk_id {
+        Some(id) => format!("recall show {session_id} --chunk {id} --window 3"),
+        None => format!("recall show {session_id}"),
+    }
+}
+
+fn result_to_json(r: &search::SearchResult) -> serde_json::Value {
+    let s = &r.session;
+    serde_json::json!({
+        "session_id": s.session_id,
+        "project": s.project,
+        "slug": s.slug,
+        "source": s.source.to_string(),
+        "timestamp": s.timestamp,
+        "excerpt": r.excerpt,
+        "chunk": r.chunk_id,
+        "inspect": inspect_hint(&s.session_id, r.chunk_id),
+    })
+}
+
+#[cfg(test)]
+mod tests;
