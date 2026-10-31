@@ -46,7 +46,7 @@ def install_baseline(root, dest):
     prefix = """use std::{cell::RefCell, time::Instant};
 use anyhow::Result;
 use rusqlite::Connection;
-use crate::{ClassifyOutcome, classify, error::RecallError};
+use crate::{classify, commands::classify::ClassifyOutcome, error::RecallError};
 use super::Metrics;
 """
     (dest / "src/classify/baseline.rs").write_text(prefix + control)
@@ -85,7 +85,7 @@ def main():
             shutil.copytree(root / name, dest / name, ignore=shutil.ignore_patterns(".git"))
         for name in ["Cargo.toml", "Cargo.lock", "README.md", "README.ja.md"]:
             shutil.copy(root / name, dest / name)
-        current_sources = ["src/main.rs", "src/classify/benchmark.rs", "src/parser/mod.rs",
+        current_sources = ["src/commands/classify.rs", "src/classify/benchmark.rs", "src/parser/mod.rs",
                            "src/parser/claude.rs", "src/parser/codex.rs", "src/parser/provenance.rs"]
         current_hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                           for name in current_sources}

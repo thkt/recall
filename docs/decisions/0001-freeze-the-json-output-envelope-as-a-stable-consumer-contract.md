@@ -53,7 +53,7 @@ For `search`, `degraded:true` means semantic (vector) coverage was lost relative
 The no-model state is reported on two different axes by design, and this asymmetry is intentional, not a contract violation:
 
 - `search` reports it on a coverage axis: no model means semantic search is unavailable, so results are FTS-only and may be thinner, hence `degraded:true`.
-- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (`run_status` in src/main.rs, with the FTS-only fallback at the `check_model` info path in src/commands/doctor.rs). `doctor` and `status` agree with each other on this axis (#166).
+- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (`run_status` in src/commands/status.rs, with the FTS-only fallback at the `check_model` info path in src/commands/doctor.rs). `doctor` and `status` agree with each other on this axis (#166).
 
 A contributor who tries to make all three commands agree on `degraded` for the no-model case would either wrongly mark `doctor`/`status` unhealthy or wrongly hide search's lost-coverage signal. The divergence is the contract.
 

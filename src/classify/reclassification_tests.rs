@@ -7,12 +7,12 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde_json::Value;
 
+use crate::commands::classify::{
+    ClassifyPhase, read_classification_origin, reclassify_sessions, reclassify_sessions_observed,
+};
 use crate::db::open_db;
 use crate::envelope::render_json_error;
 use crate::error::{classify_exit_code, error_envelope};
-use crate::{
-    ClassifyPhase, read_classification_origin, reclassify_sessions, reclassify_sessions_observed,
-};
 
 fn fixture() -> (tempfile::TempDir, Connection, Connection) {
     let root = tempfile::tempdir().unwrap();

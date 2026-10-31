@@ -6,13 +6,16 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use super::{SessionType, classify_first_turn};
+use crate::commands::classify::{
+    open_classification_file, read_classification_origin, reclassify_sessions,
+    reclassify_sessions_with, run_classify,
+};
 use crate::db::setup_test_db;
 use crate::embedder::{MockEmbedder, embed_recent_chunks};
 use crate::envelope::render_json_error;
 use crate::error::error_envelope;
 use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
 use crate::search::{SearchOptions, search, search_with_embedder};
-use crate::{reclassify_sessions, run_classify};
 
 fn strings(conn: &Connection, sql: &str) -> Vec<String> {
     conn.prepare(sql)
@@ -316,7 +319,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
         assert!(path.is_file());
         if id == "agent-example" {
             assert_eq!(
-                crate::read_classification_origin(
+                read_classification_origin(
                     fs::File::open(&path).unwrap(),
                     path.to_str().unwrap(),
                     "claude",
@@ -481,9 +484,9 @@ fn reclassification_retains_unverifiable_labels_and_falls_back_only_for_null_row
         }
         let path = path.to_str().unwrap();
         assert_eq!(
-            crate::open_classification_file(path)
+            open_classification_file(path)
                 .1
-                .and_then(|file| crate::read_classification_origin(file, path, source, id)),
+                .and_then(|file| read_classification_origin(file, path, source, id)),
             Err(reason)
         );
         conn.execute("INSERT INTO sessions (session_id, source, file_path, session_type) VALUES (?1, ?2, ?3, 'automated')", rusqlite::params![id, source, path]).unwrap();
@@ -542,7 +545,7 @@ fn reclassification_retries_after_a_writer_commits_during_source_read() {
     let other = open_db(&path).unwrap();
     other.busy_timeout(Duration::ZERO).unwrap();
     let mut reads = 0;
-    let outcomes = crate::reclassify_sessions_with(&mut conn, true, false, |_, _, _, _| {
+    let outcomes = reclassify_sessions_with(&mut conn, true, false, |_, _, _, _| {
         reads += 1;
         if reads == 1 {
             other.execute("UPDATE messages SET text = '<command-message>run</command-message>' WHERE session_id = 's'", []).unwrap();

@@ -9,9 +9,11 @@ mod tests {
     use rusqlite::{Connection, params};
     use serde_json::json;
 
+    use crate::commands::classify::{
+        ClassifyPhase, read_classification_origin, reclassify_sessions_observed,
+    };
     use crate::db::open_db;
     use crate::parser::{self, Source};
-    use crate::{ClassifyPhase, read_classification_origin, reclassify_sessions_observed};
 
     #[derive(Clone, Copy, Debug)]
     enum Mode {
