@@ -33,7 +33,7 @@ Chosen option: "Freeze the envelope shape", because the envelope is the only sta
 
 ### Confirmation
 
-A golden/snapshot test asserts the `--json` key set for `search` / `index` / `status` / `doctor` (search/index/status assertions live in tests/cli_integration.rs; `doctor`'s `data` payload freezes the top keys `healthy` / `checks` and each check object's `name` / `ok` / `detail` / `remedy`, main.rs:1316). A grep check confirms `SearchResult` and `SessionData` carry no `derive(Serialize)`. Code review verifies every new string field in `format_result` and the `json!` payloads passes `ansi::strip_control_chars`.
+A golden/snapshot test asserts the `--json` key set for `search` / `index` / `status` / `doctor` (search/index/status assertions live in tests/cli_integration.rs; `doctor`'s `data` payload freezes the top keys `healthy` / `checks` and each check object's `name` / `ok` / `detail` / `remedy`, `render_doctor_report` in src/commands/doctor.rs). A grep check confirms `SearchResult` and `SessionData` carry no `derive(Serialize)`. Code review verifies every new string field in `format_result` and the `json!` payloads passes `ansi::strip_control_chars`.
 
 ## More Information
 
@@ -53,7 +53,7 @@ For `search`, `degraded:true` means semantic (vector) coverage was lost relative
 The no-model state is reported on two different axes by design, and this asymmetry is intentional, not a contract violation:
 
 - `search` reports it on a coverage axis: no model means semantic search is unavailable, so results are FTS-only and may be thinner, hence `degraded:true`.
-- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (main.rs:864-866, with the FTS-only fallback at the `check_model` info path main.rs:1119-1130). `doctor` and `status` agree with each other on this axis (#166).
+- `doctor` and `status` report it on a health axis: FTS-only is a supported mode, not a broken index, so a not-installed model is an info-level note that never flips `healthy` to false (`run_status` in src/main.rs, with the FTS-only fallback at the `check_model` info path in src/commands/doctor.rs). `doctor` and `status` agree with each other on this axis (#166).
 
 A contributor who tries to make all three commands agree on `degraded` for the no-model case would either wrongly mark `doctor`/`status` unhealthy or wrongly hide search's lost-coverage signal. The divergence is the contract.
 

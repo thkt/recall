@@ -239,7 +239,8 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 
 ```text
 src/
-├── main.rs       CLIコマンド・出力・分類・status・doctor
+├── main.rs       CLIコマンド・出力・分類・status
+├── commands/     サブコマンド実装（doctor）
 ├── parser/       Claude Code / Codex の JSONL パーサー
 ├── indexer.rs    mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
