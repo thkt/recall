@@ -300,11 +300,7 @@ where
     if let Ok((conn, _)) = db::open_db_readonly(&path)
         && let Err(error) = model::check_index(&conn, model::selected())
     {
-        model_check = DoctorCheck::fail(
-            "model",
-            error.to_string(),
-            "select the matching --model-manifest and index, or build this model in a separate --db-path",
-        );
+        model_check = DoctorCheck::fail("model", error.to_string(), MODEL_INDEX_REMEDY);
     }
     checks.push(model_check);
 
