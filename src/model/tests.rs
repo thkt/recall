@@ -247,3 +247,43 @@ fn invalid_profile_shapes_fail_closed() {
         .is_err()
     );
 }
+
+#[test]
+fn probe_command_hands_the_child_the_parent_verified_artifact_root() {
+    let root = Path::new("/verified/artifacts");
+
+    let command = probe_command(Path::new("/bin/recall"), root, "{}");
+
+    let handed = command
+        .get_envs()
+        .find(|(key, _)| *key == "__RECALL_GEMMA_ARTIFACTS")
+        .and_then(|(_, value)| value);
+    assert_eq!(handed, Some(root.as_os_str()));
+}
+
+#[test]
+fn probe_child_uses_the_handed_root_without_rehashing_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    fs::write(dir.path().join("model.gguf"), b"not the pinned bytes").unwrap();
+    fs::write(dir.path().join("tokenizer.json"), b"{}").unwrap();
+
+    let artifacts = probe_artifacts(Some(dir.path().as_os_str().to_owned())).unwrap();
+
+    assert_eq!(
+        artifacts.root,
+        dir.path(),
+        "the parent already verified these bytes, so the child must not re-check them"
+    );
+}
+
+#[test]
+fn probe_child_without_a_handed_root_is_an_error() {
+    let error = probe_artifacts(None)
+        .err()
+        .expect("a missing root must fail");
+
+    assert!(
+        error.to_string().contains("__RECALL_GEMMA_ARTIFACTS"),
+        "{error}"
+    );
+}
