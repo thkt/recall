@@ -447,6 +447,14 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
+        [],
+    )?;
+    Ok(deleted)
+}
+
 #[cfg(test)]
 pub(crate) fn setup_test_db() -> (tempfile::TempDir, Connection) {
     let dir = tempfile::TempDir::new().unwrap();

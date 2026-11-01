@@ -257,7 +257,8 @@ Add to `~/.claude/settings.json`:
 
 ```text
 src/
-├── main.rs       CLI commands, output, classification, status and doctor
+├── main.rs       CLI definition, shared DB and model helpers, output dispatch
+├── commands/     Subcommand implementations (index, search, show, status, classify, doctor)
 ├── parser/       JSONL parsers for Claude Code and Codex formats
 ├── indexer.rs    Incremental indexer with mtime/size tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation

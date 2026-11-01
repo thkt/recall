@@ -1,0 +1,86 @@
+use std::io::Write;
+use std::path::PathBuf;
+
+use anyhow::Result;
+
+use crate::envelope::CommandOutput;
+use crate::model::{self, cached_artifacts};
+use crate::runtime::info as cli_info;
+use crate::{db, require_current_schema, resolve_db_path};
+
+pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    let path = resolve_db_path(db_path)?;
+
+    let model_ok = cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false);
+
+    if !path.exists() {
+        cli_info(&format!("database not found at {}", path.display()));
+        cli_info("run `recall index` to create the index.");
+        return Ok(CommandOutput::ok(
+            String::new(),
+            serde_json::json!({
+                "sessions": 0,
+                "qa_chunks": 0,
+                "embedded": 0,
+                "model_ready": model_ok,
+            }),
+        ));
+    }
+
+    let (conn, tier) = db::open_db_readonly(&path)?;
+
+    let (sessions, chunks, embedded) = match db::schema_state(&conn)? {
+        db::SchemaState::Empty => (0, 0, 0),
+        state => {
+            require_current_schema(state)?;
+            let sessions: i64 =
+                conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+            let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
+            let embedded: i64 =
+                conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
+                    r.get(0)
+                })?;
+            (sessions, chunks, embedded)
+        }
+    };
+
+    let mut buf = Vec::new();
+    let _ = writeln!(buf, "Sessions: {sessions}");
+    let _ = writeln!(buf, "QA chunks: {chunks}");
+    let _ = writeln!(buf, "Embedded: {embedded}/{chunks}");
+    let _ = writeln!(
+        buf,
+        "Model: {}",
+        if model_ok {
+            "ready"
+        } else {
+            "not installed (run `recall model download`)"
+        }
+    );
+    if verbose {
+        let _ = writeln!(buf, "DB: {}", path.display());
+    }
+    let markdown = String::from_utf8_lossy(&buf).into_owned();
+    let data = serde_json::json!({
+        "sessions": sessions,
+        "qa_chunks": chunks,
+        "embedded": embedded,
+        "model_ready": model_ok,
+    });
+
+    let mut notes: Vec<_> = db::stale_wal_note(&path, tier).into_iter().collect();
+    if let Err(error) = model::check_index(&conn, model::selected()) {
+        notes.push(format!(
+            "semantic search unavailable: {error}; results are text-only"
+        ));
+    }
+    Ok(CommandOutput::with_notes(
+        markdown,
+        data,
+        !notes.is_empty(),
+        notes,
+    ))
+}
+
+#[cfg(test)]
+mod tests;

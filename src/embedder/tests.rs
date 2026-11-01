@@ -322,7 +322,7 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use crate::index_and_report_with;
+    use crate::commands::index::index_and_report_with;
     use crate::indexer::IndexOptions;
 
     fn wait_until(mut ready: impl FnMut() -> bool) {
