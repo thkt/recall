@@ -123,9 +123,8 @@ fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search:
 #[test]
 fn test_format_result_basic() {
     let r = make_search_result("s1", "/home/me/project", "some excerpt");
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(output.contains("[1] 2024-03-01"));
     assert!(output.contains("test-slug"));
     assert!(output.contains("project [claude]"));
@@ -153,9 +152,8 @@ fn test_render_results_lists_header_and_each_result() {
 #[test]
 fn test_format_result_empty_project() {
     let r = make_search_result("s1", "", "excerpt");
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(output.contains("unknown [claude]"));
     assert!(!output.contains("    /"));
 }
@@ -164,9 +162,8 @@ fn test_format_result_empty_project() {
 fn test_format_result_excerpt_not_truncated() {
     let long = "a".repeat(300);
     let r = make_search_result("s1", "/proj", &long);
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(
         output.contains(&format!("> {long}")),
         "the full excerpt must render without truncation"
@@ -180,9 +177,8 @@ fn test_format_result_excerpt_not_truncated() {
 #[test]
 fn test_format_result_excerpt_strips_control_chars() {
     let r = make_search_result("s1", "/proj", "clean\x1b[31mANSI\x1b[0mhere\x07bell");
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(
         !output.contains('\x1b') && !output.contains('\x07'),
         "control characters must be stripped from the excerpt, got: {output:?}"
@@ -196,9 +192,8 @@ fn test_format_result_excerpt_strips_control_chars() {
 #[test]
 fn test_format_result_empty_excerpt() {
     let r = make_search_result("s1", "/proj", "");
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(!output.contains("> "));
 }
 
@@ -217,18 +212,16 @@ fn test_subagent_file_path_shows_parent_session() {
         excerpt: "some text".to_owned(),
         chunk_id: None,
     };
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(output.contains("abc-def-123"));
 }
 
 #[test]
 fn test_normal_session_path_shows_no_parent() {
     let r = make_search_result("s1", "/home/me/project", "excerpt");
-    let mut buf = Vec::new();
-    format_result(&mut buf, 0, &r).unwrap();
-    let output = String::from_utf8(buf).unwrap();
+    let mut output = String::new();
+    format_result(&mut output, 0, &r).unwrap();
     assert!(!output.contains("Parent:"));
 }
 

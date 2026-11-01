@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Write};
+use std::fmt::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,6 +7,7 @@ use anyhow::Result;
 use clap::Args;
 use tracing::warn;
 
+use crate::commands::build_markdown;
 use crate::embedding::Embed;
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
@@ -270,7 +271,7 @@ fn extract_parent_session(file_path: &str) -> Option<&str> {
     }
 }
 
-fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> io::Result<()> {
+fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> fmt::Result {
     let s = &r.session;
     let date = format_timestamp(s.timestamp);
     let proj_name = if s.project.is_empty() {
@@ -317,12 +318,13 @@ fn render_results(results: &[search::SearchResult]) -> String {
         return "No matching sessions found.".to_owned();
     }
 
-    let mut buf = Vec::new();
-    let _ = writeln!(buf, "Found {} sessions:\n", results.len());
-    for (i, r) in results.iter().enumerate() {
-        let _ = format_result(&mut buf, i, r);
-    }
-    String::from_utf8_lossy(&buf).into_owned()
+    build_markdown(|buf| {
+        writeln!(buf, "Found {} sessions:\n", results.len())?;
+        for (i, r) in results.iter().enumerate() {
+            format_result(buf, i, r)?;
+        }
+        Ok(())
+    })
 }
 
 fn inspect_hint(session_id: &str, chunk_id: Option<i64>) -> String {

@@ -1,10 +1,11 @@
-use std::io::Write;
+use std::fmt::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::warn;
 
+use crate::commands::build_markdown;
 use crate::compat::filter::escape_like;
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
@@ -13,23 +14,23 @@ use crate::{db, parser};
 use crate::{format_timestamp, require_current_schema, resolve_db_path};
 
 fn write_show_header(
-    buf: &mut Vec<u8>,
+    buf: &mut String,
     session: &parser::SessionData,
     verbose: bool,
     extra: &[String],
-) {
-    let _ = writeln!(buf, "# {}", session.slug);
-    let _ = writeln!(buf, "- session_id: {}", session.session_id);
-    let _ = writeln!(buf, "- date: {}", format_timestamp(session.timestamp));
-    let _ = writeln!(buf, "- project: {}", session.project);
-    let _ = writeln!(buf, "- source: {}", session.source);
+) -> fmt::Result {
+    writeln!(buf, "# {}", session.slug)?;
+    writeln!(buf, "- session_id: {}", session.session_id)?;
+    writeln!(buf, "- date: {}", format_timestamp(session.timestamp))?;
+    writeln!(buf, "- project: {}", session.project)?;
+    writeln!(buf, "- source: {}", session.source)?;
     for line in extra {
-        let _ = writeln!(buf, "{line}");
+        writeln!(buf, "{line}")?;
     }
     if verbose {
-        let _ = writeln!(buf, "- file: {}", session.file_path);
+        writeln!(buf, "- file: {}", session.file_path)?;
     }
-    let _ = writeln!(buf);
+    writeln!(buf)
 }
 
 fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<CommandOutput> {
@@ -40,14 +41,15 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
     let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
     let messages: Vec<(String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let mut buf = Vec::new();
-    write_show_header(&mut buf, &session, verbose, &[]);
-    for (role, text) in &messages {
-        let _ = writeln!(buf, "## [{role}]");
-        let _ = writeln!(buf, "{text}");
-        let _ = writeln!(buf);
-    }
-    let markdown = String::from_utf8_lossy(&buf).into_owned();
+    let markdown = build_markdown(|buf| {
+        write_show_header(buf, &session, verbose, &[])?;
+        for (role, text) in &messages {
+            writeln!(buf, "## [{role}]")?;
+            writeln!(buf, "{text}")?;
+            writeln!(buf)?;
+        }
+        Ok(())
+    });
 
     let data = serde_json::json!({
         "session_id": session.session_id,
@@ -190,24 +192,25 @@ fn render_windowed(
         _ => &[],
     };
 
-    let mut buf = Vec::new();
-    write_show_header(
-        &mut buf,
-        session,
-        verbose,
-        &[format!("- chunk: {chunk_id}"), format!("- window: {n}")],
-    );
-    for (rid, role, text) in slice {
-        let marker = if *rid >= lo && *rid <= hi {
-            " (chunk)"
-        } else {
-            ""
-        };
-        let _ = writeln!(buf, "## [{role}]{marker}");
-        let _ = writeln!(buf, "{}", cap_message(text));
-        let _ = writeln!(buf);
-    }
-    let markdown = String::from_utf8_lossy(&buf).into_owned();
+    let markdown = build_markdown(|buf| {
+        write_show_header(
+            buf,
+            session,
+            verbose,
+            &[format!("- chunk: {chunk_id}"), format!("- window: {n}")],
+        )?;
+        for (rid, role, text) in slice {
+            let marker = if *rid >= lo && *rid <= hi {
+                " (chunk)"
+            } else {
+                ""
+            };
+            writeln!(buf, "## [{role}]{marker}")?;
+            writeln!(buf, "{}", cap_message(text))?;
+            writeln!(buf)?;
+        }
+        Ok(())
+    });
 
     let data = serde_json::json!({
         "session_id": session.session_id,
@@ -242,17 +245,12 @@ fn render_chunk_fallback(
         session.session_id
     );
 
-    let mut buf = Vec::new();
-    write_show_header(
-        &mut buf,
-        session,
-        verbose,
-        &[format!("- chunk: {chunk_id}")],
-    );
-    let _ = writeln!(buf, "{}", cap_message(content));
-    let _ = writeln!(buf);
-    let _ = writeln!(buf, "{hint}");
-    let markdown = String::from_utf8_lossy(&buf).into_owned();
+    let markdown = build_markdown(|buf| {
+        write_show_header(buf, session, verbose, &[format!("- chunk: {chunk_id}")])?;
+        writeln!(buf, "{}", cap_message(content))?;
+        writeln!(buf)?;
+        writeln!(buf, "{hint}")
+    });
 
     let data = serde_json::json!({
         "session_id": session.session_id,
