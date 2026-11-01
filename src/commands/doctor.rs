@@ -1,11 +1,11 @@
-use std::fmt::Display;
-use std::io::Write;
+use std::fmt::{Display, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use rusqlite::Connection;
 
+use crate::commands::build_markdown;
 use crate::db;
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::{EMBEDDING_DIMS, Embed};
@@ -335,51 +335,52 @@ fn render_doctor_report(
         notes.push(format!("fix: model: recovery failed: {e}"));
     }
 
-    let mut buf = Vec::new();
-    let _ = writeln!(
-        buf,
-        "Health: {}",
-        if healthy { "healthy" } else { "degraded" }
-    );
-    if let Some(outcomes) = repairs {
-        for o in outcomes {
-            match &o.result {
-                Ok(n) => {
-                    let _ = writeln!(buf, "Repaired {}: {n} row(s)", o.name);
+    let markdown = build_markdown(|buf| {
+        writeln!(
+            buf,
+            "Health: {}",
+            if healthy { "healthy" } else { "degraded" }
+        )?;
+        if let Some(outcomes) = repairs {
+            for o in outcomes {
+                match &o.result {
+                    Ok(n) => {
+                        writeln!(buf, "Repaired {}: {n} row(s)", o.name)?;
+                    }
+                    Err(e) => {
+                        writeln!(buf, "Repair failed {}: {e}", o.name)?;
+                    }
                 }
-                Err(e) => {
-                    let _ = writeln!(buf, "Repair failed {}: {e}", o.name);
+            }
+        }
+        match model_recovery {
+            ModelRecovery::Succeeded => {
+                writeln!(buf, "Recovered model")?;
+            }
+            ModelRecovery::Failed(e) => {
+                writeln!(buf, "Model recovery failed: {e}")?;
+            }
+            ModelRecovery::Skipped => {}
+        }
+        for c in checks {
+            let status = if c.ok { "ok" } else { "FAIL" };
+            match (&c.detail, c.remedy) {
+                (Some(detail), Some(remedy)) => {
+                    writeln!(buf, "  {} [{status}] {detail} -> {remedy}", c.name)?;
+                }
+                (Some(detail), None) => {
+                    writeln!(buf, "  {} [{status}] {detail}", c.name)?;
+                }
+                (None, _) => {
+                    writeln!(buf, "  {} [{status}]", c.name)?;
                 }
             }
         }
-    }
-    match model_recovery {
-        ModelRecovery::Succeeded => {
-            let _ = writeln!(buf, "Recovered model");
+        if verbose {
+            writeln!(buf, "DB: {}", path.display())?;
         }
-        ModelRecovery::Failed(e) => {
-            let _ = writeln!(buf, "Model recovery failed: {e}");
-        }
-        ModelRecovery::Skipped => {}
-    }
-    for c in checks {
-        let status = if c.ok { "ok" } else { "FAIL" };
-        match (&c.detail, c.remedy) {
-            (Some(detail), Some(remedy)) => {
-                let _ = writeln!(buf, "  {} [{status}] {detail} -> {remedy}", c.name);
-            }
-            (Some(detail), None) => {
-                let _ = writeln!(buf, "  {} [{status}] {detail}", c.name);
-            }
-            (None, _) => {
-                let _ = writeln!(buf, "  {} [{status}]", c.name);
-            }
-        }
-    }
-    if verbose {
-        let _ = writeln!(buf, "DB: {}", path.display());
-    }
-    let markdown = String::from_utf8_lossy(&buf).into_owned();
+        Ok(())
+    });
 
     let checks_json: Vec<serde_json::Value> = checks
         .iter()

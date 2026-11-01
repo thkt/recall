@@ -1,8 +1,9 @@
-use std::io::Write;
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::commands::build_markdown;
 use crate::envelope::CommandOutput;
 use crate::model::{self, cached_artifacts};
 use crate::runtime::info as cli_info;
@@ -44,23 +45,24 @@ pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<Com
         }
     };
 
-    let mut buf = Vec::new();
-    let _ = writeln!(buf, "Sessions: {sessions}");
-    let _ = writeln!(buf, "QA chunks: {chunks}");
-    let _ = writeln!(buf, "Embedded: {embedded}/{chunks}");
-    let _ = writeln!(
-        buf,
-        "Model: {}",
-        if model_ok {
-            "ready"
-        } else {
-            "not installed (run `recall model download`)"
+    let markdown = build_markdown(|buf| {
+        writeln!(buf, "Sessions: {sessions}")?;
+        writeln!(buf, "QA chunks: {chunks}")?;
+        writeln!(buf, "Embedded: {embedded}/{chunks}")?;
+        writeln!(
+            buf,
+            "Model: {}",
+            if model_ok {
+                "ready"
+            } else {
+                "not installed (run `recall model download`)"
+            }
+        )?;
+        if verbose {
+            writeln!(buf, "DB: {}", path.display())?;
         }
-    );
-    if verbose {
-        let _ = writeln!(buf, "DB: {}", path.display());
-    }
-    let markdown = String::from_utf8_lossy(&buf).into_owned();
+        Ok(())
+    });
     let data = serde_json::json!({
         "sessions": sessions,
         "qa_chunks": chunks,
