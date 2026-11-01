@@ -65,6 +65,14 @@ fn run_db_check(name: &'static str, check: impl FnOnce() -> Result<DoctorCheck>)
     })
 }
 
+fn db_checks(conn: &Connection) -> Vec<DoctorCheck> {
+    vec![
+        run_db_check("integrity", || check_integrity(conn)),
+        run_db_check("orphan_embeddings", || check_orphan_embeddings(conn)),
+        run_db_check("orphan_chunks", || check_orphan_chunks(conn)),
+    ]
+}
+
 fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
     vec![DoctorCheck::fail(
         "integrity",
@@ -254,11 +262,7 @@ where
                         name: "orphan_embeddings",
                         result: fix_orphan_embeddings(&conn),
                     }]);
-                    vec![
-                        run_db_check("integrity", || check_integrity(&conn)),
-                        run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
-                        run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
-                    ]
+                    db_checks(&conn)
                 }
                 Err(e)
                     if e.downcast_ref::<RecallError>()
@@ -278,11 +282,7 @@ where
             Ok((conn, tier)) => {
                 wal_note = db::stale_wal_note(&path, tier);
                 match db::schema_state(&conn) {
-                    Ok(db::SchemaState::Current) => vec![
-                        run_db_check("integrity", || check_integrity(&conn)),
-                        run_db_check("orphan_embeddings", || check_orphan_embeddings(&conn)),
-                        run_db_check("orphan_chunks", || check_orphan_chunks(&conn)),
-                    ],
+                    Ok(db::SchemaState::Current) => db_checks(&conn),
                     Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
                         "schema",
                         "database schema is out of date".to_owned(),
