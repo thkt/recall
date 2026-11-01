@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env,
+    ffi::OsString,
     fmt::{self, Write as _},
     fs,
     io::{self, Read, Write},
@@ -233,7 +234,7 @@ pub fn handle_probe_if_needed() {
         if !gpu_available()? {
             process::exit(2);
         }
-        let artifacts = cached_artifacts()?.context("model not installed")?;
+        let artifacts = probe_artifacts(env::var_os("__RECALL_GEMMA_ARTIFACTS"))?;
         let model = artifacts.load()?;
         let v = model.embed_query("model probe")?;
         ensure!(
@@ -244,11 +245,26 @@ pub fn handle_probe_if_needed() {
     })();
     process::exit(if result.is_ok() { 0 } else { 1 });
 }
-fn probe() -> Result<bool> {
-    let mut command = Command::new(env::current_exe()?);
+/// The parent verifies the artifact checksums right before spawning the probe,
+/// and the probe's model is discarded, so the child loads from the handed root
+/// without hashing the 590 MB of artifacts a second time.
+fn probe_artifacts(root: Option<OsString>) -> Result<VerifiedArtifacts> {
+    let root = root.context("probe started without __RECALL_GEMMA_ARTIFACTS")?;
+    Ok(VerifiedArtifacts {
+        root: PathBuf::from(root),
+    })
+}
+fn probe_command(exe: &Path, verified_root: &Path, spec: &str) -> Command {
+    let mut command = Command::new(exe);
     command
         .env("__RECALL_GEMMA_PROBE", "1")
-        .env("__RECALL_GEMMA_SPEC", serde_json::to_string(selected())?);
+        .env("__RECALL_GEMMA_SPEC", spec)
+        .env("__RECALL_GEMMA_ARTIFACTS", verified_root);
+    command
+}
+fn probe(verified_root: &Path) -> Result<bool> {
+    let spec = serde_json::to_string(selected())?;
+    let mut command = probe_command(&env::current_exe()?, verified_root, &spec);
     run_probe(&mut command, Duration::from_secs(30))
 }
 
@@ -284,7 +300,7 @@ pub fn try_load_embedder_default_logging() -> Result<Arc<dyn Embed>, DegradedRea
         }
         Ok(Some(artifacts)) => artifacts,
     };
-    match probe() {
+    match probe(&artifacts.root) {
         Ok(false) => Err(DegradedReason::BackendUnavailable),
         Ok(true) => artifacts
             .load()
@@ -329,9 +345,10 @@ fn install_artifact(root: &Path, name: &str, expected: &str, reader: &mut impl R
     result
 }
 pub fn download_and_verify_model() -> Result<(), ModelDownloadError> {
-    cache::download_artifacts("recall", selected(), &cache_dir())
+    let root = cache_dir();
+    cache::download_artifacts("recall", selected(), &root)
         .map_err(|e| ModelDownloadError::DownloadFailed(e.to_string()))?;
-    match probe() {
+    match probe(&root) {
         Ok(true) => Ok(()),
         Ok(false) => Err(ModelDownloadError::BackendUnavailable),
         Err(error) => Err(ModelDownloadError::ProbeFailed(Some(error.to_string()))),
