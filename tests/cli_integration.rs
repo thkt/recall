@@ -695,39 +695,109 @@ fn classify_preview_of_missing_database_keeps_the_path_absent() {
     }
 }
 
-#[test]
-fn search_notes_automated_exclusion() {
-    let dir = TempDir::new().unwrap();
-    let claude_dir = dir.path().join("claude");
+fn index_claude_sessions(dir: &Path, sessions: &[(&str, &[&str])]) {
+    let claude_dir = dir.join("claude");
     fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-        claude_dir.join("auto.jsonl"),
-        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"<command-message>clear</command-message>"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    fs::write(
-        claude_dir.join("human.jsonl"),
-        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    )
-    .unwrap();
+    for (name, lines) in sessions {
+        fs::write(claude_dir.join(format!("{name}.jsonl")), lines.join("\n")).unwrap();
+    }
     assert_eq!(
         exit_code(
-            recall(dir.path())
+            recall(dir)
                 .env("RECALL_CLAUDE_DIR", &claude_dir)
                 .arg("index")
         ),
         0
     );
+}
 
-    let out = recall(dir.path())
-        .args(["search", "authentication", "--json"])
+fn search_stdout(dir: &Path, args: &[&str]) -> String {
+    let out = recall(dir)
+        .arg("search")
+        .args(args)
+        .arg("--json")
         .output()
         .expect("spawn recall binary");
     assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+const AUTOMATED_OPENER: &str = r#"{"type":"user","cwd":"/other","message":{"role":"user","content":"<command-message>clear</command-message>"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+const AUTOMATED_AUTH_TURN: &str = r#"{"type":"user","cwd":"/other","message":{"role":"user","content":"authentication flow review"},"timestamp":"2026-03-01T00:01:00Z"}"#;
+const HUMAN_AUTH: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+const HUMAN_UNRELATED: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"deployment checklist"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+
+#[test]
+fn search_notes_automated_sessions_that_match_the_query() {
+    let dir = TempDir::new().unwrap();
+    index_claude_sessions(
+        dir.path(),
+        &[
+            ("auto", &[AUTOMATED_OPENER, AUTOMATED_AUTH_TURN]),
+            ("human", &[HUMAN_AUTH]),
+            ("human2", &[HUMAN_AUTH]),
+        ],
+    );
+
+    let stdout = search_stdout(dir.path(), &["authentication"]);
+
     assert!(
-        stdout.contains("--include-automated"),
-        "default search must note the automated exclusion: {stdout}"
+        stdout.contains("1 automated session(s)") && stdout.contains("--include-automated"),
+        "a matching automated session must be counted in the note: {stdout}"
+    );
+}
+
+#[test]
+fn search_omits_automated_note_when_no_automated_session_matches_the_query() {
+    let dir = TempDir::new().unwrap();
+    index_claude_sessions(
+        dir.path(),
+        &[("auto", &[AUTOMATED_OPENER]), ("human", &[HUMAN_AUTH])],
+    );
+
+    let stdout = search_stdout(dir.path(), &["authentication"]);
+
+    assert!(
+        !stdout.contains("--include-automated"),
+        "an automated session that does not match the query was not excluded from it: {stdout}"
+    );
+}
+
+#[test]
+fn search_omits_automated_note_when_filters_exclude_the_automated_match() {
+    let dir = TempDir::new().unwrap();
+    index_claude_sessions(
+        dir.path(),
+        &[
+            ("auto", &[AUTOMATED_OPENER, AUTOMATED_AUTH_TURN]),
+            ("human", &[HUMAN_AUTH]),
+        ],
+    );
+
+    let stdout = search_stdout(dir.path(), &["authentication", "--project", "/proj"]);
+
+    assert!(
+        !stdout.contains("--include-automated"),
+        "--project /proj already rules out the /other automated session: {stdout}"
+    );
+}
+
+#[test]
+fn search_notes_automated_match_even_when_no_interactive_session_matches() {
+    let dir = TempDir::new().unwrap();
+    index_claude_sessions(
+        dir.path(),
+        &[
+            ("auto", &[AUTOMATED_OPENER, AUTOMATED_AUTH_TURN]),
+            ("human", &[HUMAN_UNRELATED]),
+        ],
+    );
+
+    let stdout = search_stdout(dir.path(), &["authentication"]);
+
+    assert!(
+        stdout.contains(r#""results":[]"#) && stdout.contains("1 automated session(s)"),
+        "with no interactive hit, the note is the only pointer to the automated match: {stdout}"
     );
 }
 

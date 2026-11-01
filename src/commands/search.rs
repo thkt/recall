@@ -199,21 +199,18 @@ where
         (false, Vec::new(), None)
     };
 
-    let outcome = search::search_with_embedder(
-        &conn,
-        query.as_deref(),
-        &search::SearchOptions {
-            project,
-            days,
-            source,
-            file,
-            limit: limit.into(),
-            current,
-            include_automated,
-            now_ms: None,
-        },
-        embedder.as_deref(),
-    )?;
+    let options = search::SearchOptions {
+        project,
+        days,
+        source,
+        file,
+        limit: limit.into(),
+        current,
+        include_automated,
+        now_ms: None,
+    };
+    let outcome =
+        search::search_with_embedder(&conn, query.as_deref(), &options, embedder.as_deref())?;
     let results = outcome.results;
 
     if outcome.vec_degraded {
@@ -232,19 +229,12 @@ where
         );
     }
 
-    if !include_automated {
-        let automated: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sessions WHERE session_type = 'automated'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0);
-        if automated > 0 {
-            notes.push(format!(
-                "{automated} automated session(s) excluded by default; use --include-automated to include them"
-            ));
-        }
+    let automated =
+        search::count_excluded_automated(&conn, query.as_deref(), &options).unwrap_or(0);
+    if automated > 0 {
+        notes.push(format!(
+            "{automated} automated session(s) matching this search were excluded by default; use --include-automated to include them"
+        ));
     }
 
     let markdown = render_results(&results);

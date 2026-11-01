@@ -2322,3 +2322,48 @@ fn combined_filters_apply_to_fts_hybrid_and_file_list() {
         assert!(!outcome.results_incomplete, "{mode}");
     }
 }
+
+#[test]
+fn excluded_automated_count_follows_the_file_filter_without_a_query() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "auto-a", "claude", "/proj", 1709251200000);
+    set_session_type(&conn, "auto-a", "automated");
+    seed_session_file(&conn, "auto-a", "/proj/src/a.rs");
+    insert_session(&conn, "auto-b", "claude", "/proj", 1709251200000);
+    set_session_type(&conn, "auto-b", "automated");
+    seed_session_file(&conn, "auto-b", "/proj/src/b.rs");
+    insert_session(&conn, "human-a", "claude", "/proj", 1709251200000);
+    seed_session_file(&conn, "human-a", "/proj/src/a.rs");
+    insert_session(&conn, "human-a2", "claude", "/proj", 1709251200000);
+    seed_session_file(&conn, "human-a2", "/proj/src/a.rs");
+    let opts = SearchOptions {
+        file: Some("a.rs".to_owned()),
+        ..SearchOptions::default()
+    };
+
+    let count = count_excluded_automated(&conn, None, &opts).unwrap();
+
+    assert_eq!(
+        count, 1,
+        "only auto-a is an automated session that touched a.rs"
+    );
+}
+
+#[test]
+fn excluded_automated_count_is_zero_when_automated_sessions_are_included() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "auto", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "auto", "user", "authentication flow");
+    set_session_type(&conn, "auto", "automated");
+    let opts = SearchOptions {
+        include_automated: true,
+        ..SearchOptions::default()
+    };
+
+    let count = count_excluded_automated(&conn, Some("authentication"), &opts).unwrap();
+
+    assert_eq!(
+        count, 0,
+        "nothing is excluded when automated sessions are included"
+    );
+}
