@@ -302,10 +302,8 @@ fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T>
     }
 }
 
-/// Picks one FTS hit per session in a single pass over the MATCH results,
-/// keyed by session id. `messages.session_id` is UNINDEXED, so a per-session
-/// MATCH re-reads every matching row in the index; one grouped query reads
-/// them once for all sessions.
+/// `messages.session_id` is UNINDEXED, so a per-session MATCH still reads every
+/// matching row in the index; grouping by session reads them once for all.
 fn fts_rows_per_session<T>(
     conn: &Connection,
     fts_query: &str,
@@ -343,8 +341,6 @@ fn fetch_chunks(
     vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<(f64, SearchResult)>> {
     let session_ids: Vec<&str> = ranked.iter().map(|(sid, _)| sid.as_str()).collect();
-    // The highest-ranked hit picks the chunk; the first hit in rowid order
-    // feeds the snippet fallback, matching the earlier per-session queries.
     let (best_hits, first_hits) = match fts_query {
         Some(q) => (
             fts_rows_per_session(conn, q, &session_ids, "rowid, text, MIN(rank)", |row| {
