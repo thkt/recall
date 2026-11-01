@@ -302,6 +302,37 @@ fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T>
     }
 }
 
+/// `messages.session_id` is UNINDEXED, so a per-session MATCH still reads every
+/// matching row in the index; grouping by session reads them once for all.
+fn fts_rows_per_session<T>(
+    conn: &Connection,
+    fts_query: &str,
+    session_ids: &[&str],
+    pick: &str,
+    decode: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
+) -> Result<HashMap<String, T>> {
+    if session_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        "SELECT session_id, {pick} FROM messages \
+         WHERE messages MATCH ? AND session_id IN ({}) GROUP BY session_id",
+        anon_placeholders(session_ids.len())
+    );
+    let mut params: Vec<&dyn ToSql> = vec![&fts_query];
+    params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, decode(row)?))
+    });
+    let mut picked = HashMap::new();
+    match rows.and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()) {
+        Ok(rows) => picked.extend(rows),
+        Err(e) => warn!(error = %e, "snippet extraction failed"),
+    }
+    Ok(picked)
+}
+
 fn fetch_chunks(
     conn: &Connection,
     fts_query: Option<&str>,
@@ -309,25 +340,35 @@ fn fetch_chunks(
     meta_map: &mut HashMap<String, SessionData>,
     vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<(f64, SearchResult)>> {
+    let session_ids: Vec<&str> = ranked.iter().map(|(sid, _)| sid.as_str()).collect();
+    let (best_hits, first_hits) = match fts_query {
+        Some(q) => (
+            fts_rows_per_session(conn, q, &session_ids, "rowid, text, MIN(rank)", |row| {
+                Ok((row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+            })?,
+            fts_rows_per_session(conn, q, &session_ids, "MIN(rowid)", |row| {
+                row.get::<_, i64>(1)
+            })?,
+        ),
+        None => (HashMap::new(), HashMap::new()),
+    };
     let rowid_match_sql = "SELECT c.id, MAX(c.content) FROM qa_chunks c \
-        JOIN (SELECT rowid FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
-          ON m.rowid BETWEEN c.src_rowid_lo AND c.src_rowid_hi \
-        WHERE c.session_id = ?2 AND c.src_rowid_lo IS NOT NULL HAVING COUNT(*) = 1";
+        WHERE c.session_id = ?1 AND c.src_rowid_lo IS NOT NULL \
+          AND ?2 BETWEEN c.src_rowid_lo AND c.src_rowid_hi HAVING COUNT(*) = 1";
     let mut rowid_match_stmt = conn.prepare(rowid_match_sql)?;
     let instr_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
-        JOIN (SELECT text FROM messages WHERE messages MATCH ?1 AND session_id = ?2 ORDER BY rank LIMIT 1) m \
-          ON instr(c.content, m.text) > 0 \
-        WHERE c.session_id = ?2 AND c.src_rowid_lo IS NULL HAVING COUNT(*) = 1";
+        WHERE c.session_id = ?1 AND c.src_rowid_lo IS NULL AND instr(c.content, ?2) > 0 \
+        HAVING COUNT(*) = 1";
     let mut instr_match_stmt = conn.prepare(instr_match_sql)?;
     let snippet_sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
-               FROM messages WHERE messages MATCH ?1 AND session_id = ?2 LIMIT 1";
+               FROM messages WHERE messages MATCH ?1 AND rowid = ?2";
     let mut snippet_stmt = conn.prepare(snippet_sql)?;
     let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
-        if let Some(fts_query) = fts_query {
+        if let Some((rowid, text)) = best_hits.get(sid) {
             if let Some((chunk_id, content)) = row_or_default(
-                rowid_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| {
+                rowid_match_stmt.query_row(rusqlite::params![sid, rowid], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
                 }),
                 sid,
@@ -335,17 +376,19 @@ fn fetch_chunks(
                 return (content, Some(chunk_id));
             }
             if let Some(content) = row_or_default(
-                instr_match_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+                instr_match_stmt.query_row(rusqlite::params![sid, text], |row| row.get(0)),
                 sid,
             ) {
                 return (content, None);
             }
-            if let Some(snippet) = row_or_default(
-                snippet_stmt.query_row(rusqlite::params![fts_query, sid], |row| row.get(0)),
+        }
+        if let (Some(fts_query), Some(rowid)) = (fts_query, first_hits.get(sid))
+            && let Some(snippet) = row_or_default(
+                snippet_stmt.query_row(rusqlite::params![fts_query, rowid], |row| row.get(0)),
                 sid,
-            ) {
-                return (snippet, None);
-            }
+            )
+        {
+            return (snippet, None);
         }
         if let Some(&chunk_id) = vec_chunks.get(sid)
             && let Some(content) = row_or_default(
@@ -483,8 +526,6 @@ fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
-/// Turns a user query into an FTS5 MATCH expression, or `None` when it has no
-/// searchable terms.
 fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> {
     let segmented = segment_script_boundaries(query);
     let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
@@ -509,11 +550,8 @@ fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> 
     }
 }
 
-/// Counts automated sessions that the default search left out: sessions
-/// classified automated that match the query's keywords (or, without a query,
-/// the `--file` filter) under the same filters. Sessions reachable only through
-/// the vector leg are not counted, so the count can fall short but never
-/// includes a session that does not match the search.
+/// Matches reachable only through the vector leg are not counted, so the count
+/// can fall short but never includes a session that does not match the search.
 pub fn count_excluded_automated(
     conn: &Connection,
     query: Option<&str>,

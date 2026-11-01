@@ -2407,3 +2407,95 @@ fn excluded_automated_count_reports_a_broken_vocab_table_as_an_error() {
         "a vocab table without the cnt column must surface as an error, got {result:?}"
     );
 }
+
+#[test]
+fn each_session_gets_its_own_best_chunk_when_several_sessions_match() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_session(&conn, "s2", "claude", "/proj", 1709251200000);
+    insert_message(
+        &conn,
+        "s1",
+        "user",
+        "authentication one padded with filler words to lower rank",
+    );
+    insert_message(
+        &conn,
+        "s2",
+        "user",
+        "authentication two padded with filler words to lower rank",
+    );
+    insert_message(&conn, "s1", "user", "authentication s1 best");
+    insert_message(&conn, "s2", "user", "authentication s2 best");
+    for (id, sid, text, body) in [
+        (
+            1,
+            "s1",
+            "authentication one padded with filler words to lower rank",
+            "S1_LOW",
+        ),
+        (
+            2,
+            "s2",
+            "authentication two padded with filler words to lower rank",
+            "S2_LOW",
+        ),
+        (3, "s1", "authentication s1 best", "S1_BEST"),
+        (4, "s2", "authentication s2 best", "S2_BEST"),
+    ] {
+        let rowid = message_rowid(&conn, sid, text);
+        insert_chunk_with_rowid_range(
+            &conn,
+            id,
+            sid,
+            &format!("{text} — {body}"),
+            1709251200000,
+            rowid,
+            rowid,
+        );
+    }
+
+    let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
+
+    let by_session: HashMap<_, _> = results
+        .iter()
+        .map(|r| {
+            (
+                r.session.session_id.as_str(),
+                (r.excerpt.as_str(), r.chunk_id),
+            )
+        })
+        .collect();
+    assert_eq!(by_session.len(), 2, "both sessions match: {by_session:?}");
+    assert!(by_session["s1"].0.contains("S1_BEST"), "{by_session:?}");
+    assert_eq!(by_session["s1"].1, Some(3));
+    assert!(by_session["s2"].0.contains("S2_BEST"), "{by_session:?}");
+    assert_eq!(by_session["s2"].1, Some(4));
+}
+
+#[test]
+fn snippet_fallback_comes_from_the_first_matching_message_of_the_session() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
+    insert_session(&conn, "s2", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "s2", "user", "authentication other session");
+    insert_message(
+        &conn,
+        "s1",
+        "user",
+        "authentication earliest padded with many extra filler words to lower its rank",
+    );
+    insert_message(&conn, "s1", "user", "authentication later");
+
+    let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
+
+    let s1 = results
+        .iter()
+        .find(|r| r.session.session_id == "s1")
+        .expect("s1 matches");
+    assert!(
+        s1.excerpt.contains("earl") && !s1.excerpt.contains("later") && s1.excerpt.contains("**"),
+        "without a chunk, the snippet comes from the session's first matching message: {:?}",
+        s1.excerpt
+    );
+}
