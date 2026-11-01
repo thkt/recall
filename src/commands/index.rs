@@ -49,11 +49,12 @@ pub(crate) fn index_and_report(
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
     };
-    let outcome = index_and_report_with_options(
+    let outcome = index_and_report_observed(
         db_path,
         &opts,
         || try_load_embedder_cached_with_reporter(try_load_embedder_default_logging, |_: &str| {}),
         embed_options,
+        &index_observer::Observer::stderr(),
     )?;
     if let Some(note) = &outcome.degraded_note {
         cli_info(note);
@@ -160,28 +161,11 @@ pub(crate) fn index_and_report_with<F>(
 where
     F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
-    index_and_report_with_options(
-        db_path,
-        opts,
-        load_embedder,
-        embedder::EmbedOptions::default(),
-    )
-}
-
-fn index_and_report_with_options<F>(
-    db_path: &Option<PathBuf>,
-    opts: &indexer::IndexOptions,
-    load_embedder: F,
-    embed_options: embedder::EmbedOptions,
-) -> Result<IndexOutcome>
-where
-    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
-{
     index_and_report_observed(
         db_path,
         opts,
         load_embedder,
-        embed_options,
+        embedder::EmbedOptions::default(),
         &index_observer::Observer::stderr(),
     )
 }
