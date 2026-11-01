@@ -2367,3 +2367,43 @@ fn excluded_automated_count_is_zero_when_automated_sessions_are_included() {
         "nothing is excluded when automated sessions are included"
     );
 }
+
+#[test]
+fn excluded_automated_count_is_zero_without_a_query_or_file_filter() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "auto", "claude", "/proj", 1709251200000);
+    set_session_type(&conn, "auto", "automated");
+
+    let count = count_excluded_automated(&conn, None, &SearchOptions::default()).unwrap();
+
+    assert_eq!(
+        count, 0,
+        "with nothing to match, no automated session was left out"
+    );
+}
+
+#[test]
+fn excluded_automated_count_is_zero_when_the_query_has_no_searchable_terms() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "auto", "claude", "/proj", 1709251200000);
+    insert_message(&conn, "auto", "user", "authentication flow");
+    set_session_type(&conn, "auto", "automated");
+
+    let count = count_excluded_automated(&conn, Some("!!"), &SearchOptions::default()).unwrap();
+
+    assert_eq!(count, 0, "a query with no searchable terms matches nothing");
+}
+
+#[test]
+fn excluded_automated_count_reports_a_broken_vocab_table_as_an_error() {
+    let (_dir, conn) = setup_test_db();
+    conn.execute_batch("DROP TABLE messages_vocab; CREATE TABLE messages_vocab (term TEXT);")
+        .unwrap();
+
+    let result = count_excluded_automated(&conn, Some("ab"), &SearchOptions::default());
+
+    assert!(
+        result.is_err(),
+        "a vocab table without the cnt column must surface as an error, got {result:?}"
+    );
+}
