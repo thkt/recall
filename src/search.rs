@@ -526,8 +526,6 @@ fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
-/// Turns a user query into an FTS5 MATCH expression, or `None` when it has no
-/// searchable terms.
 fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> {
     let segmented = segment_script_boundaries(query);
     let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
@@ -552,11 +550,8 @@ fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> 
     }
 }
 
-/// Counts automated sessions that the default search left out: sessions
-/// classified automated that match the query's keywords (or, without a query,
-/// the `--file` filter) under the same filters. Sessions reachable only through
-/// the vector leg are not counted, so the count can fall short but never
-/// includes a session that does not match the search.
+/// Matches reachable only through the vector leg are not counted, so the count
+/// can fall short but never includes a session that does not match the search.
 pub fn count_excluded_automated(
     conn: &Connection,
     query: Option<&str>,
