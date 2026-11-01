@@ -7,7 +7,7 @@ use crate::compat::filter::{
 };
 use crate::compat::{anon_placeholders, clean_for_trigram};
 use crate::embedding::Embed;
-use crate::storage::{QueryNormalizationConfig, SanitizeError, prepare_match_query};
+use crate::storage::{MatchFtsQuery, QueryNormalizationConfig, SanitizeError, prepare_match_query};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
@@ -53,6 +53,7 @@ pub enum CurrentSession {
     Only(String),
 }
 
+#[derive(Clone)]
 pub struct SearchOptions {
     pub project: Option<String>,
     pub days: Option<i64>,
@@ -482,6 +483,87 @@ fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
+/// Turns a user query into an FTS5 MATCH expression, or `None` when it has no
+/// searchable terms.
+fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> {
+    let segmented = segment_script_boundaries(query);
+    let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
+        segmented
+    } else {
+        query.to_owned()
+    };
+    match prepare_match_query(
+        conn,
+        &fts_input,
+        "messages_vocab",
+        &QueryNormalizationConfig::disabled(),
+    ) {
+        Ok(m) => Ok(Some(m)),
+        Err(SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms) => {
+            debug!(%query, "query produced no searchable terms");
+            Ok(None)
+        }
+        Err(e @ (SanitizeError::InvalidVocabTable(_) | SanitizeError::VocabLookupFailed(_))) => {
+            Err(e.into())
+        }
+    }
+}
+
+/// Counts automated sessions that the default search left out: sessions
+/// classified automated that match the query's keywords (or, without a query,
+/// the `--file` filter) under the same filters. Sessions reachable only through
+/// the vector leg are not counted, so the count can fall short but never
+/// includes a session that does not match the search.
+pub fn count_excluded_automated(
+    conn: &Connection,
+    query: Option<&str>,
+    opts: &SearchOptions,
+) -> Result<usize> {
+    if opts.include_automated {
+        return Ok(0);
+    }
+    let now_ms = resolve_now_ms(opts)?;
+    let unfiltered = SearchOptions {
+        include_automated: true,
+        ..opts.clone()
+    };
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    let (mut sql, column) = match query {
+        Some(query) => {
+            let Some(fts_query) = match_query(conn, query)?.and_then(|m| clean_for_trigram(&m))
+            else {
+                return Ok(0);
+            };
+            params.push(Box::new(fts_query));
+            (
+                "SELECT COUNT(DISTINCT session_id) FROM messages WHERE messages MATCH ?".to_owned(),
+                "session_id",
+            )
+        }
+        None if opts.file.is_some() => (
+            "SELECT COUNT(*) FROM sessions s WHERE 1 = 1".to_owned(),
+            "s.session_id",
+        ),
+        None => return Ok(0),
+    };
+    append_search_filters(&mut sql, &mut params, column, &unfiltered, now_ms);
+    sql.push_str(" AND ");
+    sql.push_str(column);
+    sql.push_str(
+        " IN (SELECT s4.session_id FROM sessions s4 \
+         WHERE COALESCE(s4.session_type, 'interactive') = 'automated')",
+    );
+    debug_assert_eq!(
+        params.len(),
+        sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+    let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| {
+        r.get(0)
+    })?;
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
 #[cfg(test)]
 pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Vec<SearchResult>> {
     Ok(search_with_embedder(conn, query, opts, None)?.results)
@@ -510,26 +592,8 @@ pub fn search_with_embedder<'q>(
     let Some(query) = query.into() else {
         return file_list_outcome(conn, opts, now_ms);
     };
-    let segmented = segment_script_boundaries(query);
-    let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
-        segmented
-    } else {
-        query.to_owned()
-    };
-    let matched = match prepare_match_query(
-        conn,
-        &fts_input,
-        "messages_vocab",
-        &QueryNormalizationConfig::disabled(),
-    ) {
-        Ok(m) => m,
-        Err(SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms) => {
-            debug!(%query, "query produced no searchable terms");
-            return Ok(SearchOutcome::nominal(Vec::new()));
-        }
-        Err(e @ (SanitizeError::InvalidVocabTable(_) | SanitizeError::VocabLookupFailed(_))) => {
-            return Err(e.into());
-        }
+    let Some(matched) = match_query(conn, query)? else {
+        return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = clean_for_trigram(&matched);
     let fts_query = fts_query.as_deref();
