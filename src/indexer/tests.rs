@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::*;
+use crate::commands::classify::reclassify_sessions;
 use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use crate::index_observer::recording;
@@ -339,7 +340,7 @@ fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
                     },
                     "another session's metadata cannot establish that this body is empty"
                 );
-                crate::reclassify_sessions(&mut conn, true, false).unwrap();
+                reclassify_sessions(&mut conn, true, false).unwrap();
                 assert_eq!(
                     collect_strings(&conn, "SELECT session_type FROM sessions"),
                     [if matches { "automated" } else { initial_type }],

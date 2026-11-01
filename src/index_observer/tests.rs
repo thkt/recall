@@ -5,9 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use super::*;
+use crate::commands::index::index_and_report_observed;
 use crate::db::open_db_readonly;
 use crate::embedder::{EmbedOptions, MockEmbedder};
-use crate::index_and_report_observed;
 use crate::indexer::IndexOptions;
 use tempfile::TempDir;
 
