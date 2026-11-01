@@ -152,9 +152,14 @@ fn index_and_report_forwards_index_flags_as_embed_options() {
         forward_pause: Some(Duration::from_millis(700)),
     };
 
-    let result =
-        index_and_report_with_options(&Some(db_path), &opts, || Ok(embedder.clone()), options)
-            .unwrap();
+    let result = index_and_report_observed(
+        &Some(db_path),
+        &opts,
+        || Ok(embedder.clone()),
+        options,
+        &index_observer::Observer::stderr(),
+    )
+    .unwrap();
 
     assert_eq!(result.embedded, 1);
     assert_eq!(
