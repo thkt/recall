@@ -33,10 +33,7 @@ use std::sync::Arc;
 
 use crate::embedding::Embed;
 use crate::model::handle_probe_if_needed;
-use crate::model::{
-    DegradedReason, EmbedderDegraded, download_and_verify_model, record_degraded,
-    try_load_embedder_default_logging,
-};
+use crate::model::{DegradedReason, EmbedderDegraded, download_and_verify_model, record_degraded};
 use crate::runtime::{
     codes, exit_error, home_dir, info as cli_info, init_subscriber, try_expand_shorthand,
 };
@@ -217,10 +214,6 @@ fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -
         .join("indexes")
         .join(model::selected().identity())
         .join("recall.db"))
-}
-
-fn try_load_embedder_cached() -> Result<Arc<dyn Embed>, DegradedReason> {
-    try_load_embedder_cached_with(try_load_embedder_default_logging)
 }
 
 fn try_load_embedder_cached_with<F>(open_embedder: F) -> Result<Arc<dyn Embed>, DegradedReason>

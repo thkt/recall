@@ -1,5 +1,5 @@
 use crate::{
-    embedding::Embed,
+    embedding::{EMBEDDING_DIMS, Embed},
     native::{Gemma, gpu_available},
 };
 use anyhow::{Context, Result, ensure};
@@ -21,6 +21,9 @@ use std::{
 
 #[path = "model/cache.rs"]
 mod cache;
+#[path = "model/probe_record.rs"]
+mod probe_record;
+pub(crate) use probe_record::ProbeRecords;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,13 +238,7 @@ pub fn handle_probe_if_needed() {
             process::exit(2);
         }
         let artifacts = probe_artifacts(env::var_os("__RECALL_GEMMA_ARTIFACTS"))?;
-        let model = artifacts.load()?;
-        let v = model.embed_query("model probe")?;
-        ensure!(
-            v.len() == 768 && v.iter().all(|x| x.is_finite()),
-            "invalid probe embedding"
-        );
-        Ok(())
+        self_check(artifacts.load()?.as_ref())
     })();
     process::exit(if result.is_ok() { 0 } else { 1 });
 }
@@ -291,26 +288,171 @@ fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
         thread::sleep(Duration::from_millis(10));
     }
 }
-pub fn try_load_embedder_default_logging() -> Result<Arc<dyn Embed>, DegradedReason> {
-    let artifacts = match cached_artifacts() {
-        Ok(None) => return Err(DegradedReason::NotInstalled),
+
+/// Logs a stage's wall time at debug level for `RUST_LOG=recall=debug` timing runs.
+pub(crate) fn timed<T>(stage: &'static str, run: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = run();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(stage, elapsed_ms, "model stage finished");
+    result
+}
+
+fn self_check(model: &dyn Embed) -> Result<()> {
+    let v = model.embed_query("model probe")?;
+    ensure!(
+        v.len() == EMBEDDING_DIMS && v.iter().all(|x| x.is_finite()),
+        "invalid probe embedding"
+    );
+    Ok(())
+}
+
+/// The load steps that need the GPU, the model weights or a child process.
+pub(crate) struct LoadSteps<'a> {
+    pub(crate) probe: &'a dyn Fn(&Path) -> Result<bool>,
+    pub(crate) gpu_available: &'a dyn Fn() -> Result<bool>,
+    pub(crate) load: &'a dyn Fn(&Path) -> Result<Arc<dyn Embed>>,
+}
+
+fn load_verified(root: &Path) -> Result<Arc<dyn Embed>> {
+    VerifiedArtifacts { root: root.into() }.load()
+}
+
+const HOST_STEPS: LoadSteps<'static> = LoadSteps {
+    probe: &probe,
+    gpu_available: &gpu_available,
+    load: &load_verified,
+};
+
+fn verified_root() -> Result<PathBuf, DegradedReason> {
+    match timed("artifact sha256", cached_artifacts) {
+        Ok(None) => Err(DegradedReason::NotInstalled),
         Err(error) => {
             tracing::warn!(%error,"model artifact validation failed");
-            return Err(DegradedReason::ProbeFailed);
+            Err(DegradedReason::ProbeFailed)
         }
-        Ok(Some(artifacts)) => artifacts,
-    };
-    match probe(&artifacts.root) {
+        Ok(Some(artifacts)) => Ok(artifacts.root),
+    }
+}
+
+type ResolveArtifacts<'a> = &'a dyn Fn() -> Result<(PathBuf, Option<ProbeRecords>), DegradedReason>;
+
+/// Where a command's model load finds the verified artifacts, the probe record and the load
+/// steps. Commands take it as their only model input, so tests reach the loader each command
+/// picks.
+pub(crate) struct ModelHost<'a> {
+    /// Called per load, so a command that never loads the model skips the SHA-256 check.
+    pub(crate) resolve: ResolveArtifacts<'a>,
+    pub(crate) steps: &'a LoadSteps<'a>,
+}
+
+impl ModelHost<'_> {
+    /// Used by index, rebuild and doctor: always runs the isolated probe.
+    pub(crate) fn load_probing(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
+        let (root, records) = (self.resolve)()?;
+        load_probing(&root, records.as_ref(), self.steps)
+    }
+
+    /// Used by search: skips the isolated probe in an environment where it already succeeded.
+    pub(crate) fn load_for_search(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
+        let (root, records) = (self.resolve)()?;
+        load_for_search(&root, records.as_ref(), self.steps)
+    }
+}
+
+fn resolve_on_host() -> Result<(PathBuf, Option<ProbeRecords>), DegradedReason> {
+    let root = verified_root()?;
+    Ok((root, ProbeRecords::host(&selected().identity())))
+}
+
+pub(crate) const HOST: ModelHost<'static> = ModelHost {
+    resolve: &resolve_on_host,
+    steps: &HOST_STEPS,
+};
+
+/// Records the environment only after the probe, the parent load and a parent self-check
+/// embedding all succeed; any failure clears the record.
+pub(crate) fn load_probing(
+    root: &Path,
+    records: Option<&ProbeRecords>,
+    steps: &LoadSteps<'_>,
+) -> Result<Arc<dyn Embed>, DegradedReason> {
+    // No skip ever reads the record of an environment marked no-skip, so skip the self-check.
+    let records = records.filter(|records| !records.no_skip());
+    tracing::debug!("starting the isolated model probe");
+    let loaded = match timed("isolated probe", || (steps.probe)(root)) {
         Ok(false) => Err(DegradedReason::BackendUnavailable),
-        Ok(true) => artifacts
-            .load()
+        Ok(true) => timed("model load", || (steps.load)(root))
             .map_err(degrade_with_warn("model load", DegradedReason::ProbeFailed)),
         Err(error) => Err(degrade_with_warn(
             "model probe",
             DegradedReason::ProbeFailed,
         )(error)),
+    };
+    if let Some(records) = records {
+        // A failed self-check leaves the returned model as before; it only withholds the record.
+        let verified = loaded.as_ref().is_ok_and(|model| {
+            timed("self-check embedding", || self_check(model.as_ref()))
+                .inspect_err(|error| tracing::warn!(%error, "parent model self-check failed"))
+                .is_ok()
+        });
+        if verified {
+            records.record_success();
+        } else {
+            records.clear();
+        }
     }
+    loaded
 }
+
+/// The GPU check, load and self-check run under a running marker, so a crash or hang in them
+/// stops later searches in this environment from skipping the probe.
+pub(crate) fn load_for_search(
+    root: &Path,
+    records: Option<&ProbeRecords>,
+    steps: &LoadSteps<'_>,
+) -> Result<Arc<dyn Embed>, DegradedReason> {
+    let Some(records) = records.filter(|records| records.may_skip()) else {
+        return load_probing(root, records, steps);
+    };
+    let marker = match records.begin_skipped_load() {
+        Ok(marker) => marker,
+        Err(error) => {
+            tracing::warn!(%error, "could not mark the skipped model load; running the isolated probe");
+            return load_probing(root, Some(records), steps);
+        }
+    };
+    tracing::debug!("isolated model probe skipped: this environment already passed it");
+    let loaded = load_skipping_probe(root, steps);
+    marker.finish();
+    if loaded.is_err() {
+        records.clear();
+    }
+    loaded
+}
+
+fn load_skipping_probe(
+    root: &Path,
+    steps: &LoadSteps<'_>,
+) -> Result<Arc<dyn Embed>, DegradedReason> {
+    match timed("gpu check", steps.gpu_available) {
+        Ok(true) => {}
+        Ok(false) => return Err(DegradedReason::BackendUnavailable),
+        Err(error) => {
+            return Err(degrade_with_warn("gpu check", DegradedReason::ProbeFailed)(
+                error,
+            ));
+        }
+    }
+    let model = timed("model load", || (steps.load)(root))
+        .map_err(degrade_with_warn("model load", DegradedReason::ProbeFailed))?;
+    timed("self-check embedding", || self_check(model.as_ref())).map_err(degrade_with_warn(
+        "model self-check",
+        DegradedReason::ProbeFailed,
+    ))?;
+    Ok(model)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ModelDownloadError {
     #[error("model download failed: {0}")]
@@ -401,4 +543,4 @@ pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
 
 #[cfg(test)]
 #[path = "model/tests.rs"]
-mod tests;
+pub(crate) mod tests;

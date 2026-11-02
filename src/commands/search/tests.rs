@@ -1,5 +1,8 @@
 use crate::commands::index::embed_all_pending;
-use crate::tests::{bare_empty_db, mock_loader, payload_keys, search_command, vec_chunk_count};
+use crate::model::tests::FakeHost;
+use crate::tests::{
+    bare_empty_db, mock_loader, payload_keys, search_command, seed_healthy_index, vec_chunk_count,
+};
 use crate::{embedder, open_or_create_db, parser};
 
 use super::*;
@@ -628,4 +631,31 @@ fn u002_snippet_hit_json_guides_full_show_without_inspect_line() {
         !payload.contains("--chunk"),
         "a snippet-tier hit must not emit a --chunk inspect line, got: {payload}"
     );
+}
+
+#[test]
+fn two_searches_in_one_environment_start_the_probe_only_for_the_first() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    seed_healthy_index(&open_or_create_db(&db_path).unwrap());
+    let records_dir = db_dir.path().join("probe");
+    let host = FakeHost::healthy();
+
+    for _ in 0..2 {
+        let out = host
+            .serve(db_dir.path(), &records_dir, |model_host| {
+                run_search_in(
+                    search_command("healthy chunk"),
+                    &Some(db_path.clone()),
+                    model_host,
+                )
+            })
+            .unwrap();
+        assert!(!out.degraded, "{:?}", out.notes);
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        assert_eq!(out.data["results"].as_array().unwrap().len(), 1);
+    }
+
+    assert_eq!(host.probes.get(), 1);
+    assert_eq!(host.loads.get(), 2);
 }

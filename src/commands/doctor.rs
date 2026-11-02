@@ -13,7 +13,7 @@ use crate::envelope::CommandOutput;
 use crate::error::{RecallError, download_error};
 use crate::model::{self, DegradedReason, download_and_verify_model};
 use crate::runtime::info as cli_info;
-use crate::{open_or_create_db, resolve_db_path, try_load_embedder_cached};
+use crate::{open_or_create_db, resolve_db_path, try_load_embedder_cached_with};
 
 struct DoctorCheck {
     name: &'static str,
@@ -211,9 +211,29 @@ pub(crate) fn run_doctor(
     fix: bool,
     db_path: &Option<PathBuf>,
 ) -> Result<CommandOutput> {
-    run_doctor_with(verbose, fix, db_path, try_load_embedder_cached, || {
+    run_doctor_in(verbose, fix, db_path, &model::HOST, || {
         download_and_verify_model().map_err(|e| download_error(&e))
     })
+}
+
+/// Picks the always-probe loader; the model host is the only injected model input.
+fn run_doctor_in<R>(
+    verbose: bool,
+    fix: bool,
+    db_path: &Option<PathBuf>,
+    host: &model::ModelHost<'_>,
+    recover_model: R,
+) -> Result<CommandOutput>
+where
+    R: FnOnce() -> Result<(), RecallError>,
+{
+    run_doctor_with(
+        verbose,
+        fix,
+        db_path,
+        || try_load_embedder_cached_with(|| host.load_probing()),
+        recover_model,
+    )
 }
 
 fn run_doctor_with<F, R>(

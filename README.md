@@ -263,7 +263,7 @@ src/
 ├── indexer.rs    Incremental indexer with mtime/size tracking + chunk generation
 ├── search.rs     FTS5 + hybrid vector search with graceful degradation
 ├── hybrid.rs     RRF merge + recency boost
-├── model.rs      Pinned manifests, artifact verification, isolated probe and index identity
+├── model.rs      Pinned manifests, artifact verification, isolated probe (skipped by search in a verified environment) and index identity
 ├── native.rs     EmbeddingGemma encoder via llama.cpp/Metal
 ├── embedding.rs  Shared embedding types and options
 ├── embedder.rs   Index-time embedding orchestration (generation-checked chunk batches)
@@ -276,7 +276,7 @@ Single binary. SQLite, llama.cpp, and sqlite-vec are statically linked.
 
 ## Performance
 
-Gemma product latency and indexing throughput depend on corpus, hardware, checksum verification and the isolated probe. Earlier Ruri/MLX timings are not Gemma benchmarks. The pinned BF16 model is 557,950,176 bytes, plus its tokenizer. See the [migration validation record](docs/audit/2026-10-16-gemma-validation.json) for scope and the [index measurement procedure](docs/index-observability.md) for timing conditions.
+Gemma product latency and indexing throughput depend on corpus, hardware, checksum verification and the isolated probe. `index`, `rebuild`, `doctor` and `model download` run the probe child every time. `recall search` skips it once the probe, model load and a self-check embedding have succeeded in the same environment (binary, manifest, macOS build, hardware model and `GGML_*` variables). A crash or hang during a skipped load makes that environment probe on every later search; see [DR 0013](docs/decisions/0013-skip-the-isolated-model-probe-on-search-in-a-verified-environment.md). Earlier Ruri/MLX timings are not Gemma benchmarks. The pinned BF16 model is 557,950,176 bytes, plus its tokenizer. See the [migration validation record](docs/audit/2026-10-16-gemma-validation.json) for scope and the [index measurement procedure](docs/index-observability.md) for timing conditions.
 
 ## Limitations
 

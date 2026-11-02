@@ -245,7 +245,7 @@ src/
 ├── indexer.rs    mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
 ├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
 ├── hybrid.rs     RRF 統合 + recency boost
-├── model.rs      固定manifest・artifact検証・独立probe・索引のモデル識別
+├── model.rs      固定manifest・artifact検証・独立probe（検証済み環境のsearchでは省略）・索引のモデル識別
 ├── native.rs     llama.cpp/MetalによるEmbeddingGemma encoder
 ├── embedding.rs  embeddingの共通型・オプション
 ├── embedder.rs   index時embeddingのオーケストレーション（世代を照合してチャンクをバッチ保存）
@@ -258,7 +258,7 @@ src/
 
 ## パフォーマンス
 
-Gemma製品版の時間・スループットはデータ量・機器・checksum確認・独立probeで変わります。従来のRuri/MLX計測値をGemmaの性能値としては使いません。固定BF16重みは557,950,176 bytesで、tokenizerは別です。検証範囲は[移行時の検証記録](docs/audit/2026-10-16-gemma-validation.json)、計測条件は[indexの計測手順](docs/index-observability.md)を参照してください。
+Gemma製品版の時間・スループットはデータ量・機器・checksum確認・独立probeで変わります。`index`・`rebuild`・`doctor`・`model download` は毎回probeの子プロセスを実行します。`recall search` は、同じ環境（バイナリ・manifest・macOSのビルド番号・機種・`GGML_*` の環境変数）でprobe・モデルの読み込み・確認用の埋め込みが成功した後は、probeを省きます。probeを省いた読み込みの最中に異常終了・停止した環境では、以後のsearchで毎回probeを実行します。[DR 0013](docs/decisions/0013-skip-the-isolated-model-probe-on-search-in-a-verified-environment.md)を参照してください。従来のRuri/MLX計測値をGemmaの性能値としては使いません。固定BF16重みは557,950,176 bytesで、tokenizerは別です。検証範囲は[移行時の検証記録](docs/audit/2026-10-16-gemma-validation.json)、計測条件は[indexの計測手順](docs/index-observability.md)を参照してください。
 
 ## 制限事項
 

@@ -15,7 +15,9 @@ use crate::model::{self, DegradedReason, EmbedderDegraded};
 use crate::parser::Source;
 use crate::runtime::done;
 use crate::{ansi, db, search};
-use crate::{format_timestamp, require_current_schema, resolve_db_path, try_load_embedder_cached};
+use crate::{
+    format_timestamp, require_current_schema, resolve_db_path, try_load_embedder_cached_with,
+};
 
 #[derive(Debug, Args)]
 pub(crate) struct SearchArgs {
@@ -127,7 +129,18 @@ fn resolve_current_session(
 }
 
 pub(crate) fn run_search(args: SearchArgs, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    run_search_with(args, db_path, try_load_embedder_cached)
+    run_search_in(args, db_path, &model::HOST)
+}
+
+/// Picks the probe-skipping loader; the model host is the only injected input.
+pub(crate) fn run_search_in(
+    args: SearchArgs,
+    db_path: &Option<PathBuf>,
+    host: &model::ModelHost<'_>,
+) -> Result<CommandOutput> {
+    run_search_with(args, db_path, || {
+        try_load_embedder_cached_with(|| host.load_for_search())
+    })
 }
 
 pub(crate) fn run_search_with<F>(
