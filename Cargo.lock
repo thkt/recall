@@ -1502,6 +1502,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
+ "libc",
  "llama-cpp-2",
  "reqwest",
  "rusqlite",

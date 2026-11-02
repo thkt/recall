@@ -1,6 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::path::Path;
 
+use crate::model::tests::FakeHost;
 use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
 use crate::{db, parser, search};
 
@@ -1474,5 +1475,28 @@ fn freeze_index_payload_key_set() {
         payload_keys(&out.data["skipped_roots"][0]),
         ["preserved_sessions", "reason", "source"],
         "index --json skipped_roots element keys are frozen"
+    );
+}
+
+#[test]
+fn index_still_starts_the_probe_in_an_environment_search_has_recorded() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let records_dir = dir.path().join("probe");
+    let host = FakeHost::healthy();
+    for _ in 0..2 {
+        let searched = host.serve(dir.path(), &records_dir, |model_host| {
+            model_host.load_for_search()
+        });
+        assert!(searched.is_ok());
+    }
+    assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
+
+    let loaded = host.serve(dir.path(), &records_dir, index_embedder);
+
+    assert!(loaded.is_ok());
+    assert_eq!(
+        host.probes.get(),
+        2,
+        "index and rebuild run the probe every time"
     );
 }

@@ -19,6 +19,7 @@ use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
 use crate::hybrid::{self, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
+use crate::model;
 use crate::parser::{SessionData, Source};
 
 const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
@@ -431,7 +432,7 @@ fn vec_search(
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<(String, i64)>> {
-    let embedding = embedder.embed_query(query)?;
+    let embedding = model::timed("query embedding", || embedder.embed_query(query))?;
     let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
 
     let mut sql = String::from(

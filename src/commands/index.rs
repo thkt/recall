@@ -10,7 +10,7 @@ use tracing::debug;
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::Embed;
 use crate::envelope::CommandOutput;
-use crate::model::{DegradedReason, degrade_with_warn, try_load_embedder_default_logging};
+use crate::model::{self, DegradedReason, ModelHost, degrade_with_warn};
 use crate::runtime::{done, home_dir, info as cli_info, warning};
 use crate::{ansi, embedder, index_observer, indexer};
 use crate::{
@@ -52,7 +52,7 @@ pub(crate) fn index_and_report(
     let outcome = index_and_report_observed(
         db_path,
         &opts,
-        || try_load_embedder_cached_with_reporter(try_load_embedder_default_logging, |_: &str| {}),
+        || index_embedder(&model::HOST),
         embed_options,
         &index_observer::Observer::stderr(),
     )?;
@@ -63,6 +63,11 @@ pub(crate) fn index_and_report(
         cli_info(&note);
     }
     Ok(outcome)
+}
+
+/// Picks the always-probe loader for index and rebuild.
+pub(crate) fn index_embedder(host: &ModelHost<'_>) -> Result<Arc<dyn Embed>, DegradedReason> {
+    try_load_embedder_cached_with_reporter(|| host.load_probing(), |_: &str| {})
 }
 
 #[derive(Default)]

@@ -53,8 +53,16 @@ artifacts. Both sae and recall use `~/.cache/embedding-models/<artifact-sha256>/
 bytes. Verified existing app caches are imported automatically with hard links
 where possible; old paths and app-specific index fingerprints stay intact.
 Explicit `RECALL_MODEL_DIR` selects its own directory and bypasses legacy import.
-Downloads are serialized with a shared file lock and verified before atomic replacement; a separate child
-process probes the model before normal loading. A timeout kills and reaps that child.
+Downloads are serialized with a shared file lock and verified before atomic replacement.
+`model download`, `index`, `rebuild` and `doctor` always probe the model in a separate
+child process before normal loading; a timeout kills and reaps that child. When
+`index`, `rebuild`, `doctor` or an unrecorded `search` sees the probe, the parent load
+and a parent self-check embedding succeed in an environment that still allows skipping, recall records the environment (binary, manifest, macOS build, hardware model and `GGML_*` variables)
+under `<cache base>/recall/probe/`. `recall search` skips the child in a recorded
+environment and checks the GPU, loads and self-checks in-process instead. Any change to
+those elements, any load failure, or a crash or hang during a skipped load makes search
+probe again; a crash or hang disables skipping for that environment permanently
+([DR 0013](decisions/0013-skip-the-isolated-model-probe-on-search-in-a-verified-environment.md)).
 There are no automatic model downloads on search/index and no automatic updates.
 
 The [script guide](../scripts/README.md) documents the synthetic real-CLI

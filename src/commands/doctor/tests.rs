@@ -2,9 +2,11 @@ use std::cell::Cell;
 use std::fs;
 use std::sync::Arc;
 
+use crate::commands::search::run_search_in;
 use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError};
-use crate::tests::{bare_empty_db, mock_loader, seed_healthy_index};
+use crate::model::tests::FakeHost;
+use crate::tests::{bare_empty_db, mock_loader, search_command, seed_healthy_index};
 
 use super::*;
 
@@ -875,4 +877,33 @@ fn run_doctor_fix_reports_open_failure_on_unopenable_db() {
             .contains("cannot open database"),
         "got: {integrity}"
     );
+}
+
+#[test]
+fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    seed_healthy_index(&open_or_create_db(&db_path).unwrap());
+    let records_dir = db_dir.path().join("probe");
+    let host = FakeHost::healthy();
+    for _ in 0..2 {
+        let searched = host.serve(db_dir.path(), &records_dir, |model_host| {
+            run_search_in(
+                search_command("healthy chunk"),
+                &Some(db_path.clone()),
+                model_host,
+            )
+        });
+        assert!(!searched.unwrap().degraded);
+    }
+    assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
+
+    let out = host
+        .serve(db_dir.path(), &records_dir, |model_host| {
+            run_doctor_in(false, false, &Some(db_path), model_host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(out.data["healthy"], true);
+    assert_eq!(host.probes.get(), 2, "doctor runs the probe every time");
 }

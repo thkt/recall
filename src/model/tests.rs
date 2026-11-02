@@ -1,5 +1,7 @@
 #![cfg(test)]
 use super::*;
+use crate::embedder::MockEmbedder;
+use std::cell::Cell;
 #[test]
 fn checksum_format_and_persisted_identity_survive_digest_updates() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -286,4 +288,262 @@ fn probe_child_without_a_handed_root_is_an_error() {
         error.to_string().contains("__RECALL_GEMMA_ARTIFACTS"),
         "{error}"
     );
+}
+
+/// Replaces only the probe child, the GPU check and the model load; the probe record is real.
+pub(crate) struct FakeHost {
+    pub(crate) probe_result: fn() -> Result<bool>,
+    pub(crate) gpu: fn() -> Result<bool>,
+    pub(crate) model: fn() -> Result<Arc<dyn Embed>>,
+    pub(crate) probes: Cell<usize>,
+    pub(crate) loads: Cell<usize>,
+}
+
+impl FakeHost {
+    pub(crate) fn healthy() -> Self {
+        Self {
+            probe_result: || Ok(true),
+            gpu: || Ok(true),
+            model: || Ok(Arc::new(MockEmbedder::new())),
+            probes: Cell::new(0),
+            loads: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn run<R>(&self, f: impl FnOnce(&LoadSteps<'_>) -> R) -> R {
+        let probe = |_: &Path| {
+            self.probes.set(self.probes.get() + 1);
+            (self.probe_result)()
+        };
+        let load = |_: &Path| {
+            self.loads.set(self.loads.get() + 1);
+            (self.model)()
+        };
+        f(&LoadSteps {
+            probe: &probe,
+            gpu_available: &self.gpu,
+            load: &load,
+        })
+    }
+
+    /// Hands `f` a model host whose artifacts resolve to `root` and whose record store,
+    /// keyed `env`, lives in `records_dir`; commands then pick their loader as in production.
+    pub(crate) fn serve<R>(
+        &self,
+        root: &Path,
+        records_dir: &Path,
+        f: impl FnOnce(&ModelHost<'_>) -> R,
+    ) -> R {
+        self.run(|steps| {
+            let resolve = || {
+                let records = ProbeRecords::new(records_dir.to_path_buf(), "env".to_owned());
+                Ok((root.to_path_buf(), Some(records)))
+            };
+            f(&ModelHost {
+                resolve: &resolve,
+                steps,
+            })
+        })
+    }
+}
+
+fn store(dir: &tempfile::TempDir) -> ProbeRecords {
+    ProbeRecords::new(dir.path().join("probe"), "env".to_owned())
+}
+
+fn failing_self_check() -> Result<Arc<dyn Embed>> {
+    Ok(Arc::new(MockEmbedder::failing_after(0)))
+}
+
+#[test]
+fn search_loader_with_a_matching_record_loads_without_starting_the_probe() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let records = store(&dir);
+    records.record_success();
+    let host = FakeHost::healthy();
+
+    let loaded = host.run(|steps| load_for_search(dir.path(), Some(&records), steps));
+
+    assert!(loaded.is_ok());
+    assert_eq!(host.probes.get(), 0);
+    assert_eq!(host.loads.get(), 1);
+    assert!(
+        records.may_skip(),
+        "a finished skipped load keeps the record"
+    );
+}
+
+#[test]
+fn search_loader_skip_path_without_a_gpu_returns_backend_unavailable_and_clears_the_record() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let records = store(&dir);
+    records.record_success();
+    let host = FakeHost {
+        gpu: || Ok(false),
+        ..FakeHost::healthy()
+    };
+
+    let loaded = host.run(|steps| load_for_search(dir.path(), Some(&records), steps));
+
+    assert_eq!(loaded.err(), Some(DegradedReason::BackendUnavailable));
+    assert_eq!(host.probes.get(), 0);
+    assert_eq!(host.loads.get(), 0);
+    assert!(!records.may_skip());
+}
+
+#[test]
+fn search_loader_skip_path_load_or_self_check_failure_clears_the_record() {
+    let failures: [FakeHost; 3] = [
+        FakeHost {
+            gpu: || anyhow::bail!("backend init failed"),
+            ..FakeHost::healthy()
+        },
+        FakeHost {
+            model: || anyhow::bail!("model load failed"),
+            ..FakeHost::healthy()
+        },
+        FakeHost {
+            model: failing_self_check,
+            ..FakeHost::healthy()
+        },
+    ];
+    for host in failures {
+        let dir = tempfile::TempDir::new().unwrap();
+        let records = store(&dir);
+        records.record_success();
+
+        let loaded = host.run(|steps| load_for_search(dir.path(), Some(&records), steps));
+
+        assert_eq!(loaded.err(), Some(DegradedReason::ProbeFailed));
+        assert_eq!(host.probes.get(), 0);
+        assert!(!records.may_skip());
+        let _ = host.run(|steps| load_for_search(dir.path(), Some(&records), steps));
+        assert_eq!(host.probes.get(), 1, "the next search runs the probe");
+    }
+}
+
+#[test]
+fn search_loader_runs_the_probe_when_the_record_is_missing_or_the_environment_is_marked_no_skip() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let records = store(&dir);
+    let host = FakeHost::healthy();
+
+    assert!(
+        host.run(|steps| load_for_search(dir.path(), Some(&records), steps))
+            .is_ok()
+    );
+    assert_eq!(host.probes.get(), 1, "no record: the probe runs");
+
+    drop(records.begin_skipped_load().unwrap());
+    for expected in [2, 3] {
+        assert!(
+            host.run(|steps| load_for_search(dir.path(), Some(&records), steps))
+                .is_ok()
+        );
+        assert_eq!(
+            host.probes.get(),
+            expected,
+            "a crashed skipped load keeps the environment probing even after a new success"
+        );
+    }
+
+    assert!(
+        !dir.path().join("probe").join("env.ok").exists(),
+        "an environment marked no-skip gets no record that nothing would read"
+    );
+
+    let probes_without_store = host.run(|steps| load_for_search(dir.path(), None, steps));
+    assert!(probes_without_store.is_ok());
+    assert_eq!(host.probes.get(), 4, "no usable store: the probe runs");
+}
+
+#[test]
+fn search_loader_runs_the_probe_when_the_running_marker_cannot_be_created() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let records = store(&dir);
+    records.record_success();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path().join("probe"), fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let host = FakeHost::healthy();
+
+    let loaded = host.run(|steps| load_for_search(dir.path(), Some(&records), steps));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.path().join("probe"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    assert!(loaded.is_ok(), "search must not fail or degrade");
+    assert_eq!(host.probes.get(), 1);
+}
+
+#[test]
+fn default_loader_runs_the_probe_even_when_a_matching_record_exists() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let records = store(&dir);
+    records.record_success();
+    let host = FakeHost::healthy();
+
+    let loaded = host.run(|steps| load_probing(dir.path(), Some(&records), steps));
+
+    assert!(loaded.is_ok());
+    assert_eq!(host.probes.get(), 1);
+    assert!(records.may_skip());
+}
+
+#[test]
+fn default_loader_records_success_only_after_the_parent_self_check_passes() {
+    let not_recorded: [(FakeHost, Option<DegradedReason>); 4] = [
+        (
+            FakeHost {
+                probe_result: || Ok(false),
+                ..FakeHost::healthy()
+            },
+            Some(DegradedReason::BackendUnavailable),
+        ),
+        (
+            FakeHost {
+                probe_result: || anyhow::bail!("isolated model probe timed out"),
+                ..FakeHost::healthy()
+            },
+            Some(DegradedReason::ProbeFailed),
+        ),
+        (
+            FakeHost {
+                model: || anyhow::bail!("model load failed"),
+                ..FakeHost::healthy()
+            },
+            Some(DegradedReason::ProbeFailed),
+        ),
+        // A failed parent self-check keeps today's result: the model is returned unrecorded.
+        (
+            FakeHost {
+                model: failing_self_check,
+                ..FakeHost::healthy()
+            },
+            None,
+        ),
+    ];
+    for (host, reason) in not_recorded {
+        let dir = tempfile::TempDir::new().unwrap();
+        let records = store(&dir);
+        records.record_success();
+
+        let loaded = host.run(|steps| load_probing(dir.path(), Some(&records), steps));
+
+        assert_eq!(loaded.err(), reason);
+        assert!(
+            !records.may_skip(),
+            "a failure clears and withholds the record"
+        );
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let records = store(&dir);
+    let loaded = FakeHost::healthy().run(|steps| load_probing(dir.path(), Some(&records), steps));
+    assert!(loaded.is_ok());
+    assert!(records.may_skip());
 }
