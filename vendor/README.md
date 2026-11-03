@@ -19,6 +19,84 @@ The llama.cpp submodule is fixed to
 independent EmbeddingGemma 2 evaluation. Pinning the pairing prevents a binding
 update from silently replacing the model backend with another submodule revision.
 
+## Build-time llama.cpp patches
+
+The build applies one upstream llama.cpp change on top of the pinned revision:
+
+| Patch file                                           | Upstream                                                                                                          | Effect                                                                                                                                                                   |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `patches/0001-llama-30679-faster-vocab-load.patch`   | [ggml-org/llama.cpp#30679](https://github.com/ggml-org/llama.cpp/pull/30679), commit `824eaecf48` (2026-10-21), 7 files, +73/-37 | `src/llama-model-loader.cpp` no longer converts every metadata value to a string when logging is discarded, and the vocabulary load no longer converts each array element to a string |
+
+The patch is taken whole from the upstream commit (`git format-patch -1 824eaecf48`).
+The pinned revision `1b70350` (2026-10-13) predates it.
+Decision record: [DR 0014](../docs/decisions/0014-apply-upstream-llama-cpp-fixes-as-build-time-patches-on-the-pinned-submodule.md).
+
+`build.rs` copies the llama.cpp directories it builds from (`ggml`, `src`, `common`,
+`include`, `vendor`, `cmake`, `tools`, `pocs`, the top-level `CMakeLists.txt`,
+`convert_hf_to_gguf.py`, and `LICENSE`) into `OUT_DIR`, applies every `patches/*.patch`
+to that copy in name order with `git apply`, and passes the copy to CMake.
+The submodule work tree and its pointer are not modified, so
+`git -C vendor/llama-cpp-sys-2/llama.cpp status --short` stays empty after a build.
+bindgen and the cc wrappers keep reading the original tree.
+
+Rules the build enforces:
+
+- A patch may change files below `src/` only. A patch that changes any other path fails the build.
+- A patch that does not apply fails the build, and the error names the `.patch` file.
+- After applying, the build reverses each patch as a dry run against the copy. This catches a
+  patch that `git apply` skipped while exiting 0.
+- `git` runs with `GIT_CEILING_DIRECTORIES` set to the parent of the copy and with `GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and `GIT_COMMON_DIR` removed. `OUT_DIR` is under the
+  recall repository's `target/`, and without this `git apply` prints `Skipped patch` and does nothing.
+- `git` must be on `PATH` during the build.
+
+`RECALL_LLAMA_SKIP_PATCHES=1` builds without applying any patch and emits a `cargo:warning`.
+Use it to build the unpatched baseline. Cargo reruns the build script when this variable changes.
+
+`llama_cpp_sys_2::APPLIED_PATCHES` lists the file names of the patches in the linked build.
+It is empty for a build with `RECALL_LLAMA_SKIP_PATCHES=1`. A recall test asserts that the
+vocabulary loading patch is among them.
+
+When the submodule pin moves to or past `824eaecf48`, delete the patch file and its row above in the same change.
+
+### Verifying that a patch does not change the model output
+
+The patched build must produce the same token ids, vocabulary pieces, and embedding bits as the
+unpatched build. The ignored test `real_model_bit_dump_for_build_parity` in
+`src/native/real_tests.rs` writes them to one JSON file. Its text set contains search queries,
+Japanese text, emoji, combining characters, code, whitespace, and queries and documents of
+about 511, 512, 513, 8192, and 8193 tokens, plus a multi-window document. It also writes
+`token_to_piece` for every vocabulary id, with and without special tokens. Embeddings are written
+as `f32::to_bits` in hexadecimal.
+
+`RECALL_GEMMA_TEST_ARTIFACT_DIR` is a directory with the verified `model.gguf` and
+`tokenizer.json`. The test checks their SHA-256 against `ModelSpec` before loading.
+Use the same machine, the same profile, and the same artifact directory for every dump.
+
+```sh
+dump() { # $1 = output file, remaining args = environment assignments
+  out=$1; shift
+  env "$@" RECALL_GEMMA_TEST_ARTIFACT_DIR=/path/to/artifacts \
+    RECALL_GEMMA_TEST_BITS_OUT="$out" \
+    cargo test --locked --release real_model_bit_dump_for_build_parity -- --ignored
+}
+
+dump /tmp/a1.json RECALL_LLAMA_SKIP_PATCHES=1   # unpatched, first run
+dump /tmp/a2.json RECALL_LLAMA_SKIP_PATCHES=1   # unpatched, second run
+cmp /tmp/a1.json /tmp/a2.json                   # A/A
+
+dump /tmp/b.json                                # patched
+cmp /tmp/a1.json /tmp/b.json                    # A/B
+```
+
+1. Compare the two unpatched dumps (A/A) first. If they differ, inference on that platform is not
+   reproducible, and an A/B difference would mean nothing.
+2. Compare the unpatched dump with the patched dump (A/B) only after A/A matches byte for byte.
+3. If A/B differs, do not adopt the patch. Do not change `ModelSpec`'s `implementation` to absorb the difference.
+
+When A/B matches, `ModelSpec`'s `implementation` (`recall-gemma-llama-v1`) stays unchanged.
+The frozen independent vectors are not used for this comparison.
+
 Initialize the source before building:
 
 ```sh
