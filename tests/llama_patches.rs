@@ -178,3 +178,12 @@ fn syncing_a_staged_tree_rewrites_only_the_destination_files_whose_content_diffe
     assert_eq!(modified_time(&dest.join("src/same.txt")), long_ago);
     assert!(modified_time(&dest.join("src/changed.txt")) > long_ago);
 }
+
+#[test]
+fn the_linked_llama_cpp_build_reports_the_vocabulary_loading_backport_among_its_applied_patches() {
+    assert!(
+        llama_cpp_sys_2::APPLIED_PATCHES.contains(&"0001-llama-30679-faster-vocab-load.patch"),
+        "APPLIED_PATCHES = {:?}",
+        llama_cpp_sys_2::APPLIED_PATCHES
+    );
+}
