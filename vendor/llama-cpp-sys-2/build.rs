@@ -352,6 +352,88 @@ fn is_hidden(e: &DirEntry) -> bool {
         .unwrap_or_default()
 }
 
+#[path = "patches.rs"]
+mod patches;
+
+/// Entries of the llama.cpp tree that CMake reads. Copied by directory rather than
+/// from Cargo.toml's `include` globs; a missing entry fails the CMake configure.
+const LLAMA_CMAKE_INPUTS: &[&str] = &[
+    "CMakeLists.txt",
+    "LICENSE",
+    "cmake",
+    "common",
+    "convert_hf_to_gguf.py",
+    "ggml",
+    "include",
+    "pocs",
+    "src",
+    "tools",
+    "vendor",
+];
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from.is_file() {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(from, to)?;
+        return Ok(());
+    }
+    for entry in walkdir::WalkDir::new(from)
+        .into_iter()
+        .filter_entry(|e| !is_hidden(e))
+    {
+        let entry = entry?;
+        let target = to.join(entry.path().strip_prefix(from).expect("walk stays below root"));
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if entry.path().is_file() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Stages a copy of llama.cpp, applies `patches/*.patch` to it, and syncs the
+/// result to `OUT_DIR/llama.cpp`, which CMake builds from. The submodule itself is
+/// never written. Writes the applied patch names for `APPLIED_PATCHES`.
+fn patched_llama_src(llama_src: &Path, manifest_dir: &Path, out_dir: &Path) -> PathBuf {
+    let patch_dir = manifest_dir.join("patches");
+    println!("cargo:rerun-if-changed={}", patch_dir.display());
+    println!("cargo:rerun-if-env-changed=RECALL_LLAMA_SKIP_PATCHES");
+    let skip = env::var("RECALL_LLAMA_SKIP_PATCHES").is_ok_and(|v| v == "1");
+
+    let staged = out_dir.join("llama-staging");
+    let dest = out_dir.join("llama.cpp");
+    if staged.exists() {
+        std::fs::remove_dir_all(&staged).expect("Failed to clear the llama.cpp staging copy");
+    }
+    for entry in LLAMA_CMAKE_INPUTS {
+        copy_tree(&llama_src.join(entry), &staged.join(entry))
+            .unwrap_or_else(|e| panic!("Failed to stage llama.cpp/{entry}: {e}"));
+    }
+
+    let applied = if skip {
+        println!("cargo:warning=RECALL_LLAMA_SKIP_PATCHES=1: building llama.cpp without patches");
+        Vec::new()
+    } else {
+        patches::apply_patches(&staged, &patch_dir).unwrap_or_else(|e| panic!("{e}"))
+    };
+    patches::sync_changed(&staged, &dest)
+        .unwrap_or_else(|e| panic!("Failed to sync the patched llama.cpp copy: {e}"));
+    // Confirm on the tree CMake reads, not only on the staging copy.
+    for name in &applied {
+        patches::check_applied(&dest, &patch_dir.join(name)).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    std::fs::write(
+        out_dir.join("applied_patches.rs"),
+        format!("&{applied:?}"),
+    )
+    .expect("Failed to write applied_patches.rs");
+    dest
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
@@ -617,7 +699,11 @@ fn main() {
 
     // Build with Cmake
 
-    let mut config = Config::new(&llama_src);
+    let cmake_src = patched_llama_src(&llama_src, Path::new(&manifest_dir), &out_dir);
+    let mut config = Config::new(&cmake_src);
+    // llama.cpp's build-info probes run git in the copy, which sits inside the
+    // recall checkout; stop them from reporting recall's commit.
+    config.env("GIT_CEILING_DIRECTORIES", &out_dir);
 
     // Would require extra source files to pointlessly
     // be included in what's uploaded to and downloaded from
