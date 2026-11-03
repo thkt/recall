@@ -8,6 +8,7 @@ use std::{
     fs, io,
     path::{Component, Path, PathBuf},
     process::Command,
+    time::SystemTime,
 };
 
 /// Git variables that would point `git apply` at a repository other than the one
@@ -39,13 +40,24 @@ pub fn apply_patches(staged: &Path, patch_dir: &Path) -> Result<Vec<String>, Str
             .map_err(|e| format!("{name}: cannot read {}: {e}", patch.display()))?;
         check_paths_below_src(&name, &String::from_utf8_lossy(&text))?;
         git_apply(&name, &staged, &patch, false)?;
-        // `git apply` exits 0 for a patch it silently skipped, so confirm that
-        // the patch is now present by reversing it as a dry run.
-        git_apply(&name, &staged, &patch, true)
-            .map_err(|e| format!("{name}: patch was not applied to the staged copy: {e}"))?;
+        // `git apply` exits 0 for a patch it silently skipped.
+        check_applied(&staged, &patch)?;
         applied.push(name);
     }
     Ok(applied)
+}
+
+/// Confirms that `patch` is present in `tree` by reversing it as a dry run.
+pub fn check_applied(tree: &Path, patch: &Path) -> Result<(), String> {
+    let name = patch
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tree = tree
+        .canonicalize()
+        .map_err(|e| format!("{name}: cannot resolve {}: {e}", tree.display()))?;
+    git_apply(&name, &tree, patch, true)
+        .map_err(|e| format!("{name}: patch is not applied in {}: {e}", tree.display()))
 }
 
 /// Copies the files of `staged` whose content differs from `dest` (or is missing
@@ -180,6 +192,12 @@ fn sync_dir(
             fs::create_dir_all(parent)?;
         }
         fs::copy(&from, &to)?;
+        // fs::copy keeps the source's modification time. A reverted file would then
+        // look older than its object file, and CMake would not rebuild it.
+        fs::File::options()
+            .write(true)
+            .open(&to)?
+            .set_modified(SystemTime::now())?;
         rewritten.push(relative);
     }
     Ok(())

@@ -46,4 +46,4 @@ pub const BACKENDS_DIR: Option<&str> = option_env!("GGML_BACKENDS_DIR");
 
 /// File names of the llama.cpp patches applied to the linked build, in the order
 /// they were applied.
-pub const APPLIED_PATCHES: &[&str] = &[];
+pub const APPLIED_PATCHES: &[&str] = include!(concat!(env!("OUT_DIR"), "/applied_patches.rs"));

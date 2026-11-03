@@ -43,8 +43,10 @@ Rules the build enforces:
 
 - A patch may change files below `src/` only. A patch that changes any other path fails the build.
 - A patch that does not apply fails the build, and the error names the `.patch` file.
-- After applying, the build reverses each patch as a dry run against the copy. This catches a
-  patch that `git apply` skipped while exiting 0.
+- After applying, the build reverses each patch as a dry run against the staged copy and against the
+  synced tree CMake builds from. This catches a patch that `git apply` skipped while exiting 0.
+- Syncing gives every rewritten file the current modification time, so toggling
+  `RECALL_LLAMA_SKIP_PATCHES` rebuilds the reverted files instead of reusing patched objects.
 - `git` runs with `GIT_CEILING_DIRECTORIES` set to the parent of the copy and with `GIT_DIR`,
   `GIT_WORK_TREE`, `GIT_INDEX_FILE`, and `GIT_COMMON_DIR` removed. `OUT_DIR` is under the
   recall repository's `target/`, and without this `git apply` prints `Skipped patch` and does nothing.

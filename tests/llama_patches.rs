@@ -122,7 +122,11 @@ fn a_patch_that_does_not_apply_fails_with_an_error_naming_the_patch_file_even_wh
     let staged = work.path().join("target/out/llama.cpp");
     let patch_dir = work.path().join("patches");
     llama_tree(&staged);
-    write(&patch_dir, "0001-stale-context.patch", MISMATCHED_CONTEXT_PATCH);
+    write(
+        &patch_dir,
+        "0001-stale-context.patch",
+        MISMATCHED_CONTEXT_PATCH,
+    );
 
     let error = patches::apply_patches(&staged, &patch_dir)
         .expect_err("a patch with mismatched context must fail, not be skipped");
@@ -163,6 +167,9 @@ fn syncing_a_staged_tree_rewrites_only_the_destination_files_whose_content_diffe
     write(&dest, "src/changed.txt", "old\n");
     write(&dest, "src/same.txt", "same\n");
     let long_ago = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    // A staged file as old as the destination: copying its time over would hide the
+    // rewrite from CMake.
+    set_modified_time(&staged.join("src/changed.txt"), long_ago);
     set_modified_time(&dest.join("src/changed.txt"), long_ago);
     set_modified_time(&dest.join("src/same.txt"), long_ago);
 
@@ -171,7 +178,10 @@ fn syncing_a_staged_tree_rewrites_only_the_destination_files_whose_content_diffe
     rewritten.sort();
     assert_eq!(
         rewritten,
-        vec![PathBuf::from("src/added.txt"), PathBuf::from("src/changed.txt")]
+        vec![
+            PathBuf::from("src/added.txt"),
+            PathBuf::from("src/changed.txt")
+        ]
     );
     assert_eq!(read(&dest, "src/changed.txt"), "new\n");
     assert_eq!(read(&dest, "src/added.txt"), "added\n");

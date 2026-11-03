@@ -1,0 +1,295 @@
+From 824eaecf486f5ce0070f71501094b60f3cd70864 Mon Sep 17 00:00:00 2001
+From: Evgen Mykhailenko <crosskillo@gmail.com>
+Date: Wed, 21 Oct 2026 05:03:27 -0400
+Subject: [PATCH] llama : optimize vocabulary loading (#30679)
+
+* llama : optimize vocabulary loading
+
+* Update src/unicode.h
+
+Co-authored-by: Georgi Gerganov <ggerganov@gmail.com>
+
+* CR : added reserve in gguf_kv_to_str
+
+* CR : trailing space fix
+
+---------
+
+Co-authored-by: Georgi Gerganov <ggerganov@gmail.com>
+---
+ src/llama-adapter.cpp      |  4 ++--
+ src/llama-impl.cpp         | 47 +++++++++++++++++++++++---------------
+ src/llama-impl.h           |  3 ++-
+ src/llama-model-loader.cpp |  2 +-
+ src/llama-vocab.cpp        | 32 ++++++++++++++------------
+ src/unicode.cpp            | 21 +++++++++++++++++
+ src/unicode.h              |  1 +
+ 7 files changed, 73 insertions(+), 37 deletions(-)
+
+diff --git a/src/llama-adapter.cpp b/src/llama-adapter.cpp
+index 6a7ffd6..5b342ac 100644
+--- a/src/llama-adapter.cpp
++++ b/src/llama-adapter.cpp
+@@ -179,13 +179,13 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
+                 ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(gguf_ctx, i)), gguf_get_arr_n(gguf_ctx, i))
+                 : gguf_type_name(type);
+             const char * name = gguf_get_key(gguf_ctx, i);
+-            const std::string value = gguf_kv_to_str(gguf_ctx, i);
++            const size_t MAX_VALUE_LEN = 40;
++            const std::string value = gguf_kv_to_str(gguf_ctx, i, MAX_VALUE_LEN);
+ 
+             if (type != GGUF_TYPE_ARRAY) {
+                 adapter.gguf_kv.emplace(name, value);
+             }
+ 
+-            const size_t MAX_VALUE_LEN = 40;
+             std::string print_value = value.size() > MAX_VALUE_LEN ? format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str()) : value;
+             replace_all(print_value, "\n", "\\n");
+ 
+diff --git a/src/llama-impl.cpp b/src/llama-impl.cpp
+index c216a31..4ca836c 100644
+--- a/src/llama-impl.cpp
++++ b/src/llama-impl.cpp
+@@ -11,7 +11,6 @@
+ #include <cstdarg>
+ #include <cstring>
+ #include <vector>
+-#include <sstream>
+ 
+ struct llama_logger_state {
+     ggml_log_callback log_callback = llama_log_callback_default;
+@@ -149,7 +148,7 @@ std::string llama_format_tensor_shape(const struct ggml_tensor * t) {
+     return buf;
+ }
+ 
+-static std::string gguf_data_to_str(enum gguf_type type, const void * data, int i) {
++static std::string gguf_data_to_str(enum gguf_type type, const void * data, size_t i) {
+     switch (type) {
+         case GGUF_TYPE_UINT8:   return std::to_string(((const uint8_t  *)data)[i]);
+         case GGUF_TYPE_INT8:    return std::to_string(((const int8_t   *)data)[i]);
+@@ -166,7 +165,7 @@ static std::string gguf_data_to_str(enum gguf_type type, const void * data, int
+     }
+ }
+ 
+-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
++std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len) {
+     const enum gguf_type type = gguf_get_kv_type(ctx_gguf, i);
+ 
+     switch (type) {
+@@ -175,28 +174,38 @@ std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i) {
+         case GGUF_TYPE_ARRAY:
+             {
+                 const enum gguf_type arr_type = gguf_get_arr_type(ctx_gguf, i);
+-                int arr_n = gguf_get_arr_n(ctx_gguf, i);
++                const size_t arr_n = gguf_get_arr_n(ctx_gguf, i);
+                 const void * data = arr_type == GGUF_TYPE_STRING ? nullptr : gguf_get_arr_data(ctx_gguf, i);
+-                std::stringstream ss;
+-                ss << "[";
+-                for (int j = 0; j < arr_n; j++) {
++                std::string res = "[";
++                size_t j = 0;
++                for (; j < arr_n && res.size() <= max_len; j++) {
++                    if (j > 0) {
++                        res += ", ";
++                    }
+                     if (arr_type == GGUF_TYPE_STRING) {
+-                        std::string val = gguf_get_arr_str(ctx_gguf, i, j);
+-                        // escape quotes
+-                        replace_all(val, "\\", "\\\\");
+-                        replace_all(val, "\"", "\\\"");
+-                        ss << '"' << val << '"';
++                        const char * s = gguf_get_arr_str(ctx_gguf, i, j);
++                        const size_t need = res.size() + 2 * strlen(s) + 2;
++                        if (res.capacity() < need) {
++                            res.reserve(std::max(need, 2 * res.capacity()));
++                        }
++                        res += '"';
++                        for (; *s; s++) {
++                            if (*s == '\\' || *s == '"') {
++                                res += '\\';
++                            }
++                            res += *s;
++                        }
++                        res += '"';
+                     } else if (arr_type == GGUF_TYPE_ARRAY) {
+-                        ss << "???";
++                        res += "???";
+                     } else {
+-                        ss << gguf_data_to_str(arr_type, data, j);
+-                    }
+-                    if (j < arr_n - 1) {
+-                        ss << ", ";
++                        res += gguf_data_to_str(arr_type, data, j);
+                     }
+                 }
+-                ss << "]";
+-                return ss.str();
++                if (j == arr_n) {
++                    res += "]";
++                }
++                return res;
+             }
+         default:
+             return gguf_data_to_str(type, gguf_get_val_data(ctx_gguf, i), 0);
+diff --git a/src/llama-impl.h b/src/llama-impl.h
+index 7ccd23c..884dca6 100644
+--- a/src/llama-impl.h
++++ b/src/llama-impl.h
+@@ -107,4 +107,5 @@ std::string format(const char * fmt, ...);
+ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
+ std::string llama_format_tensor_shape(const struct ggml_tensor * t);
+ 
+-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
++// arrays are rendered only until the result is longer than max_len
++std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 9dc366f..066e69e 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -807,8 +807,8 @@ llama_model_loader::llama_model_loader(
+                 ? format("%s[%s,%zu]", gguf_type_name(type), gguf_type_name(gguf_get_arr_type(metadata, i)), gguf_get_arr_n(metadata, i))
+                 : gguf_type_name(type);
+ 
+-            std::string value          = gguf_kv_to_str(metadata, i);
+             const size_t MAX_VALUE_LEN = 40;
++            std::string value          = gguf_kv_to_str(metadata, i, MAX_VALUE_LEN);
+             if (value.size() > MAX_VALUE_LEN) {
+                 value = format("%s...", value.substr(0, MAX_VALUE_LEN - 3).c_str());
+             }
+diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
+index 84f50d7..a3d5ded 100644
+--- a/src/llama-vocab.cpp
++++ b/src/llama-vocab.cpp
+@@ -2260,21 +2260,22 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+                     throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
+                 }
+                 const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
++                bpe_ranks.reserve(n_merges);
+                 for (int i = 0; i < n_merges; i++) {
+-                    const std::string word = gguf_get_arr_str(ctx, merges_keyidx, i);
++                    const char * word = gguf_get_arr_str(ctx, merges_keyidx, i);
+                     //GGML_ASSERT(unicode_cpts_from_utf8(word).size() > 0);
+ 
+                     std::string first;
+                     std::string second;
+ 
+-                    const size_t pos = word.find(' ', 1);
++                    const char * sep = *word ? strchr(word + 1, ' ') : nullptr;
+ 
+-                    if (pos != std::string::npos) {
+-                        first  = word.substr(0, pos);
+-                        second = word.substr(pos + 1);
++                    if (sep) {
++                        first.assign(word, sep - word);
++                        second.assign(sep + 1);
+                     }
+ 
+-                    bpe_ranks.emplace(std::make_pair(first, second), i);
++                    bpe_ranks.emplace(std::make_pair(std::move(first), std::move(second)), i);
+                 }
+             }
+ 
+@@ -2371,20 +2372,21 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+                     throw std::runtime_error(format("invalid gguf type for %s", kv(LLM_KV_TOKENIZER_MERGES).c_str()));
+                 }
+                 const int n_merges = gguf_get_arr_n(ctx, merges_keyidx);
++                bpe_ranks.reserve(n_merges);
+                 for (int i = 0; i < n_merges; i++) {
+-                    const std::string word = gguf_get_arr_str(ctx, merges_keyidx, i);
++                    const char * word = gguf_get_arr_str(ctx, merges_keyidx, i);
+ 
+                     std::string first;
+                     std::string second;
+ 
+-                    const size_t pos = word.find(' ', 1);
++                    const char * sep = *word ? strchr(word + 1, ' ') : nullptr;
+ 
+-                    if (pos != std::string::npos) {
+-                        first  = word.substr(0, pos);
+-                        second = word.substr(pos + 1);
++                    if (sep) {
++                        first.assign(word, sep - word);
++                        second.assign(sep + 1);
+                     }
+ 
+-                    bpe_ranks.emplace(std::make_pair(first, second), i);
++                    bpe_ranks.emplace(std::make_pair(std::move(first), std::move(second)), i);
+                 }
+             }
+ 
+@@ -2764,6 +2766,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
+     }
+ 
+     id_to_token.resize(n_tokens);
++    token_to_id.reserve(n_tokens);
+ 
+     for (uint32_t i = 0; i < n_tokens; i++) {
+         std::string word = gguf_get_arr_str(ctx, token_idx, i);
+@@ -3676,13 +3679,14 @@ static void llama_unescape_whitespace(std::string & word) {
+ 
+ static std::string llama_decode_text(const std::string & text) {
+     std::string decoded_text;
++    decoded_text.reserve(text.size());
+ 
+     const auto cpts = unicode_cpts_from_utf8(text);
+     for (const auto cpt : cpts) {
+-        const auto utf8 = unicode_cpt_to_utf8(cpt);
+         try {
+-            decoded_text += unicode_utf8_to_byte(utf8);
++            decoded_text += unicode_cpt_to_byte(cpt);
+         } catch (const std::out_of_range & /*e*/) {
++            const auto utf8 = unicode_cpt_to_utf8(cpt);
+             decoded_text += "[UNK_BYTE_0x";
+             for (const auto c : utf8) {
+                 decoded_text += format("%02x", (uint8_t) c);
+diff --git a/src/unicode.cpp b/src/unicode.cpp
+index 6c834cb..796f8e8 100644
+--- a/src/unicode.cpp
++++ b/src/unicode.cpp
+@@ -202,6 +202,19 @@ static std::unordered_map<std::string, uint8_t> unicode_utf8_to_byte_map() {
+     return map;
+ }
+ 
++static std::vector<int> unicode_cpt_to_byte_map() {
++    std::vector<int> map;
++    for (int ch = 0; ch < 256; ++ch) {
++        size_t offset = 0;
++        const uint32_t cpt = unicode_cpt_from_utf8(unicode_byte_to_utf8(ch), offset);
++        if (cpt >= map.size()) {
++            map.resize(cpt + 1, -1);
++        }
++        map[cpt] = ch;
++    }
++    return map;
++}
++
+ static std::vector<std::string> unicode_byte_encoding_process(const std::vector<std::string> & bpe_words) {
+     std::vector<std::string> bpe_encoded_words;
+     for (const auto & word : bpe_words) {
+@@ -1416,6 +1429,14 @@ uint8_t unicode_utf8_to_byte(const std::string & utf8) {
+     return map.at(utf8);
+ }
+ 
++uint8_t unicode_cpt_to_byte(uint32_t cpt) {
++    static const std::vector<int> map = unicode_cpt_to_byte_map();
++    if (cpt >= map.size() || map[cpt] < 0) {
++        throw std::out_of_range("unicode_cpt_to_byte: not a byte token code point");
++    }
++    return map[cpt];
++}
++
+ uint32_t unicode_tolower(uint32_t cpt) {
+     // binary search
+     auto it = std::lower_bound(unicode_map_lowercase.begin(), unicode_map_lowercase.end(), cpt,
+diff --git a/src/unicode.h b/src/unicode.h
+index 19bf15a..29dbfc7 100644
+--- a/src/unicode.h
++++ b/src/unicode.h
+@@ -104,6 +104,7 @@ unicode_cpt_flags unicode_cpt_flags_from_utf8(const std::string & utf8);
+ 
+ std::string unicode_byte_to_utf8(uint8_t byte);
+ uint8_t     unicode_utf8_to_byte(const std::string & utf8);
++uint8_t     unicode_cpt_to_byte (uint32_t cpt);
+ 
+ uint32_t unicode_tolower(uint32_t cpt);
+ 
