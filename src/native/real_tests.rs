@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::hash_file;
 use serde_json::Value;
-use std::{collections::HashMap, env, fs};
+use std::{collections::HashMap, env, fmt::Write as _, fs};
 
 #[test]
 #[ignore = "requires explicitly provided, verified public Gemma artifacts and the frozen independent vectors"]
@@ -109,6 +109,208 @@ fn real_model_boundaries_coverage_and_frozen_query_parity() {
     if let Some(out) = env::var_os("RECALL_GEMMA_TEST_REPORT") {
         fs::write(out, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
     }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
+}
+
+fn hex_bits(vector: &[f32]) -> String {
+    let mut s = String::with_capacity(vector.len() * 8);
+    for x in vector {
+        write!(s, "{:08x}", x.to_bits()).unwrap();
+    }
+    s
+}
+
+fn text_with_tokens(model: &LlamaModel, prefix: &str, target: usize) -> String {
+    (target - 40..=target)
+        .map(|n| "a ".repeat(n))
+        .find(|s| {
+            model
+                .vocab()
+                .tokenize(format!("{prefix}{s}").as_bytes(), true, false)
+                .len()
+                == target
+        })
+        .expect("construct exact tokenizer boundary")
+}
+
+fn token_ids(tokens: &[LlamaToken]) -> Vec<i32> {
+    tokens.iter().map(|t| t.0).collect()
+}
+
+// Writes token ids, every vocabulary piece, and embedding f32 bit patterns for a fixed text set.
+// Run it once per build (with and without the llama.cpp patches) and diff the two output files.
+// Both runs must make the same calls in the same batch composition, so nothing here depends on the build.
+#[test]
+#[ignore = "requires explicitly provided, verified public Gemma artifacts and an output path"]
+fn real_model_bit_dump_for_build_parity() {
+    let root =
+        env::var_os("RECALL_GEMMA_TEST_ARTIFACT_DIR").expect("explicit owned artifact directory");
+    let out = env::var_os("RECALL_GEMMA_TEST_BITS_OUT").expect("explicit output file for the dump");
+    let root = Path::new(&root);
+    let spec = ModelSpec::default();
+    assert_eq!(
+        hash_file(&root.join("model.gguf")).unwrap(),
+        spec.model_sha256
+    );
+    assert_eq!(
+        hash_file(&root.join("tokenizer.json")).unwrap(),
+        spec.tokenizer_sha256
+    );
+    let gemma = Gemma::load(&root.join("model.gguf"), &root.join("tokenizer.json"), spec).unwrap();
+
+    let (special_pieces, plain_pieces, boundary_queries, boundary_documents) = {
+        let model = gemma.model.lock().unwrap();
+        let vocab = model.vocab();
+        let piece_hex = |special: bool| -> Vec<String> {
+            (0..vocab.n_tokens())
+                .map(|id| hex_bytes(&vocab.token_to_piece(LlamaToken(id), special, None)))
+                .collect()
+        };
+        let boundaries = [511, 512, 513, 8192, 8193];
+        let queries: Vec<(String, String)> = boundaries
+            .iter()
+            .map(|&n| {
+                (
+                    format!("query-boundary-{n}"),
+                    text_with_tokens(&model, &gemma.spec.query_prefix, n),
+                )
+            })
+            .collect();
+        let documents: Vec<(String, String)> = boundaries
+            .iter()
+            .map(|&n| {
+                (
+                    format!("document-boundary-{n}"),
+                    text_with_tokens(&model, &gemma.spec.document_prefix, n),
+                )
+            })
+            .collect();
+        (piece_hex(true), piece_hex(false), queries, documents)
+    };
+    assert!(!special_pieces.is_empty());
+
+    let mut queries: Vec<(String, String)> = [
+        ("query-english", "Find the database rollback instructions"),
+        ("query-keywords", "sqlite wal checkpoint lock"),
+        (
+            "query-japanese",
+            "SQLite の WAL モードでロックが解除されない問題をどう直したか",
+        ),
+        (
+            "query-japanese-kana",
+            "ひらがなとカタカナ、全角ＡＢＣ１２３と半角ｱｲｳ",
+        ),
+        ("query-emoji", "🙂 deploy failed on staging 🚀👨‍👩‍👧‍👦"),
+        ("query-combining", "cafe\u{301} nai\u{308}ve resume\u{301}"),
+        (
+            "query-code",
+            "fn main() { println!(\"{}\", x as u8); } // コメント",
+        ),
+        ("query-whitespace", "  leading and trailing whitespace \n\t"),
+    ]
+    .iter()
+    .map(|(l, t)| ((*l).to_owned(), (*t).to_owned()))
+    .collect();
+    queries.extend(boundary_queries);
+
+    let mut documents: Vec<(String, String)> = [
+        (
+            "document-english",
+            "Keep the previous database for rollback.",
+        ),
+        (
+            "document-japanese",
+            "前のデータベースをロールバック用に残しておく。\nWAL を無効化した。",
+        ),
+        ("document-emoji", "ビルドが通った 🙂🎉 e\u{301} 👨‍👩‍👧‍👦"),
+        (
+            "document-code",
+            "```rust\nlet v: Vec<f32> = vec![0.0; 768];\n```\n",
+        ),
+        (
+            "document-whitespace",
+            "  \n  indented line\n\n\ttabbed line  \n",
+        ),
+    ]
+    .iter()
+    .map(|(l, t)| ((*l).to_owned(), (*t).to_owned()))
+    .collect();
+    documents.extend(boundary_documents);
+    documents.push((
+        "document-long-multi-window".to_owned(),
+        format!(
+            "  {} 終端確認TAIL\n",
+            "日本語🙂 e\u{301} token ".repeat(2500)
+        ),
+    ));
+
+    let query_records: Vec<Value> = queries
+        .iter()
+        .map(|(label, text)| {
+            let tokens = {
+                let model = gemma.model.lock().unwrap();
+                gemma
+                    .query_tokens(&model, text, &gemma.spec.query_prefix)
+                    .unwrap()
+            };
+            let vector = gemma.embed_query(text).unwrap();
+            assert_eq!(vector.len(), EMBEDDING_DIMS);
+            serde_json::json!({
+                "label": label,
+                "text_utf8_bytes": text.len(),
+                "text": (text.len() <= 200).then_some(text),
+                "tokens": token_ids(&tokens),
+                "embedding_f32_bits_hex": hex_bits(&vector),
+            })
+        })
+        .collect();
+
+    let windows: Vec<Vec<DocumentWindow>> = {
+        let model = gemma.model.lock().unwrap();
+        documents
+            .iter()
+            .map(|(_, text)| gemma.document_tokens(&model, text).unwrap())
+            .collect()
+    };
+    let texts: Vec<&str> = documents.iter().map(|(_, t)| t.as_str()).collect();
+    let embedded = gemma
+        .embed_documents_batch_with_options(&texts, &EmbedOptions::default())
+        .unwrap();
+    assert_eq!(embedded.len(), documents.len());
+    let document_records: Vec<Value> = documents
+        .iter()
+        .zip(&windows)
+        .zip(&embedded)
+        .map(|(((label, text), windows), embedding)| {
+            assert_eq!(embedding.chunks().len(), windows.len(), "{label}");
+            serde_json::json!({
+                "label": label,
+                "text_utf8_bytes": text.len(),
+                "text": (text.len() <= 200).then_some(text),
+                "windows": windows.iter().map(|w| serde_json::json!({
+                    "byte_range": [w.byte_range.start, w.byte_range.end],
+                    "tokens": token_ids(&w.tokens),
+                })).collect::<Vec<_>>(),
+                "embedding_chunks_f32_bits_hex": embedding.chunks().iter().map(|c| hex_bits(c)).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    let dump = serde_json::json!({
+        "vocab_size": special_pieces.len(),
+        "pieces_special_true_hex": special_pieces,
+        "pieces_special_false_hex": plain_pieces,
+        "queries": query_records,
+        "documents": document_records,
+    });
+    fs::write(out, serde_json::to_vec_pretty(&dump).unwrap()).unwrap();
 }
 
 #[test]
