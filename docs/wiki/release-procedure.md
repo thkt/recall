@@ -20,4 +20,6 @@
 - #140 v0.8.1 bump。release workflow 完走が #137 の実検証を兼ねると明記、`brew upgrade recall` 確認
 - #206 / #208 / #227 / #245 bump PR の定型(version のみ変更 + 変更一覧 + semver 判断)
 - #256 installed 版が古いことが不具合の原因と判明し、コード修正でなく minor リリースで対応した実例
+- #299 v0.13.0 の bump PR（version のみ変更、変更一覧、0.x 方針で minor、マージ後に `v0.13.0` タグを push）
+- #359 / #364 / #368 bump PR の定型（version のみ変更、変更一覧、semver 判断。#359 はモデル・索引の互換性が変わるため minor、#368 は依存更新と内部整理のため patch）。#364 / #368 はマージ後の tag、release.yml、Formula 更新、`brew upgrade recall` の確認を明記した
 - 現行コード: `.github/workflows/release.yml` の `build`（単体バイナリをtar化）、`release`（tagからGitHub Release公開）、`update-homebrew`（archive検査とFormula更新）
