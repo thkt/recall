@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-#[cfg(test)]
 use rusqlite::Connection;
 use tracing::debug;
 
@@ -191,77 +190,16 @@ where
     let mut conn = open_or_create_db(&path)?;
     opening.finish("complete");
 
-    let loading = observer.stage("model_load_probe");
-    let load_result = load_embedder().and_then(|embedder| {
-        embedder
-            .embed_document("probe")
-            .map(|_| embedder)
-            .map_err(degrade_with_warn(
-                "embedder inference probe: embed_document",
-                DegradedReason::ProbeFailed,
-            ))
-    });
+    let load_result = load_and_probe_embedder(load_embedder, observer);
     let embed_capable = load_result.is_ok();
-    loading.finish(if embed_capable {
-        "ready"
-    } else {
-        "unavailable; embedding deferred"
-    });
 
     let stats = indexer::index_from_dirs_observed(&mut conn, opts, embed_capable, observer)?;
     observer.count("sessions_stored", stats.total_sessions);
-    let main_msg = if stats.indexed > 0 {
-        format!(
-            "Indexed {} sessions in {:.1}s",
-            stats.indexed, stats.elapsed_secs
-        )
-    } else if !stats.parse_diagnostics.is_empty() {
-        format!(
-            "{} sessions stored; {} file(s) with unresolved parsing diagnostics",
-            stats.total_sessions,
-            stats.parse_diagnostics.len()
-        )
-    } else {
-        format!("{} sessions up to date", stats.total_sessions)
-    };
-    done(&main_msg);
-    for skipped in &stats.skipped_roots {
-        warning(
-            &skipped
-                .reason
-                .note(skipped.source.as_str(), skipped.preserved_sessions),
-        );
-    }
+    report_indexed_sessions(&stats);
     let skipped_roots = stats.skipped_roots;
 
     let chunk_stats = indexer::index_chunks_observed(&mut conn, None, observer)?;
-    let backfill = observer.stage("legacy_backfill");
-    let backfilled = indexer::backfill_rowid_ranges(&mut conn)?;
-    if backfilled > 0 {
-        debug!(
-            sessions = backfilled,
-            "linked legacy chunks to rowid ranges"
-        );
-    }
-    let on_backfill_progress = |done: usize, total: usize| {
-        backfill.progress(done.saturating_sub(1), total, 0);
-    };
-    let scanned_backfilled =
-        indexer::backfill_session_files(&mut conn, Some(&on_backfill_progress))?;
-    let parse_diagnostics = indexer::load_parse_diagnostics(&conn)?;
-    for note in parse_diagnostics
-        .iter()
-        .flat_map(indexer::FileParseDiagnostics::notes)
-    {
-        warning(&note);
-    }
-    if scanned_backfilled > 0 {
-        debug!(
-            sessions = scanned_backfilled,
-            "recorded scanned files for legacy sessions"
-        );
-    }
-    backfill.finish("committed");
+    let parse_diagnostics = run_legacy_backfill(&mut conn, observer)?;
     if chunk_stats.chunks_created > 0 {
         done(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
@@ -311,6 +249,89 @@ where
     pipeline.finish("complete; see counts for deferred or failed work");
     outcome.observations = observer.snapshot();
     Ok(outcome)
+}
+
+fn load_and_probe_embedder<F>(
+    load_embedder: F,
+    observer: &index_observer::Observer,
+) -> Result<Arc<dyn Embed>, DegradedReason>
+where
+    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+{
+    let loading = observer.stage("model_load_probe");
+    let load_result = load_embedder().and_then(|embedder| {
+        embedder
+            .embed_document("probe")
+            .map(|_| embedder)
+            .map_err(degrade_with_warn(
+                "embedder inference probe: embed_document",
+                DegradedReason::ProbeFailed,
+            ))
+    });
+    loading.finish(if load_result.is_ok() {
+        "ready"
+    } else {
+        "unavailable; embedding deferred"
+    });
+    load_result
+}
+
+fn report_indexed_sessions(stats: &indexer::IndexStats) {
+    let main_msg = if stats.indexed > 0 {
+        format!(
+            "Indexed {} sessions in {:.1}s",
+            stats.indexed, stats.elapsed_secs
+        )
+    } else if !stats.parse_diagnostics.is_empty() {
+        format!(
+            "{} sessions stored; {} file(s) with unresolved parsing diagnostics",
+            stats.total_sessions,
+            stats.parse_diagnostics.len()
+        )
+    } else {
+        format!("{} sessions up to date", stats.total_sessions)
+    };
+    done(&main_msg);
+    for skipped in &stats.skipped_roots {
+        warning(
+            &skipped
+                .reason
+                .note(skipped.source.as_str(), skipped.preserved_sessions),
+        );
+    }
+}
+
+fn run_legacy_backfill(
+    conn: &mut Connection,
+    observer: &index_observer::Observer,
+) -> Result<Vec<indexer::FileParseDiagnostics>> {
+    let backfill = observer.stage("legacy_backfill");
+    let backfilled = indexer::backfill_rowid_ranges(conn)?;
+    if backfilled > 0 {
+        debug!(
+            sessions = backfilled,
+            "linked legacy chunks to rowid ranges"
+        );
+    }
+    let on_backfill_progress = |done: usize, total: usize| {
+        backfill.progress(done.saturating_sub(1), total, 0);
+    };
+    let scanned_backfilled = indexer::backfill_session_files(conn, Some(&on_backfill_progress))?;
+    let parse_diagnostics = indexer::load_parse_diagnostics(conn)?;
+    for note in parse_diagnostics
+        .iter()
+        .flat_map(indexer::FileParseDiagnostics::notes)
+    {
+        warning(&note);
+    }
+    if scanned_backfilled > 0 {
+        debug!(
+            sessions = scanned_backfilled,
+            "recorded scanned files for legacy sessions"
+        );
+    }
+    backfill.finish("committed");
+    Ok(parse_diagnostics)
 }
 
 #[cfg(test)]

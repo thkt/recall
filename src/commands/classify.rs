@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs::{File, Permissions, metadata};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
@@ -102,6 +103,144 @@ pub(crate) fn reclassify_sessions_with(
     reclassify_sessions_observed(conn, all, dry_run, read_origin, |_| {})
 }
 
+type ClassifyRow = (String, String, String, Option<String>, Option<String>);
+
+fn read_classify_rows(conn: &mut Connection, all: bool, dry_run: bool) -> Result<Vec<ClassifyRow>> {
+    let tx = conn.transaction()?;
+    let rows = {
+        let mut stmt = tx.prepare(
+        "WITH first_turn AS (SELECT session_id, text, MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id) \
+         SELECT s.session_id, s.source, s.file_path, s.session_type, m.text \
+         FROM sessions s LEFT JOIN first_turn m ON m.session_id = s.session_id \
+         WHERE ?1 OR s.session_type IS NULL ORDER BY s.session_id",
+    ).map_err(|error| {
+        if dry_run {
+            anyhow::Error::from(RecallError::DatabaseRead(format!(
+                "cannot read database structure for classify --dry-run: {error}; \
+                 run `recall rebuild` to restore the required schema, then retry"
+            )))
+        } else {
+            error.into()
+        }
+    })?;
+        let rows = stmt.query_map([all], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.commit()?;
+    Ok(rows)
+}
+
+struct PreparedClassification {
+    outcomes: Vec<ClassifyOutcome>,
+    files: Vec<(String, ClassificationFileState)>,
+    unavailable: BTreeMap<&'static str, usize>,
+    changed: bool,
+}
+
+fn prepare_classification(
+    rows: Vec<ClassifyRow>,
+    dry_run: bool,
+    read_origin: &mut impl FnMut(File, &str, &str, &str) -> Result<bool, &'static str>,
+) -> PreparedClassification {
+    let mut outcomes = Vec::new();
+    let mut files = Vec::new();
+    let mut unavailable = BTreeMap::<&str, usize>::new();
+    let mut changed = false;
+    for (session_id, source, path, previous, first_turn) in rows {
+        let (before, file) = open_classification_file(&path);
+        let (origin, after) = match file {
+            Ok(file) => {
+                let origin = read_origin(file, &path, &source, &session_id);
+                let after = classification_file_state(&path);
+                if before != after {
+                    changed = true;
+                }
+                (origin, after)
+            }
+            Err(reason) => (Err(reason), before),
+        };
+        files.push((path, after));
+        let origin = match origin {
+            Ok(origin) => origin,
+            Err(reason) => {
+                *unavailable.entry(reason).or_default() += 1;
+                if previous.is_some() {
+                    continue;
+                }
+                false
+            }
+        };
+        let first_turn = first_turn.as_deref().unwrap_or("");
+        outcomes.push(ClassifyOutcome {
+            session_id,
+            session_type: classify::classify_session(first_turn, origin),
+            excerpt: if dry_run {
+                first_turn.trim_start().chars().take(80).collect()
+            } else {
+                String::new()
+            },
+        });
+    }
+    PreparedClassification {
+        outcomes,
+        files,
+        unavailable,
+        changed,
+    }
+}
+
+enum ApplyAttempt {
+    Applied,
+    Retry,
+}
+
+fn apply_classification(
+    conn: &mut Connection,
+    version: i64,
+    prepared: &PreparedClassification,
+    observe: &mut impl FnMut(ClassifyPhase),
+) -> Result<ApplyAttempt> {
+    observe(ClassifyPhase::WriterWaiting);
+    let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+        Ok(tx) => tx,
+        Err(error) if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
+            return Ok(ApplyAttempt::Retry);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    observe(ClassifyPhase::WriterAcquired);
+    let current: i64 = tx.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
+    if current != version
+        || prepared
+            .files
+            .iter()
+            .any(|(path, state)| classification_file_state(path) != *state)
+    {
+        tx.rollback()?;
+        observe(ClassifyPhase::WriterReleased);
+        return Ok(ApplyAttempt::Retry);
+    }
+    {
+        let mut update = tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1 AND session_type IS NOT ?2")?;
+        for o in &prepared.outcomes {
+            update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
+            observe(ClassifyPhase::Updated);
+        }
+    }
+    tx.commit()?;
+    observe(ClassifyPhase::WriterReleased);
+    Ok(ApplyAttempt::Applied)
+}
+
 pub(crate) fn reclassify_sessions_observed(
     conn: &mut Connection,
     all: bool,
@@ -109,125 +248,32 @@ pub(crate) fn reclassify_sessions_observed(
     mut read_origin: impl FnMut(File, &str, &str, &str) -> Result<bool, &'static str>,
     mut observe: impl FnMut(ClassifyPhase),
 ) -> Result<Vec<ClassifyOutcome>> {
-    use rusqlite::{ErrorCode, TransactionBehavior};
-    use std::collections::BTreeMap;
-
     for _ in 0..3 {
         let version: i64 = conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
-        let tx = conn.transaction()?;
-        let rows = {
-            let mut stmt = tx.prepare(
-            "WITH first_turn AS (SELECT session_id, text, MIN(rowid) FROM messages WHERE role = 'user' GROUP BY session_id) \
-             SELECT s.session_id, s.source, s.file_path, s.session_type, m.text \
-             FROM sessions s LEFT JOIN first_turn m ON m.session_id = s.session_id \
-             WHERE ?1 OR s.session_type IS NULL ORDER BY s.session_id",
-        ).map_err(|error| {
-            if dry_run {
-                anyhow::Error::from(RecallError::DatabaseRead(format!(
-                    "cannot read database structure for classify --dry-run: {error}; \
-                     run `recall rebuild` to restore the required schema, then retry"
-                )))
-            } else {
-                error.into()
-            }
-        })?;
-            let rows = stmt.query_map([all], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            })?;
-
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        tx.commit()?;
+        let rows = read_classify_rows(conn, all, dry_run)?;
         observe(ClassifyPhase::Snapshot);
 
-        let mut outcomes = Vec::new();
-        let mut files = Vec::new();
-        let mut unavailable = BTreeMap::<&str, usize>::new();
-        let mut changed = false;
-        for (session_id, source, path, previous, first_turn) in rows {
-            let (before, file) = open_classification_file(&path);
-            let (origin, after) = match file {
-                Ok(file) => {
-                    let origin = read_origin(file, &path, &source, &session_id);
-                    let after = classification_file_state(&path);
-                    if before != after {
-                        changed = true;
-                    }
-                    (origin, after)
-                }
-                Err(reason) => (Err(reason), before),
-            };
-            files.push((path, after));
-            let origin = match origin {
-                Ok(origin) => origin,
-                Err(reason) => {
-                    *unavailable.entry(reason).or_default() += 1;
-                    if previous.is_some() {
-                        continue;
-                    }
-                    false
-                }
-            };
-            let first_turn = first_turn.as_deref().unwrap_or("");
-            outcomes.push(ClassifyOutcome {
-                session_id,
-                session_type: classify::classify_session(first_turn, origin),
-                excerpt: if dry_run {
-                    first_turn.trim_start().chars().take(80).collect()
-                } else {
-                    String::new()
-                },
-            });
-        }
+        let prepared = prepare_classification(rows, dry_run, &mut read_origin);
         observe(ClassifyPhase::Prepared);
-        if changed {
+        if prepared.changed {
             observe(ClassifyPhase::Retry);
             continue;
         }
-        if !dry_run {
-            observe(ClassifyPhase::WriterWaiting);
-            let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
-                Ok(tx) => tx,
-                Err(error) if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
-                    observe(ClassifyPhase::Retry);
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            observe(ClassifyPhase::WriterAcquired);
-            let current: i64 = tx.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
-            if current != version
-                || files
-                    .iter()
-                    .any(|(path, state)| classification_file_state(path) != *state)
-            {
-                tx.rollback()?;
-                observe(ClassifyPhase::WriterReleased);
-                observe(ClassifyPhase::Retry);
-                continue;
-            }
-            {
-                let mut update = tx.prepare("UPDATE sessions SET session_type = ?2 WHERE session_id = ?1 AND session_type IS NOT ?2")?;
-                for o in &outcomes {
-                    update.execute(rusqlite::params![o.session_id, o.session_type.as_str()])?;
-                    observe(ClassifyPhase::Updated);
-                }
-            }
-            tx.commit()?;
-            observe(ClassifyPhase::WriterReleased);
+        if !dry_run
+            && matches!(
+                apply_classification(conn, version, &prepared, &mut observe)?,
+                ApplyAttempt::Retry
+            )
+        {
+            observe(ClassifyPhase::Retry);
+            continue;
         }
-        for (reason, count) in unavailable {
+        for (reason, count) in prepared.unavailable {
             eprintln!(
                 "warning: provenance unavailable ({reason}): {count} session(s); existing labels retained, unclassified rows use first-turn fallback"
             );
         }
-        return Ok(outcomes);
+        return Ok(prepared.outcomes);
     }
     Err(RecallError::TempFailure(
         "classification inputs kept changing or the database writer remained busy after 3 attempts; no classification changes applied; rerun `recall classify` with the same options".to_owned()
