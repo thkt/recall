@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::result::Result as StdResult;
 
 use anyhow::Result;
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info};
 
 use super::INDEX_RULES_VERSION;
@@ -77,25 +77,7 @@ pub(crate) fn index_chunks_observed(
         return Ok(ChunkStats::default());
     }
 
-    tx.execute_batch(
-        "CREATE TEMP TABLE chunk_message_rows (
-            session_id TEXT NOT NULL,
-            message_rowid INTEGER NOT NULL,
-            text_bytes INTEGER NOT NULL,
-            PRIMARY KEY (session_id, message_rowid)
-        ) WITHOUT ROWID;",
-    )?;
-    tx.execute(STAGE_CHUNK_MESSAGES, [])?;
-    let sessions: Vec<PendingChunkSession> = {
-        let mut stmt = tx.prepare(
-            "SELECT s.session_id, s.timestamp, COALESCE(SUM(r.text_bytes), 0)
-             FROM sessions s LEFT JOIN chunk_message_rows r ON r.session_id = s.session_id
-             WHERE s.chunks_indexed IS NULL OR s.chunks_indexed < 0
-             GROUP BY s.session_id ORDER BY s.session_id",
-        )?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        rows.collect::<StdResult<_, _>>()?
-    };
+    let sessions = stage_pending_sessions(&tx)?;
     let total = sessions.len();
     observer.count("sessions_chunk_pending", total);
     observer.count("sessions_chunk_remaining", total);
@@ -109,26 +91,7 @@ pub(crate) fn index_chunks_observed(
     let mut remaining = sessions.as_slice();
     while !remaining.is_empty() {
         let (batch, rest) = remaining.split_at(chunk_batch_len(remaining));
-        let mut messages: HashMap<String, Vec<(i64, Message)>> = HashMap::new();
-        {
-            let mut stmt = tx.prepare_cached(READ_CHUNK_BATCH)?;
-            let mut rows = stmt.query(rusqlite::params![batch[0].0, batch[batch.len() - 1].0])?;
-            while let Some(row) = rows.next()? {
-                let session_id: String = row.get(0)?;
-                let rowid = row.get(1)?;
-                let role_str: String = row.get(2)?;
-                let text = row.get(3)?;
-                stats.messages_read += 1;
-                let Some(role) = Role::from_db(&role_str) else {
-                    debug!(role = %role_str, session_id, "unknown role");
-                    continue;
-                };
-                messages
-                    .entry(session_id)
-                    .or_default()
-                    .push((rowid, Message { role, text }));
-            }
-        }
+        let mut messages = read_chunk_batch(&tx, batch, &mut stats)?;
         stats.message_batches += 1;
         for (session_id, timestamp, _) in batch {
             let body = messages.remove(session_id).unwrap_or_default();
@@ -136,19 +99,7 @@ pub(crate) fn index_chunks_observed(
             if chunks.is_empty() {
                 empty += 1;
             }
-            for chunk in &chunks {
-                tx.execute(
-                    "INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    rusqlite::params![chunk.session_id, chunk.content, chunk.timestamp,
-                                      chunk.src_rowid_lo, chunk.src_rowid_hi],
-                )?;
-                stats.chunks_created += 1;
-            }
-            tx.execute(
-                "UPDATE sessions SET chunks_indexed = CASE WHEN chunks_indexed = -?1 THEN ?1 ELSE 0 END WHERE session_id = ?2",
-                rusqlite::params![INDEX_RULES_VERSION, session_id],
-            )?;
+            store_session_chunks(&tx, session_id, &chunks, &mut stats)?;
             stats.sessions_chunked += 1;
             stage.progress(stats.sessions_chunked, total, 0);
             if let Some(cb) = on_progress {
@@ -172,4 +123,82 @@ pub(crate) fn index_chunks_observed(
         "Chunking complete"
     );
     Ok(stats)
+}
+
+fn stage_pending_sessions(tx: &Transaction) -> Result<Vec<PendingChunkSession>> {
+    tx.execute_batch(
+        "CREATE TEMP TABLE chunk_message_rows (
+            session_id TEXT NOT NULL,
+            message_rowid INTEGER NOT NULL,
+            text_bytes INTEGER NOT NULL,
+            PRIMARY KEY (session_id, message_rowid)
+        ) WITHOUT ROWID;",
+    )?;
+    tx.execute(STAGE_CHUNK_MESSAGES, [])?;
+    let sessions: Vec<PendingChunkSession> = {
+        let mut stmt = tx.prepare(
+            "SELECT s.session_id, s.timestamp, COALESCE(SUM(r.text_bytes), 0)
+             FROM sessions s LEFT JOIN chunk_message_rows r ON r.session_id = s.session_id
+             WHERE s.chunks_indexed IS NULL OR s.chunks_indexed < 0
+             GROUP BY s.session_id ORDER BY s.session_id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<StdResult<_, _>>()?
+    };
+    Ok(sessions)
+}
+
+fn read_chunk_batch(
+    tx: &Transaction,
+    batch: &[PendingChunkSession],
+    stats: &mut ChunkStats,
+) -> Result<HashMap<String, Vec<(i64, Message)>>> {
+    let mut messages: HashMap<String, Vec<(i64, Message)>> = HashMap::new();
+    {
+        let mut stmt = tx.prepare_cached(READ_CHUNK_BATCH)?;
+        let mut rows = stmt.query(rusqlite::params![batch[0].0, batch[batch.len() - 1].0])?;
+        while let Some(row) = rows.next()? {
+            let session_id: String = row.get(0)?;
+            let rowid = row.get(1)?;
+            let role_str: String = row.get(2)?;
+            let text = row.get(3)?;
+            stats.messages_read += 1;
+            let Some(role) = Role::from_db(&role_str) else {
+                debug!(role = %role_str, session_id, "unknown role");
+                continue;
+            };
+            messages
+                .entry(session_id)
+                .or_default()
+                .push((rowid, Message { role, text }));
+        }
+    }
+    Ok(messages)
+}
+
+fn store_session_chunks(
+    tx: &Transaction,
+    session_id: &str,
+    chunks: &[chunker::QAChunk],
+    stats: &mut ChunkStats,
+) -> Result<()> {
+    for chunk in chunks {
+        tx.execute(
+            "INSERT INTO qa_chunks (session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                chunk.session_id,
+                chunk.content,
+                chunk.timestamp,
+                chunk.src_rowid_lo,
+                chunk.src_rowid_hi
+            ],
+        )?;
+        stats.chunks_created += 1;
+    }
+    tx.execute(
+        "UPDATE sessions SET chunks_indexed = CASE WHEN chunks_indexed = -?1 THEN ?1 ELSE 0 END WHERE session_id = ?2",
+        rusqlite::params![INDEX_RULES_VERSION, session_id],
+    )?;
+    Ok(())
 }

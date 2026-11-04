@@ -340,6 +340,18 @@ fn render_doctor_report(
     model_recovery: &ModelRecovery,
 ) -> CommandOutput {
     let healthy = checks.iter().all(|c| c.ok);
+    let notes = doctor_notes(checks, repairs, model_recovery);
+    let markdown = doctor_markdown(verbose, path, healthy, checks, repairs, model_recovery);
+    let data = doctor_data(healthy, checks, repairs, model_recovery);
+    let degraded = !healthy || matches!(model_recovery, ModelRecovery::Failed(_));
+    CommandOutput::with_notes(markdown, data, degraded, notes)
+}
+
+fn doctor_notes(
+    checks: &[DoctorCheck],
+    repairs: &Option<Vec<RepairOutcome>>,
+    model_recovery: &ModelRecovery,
+) -> Vec<String> {
     let mut notes: Vec<String> = checks
         .iter()
         .filter_map(|c| c.remedy.map(|r| format!("{}: {}", c.name, r)))
@@ -354,8 +366,18 @@ fn render_doctor_report(
     if let ModelRecovery::Failed(e) = model_recovery {
         notes.push(format!("fix: model: recovery failed: {e}"));
     }
+    notes
+}
 
-    let markdown = build_markdown(|buf| {
+fn doctor_markdown(
+    verbose: bool,
+    path: &Path,
+    healthy: bool,
+    checks: &[DoctorCheck],
+    repairs: &Option<Vec<RepairOutcome>>,
+    model_recovery: &ModelRecovery,
+) -> String {
+    build_markdown(|buf| {
         writeln!(
             buf,
             "Health: {}",
@@ -400,8 +422,15 @@ fn render_doctor_report(
             writeln!(buf, "DB: {}", path.display())?;
         }
         Ok(())
-    });
+    })
+}
 
+fn doctor_data(
+    healthy: bool,
+    checks: &[DoctorCheck],
+    repairs: &Option<Vec<RepairOutcome>>,
+    model_recovery: &ModelRecovery,
+) -> serde_json::Value {
     let checks_json: Vec<serde_json::Value> = checks
         .iter()
         .map(|c| {
@@ -444,9 +473,7 @@ fn render_doctor_report(
         "model_recovered": model_recovered,
         "model_recovery_retryable": model_recovery_retryable,
     });
-
-    let degraded = !healthy || matches!(model_recovery, ModelRecovery::Failed(_));
-    CommandOutput::with_notes(markdown, data, degraded, notes)
+    data
 }
 
 #[cfg(test)]

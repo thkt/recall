@@ -139,5 +139,29 @@ pub(crate) fn recording() -> (Observer, Rc<RefCell<Vec<String>>>) {
     )
 }
 
+/// Drops time-throttled progress lines and timings, which vary between runs.
+#[cfg(test)]
+pub(crate) fn stable_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| {
+            line.split_once("processed=")
+                .and_then(|(_, rest)| rest.split_once(' '))
+                .and_then(|(progress, _)| progress.split_once('/'))
+                .is_none_or(|(done, total)| done == total)
+        })
+        .map(|line| match line.rsplit_once(" (") {
+            Some((text, timing))
+                if timing
+                    .strip_suffix("s)")
+                    .is_some_and(|seconds| seconds.parse::<f64>().is_ok()) =>
+            {
+                text.to_owned()
+            }
+            _ => line.clone(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests;

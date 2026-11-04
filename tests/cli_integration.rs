@@ -1144,3 +1144,94 @@ fn index_reports_real_file_read_failure_then_recovers() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
 }
+
+const SESSION_LINE: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+
+fn write_session(dir: &Path, body: &str) -> PathBuf {
+    let claude_dir = dir.join("claude");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::write(claude_dir.join("s1.jsonl"), body).unwrap();
+    claude_dir
+}
+
+fn index_stderr(dir: &Path, claude_dir: &Path) -> String {
+    let out = recall(dir)
+        .env("RECALL_CLAUDE_DIR", claude_dir)
+        .arg("index")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(out.status.code(), Some(0), "index should exit 0");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn assert_in_order(stderr: &str, first: &str, second: &str) {
+    let position = |text: &str| {
+        stderr
+            .find(text)
+            .unwrap_or_else(|| panic!("stderr should contain {text:?}, got: {stderr}"))
+    };
+    assert!(position(first) < position(second), "got: {stderr}");
+}
+
+#[test]
+fn index_stderr_summarizes_new_and_unchanged_runs_in_order() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = write_session(dir.path(), SESSION_LINE);
+
+    let first = index_stderr(dir.path(), &claude_dir);
+    assert_in_order(&first, "Indexed 1 sessions in ", "Created 1 chunks");
+
+    let second = index_stderr(dir.path(), &claude_dir);
+    assert_in_order(&second, "1 sessions up to date", "Chunks up to date");
+}
+
+#[test]
+fn index_stderr_summarizes_files_with_unresolved_parse_diagnostics() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = write_session(dir.path(), &format!("{SESSION_LINE}\nnot json\n"));
+    index_stderr(dir.path(), &claude_dir);
+
+    let unchanged = index_stderr(dir.path(), &claude_dir);
+
+    assert!(
+        unchanged.contains("1 sessions stored; 1 file(s) with unresolved parsing diagnostics"),
+        "got: {unchanged}"
+    );
+}
+
+#[test]
+fn index_stderr_warns_when_a_root_with_indexed_sessions_is_unavailable() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = write_session(dir.path(), SESSION_LINE);
+    index_stderr(dir.path(), &claude_dir);
+
+    let stderr = index_stderr(dir.path(), &dir.path().join("absent"));
+
+    assert!(
+        stderr.contains("claude root unavailable — preserved 1 existing session(s)"),
+        "got: {stderr}"
+    );
+}
+
+#[test]
+fn classify_warns_once_when_a_session_source_is_missing() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = write_session(dir.path(), SESSION_LINE);
+    index_stderr(dir.path(), &claude_dir);
+    fs::remove_file(claude_dir.join("s1.jsonl")).unwrap();
+
+    let out = recall(dir.path())
+        .args(["classify", "--all"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(out.status.code(), Some(0), "classify should exit 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .matches("warning: provenance unavailable (missing file): 1 session(s)")
+            .count(),
+        1,
+        "got: {stderr}"
+    );
+}
