@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::time::Instant;
 
 use rusqlite::Connection;
