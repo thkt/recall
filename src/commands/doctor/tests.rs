@@ -211,6 +211,131 @@ fn render_doctor_report_surfaces_repair_error() {
 }
 
 #[test]
+fn render_doctor_report_output_matches_every_check_repair_recovery_and_verbose_combination() {
+    const RETRYABLE: &str = "download interrupted";
+    const PERMANENT: &str = "artifact rejected";
+    let path = PathBuf::from("/tmp/recall-test.db");
+
+    for healthy in [true, false] {
+        for with_repairs in [false, true] {
+            for recovery_case in ["skipped", "succeeded", "retryable", "permanent"] {
+                for verbose in [false, true] {
+                    let mut checks = vec![
+                        DoctorCheck::pass("plain"),
+                        DoctorCheck::info("noted", "1 note".to_owned()),
+                    ];
+                    let mut check_json = vec![
+                        serde_json::json!({"name": "plain", "ok": true, "detail": null, "remedy": null}),
+                        serde_json::json!({"name": "noted", "ok": true, "detail": "1 note", "remedy": null}),
+                    ];
+                    let mut check_lines = "  plain [ok]\n  noted [ok] 1 note\n".to_owned();
+                    let mut notes = Vec::new();
+                    if !healthy {
+                        checks.push(DoctorCheck::fail("failed", "3 rows".to_owned(), "run fix"));
+                        checks.push(DoctorCheck {
+                            name: "bare",
+                            ok: false,
+                            detail: None,
+                            remedy: Some("bare remedy"),
+                        });
+                        check_json.push(serde_json::json!({"name": "failed", "ok": false, "detail": "3 rows", "remedy": "run fix"}));
+                        check_json.push(serde_json::json!({"name": "bare", "ok": false, "detail": null, "remedy": "bare remedy"}));
+                        check_lines.push_str("  failed [FAIL] 3 rows -> run fix\n  bare [FAIL]\n");
+                        notes.push("failed: run fix".to_owned());
+                        notes.push("bare: bare remedy".to_owned());
+                    }
+
+                    let repairs = with_repairs.then(|| {
+                        vec![
+                            RepairOutcome {
+                                name: "sound",
+                                result: Ok(2),
+                            },
+                            RepairOutcome {
+                                name: "broken",
+                                result: Err(anyhow::anyhow!("disk I/O error")),
+                            },
+                        ]
+                    });
+                    let mut repair_lines = "";
+                    let mut repaired = serde_json::Value::Null;
+                    if with_repairs {
+                        repair_lines =
+                            "Repaired sound: 2 row(s)\nRepair failed broken: disk I/O error\n";
+                        repaired = serde_json::json!({"sound": 2, "broken": null});
+                        notes.push("fix: broken: repair failed: disk I/O error".to_owned());
+                    }
+
+                    let (recovery, recovery_line, recovered, retryable) = match recovery_case {
+                        "skipped" => (
+                            ModelRecovery::Skipped,
+                            String::new(),
+                            serde_json::Value::Null,
+                            serde_json::Value::Null,
+                        ),
+                        "succeeded" => (
+                            ModelRecovery::Succeeded,
+                            "Recovered model\n".to_owned(),
+                            serde_json::json!(true),
+                            serde_json::Value::Null,
+                        ),
+                        "retryable" => {
+                            notes.push(format!("fix: model: recovery failed: {RETRYABLE}"));
+                            (
+                                ModelRecovery::Failed(RecallError::TempFailure(
+                                    RETRYABLE.to_owned(),
+                                )),
+                                format!("Model recovery failed: {RETRYABLE}\n"),
+                                serde_json::json!(false),
+                                serde_json::json!(true),
+                            )
+                        }
+                        "permanent" => {
+                            notes.push(format!("fix: model: recovery failed: {PERMANENT}"));
+                            (
+                                ModelRecovery::Failed(RecallError::DataError(PERMANENT.to_owned())),
+                                format!("Model recovery failed: {PERMANENT}\n"),
+                                serde_json::json!(false),
+                                serde_json::json!(false),
+                            )
+                        }
+                        _ => unreachable!(),
+                    };
+                    let recovery_failed = matches!(recovery, ModelRecovery::Failed(_));
+
+                    let out = render_doctor_report(verbose, &path, &checks, &repairs, &recovery);
+
+                    let health = if healthy { "healthy" } else { "degraded" };
+                    let db_line = if verbose {
+                        "DB: /tmp/recall-test.db\n"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(
+                        out.markdown,
+                        format!(
+                            "Health: {health}\n{repair_lines}{recovery_line}{check_lines}{db_line}"
+                        )
+                    );
+                    assert_eq!(out.notes, notes);
+                    assert_eq!(out.degraded, !healthy || recovery_failed);
+                    assert_eq!(
+                        out.data,
+                        serde_json::json!({
+                            "healthy": healthy,
+                            "checks": check_json,
+                            "repaired": repaired,
+                            "model_recovered": recovered,
+                            "model_recovery_retryable": retryable,
+                        })
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn doctor_flags_orphan_chunk_referencing_missing_session() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");

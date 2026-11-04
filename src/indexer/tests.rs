@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io;
 use std::sync::Mutex;
@@ -7,7 +8,7 @@ use super::*;
 use crate::commands::classify::reclassify_sessions;
 use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
 use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
-use crate::index_observer::recording;
+use crate::index_observer::{recording, stable_lines};
 use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
 
@@ -2535,6 +2536,119 @@ fn chunk_completion_rolls_back_with_chunks_and_retries() {
         assert_eq!((retried.chunks_created, retried.sessions_chunked), (1, 2));
         assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
     }
+}
+
+#[test]
+fn chunk_pass_reports_stage_lines_counts_and_rows_with_and_without_pending_sessions() {
+    let (_dir, mut conn) = setup_test_db();
+
+    let (observer, lines) = recording();
+    let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
+    assert_eq!(
+        (
+            stats.chunks_created,
+            stats.sessions_chunked,
+            stats.message_batches,
+            stats.message_scans,
+            stats.messages_read
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: chunking: started (not yet complete)",
+            "index: chunking: no pending sessions"
+        ]
+    );
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 0,
+            "sessions_chunked_empty": 0,
+        })
+    );
+
+    seed_session(&conn, "empty");
+    seed_session(&conn, "empty2");
+    seed_session(&conn, "s1");
+    conn.execute(
+        "UPDATE sessions SET timestamp = 1234 WHERE session_id = 's1'",
+        [],
+    )
+    .unwrap();
+    let question = seed_message(&conn, "user", "question");
+    seed_message(&conn, "unknown-role", "dropped text");
+    let (observer, lines) = recording();
+    let progress = RefCell::new(Vec::new());
+    let on_progress = |done, total| progress.borrow_mut().push((done, total));
+
+    let stats = index_chunks_observed(&mut conn, Some(&on_progress), &observer).unwrap();
+
+    assert_eq!(
+        (
+            stats.chunks_created,
+            stats.sessions_chunked,
+            stats.message_batches,
+            stats.message_scans,
+            stats.messages_read
+        ),
+        (1, 3, 1, 1, 2)
+    );
+    assert_eq!(*progress.borrow(), [(1, 3), (2, 3), (3, 3)]);
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: chunking: started (not yet complete)",
+            "index: chunking: processed=3/3 unprocessed=0 committed=0",
+            "index: chunking: committed"
+        ]
+    );
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 1,
+            "sessions_chunk_pending": 3,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 3,
+            "sessions_chunked_empty": 2,
+        })
+    );
+    let chunk: (String, String, i64, i64, i64) = conn
+        .query_row(
+            "SELECT session_id, content, timestamp, src_rowid_lo, src_rowid_hi FROM qa_chunks",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        chunk,
+        (
+            "s1".to_owned(),
+            "question".to_owned(),
+            1234,
+            question,
+            question
+        )
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT session_id || '=' || chunks_indexed FROM sessions ORDER BY session_id"
+        ),
+        ["empty=0", "empty2=0", "s1=0"]
+    );
+    assert!(
+        !conn
+            .prepare("SELECT 1 FROM temp.sqlite_master WHERE name = 'chunk_message_rows'")
+            .unwrap()
+            .exists([])
+            .unwrap(),
+        "the staging table must not outlive the pass"
+    );
 }
 
 #[test]
