@@ -24,4 +24,8 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 - #122 automated filter を FTS・vec 両候補クエリに適用
 - #283 新規 `--file` 軸の設計要件として「共有 helper 経由で FTS / vec 両 leg が継承する」を明記
 - #293 `--file` テストが FTS leg のみだった gap を audit が検出し `assert_filter_symmetric` を追加
+- #339 / #340 / #341 / #344 出自による自動会話の分類で、FTS・vec 両方の除外と `--include-automated` での復帰を完了条件にし、#344 で両方を確かめた。#341 はこのページを参照した
+- #357 全文・ベクトル・ファイル一覧のフィルターを共通の入口から適用するよう整理し、ベクトル単独の順位を確かめる回帰テストを足した
+- #376 automated 除外件数の絞り込みを `append_search_filters` で検索本体と揃え、ベクトルだけで一致するセッションを数えない非対称を Review focus に挙げた
+- [research:session-provenance-classification.md](../research/session-provenance-classification.md) 共有フィルターの維持を完了条件にし、このページを参照した
 - 現行コード: `src/search.rs` の `append_search_filters` (全フィルタの適用)、`build_fts_candidate_query` / `vec_search` / `file_list_outcome` (3 経路からの呼び出し)、`src/search/tests.rs` の `combined_filters_apply_to_fts_hybrid_and_file_list` と `assert_filter_symmetric` を用いたテスト (対称性固定)

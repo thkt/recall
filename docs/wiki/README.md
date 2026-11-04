@@ -13,5 +13,12 @@
 - [リリース](release-procedure.md)
 - [FTS・vectorのフィルタ対称性](fts-vec-two-leg-symmetry.md)
 - [Gemmaの検証・モデル更新・切戻し](../gemma-model-updates.md)
+- [性能改善の計測](performance-measurement.md)
+- [合成 fixture による検証](synthetic-fixtures-only.md)
+- [実モデル検証はホストで行う](host-only-model-verification.md)
+- [README の日英同時更新](bilingual-readme-updates.md)
+- [振る舞いを変えない変更の一致確認](behavior-preserving-equivalence.md)
+- [並行競合のテスト](deterministic-concurrency-tests.md)
+- [依存更新 PR](dependency-update-prs.md)
 
 旧amici/ruricoのrev lockstep手順は依存の撤去に伴い削除した。過去の更新理由はGit履歴で参照できる。
