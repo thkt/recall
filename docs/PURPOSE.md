@@ -4,7 +4,7 @@
 
 <!-- 現在の痛み。このプロジェクトがなければ何が困るか -->
 
-過去のClaude Code / Codexセッションから「あのとき何をどう解決したか」を探すのが困難。数千のJSONLファイルをgrepするのは非現実的で、キーワードを正確に思い出せない限り過去の解決策に到達できない。
+過去の Claude Code/Codex セッションから「あのとき何をどう解決したか」を探すのが困難。数千の JSONL ファイルを grep するのは非現実的で、キーワードを正確に思い出せない限り過去の解決策に到達できない。
 
 ## Outcome
 
@@ -16,15 +16,15 @@
 
 <!-- 誰のためのものか。内部ツールなら利用する開発者の役割・状況 -->
 
-- Claude Code / Codexを日常的に使う開発者
-- Claude Code / CodexのAIエージェント（ツールとしてrecallを呼び出す）
+- Claude Code/Codex を日常的に使う開発者
+- Claude Code/Codex の AI エージェント（ツールとして recall を呼び出す）
 
 ## Scope
 
 ### In
 
-- ローカルのJSONLセッションファイルの全文検索 + semantic search（ハイブリッド）
-- FTS5インデックスの増分更新 + index-time embedding（検索は構築済み index を読むのみ）
+- ローカルの JSONL セッションファイルの全文検索 + semantic search（ハイブリッド）
+- FTS5 インデックスの増分更新 + index-time embedding（検索は構築済み index を読むのみ）
 - プロジェクト・期間・ソースによるフィルタリング
 - FTS5 rank + RRF（embedding 利用可能時に vector 検索を統合）+ recency boost によるランキング
 - 単一セッションの会話全文表示（`recall show <id>`、ID 前方一致）
@@ -43,9 +43,9 @@
 <!-- 意図的に受け入れている制約・省略 -->
 
 - テキストのみインデックス。ツール使用ブロック・システムプロンプトは除外
-- SQLite / mlx-rs / sqlite-vec を静的リンク（バイナリサイズ > 依存ゼロを優先）
+- SQLite/llama.cpp/sqlite-vec を静的リンク（バイナリサイズ > 依存ゼロを優先）
 - 検索結果は抜粋のみ表示（単一セッションの全文は `recall show <id>` で表示）
-- embedding はローカル MLX のみ（Apple Silicon 専用、CPU fallback なし）。ネットワーク・APIキー不要で、セッションデータはマシン外に出ない
+- embedding はローカルの llama.cpp/Metal のみ（Apple Silicon 専用、CPU fallback なし）。ネットワーク・API キー不要で、セッションデータはマシン外に出ない
 - モデル未取得でも index は FTS5 を構築し、検索はキーワードランキングに縮退（モデルは `recall model download` で別途取得）
 
 ## Priorities
