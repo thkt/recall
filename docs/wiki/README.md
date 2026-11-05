@@ -22,5 +22,6 @@
 - [依存更新 PR](dependency-update-prs.md)
 - [無関係な Cargo.lock 更新の分離](unrelated-lockfile-updates.md)
 - [実施しなかった検証の記載](record-skipped-verification.md)
+- [サンドボックス外で実行するテスト](tests-outside-sandbox.md)
 
 旧amici/ruricoのrev lockstep手順は依存の撤去に伴い削除した。過去の更新理由はGit履歴で参照できる。
