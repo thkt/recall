@@ -6,10 +6,6 @@
 
 ## 昇格待ち
 
-- accepted の DR 本文を現行仕様で上書きせず、新しい判断は後続の DR で扱う #340 [research:session-provenance-classification.md](../research/session-provenance-classification.md) [research:issue-342-scope.md](../research/issue-342-scope.md)
-- 読み取り専用マウント・ローカル TCP を使うテストはサンドボックス外で実行する #357 #367
-- 作業と無関係な Cargo.lock の更新が混ざったら、別コミットに分けるか差し戻す #373 #383
-
 ## 単発
 
 - cargo machete で未使用 direct dependency を検出し、Cargo.lock 上のトランジティブ残存を確認して削除する — #176
@@ -22,5 +18,15 @@
 - ドキュメントや issue タイトルにバージョン番号を固定せず「現行実装」等と書いて陳腐化を防ぐ — #109
 - /polish (Codex レビュー) は 2 回走らせる(1 回目の見落としが 2 回目で出ることがある) — #61
 - /build の Red ゲートが Rust の snake_case テスト名を計画のテスト名と照合できず、Green を飛ばして未実装のまま進む — #383
+- 検証は合成 fixture と scratch path で行い、本番索引と私的ログに触れない #389
+- 依存更新 PR は Cargo ファイルだけを変え、影響と残る警告を書く #385
+- リリース手順 #386
+- 並行競合のテストは固定 sleep に頼らず順序を固定する #389
+- コード移動だけの PR は、移動前後のトークン比較と `git diff --color-moved` で移動だけであることを示す #388
+- 本番コードを壊す変異を入れて、固定テストが検出できるかを確かめる #389
+- テスト専用のコードを別ファイルへ移すときは、先頭の `#![cfg(test)]` で coverage の対象から外す #388
 
 ## 棄却
+
+- accepted の DR 本文を現行仕様で上書きせず、新しい判断は後続の DR で扱う #340 [research:session-provenance-classification.md](../research/session-provenance-classification.md) [research:issue-342-scope.md](../research/issue-342-scope.md) #388
+  現行の履歴と合わないため落とした。#321 は DR-0011 の Chosen option を書き換え、#341 は DR-0006 の終了コード表に追記し、#383 は DR-0014 の本文を更新した。
