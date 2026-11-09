@@ -1273,6 +1273,10 @@ fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() 
         stderr.contains("claude root could not be fully read — preserved 1 existing session(s)"),
         "the empty CLAUDE_CONFIG_DIR run should report the Claude root as not read, got: {stderr}"
     );
+    assert!(
+        stderr.contains("check that the root is an absolute path"),
+        "the note should point at the root's path, got: {stderr}"
+    );
 }
 
 #[test]
