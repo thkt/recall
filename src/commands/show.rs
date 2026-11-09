@@ -281,7 +281,7 @@ pub(crate) fn run_show(
         );
     }
 
-    let (conn, _tier) = db::open_db_readonly(&path)?;
+    let (conn, tier) = db::open_db_readonly(&path)?;
     match db::schema_state(&conn)? {
         db::SchemaState::Empty => Err(RecallError::Usage(
             "Database not found. Run `recall index` first.".to_owned(),
@@ -289,7 +289,12 @@ pub(crate) fn run_show(
         .into()),
         state => {
             require_current_schema(state)?;
-            show_session_windowed(&conn, session_id, verbose, chunk, window)
+            let mut out = show_session_windowed(&conn, session_id, verbose, chunk, window)?;
+            if let Some(note) = db::stale_wal_note(&path, tier) {
+                out.degraded = true;
+                out.notes.push(note);
+            }
+            Ok(out)
         }
     }
 }

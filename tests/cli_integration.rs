@@ -907,6 +907,43 @@ fn read_commands_work_in_readonly_directory() {
 
 #[cfg(unix)]
 #[test]
+fn show_on_an_immutable_open_with_stale_wal_surfaces_degraded_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let db = dir.path().join("recall.db");
+    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
+    fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let out = recall(dir.path())
+        .args(["show", "s1", "--json"])
+        .output()
+        .expect("spawn recall binary");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["degraded"], true, "{envelope}");
+    assert_eq!(
+        envelope["notes"].as_array().map(Vec::len),
+        Some(1),
+        "{envelope}"
+    );
+    root_skip::assert_copy_based_remedy(envelope["notes"][0].as_str().unwrap(), "show");
+}
+
+#[cfg(unix)]
+#[test]
 fn immutable_open_with_stale_wal_surfaces_degraded_note() {
     use std::os::unix::fs::PermissionsExt;
 
