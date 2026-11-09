@@ -14,6 +14,7 @@ fn cli(root: &Path) -> Command {
         .env("RECALL_MODEL_DIR", root.join("model"))
         .env("RECALL_CLAUDE_DIR", root.join("claude"))
         .env("RECALL_CODEX_DIR", root.join("codex"))
+        .env_remove("RECALL_CODEX_ARCHIVED_DIR")
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("HF_HOME", root.join("hf"))

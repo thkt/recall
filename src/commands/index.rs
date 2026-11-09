@@ -43,10 +43,12 @@ pub(crate) fn index_and_report(
     let home = home_dir().context("Could not determine home directory")?;
     let claude_dir = indexer::resolve_claude_dir(&home);
     let codex_dir = indexer::resolve_codex_dir(&home);
+    let codex_archived_dir = indexer::resolve_codex_archived_dir(&home);
     let opts = indexer::IndexOptions {
         force,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: codex_archived_dir.as_deref(),
     };
     let outcome = index_and_report_observed(
         db_path,
@@ -104,11 +106,7 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         ));
     }
     for skipped in &outcome.skipped_roots {
-        notes.push(
-            skipped
-                .reason
-                .note(skipped.source.as_str(), skipped.preserved_sessions),
-        );
+        notes.push(skipped.note());
     }
     if let Some(note) = preserved_embedded_note(outcome.preserved_embedded) {
         notes.push(note);
@@ -293,11 +291,7 @@ fn report_indexed_sessions(stats: &indexer::IndexStats) {
     };
     done(&main_msg);
     for skipped in &stats.skipped_roots {
-        warning(
-            &skipped
-                .reason
-                .note(skipped.source.as_str(), skipped.preserved_sessions),
-        );
+        warning(&skipped.note());
     }
 }
 

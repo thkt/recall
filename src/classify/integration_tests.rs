@@ -334,6 +334,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
         force: false,
         claude_dir: &claude,
         codex_dir: &codex,
+        codex_archived_dir: None,
     };
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 14);
     index_chunks(&mut conn, None).unwrap();

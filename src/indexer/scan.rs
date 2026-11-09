@@ -28,17 +28,43 @@ pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
     resolve_claude_dir_with(home, |key| env::var_os(key))
 }
 
+/// An empty `RECALL_CODEX_DIR` counts as unset: an empty path would sit above every
+/// row as a missing root and keep every Codex row forever.
+fn codex_dir_override(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("RECALL_CODEX_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
 pub(crate) fn resolve_codex_dir_with<F>(home: &Path, get: F) -> PathBuf
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    get("RECALL_CODEX_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex").join("sessions"))
+    codex_dir_override(get).unwrap_or_else(|| home.join(".codex").join("sessions"))
 }
 
 pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
     resolve_codex_dir_with(home, |key| env::var_os(key))
+}
+
+/// `RECALL_CODEX_DIR` alone turns the default archive off, so pointing recall at
+/// another sessions tree never mixes in the real `~/.codex/archived_sessions`.
+/// An empty `RECALL_CODEX_ARCHIVED_DIR` turns it off too, for the same reason an empty
+/// `RECALL_CODEX_DIR` counts as unset.
+pub(crate) fn resolve_codex_archived_dir_with<F>(home: &Path, get: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
+    if let Some(dir) = get("RECALL_CODEX_ARCHIVED_DIR") {
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
+    }
+    codex_dir_override(get)
+        .is_none()
+        .then(|| home.join(".codex").join("archived_sessions"))
+}
+
+pub(crate) fn resolve_codex_archived_dir(home: &Path) -> Option<PathBuf> {
+    resolve_codex_archived_dir_with(home, |key| env::var_os(key))
 }
 
 pub(super) struct ScanOutcome {
@@ -46,19 +72,56 @@ pub(super) struct ScanOutcome {
     /// Compressed logs left unparsed because their plain copy sits beside them.
     /// They are still on disk, so a row pointing at one must not be deleted.
     pub(super) set_aside: Vec<PathBuf>,
-    pub(super) scanned: HashSet<Source>,
+    pub(super) removal: RemovalGate,
     pub(super) skipped: HashMap<Source, SkippedReason>,
+}
+
+/// Decides which rows a run may delete because their file was not found (DR 0004).
+#[derive(Default)]
+pub(super) struct RemovalGate {
+    fully_read: HashSet<Source>,
+    missing_roots: Vec<(Source, PathBuf)>,
+}
+
+impl RemovalGate {
+    #[cfg(test)]
+    pub(super) fn fully_read(sources: impl IntoIterator<Item = Source>) -> Self {
+        Self {
+            fully_read: sources.into_iter().collect(),
+            missing_roots: Vec::new(),
+        }
+    }
+
+    pub(super) fn is_fully_read(&self, source: Source) -> bool {
+        self.fully_read.contains(&source)
+    }
+
+    /// A row may go only when every present root of its source was read in full
+    /// and the row does not lie under a root that is missing this run.
+    pub(super) fn allows(&self, source: Option<Source>, path: &Path) -> bool {
+        source.is_some_and(|source| {
+            self.is_fully_read(source)
+                && !self
+                    .missing_roots
+                    .iter()
+                    .any(|(owner, root)| *owner == source && path.starts_with(root))
+        })
+    }
 }
 
 pub(super) fn collect_sources(opts: &IndexOptions) -> ScanOutcome {
     let mut out = ScanOutcome {
         sources: Vec::new(),
         set_aside: Vec::new(),
-        scanned: HashSet::new(),
+        removal: RemovalGate::default(),
         skipped: HashMap::new(),
     };
-    classify_root(opts.claude_dir, Source::Claude, &mut out);
-    classify_root(opts.codex_dir, Source::Codex, &mut out);
+    classify_roots(Source::Claude, &[opts.claude_dir], &mut out);
+    let codex_roots: Vec<&Path> = [opts.codex_dir]
+        .into_iter()
+        .chain(opts.codex_archived_dir)
+        .collect();
+    classify_roots(Source::Codex, &codex_roots, &mut out);
     out.set_aside = set_aside_compressed_copies_of_plain_logs(&mut out.sources);
     out
 }
@@ -79,14 +142,41 @@ fn set_aside_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)
     set_aside.into_iter().map(|(path, _)| path).collect()
 }
 
-fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {
-    if !dir.is_dir() {
-        out.skipped.insert(source, SkippedReason::MissingRoot);
-    } else if collect_jsonl_files(dir, &mut out.sources, source) {
-        out.scanned.insert(source);
-    } else {
+/// One unreadable root blocks every deletion for its source: a session that just moved
+/// into that root would otherwise be deleted from the root it left. A root counts as
+/// missing when it does not exist or is not a directory; `is_dir()` would also call it
+/// missing when `stat` fails on a permission error.
+fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
+    let mut any_present = false;
+    let mut all_read = true;
+    for root in roots {
+        match fs::metadata(root) {
+            Ok(meta) if meta.is_dir() => {
+                any_present = true;
+                all_read &= collect_jsonl_files(root, &mut out.sources, source);
+            }
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                warn!(path = %root.display(), error = %e, "cannot inspect root");
+                all_read = false;
+            }
+            _ => out.removal.missing_roots.push((source, root.to_path_buf())),
+        }
+    }
+    if !all_read {
         out.skipped
             .insert(source, SkippedReason::IncompleteEnumeration);
+    } else if any_present {
+        out.removal.fully_read.insert(source);
+        if out.removal.missing_roots.iter().any(|(s, _)| *s == source) {
+            out.skipped.insert(source, SkippedReason::MissingRoot);
+        }
+    } else {
+        out.skipped.insert(source, SkippedReason::MissingRoot);
     }
 }
 

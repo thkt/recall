@@ -240,12 +240,22 @@ Add to `~/.claude/settings.json`:
 ## How it works
 
 ```text
-~/.claude/projects/**/*.jsonl       ─┐
-                                     ├─→ Parse → FTS5 + Q&A chunks → Index-time embedding
-~/.codex/sessions/**/*.jsonl(.zst)  ─┘
+~/.claude/projects/**/*.jsonl              ─┐
+~/.codex/sessions/**/*.jsonl(.zst)         ─┼─→ Parse → FTS5 + Q&A chunks → Index-time embedding
+~/.codex/archived_sessions/*.jsonl(.zst)   ─┘
 ```
 
-**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file and skips the body only when its stored size matches and its mtime differs by less than 1 ms. Size changes trigger a re-parse even when mtime is preserved. If metadata changes during parsing, the next index run retries the file. Older indexes without stored sizes are re-read once; embedded sessions remain pending while embedding is unavailable. Same-size replacements with mtime unchanged (or differing by less than 1 ms) are not detected; use `recall rebuild` with a working model to refresh them. Files are not fully hashed for freshness. Codex logs compressed to `.jsonl.zst` are read in place, and a session keeps its chunks and embeddings when its log is compressed. While a plain `.jsonl` and its `.jsonl.zst` copy sit in the same directory, only the plain file is indexed.
+**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file and skips the body only when its stored size matches and its mtime differs by less than 1 ms. Size changes trigger a re-parse even when mtime is preserved. If metadata changes during parsing, the next index run retries the file. Older indexes without stored sizes are re-read once; embedded sessions remain pending while embedding is unavailable. Same-size replacements with mtime unchanged (or differing by less than 1 ms) are not detected; use `recall rebuild` with a working model to refresh them. Files are not fully hashed for freshness.
+
+**Compressed and archived Codex logs** — A Codex session keeps its chunks and embeddings when Codex compresses or archives its log.
+
+- Logs compressed to `.jsonl.zst` are read in place. While a plain `.jsonl` and its `.jsonl.zst` copy sit in the same directory, only the plain file is indexed.
+- Sessions archived to `~/.codex/archived_sessions/` stay indexed. `RECALL_CODEX_ARCHIVED_DIR` selects another archive directory, and an empty value turns the archive off. Setting only `RECALL_CODEX_DIR` also stops reading the default archive. An empty `RECALL_CODEX_DIR` counts as unset.
+
+**Removal** — A session is removed from the index only after its file is absent from a fully read root.
+
+- A missing root keeps the sessions indexed under it.
+- A root that exists but cannot be fully read keeps every session of its source for that run. For Codex, an unreadable archive also keeps the sessions under `~/.codex/sessions/`.
 
 **Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
 
@@ -282,7 +292,7 @@ Gemma product latency and indexing throughput depend on corpus, hardware, checks
 
 | Limitation          | Details                                                                     |
 | ------------------- | --------------------------------------------------------------------------- |
-| Local sessions only | Searches `~/.claude/projects/` and `~/.codex/sessions/`. No cloud sync      |
+| Local sessions only | Searches `~/.claude/projects/`, `~/.codex/sessions/`, and `~/.codex/archived_sessions/`. No cloud sync |
 | Text only           | Images, tool results, and binary content are not indexed                    |
 | Apple Silicon only  | Requires Apple Silicon. The supported model probe requires the GPU backend           |
 | Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations |

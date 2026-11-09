@@ -28,6 +28,7 @@ fn index_runs_keep_their_stage_order_for_ready_unavailable_legacy_and_failed_bac
         force: false,
         claude_dir: &source,
         codex_dir: &absent,
+        codex_archived_dir: None,
     };
     let db = dir.path().join("index.db");
     let run = |loader: Result<Arc<dyn Embed>, DegradedReason>| {
@@ -206,6 +207,7 @@ fn slow_loader_is_announced_before_work_and_run_counts_distinguish_changes() {
         force: false,
         claude_dir: &source,
         codex_dir: &absent,
+        codex_archived_dir: None,
     };
     let db = Some(dir.path().join("index.db"));
     for (run, updated, unchanged) in [(0, 1, 0), (1, 0, 1), (2, 1, 0)] {

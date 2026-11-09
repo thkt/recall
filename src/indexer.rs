@@ -17,13 +17,13 @@ use chunks::{
 pub use diagnostics::FileParseDiagnostics;
 pub(crate) use diagnostics::load_parse_diagnostics;
 use diagnostics::{cleanup_parse_diagnostics, save_parse_diagnostics, save_read_error};
-use scan::collect_sources;
 #[cfg(test)]
 use scan::{
     MAX_DIR_DEPTH, collect_from_entries, collect_jsonl_files, resolve_claude_dir_with,
-    resolve_codex_dir_with,
+    resolve_codex_archived_dir_with, resolve_codex_dir_with,
 };
-pub(crate) use scan::{resolve_claude_dir, resolve_codex_dir};
+use scan::{RemovalGate, collect_sources};
+pub(crate) use scan::{resolve_claude_dir, resolve_codex_archived_dir, resolve_codex_dir};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -65,6 +65,21 @@ pub struct SkippedRoot {
     pub source: Source,
     pub preserved_sessions: usize,
     pub reason: SkippedReason,
+    /// Another root of the same source was read in full, so its deleted sessions were removed.
+    pub other_roots_reconciled: bool,
+}
+
+impl SkippedRoot {
+    pub(crate) fn note(&self) -> String {
+        let source = self.source.as_str();
+        if self.other_roots_reconciled && self.reason == SkippedReason::MissingRoot {
+            return format!(
+                "a {source} root is unavailable — preserved {preserved} existing session(s) under it and reconciled the rest; re-run `recall index` once the root is back so a full scan can reconcile them",
+                preserved = self.preserved_sessions,
+            );
+        }
+        self.reason.note(source, self.preserved_sessions)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,6 +139,7 @@ pub(crate) struct IndexOptions<'a> {
     pub force: bool,
     pub claude_dir: &'a Path,
     pub codex_dir: &'a Path,
+    pub codex_archived_dir: Option<&'a Path>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -555,10 +571,10 @@ pub(crate) fn index_from_dirs_observed(
         &tx,
         &existing,
         &source_paths,
-        &scan.scanned,
+        &scan.removal,
         &totals.preserved_sessions,
     )?;
-    let parse_diagnostics = cleanup_parse_diagnostics(&tx, &source_paths, &scan.scanned)?;
+    let parse_diagnostics = cleanup_parse_diagnostics(&tx, &source_paths, &scan.removal)?;
     tx.commit().context("Failed to commit transaction")?;
 
     observer.count("files_updated_committed", totals.indexed);
@@ -586,7 +602,12 @@ pub(crate) fn index_from_dirs_observed(
         parse_diagnostics,
         total_sessions,
         elapsed_secs: start.elapsed().as_secs_f64(),
-        skipped_roots: summarize_skipped_roots(&existing, &source_paths, &scan.skipped),
+        skipped_roots: summarize_skipped_roots(
+            &existing,
+            &source_paths,
+            &scan.skipped,
+            &scan.removal,
+        ),
         preserved_embedded: totals.preserved_embedded,
     })
 }
@@ -615,6 +636,7 @@ fn summarize_skipped_roots(
     existing: &HashMap<String, SessionEntry>,
     source_paths: &HashSet<&Path>,
     skipped: &HashMap<Source, SkippedReason>,
+    removal: &RemovalGate,
 ) -> Vec<SkippedRoot> {
     [Source::Claude, Source::Codex]
         .into_iter()
@@ -623,7 +645,10 @@ fn summarize_skipped_roots(
             let preserved_sessions = existing
                 .iter()
                 .filter(|(fp, e)| {
-                    e.source == Some(source) && !source_paths.contains(Path::new(fp.as_str()))
+                    let fp = Path::new(fp.as_str());
+                    e.source == Some(source)
+                        && !source_paths.contains(fp)
+                        && !removal.allows(e.source, fp)
                 })
                 .count();
             let emit = match reason {
@@ -634,6 +659,7 @@ fn summarize_skipped_roots(
                 source,
                 preserved_sessions,
                 reason,
+                other_roots_reconciled: removal.is_fully_read(source),
             })
         })
         .collect()
@@ -674,7 +700,7 @@ fn cleanup_orphans(
     tx: &Transaction,
     existing: &HashMap<String, SessionEntry>,
     source_paths: &HashSet<&Path>,
-    scanned: &HashSet<Source>,
+    removal: &RemovalGate,
     preserved_sessions: &HashSet<String>,
 ) -> Result<()> {
     if existing.is_empty() {
@@ -682,8 +708,9 @@ fn cleanup_orphans(
     }
     for (fp, entry) in existing {
         // A missing/unreadable source root is not evidence that its sessions were deleted.
-        let scanned_here = entry.source.is_some_and(|s| scanned.contains(&s));
-        if !scanned_here || preserved_sessions.contains(&entry.session_id) {
+        if !removal.allows(entry.source, Path::new(fp.as_str()))
+            || preserved_sessions.contains(&entry.session_id)
+        {
             continue;
         }
         if !source_paths.contains(Path::new(fp.as_str())) {

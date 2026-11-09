@@ -1075,6 +1075,7 @@ fn test_index_then_search_roundtrip() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1126,6 +1127,7 @@ fn test_index_then_search_roundtrip() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )

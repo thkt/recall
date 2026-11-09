@@ -38,6 +38,7 @@ fn test_index_from_dirs_indexes_and_skips() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -52,6 +53,7 @@ fn test_index_from_dirs_indexes_and_skips() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -80,6 +82,7 @@ fn test_index_from_dirs_steady_state_keeps_db_stable() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
 
     index_from_dirs(&mut conn, &opts, true).unwrap();
@@ -132,6 +135,7 @@ fn test_index_from_dirs_reindexes_appended_file() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
 
@@ -228,6 +232,7 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
                 } else {
                     &absent
                 },
+                codex_archived_dir: None,
             };
             let initial = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
             rewrite_with_mtime(&file, question, initial);
@@ -304,6 +309,7 @@ fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
                 force: false,
                 claude_dir: &absent,
                 codex_dir: root.path(),
+                codex_archived_dir: None,
             };
             let initial = format!(
                 "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"session-a\",\"source\":\"exec\"}}}}\n{}",
@@ -410,6 +416,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
             force: false,
             claude_dir: root.path(),
             codex_dir: &absent,
+            codex_archived_dir: None,
         };
         assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
         assert_eq!(
@@ -449,6 +456,7 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         force: false,
         claude_dir: root.path(),
         codex_dir: &absent,
+        codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
@@ -518,6 +526,7 @@ fn index_one_claude_session(content: &str) -> Option<String> {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -560,6 +569,7 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -577,6 +587,7 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -608,6 +619,7 @@ fn test_index_from_dirs_force_reindexes() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -635,6 +647,7 @@ fn test_index_from_dirs_force_reindexes() {
             force: true,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -671,6 +684,7 @@ fn test_orphan_cleanup_removes_deleted_files() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -704,6 +718,7 @@ fn test_orphan_cleanup_removes_deleted_files() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -754,6 +769,7 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -775,6 +791,7 @@ fn test_missing_source_roots_preserve_existing_index() {
             force: false,
             claude_dir: &gone_claude,
             codex_dir: &gone_codex,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -804,6 +821,7 @@ fn test_partial_missing_root_preserves_unscanned_source_only() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &gone_codex,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -841,6 +859,7 @@ fn test_unreadable_source_root_preserves_index() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     );
@@ -874,6 +893,7 @@ fn test_unreadable_child_subdir_preserves_source() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     );
@@ -918,6 +938,7 @@ fn test_deleted_file_under_scanned_root_cascades_cleanup() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -972,6 +993,7 @@ fn test_skipped_root_reports_preserved_count() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &gone_codex,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1014,6 +1036,7 @@ fn test_skipped_root_counts_only_file_absent_rows() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1031,6 +1054,7 @@ fn test_skipped_root_counts_only_file_absent_rows() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     );
@@ -1082,6 +1106,7 @@ fn test_incomplete_enumeration_surfaces_with_empty_db() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     );
@@ -1114,6 +1139,7 @@ fn test_missing_root_with_no_preserved_rows_is_silent() {
             force: false,
             claude_dir: &gone_claude,
             codex_dir: &gone_codex,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1229,6 +1255,7 @@ fn test_cleanup_deletes_real_orphan_when_new_file_added() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1319,6 +1346,7 @@ fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
                 force: false,
                 claude_dir: &claude_dir,
                 codex_dir: &codex_dir,
+                codex_archived_dir: None,
             };
             assert_eq!(collect_sources(&opts).sources.len(), 2);
 
@@ -1376,6 +1404,7 @@ fn complete_scan_preserves_sessions_with_unknown_source() {
             force: false,
             claude_dir: root.path(),
             codex_dir: root.path(),
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1415,6 +1444,7 @@ fn test_force_rebuild_preserves_missing_source_root() {
             force: true,
             claude_dir: &claude_dir,
             codex_dir: &gone_codex,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1476,6 +1506,7 @@ fn test_force_rebuild_all_roots_missing_preserves_index() {
             force: true,
             claude_dir: &gone_claude,
             codex_dir: &gone_codex,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1530,6 +1561,7 @@ fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
             force: true,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1598,6 +1630,7 @@ fn test_session_id_collision_cleans_old_messages() {
             force: false,
             claude_dir: &dir_a,
             codex_dir: &empty_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1611,6 +1644,7 @@ fn test_session_id_collision_cleans_old_messages() {
             force: false,
             claude_dir: &dir_b,
             codex_dir: &empty_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -1656,6 +1690,7 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         };
         assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
         assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
@@ -1815,6 +1850,7 @@ fn test_011_index_chunks_incremental() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
     let first = index_chunks(&mut conn, None).unwrap();
@@ -1987,6 +2023,7 @@ fn test_embed_recent_chunks_populates_vec_chunks() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -2288,6 +2325,7 @@ fn edit_write_の_file_path_が_session_files_に入る() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -2360,6 +2398,7 @@ fn 妥当でない値は捨てられる() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -2777,6 +2816,7 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
     assert_eq!(stats.indexed, 1);
@@ -2872,6 +2912,7 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
         force: false,
         claude_dir: tmp.path(),
         codex_dir: &missing,
+        codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
     let existing = load_existing_sessions(&conn).unwrap();
@@ -2921,9 +2962,12 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         let sources: Vec<_> = paths.iter().cloned().map(|p| (p, Source::Claude)).collect();
         index_all(&ctx, &sources, &Observer::default()).unwrap();
         let source_paths = paths.iter().map(PathBuf::as_path).collect();
-        let diagnostics =
-            cleanup_parse_diagnostics(&tx, &source_paths, &HashSet::from([Source::Claude]))
-                .unwrap();
+        let diagnostics = cleanup_parse_diagnostics(
+            &tx,
+            &source_paths,
+            &RemovalGate::fully_read([Source::Claude]),
+        )
+        .unwrap();
         tx.commit().unwrap();
         diagnostics
     }
@@ -2993,6 +3037,7 @@ fn failed_fts_transaction_never_reports_saved_files() {
         force: false,
         claude_dir: source.path(),
         codex_dir: &absent,
+        codex_archived_dir: None,
     };
     let error = index_from_dirs_observed(&mut conn, &opts, true, &observer)
         .err()
@@ -3026,6 +3071,7 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
         force: false,
         claude_dir: source.path(),
         codex_dir: &absent,
+        codex_archived_dir: None,
     };
     let observer = Observer::default();
     index_from_dirs_observed(&mut conn, &opts, true, &observer).unwrap();
@@ -3141,6 +3187,7 @@ fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
             force: false,
             claude_dir: &root,
             codex_dir: &absent,
+            codex_archived_dir: None,
         };
         let writer = open_db(&db_dir.path().join("test.db")).unwrap();
         writer.busy_timeout(Duration::ZERO).unwrap();
@@ -3155,6 +3202,7 @@ fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
                 force: false,
                 claude_dir: &writer_root,
                 codex_dir: &absent,
+                codex_archived_dir: None,
             };
             index_from_dirs(&mut writer, &opts, true)?;
             index_chunks(&mut writer, None)?;
@@ -3239,6 +3287,7 @@ fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
             force: false,
             claude_dir: &root,
             codex_dir: &absent,
+            codex_archived_dir: None,
         };
         write_reuse_conversation(&path, &original);
         index_from_dirs(&mut conn, &opts, true).unwrap();
@@ -3426,6 +3475,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         force: false,
         claude_dir: tmp.path(),
         codex_dir: &absent,
+        codex_archived_dir: None,
     };
     let mut messages = vec![
         ("user", "stable"),
@@ -3543,6 +3593,7 @@ fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         };
         index_from_dirs(&mut conn, &opts, true).unwrap();
         index_chunks(&mut conn, None).unwrap();
@@ -3583,6 +3634,7 @@ fn plain_codex_log_is_indexed_once_when_its_compressed_copy_sits_beside_it() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
 
     let first = index_from_dirs(&mut conn, &opts, true).unwrap();
@@ -3616,6 +3668,7 @@ fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
@@ -3652,6 +3705,7 @@ fn compressed_logs_are_collected_from_the_codex_root_only() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     })
     .sources
     .into_iter()
@@ -3686,6 +3740,7 @@ fn undecodable_compressed_codex_log_is_reported_as_a_read_error_and_other_sessio
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         },
         true,
     )
@@ -3699,5 +3754,316 @@ fn undecodable_compressed_codex_log_is_reported_as_a_read_error_and_other_sessio
             .map(|d| (d.file_path.as_path(), d.source, d.read_error))
             .collect::<Vec<_>>(),
         [(corrupt.as_path(), Source::Codex, true)]
+    );
+}
+
+fn rollout_name(n: u8) -> String {
+    format!("rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-0000000000{n:02}.jsonl")
+}
+
+fn rollout_body(n: u8, topic: &str) -> String {
+    format!(
+        r#"{{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{{"id":"01900000-0000-7000-8000-0000000000{n:02}","cwd":"/proj"}}}}
+{{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{{"role":"user","content":[{{"type":"input_text","text":"{topic} question"}}]}}}}
+"#
+    )
+}
+
+struct CodexRoots {
+    tmp: TempDir,
+    claude: PathBuf,
+    sessions: PathBuf,
+    day: PathBuf,
+    archived: PathBuf,
+}
+
+impl CodexRoots {
+    fn new() -> Self {
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join("claude_projects");
+        let sessions = tmp.path().join(".codex/sessions");
+        let day = sessions.join("2026/04/27");
+        let archived = tmp.path().join(".codex/archived_sessions");
+        fs::create_dir_all(&day).unwrap();
+        fs::create_dir_all(&archived).unwrap();
+        Self {
+            tmp,
+            claude,
+            sessions,
+            day,
+            archived,
+        }
+    }
+
+    fn opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
+            force: false,
+            claude_dir: &self.claude,
+            codex_dir: &self.sessions,
+            codex_archived_dir: Some(&self.archived),
+        }
+    }
+}
+
+fn session_ids(conn: &Connection) -> Vec<String> {
+    collect_strings(conn, "SELECT session_id FROM sessions ORDER BY session_id")
+}
+
+#[test]
+fn archiving_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
+    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
+    for body in [format!("{meta}\n{ROLLOUT_TURNS}"), ROLLOUT_TURNS.to_owned()] {
+        let (_db, mut conn) = setup_test_db();
+        let roots = CodexRoots::new();
+        let live = roots.day.join(ROLLOUT_NAME);
+        fs::write(&live, &body).unwrap();
+        index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+        index_chunks(&mut conn, None).unwrap();
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+        let row_before = session_row(&conn);
+        let vectors_before = stored_vectors(&conn);
+        assert!(!vectors_before.is_empty());
+
+        let compressed = compress_log(&live);
+        let archived = roots.archived.join(compressed.file_name().unwrap());
+        fs::rename(&compressed, &archived).unwrap();
+        fs::remove_file(&live).unwrap();
+        let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+        assert_eq!(stats.total_sessions, 1, "{body}");
+        assert_eq!(
+            session_row(&conn),
+            [row_before[0].replace(live.to_str().unwrap(), archived.to_str().unwrap())],
+            "only the file path changes; the slug keeps the session's date"
+        );
+        assert_eq!(stored_vectors(&conn), vectors_before);
+        assert!(stats.skipped_roots.is_empty());
+    }
+}
+
+#[test]
+fn absent_archived_root_neither_reports_nor_blocks_codex_cleanup() {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    fs::remove_dir(&roots.archived).unwrap();
+    fs::write(roots.day.join(rollout_name(1)), rollout_body(1, "kept")).unwrap();
+    let deleted = roots.day.join(rollout_name(3));
+    fs::write(&deleted, rollout_body(3, "deleted")).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    fs::remove_file(&deleted).unwrap();
+    let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(session_ids(&conn), ["01900000-0000-7000-8000-000000000001"]);
+    assert!(stats.skipped_roots.is_empty());
+}
+
+#[test]
+fn missing_archived_root_keeps_its_sessions_and_still_removes_sessions_deleted_elsewhere() {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    fs::write(roots.day.join(rollout_name(1)), rollout_body(1, "live")).unwrap();
+    fs::write(
+        roots.archived.join(rollout_name(2)),
+        rollout_body(2, "archived"),
+    )
+    .unwrap();
+    let deleted = roots.day.join(rollout_name(3));
+    fs::write(&deleted, rollout_body(3, "deleted")).unwrap();
+    assert_eq!(
+        index_from_dirs(&mut conn, &roots.opts(), true)
+            .unwrap()
+            .total_sessions,
+        3
+    );
+
+    fs::remove_dir_all(&roots.archived).unwrap();
+    fs::remove_file(&deleted).unwrap();
+    let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(
+        session_ids(&conn),
+        [
+            "01900000-0000-7000-8000-000000000001",
+            "01900000-0000-7000-8000-000000000002"
+        ]
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::MissingRoot, 1)]
+    );
+    let note = stats.skipped_roots[0].note();
+    assert!(
+        note.contains("reconciled the rest") && !note.contains("none deleted this run"),
+        "the other Codex root was cleaned, so the note must not claim nothing was deleted: {note}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_archived_root_keeps_its_parse_diagnostics_and_still_clears_those_deleted_elsewhere() {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let mut undecodable = zstd::encode_all(rollout_body(2, "broken").as_bytes(), 0).unwrap();
+    undecodable.truncate(undecodable.len() / 2);
+    let archived = roots.archived.join(format!("{}.zst", rollout_name(2)));
+    let deleted = roots.day.join(format!("{}.zst", rollout_name(3)));
+    fs::write(&archived, &undecodable).unwrap();
+    fs::write(&deleted, &undecodable).unwrap();
+    let diagnosed = |stats: &IndexStats| -> Vec<PathBuf> {
+        let mut paths: Vec<_> = stats
+            .parse_diagnostics
+            .iter()
+            .map(|d| d.file_path.clone())
+            .collect();
+        paths.sort();
+        paths
+    };
+    let first = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    let mut both = vec![archived.clone(), deleted.clone()];
+    both.sort();
+    assert_eq!(diagnosed(&first), both);
+
+    fs::remove_dir_all(&roots.archived).unwrap();
+    fs::remove_file(&deleted).unwrap();
+    let second = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(diagnosed(&second), [archived]);
+}
+
+#[test]
+fn unreadable_archived_root_keeps_every_codex_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    fs::write(roots.day.join(rollout_name(1)), rollout_body(1, "live")).unwrap();
+    fs::write(
+        roots.archived.join(rollout_name(2)),
+        rollout_body(2, "archived"),
+    )
+    .unwrap();
+    let moved = roots.day.join(rollout_name(3));
+    fs::write(&moved, rollout_body(3, "moved")).unwrap();
+    assert_eq!(
+        index_from_dirs(&mut conn, &roots.opts(), true)
+            .unwrap()
+            .total_sessions,
+        3
+    );
+
+    fs::rename(&moved, roots.archived.join(rollout_name(3))).unwrap();
+    let permissions = fs::metadata(&roots.archived).unwrap().permissions();
+    fs::set_permissions(&roots.archived, fs::Permissions::from_mode(0o000)).unwrap();
+    let stats = index_from_dirs(&mut conn, &roots.opts(), true);
+    fs::set_permissions(&roots.archived, permissions).unwrap();
+    let stats = stats.unwrap();
+
+    assert_eq!(
+        session_ids(&conn).len(),
+        3,
+        "a session moved into an unreadable root survives"
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 2)]
+    );
+    drop(roots.tmp);
+}
+
+#[test]
+fn archived_root_whose_parent_cannot_be_searched_keeps_every_codex_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let locked = roots.tmp.path().join("locked");
+    let archived = locked.join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    let opts = IndexOptions {
+        codex_archived_dir: Some(&archived),
+        ..roots.opts()
+    };
+    fs::write(roots.day.join(rollout_name(1)), rollout_body(1, "live")).unwrap();
+    let moved = roots.day.join(rollout_name(3));
+    fs::write(&moved, rollout_body(3, "moved")).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    fs::rename(&moved, archived.join(rollout_name(3))).unwrap();
+    let permissions = fs::metadata(&locked).unwrap().permissions();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true);
+    fs::set_permissions(&locked, permissions).unwrap();
+    let stats = stats.unwrap();
+
+    assert_eq!(
+        session_ids(&conn).len(),
+        2,
+        "a session moved into a root that cannot be inspected survives"
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
+    );
+}
+
+fn archived_dir_for(vars: &[(&str, &str)]) -> Option<PathBuf> {
+    resolve_codex_archived_dir_with(Path::new("/fake/home"), |key| {
+        vars.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(v))
+    })
+}
+
+#[test]
+fn empty_codex_archived_dir_turns_the_archive_off() {
+    assert_eq!(archived_dir_for(&[("RECALL_CODEX_ARCHIVED_DIR", "")]), None);
+}
+
+#[test]
+fn empty_codex_sessions_dir_counts_as_unset() {
+    assert_eq!(
+        resolve_codex_dir_with(Path::new("/fake/home"), |key| {
+            (key == "RECALL_CODEX_DIR").then(OsString::new)
+        }),
+        PathBuf::from("/fake/home/.codex/sessions")
+    );
+    assert_eq!(
+        archived_dir_for(&[("RECALL_CODEX_DIR", "")]),
+        Some(PathBuf::from("/fake/home/.codex/archived_sessions"))
+    );
+}
+
+#[test]
+fn codex_archived_dir_defaults_under_home_unless_only_the_sessions_dir_is_overridden() {
+    let resolve = archived_dir_for;
+
+    assert_eq!(
+        resolve(&[]),
+        Some(PathBuf::from("/fake/home/.codex/archived_sessions"))
+    );
+    assert_eq!(resolve(&[("RECALL_CODEX_DIR", "/tmp/codex")]), None);
+    assert_eq!(
+        resolve(&[
+            ("RECALL_CODEX_DIR", "/tmp/codex"),
+            ("RECALL_CODEX_ARCHIVED_DIR", "/tmp/archived")
+        ]),
+        Some(PathBuf::from("/tmp/archived"))
+    );
+    assert_eq!(
+        resolve(&[("RECALL_CODEX_ARCHIVED_DIR", "/tmp/archived")]),
+        Some(PathBuf::from("/tmp/archived"))
     );
 }

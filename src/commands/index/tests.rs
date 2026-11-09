@@ -145,6 +145,7 @@ fn index_and_report_forwards_index_flags_as_embed_options() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
 
     let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
@@ -183,6 +184,7 @@ fn index_and_report_forwards_default_embed_options_when_flags_unset() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
 
     let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
@@ -214,6 +216,7 @@ fn rebuild_reembeds_all_and_rebuilds_fts_index() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
     {
@@ -229,6 +232,7 @@ fn rebuild_reembeds_all_and_rebuilds_fts_index() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
 
@@ -262,6 +266,7 @@ fn index_and_report_with_backfills_legacy_null_rowid_ranges() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
@@ -380,6 +385,7 @@ fn backfill_が本文_index_と_embedding_を変えない() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
 
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
@@ -439,6 +445,7 @@ fn 二回目の_index_で_backfill_が再実行されない() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
 
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
@@ -511,6 +518,7 @@ fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
@@ -519,6 +527,7 @@ fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
         force: false,
         claude_dir: &gone_claude,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path), &missing_opts, mock_loader).unwrap();
 
@@ -548,6 +557,7 @@ fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
         Err(DegradedReason::NotInstalled)
@@ -594,6 +604,7 @@ fn index_and_report_with_degraded_loader_emits_model_download_note() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
         Err(DegradedReason::NotInstalled)
@@ -627,6 +638,7 @@ fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
             force: false,
             claude_dir: &claude_dir,
             codex_dir: &codex_dir,
+            codex_archived_dir: None,
         };
         let outcome = index_and_report_with(&Some(db_path), &opts, || Err(reason))
             .expect("a degraded index must succeed");
@@ -662,6 +674,7 @@ fn index_and_report_with_disabled_loader_is_indistinguishable_from_success() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path), &opts, || Err(DegradedReason::Disabled))
         .expect("a disabled-embedder index must succeed");
@@ -696,6 +709,7 @@ fn model_absent_rebuild_preserves_existing_embeddings() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
     let before = {
@@ -711,6 +725,7 @@ fn model_absent_rebuild_preserves_existing_embeddings() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -739,6 +754,7 @@ fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
     let before = {
@@ -754,6 +770,7 @@ fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
@@ -790,6 +807,7 @@ fn model_present_rebuild_heals_orphan_vec_rows() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
@@ -808,6 +826,7 @@ fn model_present_rebuild_heals_orphan_vec_rows() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, mock_loader).unwrap();
 
@@ -839,6 +858,7 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
     let before = {
@@ -865,6 +885,7 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -904,6 +925,7 @@ fn model_absent_rebuild_surfaces_preserved_count_and_note() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
@@ -911,6 +933,7 @@ fn model_absent_rebuild_surfaces_preserved_count_and_note() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -962,6 +985,7 @@ fn model_absent_index_adds_new_session_and_preserves_embeddings() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
     let before = {
@@ -979,6 +1003,7 @@ fn model_absent_index_adds_new_session_and_preserves_embeddings() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
         Err(DegradedReason::NotInstalled)
@@ -1024,6 +1049,7 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, || {
         Err(DegradedReason::NotInstalled)
@@ -1047,6 +1073,7 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
         force: true,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -1091,6 +1118,7 @@ fn model_absent_incremental_index_preserves_edited_embedded_session() {
         force: false,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
     let before = {
@@ -1295,6 +1323,7 @@ fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons()
             source: parser::Source::Codex,
             preserved_sessions: 1,
             reason: indexer::SkippedReason::MissingRoot,
+            other_roots_reconciled: false,
         });
         let out = index_command_output(&outcome);
         assert!(out.degraded);
@@ -1361,6 +1390,7 @@ fn index_command_output_surfaces_skipped_root_in_json() {
             source: parser::Source::Codex,
             preserved_sessions: 2,
             reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1412,6 +1442,7 @@ fn index_command_note_for_zero_preserved_incomplete_root_omits_reconcile() {
             source: parser::Source::Claude,
             preserved_sessions: 0,
             reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1451,6 +1482,7 @@ fn freeze_index_payload_key_set() {
             source: parser::Source::Codex,
             preserved_sessions: 2,
             reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
