@@ -1983,6 +1983,41 @@ fn test_010_claude_config_dir_used_as_fallback() {
     );
 }
 
+// | RECALL_CLAUDE_DIR | CLAUDE_CONFIG_DIR | resolved root               |
+// | ----------------- | ----------------- | --------------------------- |
+// | ""                | /custom/config    | /custom/config/projects     |
+// | unset             | ""                | /fake/home/.claude/projects |
+// | ""                | ""                | /fake/home/.claude/projects |
+#[test]
+fn empty_claude_dir_env_vars_count_as_unset() {
+    let home = Path::new("/fake/home");
+    let rows = [
+        (Some(""), Some("/custom/config"), "/custom/config/projects"),
+        (None, Some(""), "/fake/home/.claude/projects"),
+        (Some(""), Some(""), "/fake/home/.claude/projects"),
+    ];
+
+    let actual: Vec<PathBuf> = rows
+        .iter()
+        .map(|&(recall_dir, config_dir, _)| {
+            resolve_claude_dir_with(home, |key| match key {
+                "RECALL_CLAUDE_DIR" => recall_dir.map(OsString::from),
+                "CLAUDE_CONFIG_DIR" => config_dir.map(OsString::from),
+                _ => None,
+            })
+        })
+        .collect();
+    let expected: Vec<PathBuf> = rows
+        .iter()
+        .map(|&(_, _, root)| PathBuf::from(root))
+        .collect();
+
+    assert_eq!(
+        actual, expected,
+        "an empty RECALL_CLAUDE_DIR / CLAUDE_CONFIG_DIR should fall through to the next source"
+    );
+}
+
 #[test]
 fn test_codex_dir_env_override() {
     let home = Path::new("/fake/home");

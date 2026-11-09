@@ -11,15 +11,22 @@ use tracing::{debug, warn};
 use super::{IndexOptions, SkippedReason};
 use crate::parser::{Source, is_compressed_log, is_session_log};
 
+/// Every session root read from the environment goes through here. An empty value
+/// counts as unset: `PathBuf::from("")` sits above every row as a missing root, and
+/// `"".join("projects")` resolves against the current directory.
+fn env_dir(get: &impl Fn(&str) -> Option<OsString>, key: &str) -> Option<PathBuf> {
+    get(key).filter(|dir| !dir.is_empty()).map(PathBuf::from)
+}
+
 pub(crate) fn resolve_claude_dir_with<F>(home: &Path, get: F) -> PathBuf
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    if let Some(dir) = get("RECALL_CLAUDE_DIR") {
-        return PathBuf::from(dir);
+    if let Some(dir) = env_dir(&get, "RECALL_CLAUDE_DIR") {
+        return dir;
     }
-    if let Some(dir) = get("CLAUDE_CONFIG_DIR") {
-        return PathBuf::from(dir).join("projects");
+    if let Some(dir) = env_dir(&get, "CLAUDE_CONFIG_DIR") {
+        return dir.join("projects");
     }
     home.join(".claude").join("projects")
 }
@@ -28,19 +35,11 @@ pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
     resolve_claude_dir_with(home, |key| env::var_os(key))
 }
 
-/// An empty `RECALL_CODEX_DIR` counts as unset: an empty path would sit above every
-/// row as a missing root and keep every Codex row forever.
-fn codex_dir_override(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
-    get("RECALL_CODEX_DIR")
-        .filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-}
-
 pub(crate) fn resolve_codex_dir_with<F>(home: &Path, get: F) -> PathBuf
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    codex_dir_override(get).unwrap_or_else(|| home.join(".codex").join("sessions"))
+    env_dir(&get, "RECALL_CODEX_DIR").unwrap_or_else(|| home.join(".codex").join("sessions"))
 }
 
 pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
@@ -49,8 +48,8 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
 
 /// `RECALL_CODEX_DIR` alone turns the default archive off, so pointing recall at
 /// another sessions tree never mixes in the real `~/.codex/archived_sessions`.
-/// An empty `RECALL_CODEX_ARCHIVED_DIR` turns it off too, for the same reason an empty
-/// `RECALL_CODEX_DIR` counts as unset.
+/// An empty `RECALL_CODEX_ARCHIVED_DIR` also turns it off, unlike the other roots,
+/// so the archive can be switched off on its own.
 pub(crate) fn resolve_codex_archived_dir_with<F>(home: &Path, get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -58,7 +57,7 @@ where
     if let Some(dir) = get("RECALL_CODEX_ARCHIVED_DIR") {
         return (!dir.is_empty()).then(|| PathBuf::from(dir));
     }
-    codex_dir_override(get)
+    env_dir(&get, "RECALL_CODEX_DIR")
         .is_none()
         .then(|| home.join(".codex").join("archived_sessions"))
 }

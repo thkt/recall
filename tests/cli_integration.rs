@@ -1214,6 +1214,67 @@ fn index_stderr_warns_when_a_root_with_indexed_sessions_is_unavailable() {
     );
 }
 
+/// #398: an empty `CLAUDE_CONFIG_DIR` must not turn a `projects/` dir in the cwd into
+/// the Claude root, or the run deletes every indexed Claude session outside it.
+#[test]
+fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() {
+    let dir = TempDir::new().unwrap();
+    // HOME has no `.claude`, so the fallback root is missing rather than the real home.
+    let home = dir.path().join("home");
+    let config_dir = dir.path().join("config");
+    let work_dir = dir.path().join("work");
+    fs::create_dir_all(&home).unwrap();
+    let session_dir = config_dir.join("projects").join("p");
+    fs::create_dir_all(&session_dir).unwrap();
+    fs::write(session_dir.join("s1.jsonl"), SESSION_LINE).unwrap();
+    fs::create_dir_all(work_dir.join("projects")).unwrap();
+    let isolated = || {
+        let mut cmd = recall(dir.path());
+        cmd.env_remove("RECALL_CLAUDE_DIR").env("HOME", &home);
+        cmd
+    };
+    let search_hello = || {
+        let out = isolated()
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .args(["search", "hello"])
+            .output()
+            .expect("spawn recall binary");
+        assert_eq!(out.status.code(), Some(0), "search should exit 0");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    let first = isolated()
+        .env("CLAUDE_CONFIG_DIR", &config_dir)
+        .arg("index")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(first.status.code(), Some(0), "first index should exit 0");
+    let before = search_hello();
+    assert!(
+        before.contains("Found 1 sessions:"),
+        "premise: the first index should store the session, got: {before}"
+    );
+
+    let second = isolated()
+        .env("CLAUDE_CONFIG_DIR", "")
+        .current_dir(&work_dir)
+        .arg("index")
+        .output()
+        .expect("spawn recall binary");
+    assert_eq!(second.status.code(), Some(0), "second index should exit 0");
+    let after = search_hello();
+
+    assert!(
+        after.contains("Found 1 sessions:"),
+        "an empty CLAUDE_CONFIG_DIR run should keep the indexed session, got: {after}"
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("claude root unavailable — preserved 1 existing session(s)"),
+        "the empty CLAUDE_CONFIG_DIR run should report the missing Claude root, got: {stderr}"
+    );
+}
+
 #[test]
 fn classify_warns_once_when_a_session_source_is_missing() {
     let dir = TempDir::new().unwrap();
