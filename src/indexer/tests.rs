@@ -3905,6 +3905,37 @@ fn missing_archived_root_keeps_its_sessions_and_still_removes_sessions_deleted_e
 
 #[cfg(unix)]
 #[test]
+fn missing_archived_root_keeps_its_parse_diagnostics_and_still_clears_those_deleted_elsewhere() {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let mut undecodable = zstd::encode_all(rollout_body(2, "broken").as_bytes(), 0).unwrap();
+    undecodable.truncate(undecodable.len() / 2);
+    let archived = roots.archived.join(format!("{}.zst", rollout_name(2)));
+    let deleted = roots.day.join(format!("{}.zst", rollout_name(3)));
+    fs::write(&archived, &undecodable).unwrap();
+    fs::write(&deleted, &undecodable).unwrap();
+    let diagnosed = |stats: &IndexStats| -> Vec<PathBuf> {
+        let mut paths: Vec<_> = stats
+            .parse_diagnostics
+            .iter()
+            .map(|d| d.file_path.clone())
+            .collect();
+        paths.sort();
+        paths
+    };
+    let first = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    let mut both = vec![archived.clone(), deleted.clone()];
+    both.sort();
+    assert_eq!(diagnosed(&first), both);
+
+    fs::remove_dir_all(&roots.archived).unwrap();
+    fs::remove_file(&deleted).unwrap();
+    let second = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(diagnosed(&second), [archived]);
+}
+
+#[test]
 fn unreadable_archived_root_keeps_every_codex_session() {
     use std::os::unix::fs::PermissionsExt;
 
