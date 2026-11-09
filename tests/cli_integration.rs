@@ -995,6 +995,26 @@ fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log()
 }
 
 #[test]
+fn show_on_an_index_from_an_older_version_asks_for_a_rebuild() {
+    let dir = TempDir::new().unwrap();
+    rusqlite::Connection::open(dir.path().join("recall.db"))
+        .unwrap()
+        .execute_batch("CREATE TABLE sessions (session_id TEXT PRIMARY KEY);")
+        .unwrap();
+
+    let out = recall(dir.path())
+        .args(["show", "s1", "--json"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(out.status.code(), Some(65));
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "DATA_ERROR");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("run `recall rebuild`"), "{message}");
+}
+
+#[test]
 fn show_from_a_writable_directory_reads_the_write_ahead_log_without_a_note() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
