@@ -43,12 +43,14 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
 
 /// `RECALL_CODEX_DIR` alone turns the default archive off, so pointing recall at
 /// another sessions tree never mixes in the real `~/.codex/archived_sessions`.
+/// An empty `RECALL_CODEX_ARCHIVED_DIR` turns it off too: an empty path would sit
+/// above every row as a missing root and keep every Codex row forever.
 pub(crate) fn resolve_codex_archived_dir_with<F>(home: &Path, get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
 {
     if let Some(dir) = get("RECALL_CODEX_ARCHIVED_DIR") {
-        return Some(PathBuf::from(dir));
+        return (!dir.is_empty()).then(|| PathBuf::from(dir));
     }
     get("RECALL_CODEX_DIR")
         .is_none()
@@ -135,16 +137,28 @@ fn set_aside_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)
 }
 
 /// One unreadable root blocks every deletion for its source: a session that just moved
-/// into that root would otherwise be deleted from the root it left.
+/// into that root would otherwise be deleted from the root it left. A root counts as
+/// missing only when it does not exist; `is_dir()` would also call it missing when
+/// `stat` fails on a permission error.
 fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
     let mut any_present = false;
     let mut all_read = true;
     for root in roots {
-        if root.is_dir() {
-            any_present = true;
-            all_read &= collect_jsonl_files(root, &mut out.sources, source);
-        } else {
-            out.removal.missing_roots.push((source, root.to_path_buf()));
+        match fs::metadata(root) {
+            Ok(meta) if meta.is_dir() => {
+                any_present = true;
+                all_read &= collect_jsonl_files(root, &mut out.sources, source);
+            }
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                warn!(path = %root.display(), error = %e, "cannot inspect root");
+                all_read = false;
+            }
+            _ => out.removal.missing_roots.push((source, root.to_path_buf())),
         }
     }
     if !all_read {

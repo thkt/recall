@@ -3949,15 +3949,61 @@ fn unreadable_archived_root_keeps_every_codex_session() {
 }
 
 #[test]
-fn codex_archived_dir_defaults_under_home_unless_only_the_sessions_dir_is_overridden() {
-    let home = Path::new("/fake/home");
-    let resolve = |vars: &[(&str, &str)]| {
-        resolve_codex_archived_dir_with(home, |key| {
-            vars.iter()
-                .find(|(k, _)| *k == key)
-                .map(|(_, v)| OsString::from(v))
-        })
+fn archived_root_whose_parent_cannot_be_searched_keeps_every_codex_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let locked = roots.tmp.path().join("locked");
+    let archived = locked.join("archived_sessions");
+    fs::create_dir_all(&archived).unwrap();
+    let opts = IndexOptions {
+        codex_archived_dir: Some(&archived),
+        ..roots.opts()
     };
+    fs::write(roots.day.join(rollout_name(1)), rollout_body(1, "live")).unwrap();
+    let moved = roots.day.join(rollout_name(3));
+    fs::write(&moved, rollout_body(3, "moved")).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    fs::rename(&moved, archived.join(rollout_name(3))).unwrap();
+    let permissions = fs::metadata(&locked).unwrap().permissions();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true);
+    fs::set_permissions(&locked, permissions).unwrap();
+    let stats = stats.unwrap();
+
+    assert_eq!(
+        session_ids(&conn).len(),
+        2,
+        "a session moved into a root that cannot be inspected survives"
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
+    );
+}
+
+fn archived_dir_for(vars: &[(&str, &str)]) -> Option<PathBuf> {
+    resolve_codex_archived_dir_with(Path::new("/fake/home"), |key| {
+        vars.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| OsString::from(v))
+    })
+}
+
+#[test]
+fn empty_codex_archived_dir_turns_the_archive_off() {
+    assert_eq!(archived_dir_for(&[("RECALL_CODEX_ARCHIVED_DIR", "")]), None);
+}
+
+#[test]
+fn codex_archived_dir_defaults_under_home_unless_only_the_sessions_dir_is_overridden() {
+    let resolve = archived_dir_for;
 
     assert_eq!(
         resolve(&[]),

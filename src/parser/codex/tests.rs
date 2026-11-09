@@ -297,6 +297,8 @@ fn archived_log_takes_its_slug_date_from_the_rollout_name() {
     );
     for name in [
         "rollout-2026-1-18T01.jsonl",
+        "rollout-2026-13-01T00-00-00-x.jsonl",
+        "rollout-2026-02-30T00-00-00-x.jsonl",
         "rollout-x.jsonl",
         "other-2026-01-18.jsonl",
     ] {

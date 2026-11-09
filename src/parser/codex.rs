@@ -4,6 +4,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::provenance::{CodexOrigin, codex_automated};
+use crate::date::days_from_civil;
 
 use super::{
     Message, ParseResult, Role, SessionData, Source, extract_text, parse_iso_timestamp,
@@ -171,10 +172,17 @@ fn extract_date_from_path(path: &str) -> Option<String> {
 fn date_from_rollout_name(path: &str) -> Option<String> {
     let name = path.rsplit(['/', '\\']).next()?;
     let date = name.strip_prefix("rollout-")?.get(..10)?;
-    let is_date = date.bytes().enumerate().all(|(i, b)| match i {
+    let is_shaped = date.bytes().enumerate().all(|(i, b)| match i {
         4 | 7 => b == b'-',
         _ => b.is_ascii_digit(),
     });
+    let is_date = is_shaped
+        && days_from_civil(
+            date[..4].parse().ok()?,
+            date[5..7].parse().ok()?,
+            date[8..].parse().ok()?,
+        )
+        .is_some();
     is_date.then(|| date.to_owned())
 }
 
