@@ -1214,16 +1214,16 @@ fn index_stderr_warns_when_a_root_with_indexed_sessions_is_unavailable() {
     );
 }
 
-/// #398: an empty `CLAUDE_CONFIG_DIR` must not turn a `projects/` dir in the cwd into
-/// the Claude root, or the run deletes every indexed Claude session outside it.
+/// #398: an empty `CLAUDE_CONFIG_DIR` must neither turn a `projects/` dir in the cwd into
+/// the Claude root nor fall back to the default root; either run would read an empty root
+/// in full and delete the session indexed from the configured one.
 #[test]
 fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() {
     let dir = TempDir::new().unwrap();
-    // HOME has no `.claude`, so the fallback root is missing rather than the real home.
     let home = dir.path().join("home");
     let config_dir = dir.path().join("config");
     let work_dir = dir.path().join("work");
-    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(home.join(".claude").join("projects")).unwrap();
     let session_dir = config_dir.join("projects").join("p");
     fs::create_dir_all(&session_dir).unwrap();
     fs::write(session_dir.join("s1.jsonl"), SESSION_LINE).unwrap();
@@ -1270,8 +1270,8 @@ fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() 
     );
     let stderr = String::from_utf8_lossy(&second.stderr);
     assert!(
-        stderr.contains("claude root unavailable — preserved 1 existing session(s)"),
-        "the empty CLAUDE_CONFIG_DIR run should report the missing Claude root, got: {stderr}"
+        stderr.contains("claude root could not be fully read — preserved 1 existing session(s)"),
+        "the empty CLAUDE_CONFIG_DIR run should report the Claude root as not read, got: {stderr}"
     );
 }
 

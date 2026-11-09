@@ -229,7 +229,7 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 
 **インデックス** — `recall index` でセッションディレクトリをスキャン、JSONLを解析し、全文検索インデックスとQ&Aチャンクを構築し、新規チャンクをembeddingします。差分更新では全セッションファイルを走査し、保存済みサイズが一致し、mtime差が1ms未満の場合だけ本文の再解析を省きます。mtimeを保持した追記・切詰めもサイズ差で検出します。読取り中に更新印が変わったファイルは次回のindexで再読取りします。サイズ未保存の旧インデックスは一度再読取りし、embeddingが利用できない間は既存embeddingを持つ会話の更新を保留します。同じサイズでmtimeも同じ（または差が1ms未満）の内容差し替えは検出できません。その場合は、動作するモデルを用意して `recall rebuild` で更新してください。更新判定のための全件ハッシュ計算は行いません。
 
-**セッションの読み込み先** — Claude のセッションは `RECALL_CLAUDE_DIR`、なければ `$CLAUDE_CONFIG_DIR/projects`、なければ `~/.claude/projects` から読みます。Codex のセッションは `RECALL_CODEX_DIR`、なければ `~/.codex/sessions` から読みます。これらの変数に空文字を設定した場合は、未設定として扱います。
+**セッションの読み込み先** — Claude のセッションは `RECALL_CLAUDE_DIR`、なければ `$CLAUDE_CONFIG_DIR/projects`、なければ `~/.claude/projects` から読みます。Codex のセッションは `RECALL_CODEX_DIR`、なければ `~/.codex/sessions` から読みます。絶対パスでない root は読みません。空文字の変数から作った root も同じです。その場合は、その source の索引済みセッションをすべて残し、値を直すまで実行のたびに「全件を読めなかった root」として報告します。
 
 **圧縮・アーカイブされた Codex のログ** — Codex がログを圧縮またはアーカイブしても、そのセッションのチャンクと embedding を引き継ぎます。
 

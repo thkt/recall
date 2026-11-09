@@ -247,7 +247,7 @@ Add to `~/.claude/settings.json`:
 
 **Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file and skips the body only when its stored size matches and its mtime differs by less than 1 ms. Size changes trigger a re-parse even when mtime is preserved. If metadata changes during parsing, the next index run retries the file. Older indexes without stored sizes are re-read once; embedded sessions remain pending while embedding is unavailable. Same-size replacements with mtime unchanged (or differing by less than 1 ms) are not detected; use `recall rebuild` with a working model to refresh them. Files are not fully hashed for freshness.
 
-**Session roots** — Claude sessions are read from `RECALL_CLAUDE_DIR`, else `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`. Codex sessions are read from `RECALL_CODEX_DIR`, else `~/.codex/sessions`. An empty value of these variables counts as unset.
+**Session roots** — Claude sessions are read from `RECALL_CLAUDE_DIR`, else `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects`. Codex sessions are read from `RECALL_CODEX_DIR`, else `~/.codex/sessions`. A root that is not an absolute path, including one from an empty variable, is not read. recall then keeps every indexed session of that source and reports the root as not fully read on every run until the value is fixed.
 
 **Compressed and archived Codex logs** — A Codex session keeps its chunks and embeddings when Codex compresses or archives its log.
 

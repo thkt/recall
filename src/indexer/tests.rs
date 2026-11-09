@@ -1983,39 +1983,41 @@ fn test_010_claude_config_dir_used_as_fallback() {
     );
 }
 
-// | RECALL_CLAUDE_DIR | CLAUDE_CONFIG_DIR | resolved root               |
-// | ----------------- | ----------------- | --------------------------- |
-// | ""                | /custom/config    | /custom/config/projects     |
-// | unset             | ""                | /fake/home/.claude/projects |
-// | ""                | ""                | /fake/home/.claude/projects |
 #[test]
-fn empty_claude_dir_env_vars_count_as_unset() {
-    let home = Path::new("/fake/home");
-    let rows = [
-        (Some(""), Some("/custom/config"), "/custom/config/projects"),
-        (None, Some(""), "/fake/home/.claude/projects"),
-        (Some(""), Some(""), "/fake/home/.claude/projects"),
-    ];
+fn session_root_that_is_not_an_absolute_path_is_not_read_and_keeps_its_sessions() {
+    // `src` exists relative to the package root, where the test runner starts, and holds
+    // no session logs: read as a root, it would look like every Claude session was deleted.
+    for relative in ["", "src"] {
+        let (_dir, mut conn) = setup_test_db();
+        let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
-    let actual: Vec<PathBuf> = rows
-        .iter()
-        .map(|&(recall_dir, config_dir, _)| {
-            resolve_claude_dir_with(home, |key| match key {
-                "RECALL_CLAUDE_DIR" => recall_dir.map(OsString::from),
-                "CLAUDE_CONFIG_DIR" => config_dir.map(OsString::from),
-                _ => None,
-            })
-        })
-        .collect();
-    let expected: Vec<PathBuf> = rows
-        .iter()
-        .map(|&(_, _, root)| PathBuf::from(root))
-        .collect();
+        let stats = index_from_dirs(
+            &mut conn,
+            &IndexOptions {
+                force: false,
+                claude_dir: Path::new(relative),
+                codex_dir: &codex_dir,
+                codex_archived_dir: None,
+            },
+            true,
+        )
+        .unwrap();
 
-    assert_eq!(
-        actual, expected,
-        "an empty RECALL_CLAUDE_DIR / CLAUDE_CONFIG_DIR should fall through to the next source"
-    );
+        assert_eq!(
+            collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
+            ["claude", "codex"],
+            "{relative:?}"
+        );
+        assert_eq!(
+            stats
+                .skipped_roots
+                .iter()
+                .map(|s| (s.source, s.reason, s.preserved_sessions))
+                .collect::<Vec<_>>(),
+            [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)],
+            "{relative:?}"
+        );
+    }
 }
 
 #[test]
@@ -4065,20 +4067,6 @@ fn archived_dir_for(vars: &[(&str, &str)]) -> Option<PathBuf> {
 #[test]
 fn empty_codex_archived_dir_turns_the_archive_off() {
     assert_eq!(archived_dir_for(&[("RECALL_CODEX_ARCHIVED_DIR", "")]), None);
-}
-
-#[test]
-fn empty_codex_sessions_dir_counts_as_unset() {
-    assert_eq!(
-        resolve_codex_dir_with(Path::new("/fake/home"), |key| {
-            (key == "RECALL_CODEX_DIR").then(OsString::new)
-        }),
-        PathBuf::from("/fake/home/.codex/sessions")
-    );
-    assert_eq!(
-        archived_dir_for(&[("RECALL_CODEX_DIR", "")]),
-        Some(PathBuf::from("/fake/home/.codex/archived_sessions"))
-    );
 }
 
 #[test]
