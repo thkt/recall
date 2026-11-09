@@ -340,10 +340,10 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     };
 
     if !sql.contains("sub_idx") {
-        notify_schema_change("recall", "embeddings", 0, "recall index");
         let tx = conn.transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
         tx.commit()?;
+        notify_schema_change("recall", "embeddings", 0, "`recall index`");
     }
 
     Ok(())
@@ -435,13 +435,13 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
         let session_count: i64 =
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
         let count = usize::try_from(session_count).unwrap_or(0);
-        notify_schema_change("recall", "cached sessions", count, "recall index");
         let tx = conn.transaction()?;
         tx.execute_batch(
             "DROP TABLE messages; DELETE FROM sessions; \
              DROP TABLE IF EXISTS qa_chunks; DROP TABLE IF EXISTS vec_chunks;",
         )?;
         tx.commit()?;
+        notify_schema_change("recall", "cached sessions", count, "`recall index`");
     }
 
     Ok(())

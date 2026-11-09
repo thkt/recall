@@ -111,7 +111,7 @@ fn status_verbose_includes_db_path() {
 }
 
 #[test]
-fn index_upgrading_an_embedding_table_without_sub_vectors_points_at_recall_index() {
+fn upgrading_an_old_embedding_table_tells_the_user_to_run_recall_index() {
     let dir = TempDir::new().unwrap();
     rusqlite::Connection::open(dir.path().join("recall.db"))
         .unwrap()
@@ -125,10 +125,8 @@ fn index_upgrading_an_embedding_table_without_sub_vectors_points_at_recall_index
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
-    assert!(
-        stderr.contains("embeddings schema changed (0 cached entries); run `recall index`"),
-        "the upgrade notice must name a command that exists, got: {stderr}"
-    );
+    assert!(stderr.contains("embeddings schema changed"), "{stderr}");
+    assert!(stderr.contains("run `recall index`"), "{stderr}");
 }
 
 #[test]

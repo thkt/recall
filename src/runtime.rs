@@ -39,7 +39,7 @@ pub fn init_subscriber(filter: &str) {
 }
 pub fn notify_schema_change(app: &str, what: &str, count: usize, remedy: &str) {
     warning(&format!(
-        "{app}: {what} schema changed ({count} cached entries); run `{remedy}`"
+        "{app}: {what} schema changed ({count} cached entries); run {remedy}"
     ));
 }
 

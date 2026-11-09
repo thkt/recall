@@ -300,6 +300,46 @@ fn known_subcommands_covers_every_clap_subcommand() {
     }
 }
 
+/// A remedy that names a removed subcommand reads as a search query after shorthand
+/// expansion (`recall embed` became `recall search embed`), so every `` `recall <word>` ``
+/// in production code must name a subcommand that exists.
+#[test]
+fn every_command_a_message_tells_the_user_to_run_exists() {
+    let mut unknown = Vec::new();
+    for (file, word) in commands_named_in(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))) {
+        if !KNOWN_SUBCOMMANDS.contains(&word.as_str()) {
+            unknown.push(format!("{}: `recall {word}`", file.display()));
+        }
+    }
+    assert!(
+        unknown.is_empty(),
+        "messages name commands that do not exist: {unknown:?}"
+    );
+}
+
+fn commands_named_in(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut named = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if path.is_dir() {
+            named.extend(commands_named_in(&path));
+        } else if name.ends_with(".rs") && !name.ends_with("tests.rs") {
+            let source = fs::read_to_string(&path).unwrap();
+            for rest in source.split("`recall ").skip(1) {
+                let word: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '-')
+                    .collect();
+                if !word.is_empty() && !word.starts_with('-') {
+                    named.push((path.clone(), word));
+                }
+            }
+        }
+    }
+    named
+}
+
 #[test]
 fn readme_describes_index_time_embedding_not_post_search_growth() {
     let en = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
