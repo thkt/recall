@@ -3633,3 +3633,40 @@ fn compressed_logs_are_collected_from_the_codex_root_only() {
         [(PathBuf::from("codex_sessions/a.jsonl.zst"), Source::Codex)]
     );
 }
+
+#[test]
+fn undecodable_compressed_codex_log_is_reported_as_a_read_error_and_other_sessions_index() {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    fs::write(day_dir.join(ROLLOUT_NAME), ROLLOUT_TURNS).unwrap();
+    let corrupt =
+        day_dir.join("rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000002.jsonl.zst");
+    let mut truncated = zstd::encode_all(ROLLOUT_TURNS.as_bytes(), 0).unwrap();
+    truncated.truncate(truncated.len() / 2);
+    fs::write(&corrupt, truncated).unwrap();
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!((stats.indexed, stats.total_sessions), (1, 1));
+    assert_eq!(
+        stats
+            .parse_diagnostics
+            .iter()
+            .map(|d| (d.file_path.as_path(), d.source, d.read_error))
+            .collect::<Vec<_>>(),
+        [(corrupt.as_path(), Source::Codex, true)]
+    );
+}
