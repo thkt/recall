@@ -144,8 +144,8 @@ fn set_aside_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)
 
 /// One unreadable root blocks every deletion for its source: a session that just moved
 /// into that root would otherwise be deleted from the root it left. A root counts as
-/// missing only when it does not exist; `is_dir()` would also call it missing when
-/// `stat` fails on a permission error.
+/// missing when it does not exist or is not a directory; `is_dir()` would also call it
+/// missing when `stat` fails on a permission error.
 fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
     let mut any_present = false;
     let mut all_read = true;
