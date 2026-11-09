@@ -65,6 +65,21 @@ pub struct SkippedRoot {
     pub source: Source,
     pub preserved_sessions: usize,
     pub reason: SkippedReason,
+    /// Another root of the same source was read in full, so its deleted sessions were removed.
+    pub other_roots_reconciled: bool,
+}
+
+impl SkippedRoot {
+    pub(crate) fn note(&self) -> String {
+        let source = self.source.as_str();
+        if self.other_roots_reconciled && self.reason == SkippedReason::MissingRoot {
+            return format!(
+                "a {source} root is unavailable — preserved {preserved} existing session(s) under it and reconciled the rest; re-run `recall index` once the root is back so a full scan can reconcile them",
+                preserved = self.preserved_sessions,
+            );
+        }
+        self.reason.note(source, self.preserved_sessions)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,6 +659,7 @@ fn summarize_skipped_roots(
                 source,
                 preserved_sessions,
                 reason,
+                other_roots_reconciled: removal.is_fully_read(source),
             })
         })
         .collect()

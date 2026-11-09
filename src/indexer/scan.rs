@@ -84,11 +84,15 @@ impl RemovalGate {
         }
     }
 
+    pub(super) fn is_fully_read(&self, source: Source) -> bool {
+        self.fully_read.contains(&source)
+    }
+
     /// A row may go only when every present root of its source was read in full
     /// and the row does not lie under a root that is missing this run.
     pub(super) fn allows(&self, source: Option<Source>, path: &Path) -> bool {
         source.is_some_and(|source| {
-            self.fully_read.contains(&source)
+            self.is_fully_read(source)
                 && !self
                     .missing_roots
                     .iter()

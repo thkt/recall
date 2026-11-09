@@ -1323,6 +1323,7 @@ fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons()
             source: parser::Source::Codex,
             preserved_sessions: 1,
             reason: indexer::SkippedReason::MissingRoot,
+            other_roots_reconciled: false,
         });
         let out = index_command_output(&outcome);
         assert!(out.degraded);
@@ -1389,6 +1390,7 @@ fn index_command_output_surfaces_skipped_root_in_json() {
             source: parser::Source::Codex,
             preserved_sessions: 2,
             reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1440,6 +1442,7 @@ fn index_command_note_for_zero_preserved_incomplete_root_omits_reconcile() {
             source: parser::Source::Claude,
             preserved_sessions: 0,
             reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1479,6 +1482,7 @@ fn freeze_index_payload_key_set() {
             source: parser::Source::Codex,
             preserved_sessions: 2,
             reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),

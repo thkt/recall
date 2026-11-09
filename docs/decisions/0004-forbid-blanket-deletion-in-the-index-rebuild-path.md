@@ -32,12 +32,13 @@ Chosen option: "Forbid blanket deletion", because it is the only option that nev
 - Good, because a missing or unreadable root preserves its existing rows instead of wiping them: the source never enters `scanned`, so `cleanup_orphans` skips it (indexer.rs:622-624)
 - Good, because any enumeration uncertainty (a `read_dir` error, a per-entry `file_type` failure, or a `MAX_DIR_DEPTH` truncation) flips `fully_read` to false, so the conservative branch is the default rather than an explicit special case (#181, indexer.rs:682-710)
 - Good, because a `None`-typed source row (an unrecognized DB value) is also preserved rather than deleted
+- Good, because a source with several roots (Codex `sessions/` and `archived_sessions/`, #395) keeps the same guarantee per root: one unreadable root blocks every deletion for the source, since a session that just moved into it would otherwise be deleted from the root it left, while a missing root preserves only the rows under it and the other root still reconciles
 - Bad, because a genuinely deleted session under a root that fails to enumerate lingers as a stale row until a clean run of that root confirms its absence
 - Bad, because the invariant is a code-review constraint on new delete paths, not a type the compiler enforces
 
 ### Confirmation
 
-`cleanup_orphans` deletes a row only when `entry.source` is in `scanned` (indexer.rs:622), and `scanned` admits a source only when `collect_jsonl_files` returned `fully_read == true`. Tests inject an `Err` directory entry and a depth-limit truncation to assert the source is preserved (the per-entry path that a real APFS `file_type()` never triggers, indexer.rs:689-705). A new reset/export-reset delete path must reuse `cleanup_orphans` or carry an equivalent scanned-root gate; code review verifies this against this ADR, since no test reaches a path that does not exist yet.
+`cleanup_orphans`, `cleanup_parse_diagnostics`, and the preserved count in `skipped_roots` all ask `RemovalGate::allows` (src/indexer/scan.rs). It admits a row only when every present root of its source returned `fully_read == true` from `collect_jsonl_files` and the row does not lie under a root that is missing this run (amended 2026-11-09 for #395; this replaced the per-source `scanned` set). Tests inject an `Err` directory entry and a depth-limit truncation to assert the source is preserved (the per-entry path that a real APFS `file_type()` never triggers, indexer.rs:689-705). A new reset/export-reset delete path must reuse `cleanup_orphans` or carry an equivalent scanned-root gate; code review verifies this against this ADR, since no test reaches a path that does not exist yet.
 
 ## More Information
 
