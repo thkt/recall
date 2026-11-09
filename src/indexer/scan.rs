@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use super::{IndexOptions, SkippedReason};
-use crate::parser::Source;
+use crate::parser::{Source, is_compressed_log, is_session_log};
 
 pub(crate) fn resolve_claude_dir_with<F>(home: &Path, get: F) -> PathBuf
 where
@@ -54,7 +54,20 @@ pub(super) fn collect_sources(opts: &IndexOptions) -> ScanOutcome {
     };
     classify_root(opts.claude_dir, Source::Claude, &mut out);
     classify_root(opts.codex_dir, Source::Codex, &mut out);
+    drop_compressed_copies_of_plain_logs(&mut out.sources);
     out
+}
+
+/// While Codex compresses a log, the plain file and its `.zst` copy coexist.
+/// Indexing both would make each run replace the session row with the other path.
+fn drop_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)>) {
+    let plain: HashSet<PathBuf> = sources
+        .iter()
+        .filter(|(path, _)| !is_compressed_log(path))
+        .map(|(path, _)| path.clone())
+        .collect();
+    sources
+        .retain(|(path, _)| !is_compressed_log(path) || !plain.contains(&path.with_extension("")));
 }
 
 fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {
@@ -126,7 +139,7 @@ pub(super) fn collect_from_entries(
         let path = entry.path();
         if ft.is_dir() {
             fully_read &= collect_jsonl_files_inner(&path, out, source, depth + 1);
-        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+        } else if is_session_log(&path, source) {
             out.push((path, source));
         }
     }
