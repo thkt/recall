@@ -7,6 +7,7 @@ pub use codex::parse_codex_session;
 
 use std::fmt;
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -102,6 +103,29 @@ impl LineDiagnostics {
     }
 }
 
+const COMPRESSED_LOG_SUFFIX: &str = ".jsonl.zst";
+
+/// Codex compresses older rollouts to `.jsonl.zst` in place; Claude Code writes plain `.jsonl` only.
+pub(crate) fn is_session_log(path: &Path, source: Source) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+        || (source == Source::Codex && is_compressed_log(path))
+}
+
+pub(crate) fn is_compressed_log(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        name.as_encoded_bytes()
+            .ends_with(COMPRESSED_LOG_SUFFIX.as_bytes())
+    })
+}
+
+fn session_log_reader(file: File, path: &Path) -> Result<Box<dyn Read>> {
+    if !is_compressed_log(path) {
+        return Ok(Box::new(file));
+    }
+    let decoder = zstd::stream::read::Decoder::new(file).context("Failed to start zstd decoder")?;
+    Ok(Box::new(decoder))
+}
+
 pub(crate) fn parse_session_including_empty(
     path: &Path,
     source: Source,
@@ -127,10 +151,11 @@ pub(crate) fn parse_classification(
     let Some(session_id) = session_id_from_path(path) else {
         return Ok(None);
     };
+    let reader = session_log_reader(file, path)?;
     let (session_id, origin, diagnostics) = match source {
         Source::Claude => {
             let mut origin = ClaudeOrigin::new(path, &session_id);
-            let diagnostics = scan_jsonl_reader(file, |entry| {
+            let diagnostics = scan_jsonl_reader(reader, |entry| {
                 origin.observe(&claude::ClaudeEntry::from_json(entry));
             })?;
             let origin = origin.finish();
@@ -138,7 +163,7 @@ pub(crate) fn parse_classification(
         }
         Source::Codex => {
             let mut origin = CodexOrigin::new(session_id);
-            let diagnostics = scan_jsonl_reader(file, |entry| {
+            let diagnostics = scan_jsonl_reader(reader, |entry| {
                 origin.observe(&codex::CodexEntry::from_json(entry));
             })?;
             let (session_id, origin) = origin.finish();
@@ -318,7 +343,7 @@ pub(super) fn parse_jsonl_entries(
 ) -> Result<(Vec<Message>, LineDiagnostics)> {
     let file = File::open(path).context("Failed to open session file")?;
     let mut messages = Vec::new();
-    let diagnostics = scan_jsonl_reader(file, |entry| {
+    let diagnostics = scan_jsonl_reader(session_log_reader(file, path)?, |entry| {
         if let Some(message) = process(entry) {
             messages.push(message);
         }
@@ -326,11 +351,11 @@ pub(super) fn parse_jsonl_entries(
     Ok((messages, diagnostics))
 }
 
-fn scan_jsonl_reader(file: File, mut process: impl FnMut(&Value)) -> Result<LineDiagnostics> {
+fn scan_jsonl_reader(log: impl Read, mut process: impl FnMut(&Value)) -> Result<LineDiagnostics> {
     use std::io::{BufRead, BufReader};
     use std::str;
 
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(log);
     let mut diagnostics = LineDiagnostics::default();
     let mut bytes = Vec::new();
 
@@ -377,7 +402,11 @@ fn scan_jsonl_reader(file: File, mut process: impl FnMut(&Value)) -> Result<Line
 }
 
 pub(super) fn session_id_from_path(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let name = path.file_name()?.to_str()?;
+    let stem = match name.strip_suffix(COMPRESSED_LOG_SUFFIX) {
+        Some(stem) => stem,
+        None => path.file_stem()?.to_str()?,
+    };
     if stem.is_empty() {
         return None;
     }

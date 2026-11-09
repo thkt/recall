@@ -25,6 +25,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Artifact bytes need TLS, HTTP/2 and proxy support, without charset decoding.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "http2", "system-proxy"] }
 thiserror = "2"
+# Codex compresses older session logs to `.jsonl.zst`; zstd-sys builds libzstd from source and links it statically.
+zstd = { version = "0.14.3", default-features = false }
 
 [dev-dependencies]
 # Reads `APPLIED_PATCHES` to check the linked llama.cpp build carries the patches.

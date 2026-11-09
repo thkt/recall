@@ -3494,3 +3494,210 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     assert_eq!(model.calls(), 1);
     assert_eq!(chunk_vectors(&conn).len(), 2);
 }
+
+const ROLLOUT_NAME: &str = "rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000001.jsonl";
+const ROLLOUT_TURNS: &str = concat!(
+    r#"{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"which flag disables the cache"}]}}"#,
+    "\n",
+    r#"{"timestamp":"2026-04-27T00:00:02Z","type":"response_item","payload":{"role":"assistant","content":[{"type":"output_text","text":"pass --no-cache"}]}}"#,
+    "\n",
+);
+
+fn compress_log(plain: &Path) -> PathBuf {
+    let compressed = plain.with_file_name(format!(
+        "{}.zst",
+        plain.file_name().unwrap().to_str().unwrap()
+    ));
+    let body = fs::read(plain).unwrap();
+    fs::write(&compressed, zstd::encode_all(body.as_slice(), 0).unwrap()).unwrap();
+    compressed
+}
+
+fn session_row(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT json_array(session_id, file_path, slug, project, timestamp) FROM sessions",
+    )
+}
+
+fn stored_vectors(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT json_array(c.content, hex(v.embedding)) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id ORDER BY c.content, v.sub_idx",
+    )
+}
+
+#[test]
+fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
+    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
+    for body in [format!("{meta}\n{ROLLOUT_TURNS}"), ROLLOUT_TURNS.to_owned()] {
+        let (_db, mut conn) = setup_test_db();
+        let tmp = TempDir::new().unwrap();
+        let claude_dir = tmp.path().join("claude_projects");
+        let codex_dir = tmp.path().join("codex_sessions");
+        let day_dir = codex_dir.join("2026/04/27");
+        fs::create_dir_all(&day_dir).unwrap();
+        let plain = day_dir.join(ROLLOUT_NAME);
+        fs::write(&plain, &body).unwrap();
+        let opts = IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        };
+        index_from_dirs(&mut conn, &opts, true).unwrap();
+        index_chunks(&mut conn, None).unwrap();
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+        let row_before = session_row(&conn);
+        let vectors_before = stored_vectors(&conn);
+        assert_eq!(row_before.len(), 1);
+        assert!(!vectors_before.is_empty());
+
+        let compressed = compress_log(&plain);
+        fs::remove_file(&plain).unwrap();
+        let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+
+        assert_eq!(stats.total_sessions, 1, "{body}");
+        let row_after = session_row(&conn);
+        assert_eq!(
+            row_after,
+            [row_before[0].replace(plain.to_str().unwrap(), compressed.to_str().unwrap())],
+            "only the file path changes"
+        );
+        assert_eq!(stored_vectors(&conn), vectors_before);
+        assert!(stats.parse_diagnostics.is_empty());
+    }
+}
+
+#[test]
+fn plain_codex_log_is_indexed_once_when_its_compressed_copy_sits_beside_it() {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    let plain = day_dir.join(ROLLOUT_NAME);
+    fs::write(&plain, ROLLOUT_TURNS).unwrap();
+    compress_log(&plain);
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+
+    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    assert_eq!((first.indexed, first.total_sessions), (1, 1));
+    assert_eq!(
+        second.indexed, 0,
+        "the two copies must not replace each other"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [plain.to_str().unwrap()]
+    );
+}
+
+#[test]
+fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_it() {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    let plain = day_dir.join(ROLLOUT_NAME);
+    fs::write(&plain, ROLLOUT_TURNS).unwrap();
+    compress_log(&plain);
+    fs::remove_file(&plain).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    let row_before = session_row(&conn);
+    let vectors_before = stored_vectors(&conn);
+    assert!(!vectors_before.is_empty());
+
+    fs::write(&plain, "").unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    assert_eq!(session_row(&conn), row_before);
+    assert_eq!(stored_vectors(&conn), vectors_before);
+}
+
+#[test]
+fn compressed_logs_are_collected_from_the_codex_root_only() {
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    fs::create_dir_all(&claude_dir).unwrap();
+    fs::create_dir_all(&codex_dir).unwrap();
+    for dir in [&claude_dir, &codex_dir] {
+        fs::write(
+            dir.join("a.jsonl.zst"),
+            zstd::encode_all(&b"{}\n"[..], 0).unwrap(),
+        )
+        .unwrap();
+        fs::write(dir.join("b.zst"), "").unwrap();
+        fs::write(dir.join("c.jsonl.gz"), "").unwrap();
+    }
+
+    let mut found: Vec<_> = collect_sources(&IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    })
+    .sources
+    .into_iter()
+    .map(|(path, source)| (path.strip_prefix(tmp.path()).unwrap().to_owned(), source))
+    .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0));
+
+    assert_eq!(
+        found,
+        [(PathBuf::from("codex_sessions/a.jsonl.zst"), Source::Codex)]
+    );
+}
+
+#[test]
+fn undecodable_compressed_codex_log_is_reported_as_a_read_error_and_other_sessions_index() {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    fs::write(day_dir.join(ROLLOUT_NAME), ROLLOUT_TURNS).unwrap();
+    let corrupt =
+        day_dir.join("rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000002.jsonl.zst");
+    let mut truncated = zstd::encode_all(ROLLOUT_TURNS.as_bytes(), 0).unwrap();
+    truncated.truncate(truncated.len() / 2);
+    fs::write(&corrupt, truncated).unwrap();
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!((stats.indexed, stats.total_sessions), (1, 1));
+    assert_eq!(
+        stats
+            .parse_diagnostics
+            .iter()
+            .map(|d| (d.file_path.as_path(), d.source, d.read_error))
+            .collect::<Vec<_>>(),
+        [(corrupt.as_path(), Source::Codex, true)]
+    );
+}

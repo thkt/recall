@@ -224,3 +224,58 @@ fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
     }
     Ok(parsed)
 }
+
+#[test]
+fn compressed_log_parses_to_the_same_session_as_its_plain_copy() {
+    let name = "rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000001.jsonl";
+    let turns = concat!(
+        r#"{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"compressed question"}]}}"#,
+        "\n",
+        r#"{"timestamp":"2026-04-27T00:00:02Z","type":"response_item","payload":{"role":"assistant","content":[{"type":"output_text","text":"compressed answer"}]}}"#,
+        "\n",
+    );
+    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
+    for (body, expected_id) in [
+        (
+            format!("{meta}\n{turns}"),
+            "01900000-0000-7000-8000-000000000001",
+        ),
+        (
+            turns.to_owned(),
+            "rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000001",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let plain_dir = root.path().join("plain/sessions/2026/04/27");
+        let zst_dir = root.path().join("zst/sessions/2026/04/27");
+        fs::create_dir_all(&plain_dir).unwrap();
+        fs::create_dir_all(&zst_dir).unwrap();
+        let plain = plain_dir.join(name);
+        let compressed = zst_dir.join(format!("{name}.zst"));
+        fs::write(&plain, &body).unwrap();
+        fs::write(&compressed, zstd::encode_all(body.as_bytes(), 0).unwrap()).unwrap();
+
+        let from_plain = parse_codex_session(&plain).unwrap().unwrap();
+        let from_zst = parse_codex_session(&compressed).unwrap().unwrap();
+
+        assert_eq!(from_zst.metadata.session_id, expected_id);
+        assert_eq!(from_zst.metadata.session_id, from_plain.metadata.session_id);
+        assert_eq!(from_zst.metadata.slug, from_plain.metadata.slug);
+        assert_eq!(from_zst.metadata.project, from_plain.metadata.project);
+        assert_eq!(from_zst.metadata.timestamp, from_plain.metadata.timestamp);
+        assert_eq!(
+            from_zst
+                .messages
+                .iter()
+                .map(|m| (m.role, m.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (Role::User, "compressed question"),
+                (Role::Assistant, "compressed answer")
+            ]
+        );
+        assert_eq!(from_zst.origin, from_plain.origin);
+        assert!(!from_zst.origin.identity_conflict);
+        assert!(from_zst.diagnostics.is_empty());
+    }
+}

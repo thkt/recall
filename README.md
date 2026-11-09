@@ -240,12 +240,12 @@ Add to `~/.claude/settings.json`:
 ## How it works
 
 ```text
-~/.claude/projects/**/*.jsonl  ─┐
-                                ├─→ Parse → FTS5 + Q&A chunks → Index-time embedding
-~/.codex/sessions/**/*.jsonl   ─┘
+~/.claude/projects/**/*.jsonl       ─┐
+                                     ├─→ Parse → FTS5 + Q&A chunks → Index-time embedding
+~/.codex/sessions/**/*.jsonl(.zst)  ─┘
 ```
 
-**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file and skips the body only when its stored size matches and its mtime differs by less than 1 ms. Size changes trigger a re-parse even when mtime is preserved. If metadata changes during parsing, the next index run retries the file. Older indexes without stored sizes are re-read once; embedded sessions remain pending while embedding is unavailable. Same-size replacements with mtime unchanged (or differing by less than 1 ms) are not detected; use `recall rebuild` with a working model to refresh them. Files are not fully hashed for freshness.
+**Indexing** — `recall index` scans session directories, parses JSONL, builds a full-text index, generates Q&A chunks, and embeds new chunks. Incremental by default — it walks every session file and skips the body only when its stored size matches and its mtime differs by less than 1 ms. Size changes trigger a re-parse even when mtime is preserved. If metadata changes during parsing, the next index run retries the file. Older indexes without stored sizes are re-read once; embedded sessions remain pending while embedding is unavailable. Same-size replacements with mtime unchanged (or differing by less than 1 ms) are not detected; use `recall rebuild` with a working model to refresh them. Files are not fully hashed for freshness. Codex logs compressed to `.jsonl.zst` are read in place, and a session keeps its chunks and embeddings when its log is compressed. While a plain `.jsonl` and its `.jsonl.zst` copy sit in the same directory, only the plain file is indexed.
 
 **Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
 

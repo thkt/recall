@@ -522,7 +522,11 @@ pub(crate) fn index_from_dirs_observed(
     observer.count("files_updated_committed", 0);
     enumeration.finish("complete; unavailable roots reported separately");
     let sources = &scan.sources;
-    let source_paths: HashSet<&Path> = sources.iter().map(|(p, _)| p.as_path()).collect();
+    let source_paths: HashSet<&Path> = sources
+        .iter()
+        .map(|(p, _)| p.as_path())
+        .chain(scan.set_aside.iter().map(PathBuf::as_path))
+        .collect();
 
     info!(count = sources.len(), "Found source files");
 
