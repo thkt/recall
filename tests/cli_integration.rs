@@ -15,6 +15,7 @@ fn recall(dir: &Path) -> Command {
         .env_remove("RECALL_MODEL_MANIFEST")
         .env("RECALL_CLAUDE_DIR", dir.join("no-claude"))
         .env("RECALL_CODEX_DIR", dir.join("no-codex"))
+        .env_remove("RECALL_CODEX_ARCHIVED_DIR")
         .env_remove("CLAUDE_CODE_SESSION_ID");
     cmd
 }
