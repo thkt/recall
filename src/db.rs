@@ -340,7 +340,7 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     };
 
     if !sql.contains("sub_idx") {
-        notify_schema_change("recall", "embeddings", 0, "recall embed");
+        notify_schema_change("recall", "embeddings", 0, "recall index");
         let tx = conn.transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
         tx.commit()?;

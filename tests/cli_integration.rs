@@ -111,6 +111,27 @@ fn status_verbose_includes_db_path() {
 }
 
 #[test]
+fn index_upgrading_an_embedding_table_without_sub_vectors_points_at_recall_index() {
+    let dir = TempDir::new().unwrap();
+    rusqlite::Connection::open(dir.path().join("recall.db"))
+        .unwrap()
+        .execute_batch("CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB);")
+        .unwrap();
+
+    let out = recall(dir.path())
+        .arg("index")
+        .output()
+        .expect("spawn recall binary");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("embeddings schema changed (0 cached entries); run `recall index`"),
+        "the upgrade notice must name a command that exists, got: {stderr}"
+    );
+}
+
+#[test]
 fn search_with_matching_index_lists_results() {
     let dir = TempDir::new().unwrap();
     let claude_dir = dir.path().join("claude");
