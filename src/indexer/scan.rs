@@ -3,6 +3,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirEntry};
 use std::io;
+use std::mem;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
@@ -42,6 +43,9 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
 
 pub(super) struct ScanOutcome {
     pub(super) sources: Vec<(PathBuf, Source)>,
+    /// Compressed logs left unparsed because their plain copy sits beside them.
+    /// They are still on disk, so a row pointing at one must not be deleted.
+    pub(super) set_aside: Vec<PathBuf>,
     pub(super) scanned: HashSet<Source>,
     pub(super) skipped: HashMap<Source, SkippedReason>,
 }
@@ -49,25 +53,30 @@ pub(super) struct ScanOutcome {
 pub(super) fn collect_sources(opts: &IndexOptions) -> ScanOutcome {
     let mut out = ScanOutcome {
         sources: Vec::new(),
+        set_aside: Vec::new(),
         scanned: HashSet::new(),
         skipped: HashMap::new(),
     };
     classify_root(opts.claude_dir, Source::Claude, &mut out);
     classify_root(opts.codex_dir, Source::Codex, &mut out);
-    drop_compressed_copies_of_plain_logs(&mut out.sources);
+    out.set_aside = set_aside_compressed_copies_of_plain_logs(&mut out.sources);
     out
 }
 
 /// While Codex compresses a log, the plain file and its `.zst` copy coexist.
 /// Indexing both would make each run replace the session row with the other path.
-fn drop_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)>) {
+fn set_aside_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)>) -> Vec<PathBuf> {
     let plain: HashSet<PathBuf> = sources
         .iter()
         .filter(|(path, _)| !is_compressed_log(path))
         .map(|(path, _)| path.clone())
         .collect();
-    sources
-        .retain(|(path, _)| !is_compressed_log(path) || !plain.contains(&path.with_extension("")));
+    let (kept, set_aside): (Vec<_>, Vec<_>) =
+        mem::take(sources).into_iter().partition(|(path, _)| {
+            !is_compressed_log(path) || !plain.contains(&path.with_extension(""))
+        });
+    *sources = kept;
+    set_aside.into_iter().map(|(path, _)| path).collect()
 }
 
 fn classify_root(dir: &Path, source: Source, out: &mut ScanOutcome) {

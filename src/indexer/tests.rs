@@ -3601,6 +3601,37 @@ fn plain_codex_log_is_indexed_once_when_its_compressed_copy_sits_beside_it() {
 }
 
 #[test]
+fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_it() {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    let plain = day_dir.join(ROLLOUT_NAME);
+    fs::write(&plain, ROLLOUT_TURNS).unwrap();
+    compress_log(&plain);
+    fs::remove_file(&plain).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    let row_before = session_row(&conn);
+    let vectors_before = stored_vectors(&conn);
+    assert!(!vectors_before.is_empty());
+
+    fs::write(&plain, "").unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    assert_eq!(session_row(&conn), row_before);
+    assert_eq!(stored_vectors(&conn), vectors_before);
+}
+
+#[test]
 fn compressed_logs_are_collected_from_the_codex_root_only() {
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
