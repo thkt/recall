@@ -8,6 +8,7 @@ use anyhow::Result;
 use rusqlite::types::Value;
 use rusqlite::{Connection, Transaction};
 
+use super::scan::RemovalGate;
 use crate::ansi;
 use crate::parser::LineDiagnostics;
 use crate::parser::Source;
@@ -123,11 +124,11 @@ pub(crate) fn load_parse_diagnostics(conn: &Connection) -> Result<Vec<FileParseD
 pub(super) fn cleanup_parse_diagnostics(
     tx: &Transaction,
     source_paths: &HashSet<&Path>,
-    scanned: &HashSet<Source>,
+    removal: &RemovalGate,
 ) -> Result<Vec<FileParseDiagnostics>> {
     let mut remaining = Vec::new();
     for diagnostic in load_parse_diagnostics(tx)? {
-        if scanned.contains(&diagnostic.source)
+        if removal.allows(Some(diagnostic.source), &diagnostic.file_path)
             && !source_paths.contains(diagnostic.file_path.as_path())
         {
             let removed = tx.execute(

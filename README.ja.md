@@ -222,12 +222,12 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 ## 仕組み
 
 ```text
-~/.claude/projects/**/*.jsonl       ─┐
-                                     ├─→ Parse → FTS5 + Q&Aチャンク → Index-time embedding
-~/.codex/sessions/**/*.jsonl(.zst)  ─┘
+~/.claude/projects/**/*.jsonl              ─┐
+~/.codex/sessions/**/*.jsonl(.zst)         ─┼─→ Parse → FTS5 + Q&Aチャンク → Index-time embedding
+~/.codex/archived_sessions/*.jsonl(.zst)   ─┘
 ```
 
-**インデックス** — `recall index` でセッションディレクトリをスキャン、JSONLを解析し、全文検索インデックスとQ&Aチャンクを構築し、新規チャンクをembeddingします。差分更新では全セッションファイルを走査し、保存済みサイズが一致し、mtime差が1ms未満の場合だけ本文の再解析を省きます。mtimeを保持した追記・切詰めもサイズ差で検出します。読取り中に更新印が変わったファイルは次回のindexで再読取りします。サイズ未保存の旧インデックスは一度再読取りし、embeddingが利用できない間は既存embeddingを持つ会話の更新を保留します。同じサイズでmtimeも同じ（または差が1ms未満）の内容差し替えは検出できません。その場合は、動作するモデルを用意して `recall rebuild` で更新してください。更新判定のための全件ハッシュ計算は行いません。`.jsonl.zst` に圧縮された Codex のログはそのまま読み、圧縮後も同じセッションのチャンクと embedding を引き継ぎます。同じディレクトリに `.jsonl` と同名の `.jsonl.zst` が並んでいる間は、`.jsonl` だけを索引に入れます。
+**インデックス** — `recall index` でセッションディレクトリをスキャン、JSONLを解析し、全文検索インデックスとQ&Aチャンクを構築し、新規チャンクをembeddingします。差分更新では全セッションファイルを走査し、保存済みサイズが一致し、mtime差が1ms未満の場合だけ本文の再解析を省きます。mtimeを保持した追記・切詰めもサイズ差で検出します。読取り中に更新印が変わったファイルは次回のindexで再読取りします。サイズ未保存の旧インデックスは一度再読取りし、embeddingが利用できない間は既存embeddingを持つ会話の更新を保留します。同じサイズでmtimeも同じ（または差が1ms未満）の内容差し替えは検出できません。その場合は、動作するモデルを用意して `recall rebuild` で更新してください。更新判定のための全件ハッシュ計算は行いません。`.jsonl.zst` に圧縮された Codex のログはそのまま読み、圧縮後も同じセッションのチャンクと embedding を引き継ぎます。同じディレクトリに `.jsonl` と同名の `.jsonl.zst` が並んでいる間は、`.jsonl` だけを索引に入れます。`~/.codex/archived_sessions/` にアーカイブされたセッションも索引に残り、embedding を引き継ぎます。`RECALL_CODEX_ARCHIVED_DIR` で別のアーカイブ先を指定できます。`RECALL_CODEX_DIR` だけを指定した場合は、既定のアーカイブ先を読みません。セッションを索引から消すのは、全件を読めた root からファイルがなくなったときだけです。存在しない root の配下にあったセッションは残します。Codex の root のどれかを全件読めなかった回は、Codex のセッションを 1 件も消しません。
 
 **検索** — `recall search` は構築済みインデックスを読むだけで、インデックスは作成しません。事前に `recall index` でリフレッシュするか、[Hook](#hook) を登録してセッション終了時に自動インデックスしてください。空のインデックスを検索すると `No sessions indexed. Run recall index first.` を表示します。
 
@@ -262,7 +262,7 @@ Gemma製品版の時間・スループットはデータ量・機器・checksum�
 
 ## 制限事項
 
-- `~/.claude/projects/` と `~/.codex/sessions/` のローカルセッションのみ対応。クラウド同期なし
+- `~/.claude/projects/`、`~/.codex/sessions/`、`~/.codex/archived_sessions/` のローカルセッションのみ対応。クラウド同期なし
 - 画像、ツール結果、バイナリコンテンツはインデックスしない
 - Apple Siliconが必要。検証対象はllama.cpp/MetalのGPU backend
 - 検索結果は抜粋表示。完全な会話は `recall show <id>` で表示可能

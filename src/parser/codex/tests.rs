@@ -279,3 +279,31 @@ fn compressed_log_parses_to_the_same_session_as_its_plain_copy() {
         assert!(from_zst.diagnostics.is_empty());
     }
 }
+
+#[test]
+fn archived_log_takes_its_slug_date_from_the_rollout_name() {
+    assert_eq!(
+        extract_date_from_path(
+            "/home/.codex/archived_sessions/rollout-2026-01-18T01-37-09-019bccd1-564a-73b3-b3b0-f6b12671ed24.jsonl.zst"
+        ),
+        Some("2026-01-18".to_owned())
+    );
+    assert_eq!(
+        extract_date_from_path(
+            "/home/.codex/sessions/2026/01/18/rollout-2026-01-19T00-00-00-x.jsonl"
+        ),
+        Some("2026-01-18".to_owned()),
+        "the dated directory still wins"
+    );
+    for name in [
+        "rollout-2026-1-18T01.jsonl",
+        "rollout-x.jsonl",
+        "other-2026-01-18.jsonl",
+    ] {
+        assert_eq!(
+            extract_date_from_path(&format!("/a/archived_sessions/{name}")),
+            None,
+            "{name}"
+        );
+    }
+}

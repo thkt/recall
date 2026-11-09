@@ -43,10 +43,12 @@ pub(crate) fn index_and_report(
     let home = home_dir().context("Could not determine home directory")?;
     let claude_dir = indexer::resolve_claude_dir(&home);
     let codex_dir = indexer::resolve_codex_dir(&home);
+    let codex_archived_dir = indexer::resolve_codex_archived_dir(&home);
     let opts = indexer::IndexOptions {
         force,
         claude_dir: &claude_dir,
         codex_dir: &codex_dir,
+        codex_archived_dir: codex_archived_dir.as_deref(),
     };
     let outcome = index_and_report_observed(
         db_path,

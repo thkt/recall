@@ -374,6 +374,7 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
                 force: true,
                 claude_dir: &root.join("claude"),
                 codex_dir: &root.join("codex"),
+                codex_archived_dir: None,
             },
             || Ok(Arc::new(embedder) as Arc<dyn Embed>),
         )
