@@ -250,7 +250,7 @@ Add to `~/.claude/settings.json`:
 **Compressed and archived Codex logs** — A Codex session keeps its chunks and embeddings when Codex compresses or archives its log.
 
 - Logs compressed to `.jsonl.zst` are read in place. While a plain `.jsonl` and its `.jsonl.zst` copy sit in the same directory, only the plain file is indexed.
-- Sessions archived to `~/.codex/archived_sessions/` stay indexed. `RECALL_CODEX_ARCHIVED_DIR` selects another archive directory, and an empty value turns the archive off. Setting only `RECALL_CODEX_DIR` also stops reading the default archive.
+- Sessions archived to `~/.codex/archived_sessions/` stay indexed. `RECALL_CODEX_ARCHIVED_DIR` selects another archive directory, and an empty value turns the archive off. Setting only `RECALL_CODEX_DIR` also stops reading the default archive. An empty `RECALL_CODEX_DIR` counts as unset.
 
 **Removal** — A session is removed from the index only after its file is absent from a fully read root.
 

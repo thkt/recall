@@ -28,13 +28,19 @@ pub(crate) fn resolve_claude_dir(home: &Path) -> PathBuf {
     resolve_claude_dir_with(home, |key| env::var_os(key))
 }
 
+/// An empty `RECALL_CODEX_DIR` counts as unset: an empty path would sit above every
+/// row as a missing root and keep every Codex row forever.
+fn codex_dir_override(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    get("RECALL_CODEX_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
 pub(crate) fn resolve_codex_dir_with<F>(home: &Path, get: F) -> PathBuf
 where
     F: Fn(&str) -> Option<OsString>,
 {
-    get("RECALL_CODEX_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".codex").join("sessions"))
+    codex_dir_override(get).unwrap_or_else(|| home.join(".codex").join("sessions"))
 }
 
 pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
@@ -43,8 +49,8 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
 
 /// `RECALL_CODEX_DIR` alone turns the default archive off, so pointing recall at
 /// another sessions tree never mixes in the real `~/.codex/archived_sessions`.
-/// An empty `RECALL_CODEX_ARCHIVED_DIR` turns it off too: an empty path would sit
-/// above every row as a missing root and keep every Codex row forever.
+/// An empty `RECALL_CODEX_ARCHIVED_DIR` turns it off too, for the same reason an empty
+/// `RECALL_CODEX_DIR` counts as unset.
 pub(crate) fn resolve_codex_archived_dir_with<F>(home: &Path, get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -52,7 +58,7 @@ where
     if let Some(dir) = get("RECALL_CODEX_ARCHIVED_DIR") {
         return (!dir.is_empty()).then(|| PathBuf::from(dir));
     }
-    get("RECALL_CODEX_DIR")
+    codex_dir_override(get)
         .is_none()
         .then(|| home.join(".codex").join("archived_sessions"))
 }

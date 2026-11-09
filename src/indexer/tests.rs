@@ -4002,6 +4002,20 @@ fn empty_codex_archived_dir_turns_the_archive_off() {
 }
 
 #[test]
+fn empty_codex_sessions_dir_counts_as_unset() {
+    assert_eq!(
+        resolve_codex_dir_with(Path::new("/fake/home"), |key| {
+            (key == "RECALL_CODEX_DIR").then(OsString::new)
+        }),
+        PathBuf::from("/fake/home/.codex/sessions")
+    );
+    assert_eq!(
+        archived_dir_for(&[("RECALL_CODEX_DIR", "")]),
+        Some(PathBuf::from("/fake/home/.codex/archived_sessions"))
+    );
+}
+
+#[test]
 fn codex_archived_dir_defaults_under_home_unless_only_the_sessions_dir_is_overridden() {
     let resolve = archived_dir_for;
 
