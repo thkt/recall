@@ -71,3 +71,46 @@ fn a_trailing_uppercase_or_with_nothing_after_it_is_ignored() {
 
     assert_eq!(matched_sessions(&conn, "hello OR"), ["hello"]);
 }
+
+#[test]
+fn a_term_with_hyphens_finds_the_message_containing_it() {
+    let (_dir, conn) = db_with_messages(&[
+        ("hyphen", "we added a rate-limit to the gateway"),
+        ("apart", "the rate was raised and the limit was lifted"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "rate-limit"), ["hyphen"]);
+}
+
+#[test]
+fn a_term_with_colons_finds_the_message_containing_it() {
+    let (_dir, conn) = db_with_messages(&[
+        ("colon", "import std::collections for the map"),
+        ("apart", "std was imported and collections were listed"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "std::collections"), ["colon"]);
+}
+
+#[test]
+fn a_quoted_phrase_finds_the_message_with_those_words_adjacent_and_not_one_with_them_apart() {
+    let (_dir, conn) = db_with_messages(&[
+        ("adjacent", "restart the connection pool before deploy"),
+        ("apart", "the pool needs a connection restart before deploy"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "\"connection pool\""),
+        ["adjacent"]
+    );
+}
+
+#[test]
+fn an_unclosed_quote_finds_the_message_containing_the_quoted_word() {
+    let (_dir, conn) = db_with_messages(&[
+        ("quoted", "debugging the tokio scheduler"),
+        ("other", "debugging the rayon scheduler"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "\"tokio"), ["quoted"]);
+}
