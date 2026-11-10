@@ -154,3 +154,64 @@ fn parentheses_group_an_or_before_the_and_that_follows_it() {
         ["alpha-gamma", "beta-gamma"]
     );
 }
+
+fn query_error_code(conn: &Connection, query: &str) -> crate::error::ErrorCode {
+    match search(conn, query, &SearchOptions::default()) {
+        Ok(results) => panic!(
+            "query {query:?} should be rejected as a syntax error but matched {} sessions",
+            results.len()
+        ),
+        Err(err) => crate::error::error_envelope(&err).error.code,
+    }
+}
+
+#[test]
+fn a_not_excludes_messages_containing_the_word_after_it() {
+    let (_dir, conn) = db_with_messages(&[
+        ("alpha-only", "alpha release notes"),
+        ("alpha-beta", "alpha release with beta tag"),
+        ("beta-only", "beta tag notes"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "alpha NOT beta"), ["alpha-only"]);
+}
+
+#[test]
+fn a_short_word_after_not_is_ignored_and_the_rest_of_the_query_still_matches() {
+    let (_dir, conn) = db_with_messages(&[
+        ("with-short", "alpha release zz marker"),
+        ("without-short", "alpha release notes"),
+        ("unrelated", "gamma release notes"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "alpha NOT zz"),
+        ["with-short", "without-short"]
+    );
+}
+
+#[test]
+fn a_short_word_before_not_is_rejected_as_a_query_syntax_error() {
+    let (_dir, conn) = db_with_messages(&[
+        ("short-only", "zz marker notes"),
+        ("short-beta", "zz marker with beta tag"),
+    ]);
+
+    assert_eq!(
+        query_error_code(&conn, "zz NOT beta"),
+        crate::error::ErrorCode::DataError
+    );
+}
+
+#[test]
+fn a_not_with_nothing_before_it_is_rejected_as_a_query_syntax_error() {
+    let (_dir, conn) = db_with_messages(&[
+        ("alpha-only", "alpha release notes"),
+        ("alpha-beta", "alpha release with beta tag"),
+    ]);
+
+    assert_eq!(
+        query_error_code(&conn, "NOT beta"),
+        crate::error::ErrorCode::DataError
+    );
+}
