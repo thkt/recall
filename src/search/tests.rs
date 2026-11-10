@@ -522,6 +522,27 @@ fn recency_lifts_a_new_session_over_somewhat_better_older_text_matches() {
 }
 
 #[test]
+fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order() {
+    let (_dir, conn) = setup_test_db();
+    for sid in ["m", "z", "a", "q"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+    // A limit of 1 reads three candidates, so the tie also decides which
+    // session is left out before the final ranking.
+    let one = SearchOptions {
+        limit: 1,
+        ..at_now()
+    };
+
+    assert_eq!(
+        ids(&search(&conn, "authentication", &at_now()).unwrap()),
+        ["a", "m", "q", "z"]
+    );
+    assert_eq!(ids(&search(&conn, "authentication", &one).unwrap()), ["a"]);
+}
+
+#[test]
 fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
     let (_dir, conn) = setup_test_db();
     seed_new_session_ranked_third_by_text(&conn);
