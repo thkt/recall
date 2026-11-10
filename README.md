@@ -91,7 +91,23 @@ Backward compatible: `recall "query"` works as shorthand for `recall search "que
 | `--include-automated` | Include automated (hook/script/agent) sessions; excluded by default |
 | `-v`                  | Verbose output                                                      |
 
-Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
+Query syntax:
+
+| Syntax              | Meaning                                                                                                  |
+| ------------------- | -------------------------------------------------------------------------------------------------------- |
+| `word1 word2`       | Sessions with a message containing every word                                                            |
+| `"quoted phrase"`   | Words adjacent and in order. An unclosed quote is closed at the end of the query                         |
+| `a AND b`, `a OR b` | Operators are uppercase only                                                                             |
+| `a NOT b`           | Messages that contain `a` but not `b`. `NOT` needs a term on its left, so `NOT b` alone is a query error |
+| `(a OR b) AND c`    | Parentheses group operands                                                                               |
+
+Matching is per message, for `NOT` as well as `AND`. `a AND b` finds a session only when one message contains both words, not when `a` and `b` appear in different messages. `a NOT b` finds a session when one of its messages contains `a` without `b`, even if another message contains `b`. Terms with `-` or `:` (such as `foo-bar` or `key:value`) are searched as one quoted phrase.
+
+Uppercase `AND`, `OR` and `NOT` are operators whenever they stand as separate words outside quotes, including in literal text such as `404 NOT FOUND` or `IS NOT NULL`. Quote such text to search it as written: `"IS NOT NULL"`.
+
+Lowercase `and`, `or` and `not` are not operators. In a query without uppercase operators, they are searched as words. The search drops one at the start or end of the query, or next to another of the three.
+
+A query containing an operator skips CJK segmentation and short-term expansion (the prefix match that lets a term under 3 characters find indexed words starting with it). A short term to the left of `NOT` is a query error; a short term to its right is ignored.
 
 ### Index
 

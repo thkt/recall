@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use crate::model::ModelDownloadError;
 use crate::runtime::codes;
-use crate::storage::SanitizeError;
+use crate::storage::{MIN_TRIGRAM_TERM_CHARS, SanitizeError};
 use serde::Serialize;
 
 use crate::envelope::{ErrorEnvelope, ErrorPayload};
@@ -39,6 +39,8 @@ pub(crate) enum RecallError {
     #[error("{0}")]
     DataError(String),
     #[error("{0}")]
+    QuerySyntax(String),
+    #[error("{0}")]
     DatabaseRead(String),
     #[error("{0}")]
     Internal(String),
@@ -50,7 +52,9 @@ impl RecallError {
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             Self::Usage(_) => ErrorCode::UsageError,
-            Self::DataError(_) | Self::DatabaseRead(_) => ErrorCode::DataError,
+            Self::DataError(_) | Self::QuerySyntax(_) | Self::DatabaseRead(_) => {
+                ErrorCode::DataError
+            }
             Self::Internal(_) => ErrorCode::Internal,
             Self::TempFailure(_) => ErrorCode::TempFailure,
         }
@@ -66,14 +70,13 @@ impl RecallError {
                 "See `recall --help`; if the index is missing, run `recall index` first."
                     .to_owned(),
             ),
-            Self::DataError(_) => Some(
-                "Revise the query: drop bare AND/OR/NOT operators and recheck the syntax."
-                    .to_owned(),
-            ),
+            Self::QuerySyntax(_) => Some(format!(
+                "Supported query syntax: words, \"quoted phrases\", uppercase AND / OR / NOT between terms, and parentheses for grouping. NOT needs a left term of at least {MIN_TRIGRAM_TERM_CHARS} characters."
+            )),
             Self::TempFailure(_) => {
                 Some("Retry the command; the failure may be transient.".to_owned())
             }
-            Self::Internal(_) | Self::DatabaseRead(_) => None,
+            Self::DataError(_) | Self::Internal(_) | Self::DatabaseRead(_) => None,
         };
         ErrorEnvelope {
             error: ErrorPayload {

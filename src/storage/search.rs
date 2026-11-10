@@ -1,22 +1,88 @@
+use std::iter::repeat_n;
+
 use rusqlite::Connection;
 
 use super::query_normalize::{QueryNormalizationConfig, normalize_for_fts};
 
-fn strip_near_groups(query: &str) -> Vec<&str> {
+/// A quoted phrase or a bare word of a query. A phrase runs from a quote to the
+/// next quote, or to the end of the query when the quote is unclosed, and its
+/// text excludes the quotes.
+#[derive(Debug, Clone, Copy)]
+enum Piece<'a> {
+    Phrase(&'a str),
+    Word(&'a str),
+}
+
+/// Splits a query at whitespace outside quotes into tokens, each the phrases
+/// and words written with nothing between them. A word ends at whitespace or a
+/// quote; a char for which `stands_alone` is true also ends a word and becomes
+/// a one-char word of its own. The plain sanitizer, the short-term expansion
+/// and the operator tokenizer all read phrases through this function, so they
+/// agree on where a phrase starts and ends.
+fn scan_tokens(query: &str, stands_alone: fn(char) -> bool) -> Vec<Vec<Piece<'_>>> {
+    let mut tokens: Vec<Vec<Piece<'_>>> = Vec::new();
+    let mut rest = query;
+    loop {
+        let trimmed = rest.trim_start();
+        let attached = trimmed.len() == rest.len();
+        rest = trimmed;
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        let piece = if let Some(after_quote) = rest.strip_prefix('"') {
+            let end = after_quote.find('"').unwrap_or(after_quote.len());
+            rest = after_quote.get(end + 1..).unwrap_or("");
+            Piece::Phrase(&after_quote[..end])
+        } else {
+            let end = if stands_alone(c) {
+                c.len_utf8()
+            } else {
+                rest.find(|c: char| c.is_whitespace() || c == '"' || stands_alone(c))
+                    .unwrap_or(rest.len())
+            };
+            let word = &rest[..end];
+            rest = &rest[end..];
+            Piece::Word(word)
+        };
+        match tokens.last_mut() {
+            Some(token) if attached => token.push(piece),
+            _ => tokens.push(vec![piece]),
+        }
+    }
+    tokens
+}
+
+fn count_in_words(token: &[Piece<'_>], paren: char) -> usize {
+    token
+        .iter()
+        .map(|piece| match piece {
+            Piece::Word(word) => word.matches(paren).count(),
+            Piece::Phrase(_) => 0,
+        })
+        .sum()
+}
+
+fn strip_near_groups(query: &str) -> Vec<Vec<Piece<'_>>> {
     let mut tokens = Vec::new();
     let mut paren_depth: usize = 0;
-    for w in query.split_whitespace() {
-        let upper = w.to_ascii_uppercase();
-        if upper.starts_with("NEAR(") || upper.starts_with("NEAR/") {
-            paren_depth += w.chars().filter(|&c| c == '(').count();
-            paren_depth = paren_depth.saturating_sub(w.chars().filter(|&c| c == ')').count());
+    for token in scan_tokens(query, |_| false) {
+        let opens_near = match token.first() {
+            Some(Piece::Word(w)) => {
+                let upper = w.to_ascii_uppercase();
+                upper.starts_with("NEAR(") || upper.starts_with("NEAR/")
+            }
+            _ => false,
+        };
+        if opens_near {
+            paren_depth += count_in_words(&token, '(');
+            paren_depth = paren_depth.saturating_sub(count_in_words(&token, ')'));
             continue;
         }
         if paren_depth > 0 {
-            paren_depth = paren_depth.saturating_sub(w.chars().filter(|&c| c == ')').count());
+            paren_depth = paren_depth.saturating_sub(count_in_words(&token, ')'));
             continue;
         }
-        tokens.push(w);
+        tokens.push(token);
     }
     tokens
 }
@@ -80,29 +146,54 @@ pub(crate) fn sanitize_fts_query(query: &str) -> Result<SanitizedFtsQuery, Sanit
         return Err(SanitizeError::EmptyInput);
     }
     let tokens: Vec<String> = strip_near_groups(query)
-        .into_iter()
-        .map(|w| {
-            let stripped = w.trim_start_matches(['^', '+', '-']);
-            let cleaned = stripped.trim_matches(['(', ')']);
-            if (cleaned.contains(':') || cleaned.contains('-')) && !cleaned.starts_with('"') {
-                let unquoted = cleaned.replace('"', "");
-                format!("\"{unquoted}\"")
-            } else {
-                cleaned.to_owned()
-            }
-        })
+        .iter()
+        .map(|token| clean_token(token))
         .filter(|w| !w.is_empty())
         .collect();
     let result = drop_dangling_operators(&tokens).join(" ");
     if result.is_empty() {
         return Err(SanitizeError::NoSearchableTerms);
     }
-    let quote_count = result.chars().filter(|&c| c == '"').count();
-    if quote_count % 2 != 0 {
-        Ok(SanitizedFtsQuery(format!("{result}\"")))
-    } else {
-        Ok(SanitizedFtsQuery(result))
+    Ok(SanitizedFtsQuery(result))
+}
+
+/// A lone word loses its `^` / `+` / `-` prefix and its outer parentheses. It is
+/// quoted when it holds `:` or `-`. A token holding a phrase keeps the phrase
+/// verbatim and closed, and only the words at its edges lose the prefix and
+/// parentheses. Such a token is never an operator, so `drop_dangling_operators`
+/// leaves the and / or / not words inside a phrase in place.
+fn clean_token(token: &[Piece<'_>]) -> String {
+    if let [Piece::Word(word)] = token {
+        let cleaned = word
+            .trim_start_matches(['^', '+', '-'])
+            .trim_matches(['(', ')']);
+        return if cleaned.contains([':', '-']) {
+            format!("\"{cleaned}\"")
+        } else {
+            cleaned.to_owned()
+        };
     }
+    let last = token.len() - 1;
+    token
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| match piece {
+            Piece::Phrase(text) => format!("\"{text}\""),
+            Piece::Word(word) => {
+                let word = if i == 0 {
+                    word.trim_start_matches(['^', '+', '-', '(', ')'])
+                } else {
+                    word
+                };
+                let word = if i == last {
+                    word.trim_end_matches(['(', ')'])
+                } else {
+                    word
+                };
+                word.to_owned()
+            }
+        })
+        .collect()
 }
 
 pub fn fts_quote(s: &str) -> String {
@@ -118,6 +209,296 @@ pub fn prepare_match_query(
     let normalized = normalize_for_fts(query, normalization);
     let sanitized = sanitize_fts_query(&normalized)?;
     fts_expand_short_terms(conn, &sanitized, vocab_table)
+}
+
+/// A query that uses uppercase AND / OR / NOT is parsed into a tree and
+/// rendered as an FTS5 MATCH without CJK segmentation or short-term vocab
+/// expansion. FTS5 evaluates the operators per message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorQuery {
+    /// Final MATCH string, `None` when every term is shorter than
+    /// `MIN_TRIGRAM_TERM_CHARS`.
+    pub match_query: Option<String>,
+    /// MATCH strings for the right side of every NOT whose exclusion applies to
+    /// the whole query (see `Node::render`).
+    pub not_operands: Vec<String>,
+    /// Terms outside every NOT right side, for the embedder. Empty only when
+    /// the query holds no term at all, such as `( AND )`.
+    pub embed_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct QuerySyntaxError(String);
+
+/// The trigram tokenizer indexes nothing shorter than 3 characters, so a
+/// shorter term cannot match on its own.
+pub const MIN_TRIGRAM_TERM_CHARS: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Token {
+    Open,
+    Close,
+    And,
+    Or,
+    Not,
+    Term(String),
+}
+
+fn tokenize_operator_query(query: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut depth: usize = 0;
+    let pieces = scan_tokens(query, |c| matches!(c, '(' | ')'));
+    for piece in pieces.into_iter().flatten() {
+        match piece {
+            Piece::Phrase("") => {}
+            Piece::Phrase(text) => tokens.push(Token::Term(text.to_owned())),
+            Piece::Word("(") => {
+                depth += 1;
+                tokens.push(Token::Open);
+            }
+            Piece::Word(")") => {
+                if depth > 0 {
+                    depth -= 1;
+                    tokens.push(Token::Close);
+                }
+            }
+            Piece::Word("AND") => tokens.push(Token::And),
+            Piece::Word("OR") => tokens.push(Token::Or),
+            Piece::Word("NOT") => tokens.push(Token::Not),
+            Piece::Word(word) => {
+                let term = word.trim_start_matches(['^', '+', '-']);
+                if !term.is_empty() {
+                    tokens.push(Token::Term(term.to_owned()));
+                }
+            }
+        }
+    }
+    tokens.extend(repeat_n(Token::Close, depth));
+    tokens
+}
+
+enum Node {
+    Term(String),
+    And(Vec<Node>),
+    Or(Vec<Node>),
+    /// `left NOT a NOT b` keeps the chain flat, so its length adds no recursion.
+    Not(Box<Node>, Vec<Node>),
+}
+
+/// The parser recurses once per parenthesis level; this bound keeps a deeply
+/// nested query from overflowing the stack.
+const MAX_PAREN_DEPTH: usize = 32;
+
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+    depth: usize,
+}
+
+impl Parser {
+    fn peek(&self) -> Option<&Token> {
+        self.tokens.get(self.pos)
+    }
+
+    fn eat(&mut self, token: &Token) -> bool {
+        let found = self.peek() == Some(token);
+        if found {
+            self.pos += 1;
+        }
+        found
+    }
+
+    fn list(
+        &mut self,
+        separator: &Token,
+        item: fn(&mut Self) -> Result<Option<Node>, QuerySyntaxError>,
+        join: fn(Vec<Node>) -> Node,
+    ) -> Result<Option<Node>, QuerySyntaxError> {
+        let mut items = Vec::new();
+        loop {
+            if self.eat(separator) {
+                continue;
+            }
+            match item(self)? {
+                Some(node) => items.push(node),
+                None => break,
+            }
+        }
+        Ok(match items.len() {
+            0 => None,
+            1 => items.pop(),
+            _ => Some(join(items)),
+        })
+    }
+
+    fn or(&mut self) -> Result<Option<Node>, QuerySyntaxError> {
+        self.list(&Token::Or, Self::and, Node::Or)
+    }
+
+    fn and(&mut self) -> Result<Option<Node>, QuerySyntaxError> {
+        self.list(&Token::And, Self::not, Node::And)
+    }
+
+    fn not(&mut self) -> Result<Option<Node>, QuerySyntaxError> {
+        let Some(left) = self.primary()? else {
+            if self.peek() == Some(&Token::Not) {
+                return Err(QuerySyntaxError("NOT needs a term on its left".to_owned()));
+            }
+            return Ok(None);
+        };
+        let mut excluded = Vec::new();
+        while self.eat(&Token::Not) {
+            excluded.extend(self.primary()?);
+        }
+        Ok(Some(if excluded.is_empty() {
+            left
+        } else {
+            Node::Not(Box::new(left), excluded)
+        }))
+    }
+
+    fn primary(&mut self) -> Result<Option<Node>, QuerySyntaxError> {
+        loop {
+            match self.peek() {
+                Some(Token::Term(text)) => {
+                    let node = Node::Term(text.clone());
+                    self.pos += 1;
+                    return Ok(Some(node));
+                }
+                Some(Token::Open) => {
+                    if self.depth == MAX_PAREN_DEPTH {
+                        return Err(QuerySyntaxError(format!(
+                            "parentheses nest deeper than {MAX_PAREN_DEPTH} levels"
+                        )));
+                    }
+                    self.pos += 1;
+                    self.depth += 1;
+                    let inner = self.or()?;
+                    self.depth -= 1;
+                    self.eat(&Token::Close);
+                    if inner.is_some() {
+                        return Ok(inner);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+}
+
+fn join_group(mut parts: Vec<String>, separator: &str) -> Option<String> {
+    match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        _ => Some(format!("({})", parts.join(separator))),
+    }
+}
+
+impl Node {
+    /// Renders the MATCH string of this node. `required` is true when every
+    /// match of the whole query must also match this node: the root, the
+    /// members of a required AND, and the left side of a required NOT. Only a
+    /// required NOT records its right side in `not_operands`, because only its
+    /// exclusion applies to the whole query. A NOT under an OR, or inside
+    /// another NOT's right side, records nothing. That holds even when the OR's
+    /// other branches render no MATCH, because the embedder still searches for
+    /// their terms. The vector leg then keeps a session that such a NOT would
+    /// exclude, which is preferred to dropping one the query allows.
+    fn render(
+        &self,
+        required: bool,
+        not_operands: &mut Vec<String>,
+    ) -> Result<Option<String>, QuerySyntaxError> {
+        match self {
+            Self::Term(text) => {
+                Ok((text.chars().count() >= MIN_TRIGRAM_TERM_CHARS).then(|| fts_quote(text)))
+            }
+            Self::And(nodes) => Ok(join_group(
+                Self::render_all(nodes, required, not_operands)?,
+                " AND ",
+            )),
+            Self::Or(nodes) => Ok(join_group(
+                Self::render_all(nodes, false, not_operands)?,
+                " OR ",
+            )),
+            Self::Not(left, excluded) => {
+                let Some(left) = left.render(required, not_operands)? else {
+                    return Err(QuerySyntaxError(format!(
+                        "NOT needs a left term of at least {MIN_TRIGRAM_TERM_CHARS} characters"
+                    )));
+                };
+                let rights = Self::render_all(excluded, false, not_operands)?;
+                // `((left NOT a) NOT b)`, built in one pass instead of one copy per NOT.
+                let mut rendered = "(".repeat(rights.len());
+                rendered.push_str(&left);
+                for right in &rights {
+                    rendered.push_str(" NOT ");
+                    rendered.push_str(right);
+                    rendered.push(')');
+                }
+                if required {
+                    not_operands.extend(rights);
+                }
+                Ok(Some(rendered))
+            }
+        }
+    }
+
+    fn render_all(
+        nodes: &[Self],
+        required: bool,
+        not_operands: &mut Vec<String>,
+    ) -> Result<Vec<String>, QuerySyntaxError> {
+        let mut parts = Vec::new();
+        for node in nodes {
+            parts.extend(node.render(required, not_operands)?);
+        }
+        Ok(parts)
+    }
+
+    fn collect_embed_terms<'a>(&'a self, terms: &mut Vec<&'a str>) {
+        match self {
+            Self::Term(text) => terms.push(text),
+            Self::And(nodes) | Self::Or(nodes) => {
+                nodes.iter().for_each(|n| n.collect_embed_terms(terms));
+            }
+            Self::Not(left, _) => left.collect_embed_terms(terms),
+        }
+    }
+}
+
+/// Returns `Ok(None)` when the query has no uppercase AND / OR / NOT outside
+/// quotes, so the caller keeps the plain path.
+pub fn prepare_operator_query(query: &str) -> Result<Option<OperatorQuery>, QuerySyntaxError> {
+    let tokens = tokenize_operator_query(query);
+    if !tokens
+        .iter()
+        .any(|t| matches!(t, Token::And | Token::Or | Token::Not))
+    {
+        return Ok(None);
+    }
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
+    let Some(tree) = parser.or()? else {
+        return Ok(Some(OperatorQuery {
+            match_query: None,
+            not_operands: Vec::new(),
+            embed_text: String::new(),
+        }));
+    };
+    let mut not_operands = Vec::new();
+    let match_query = tree.render(true, &mut not_operands)?;
+    let mut terms = Vec::new();
+    tree.collect_embed_terms(&mut terms);
+    Ok(Some(OperatorQuery {
+        match_query,
+        not_operands,
+        embed_text: terms.join(" "),
+    }))
 }
 
 fn expand_token_via_vocab(
@@ -179,7 +560,17 @@ pub(crate) fn fts_expand_short_terms(
     };
 
     let mut parts = Vec::new();
-    for token in query.as_str().split_whitespace() {
+    // A phrase is quoted once as a whole instead of once per word.
+    let pieces = scan_tokens(query.as_str(), |_| false);
+    for piece in pieces.into_iter().flatten() {
+        let token = match piece {
+            Piece::Phrase("") => continue,
+            Piece::Phrase(text) => {
+                parts.push(fts_quote(text));
+                continue;
+            }
+            Piece::Word(word) => word,
+        };
         if token.chars().count() >= 3 || is_fts5_operator(token) {
             parts.push(fts_quote(token));
             continue;

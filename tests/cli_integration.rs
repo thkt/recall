@@ -1439,3 +1439,40 @@ fn classify_warns_once_when_a_session_source_is_missing() {
         "got: {stderr}"
     );
 }
+
+#[test]
+fn recall_search_with_a_not_query_returns_only_the_sessions_without_the_excluded_word() {
+    let dir = TempDir::new().unwrap();
+    let turn = |text: &str| {
+        format!(
+            r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"{text}"}},"timestamp":"2026-03-01T00:00:00Z"}}"#
+        )
+    };
+    let wanted = turn("authentication notes");
+    let excluded = turn("authentication and deployment notes");
+    let unrelated = turn("checklist for release");
+    index_claude_sessions(
+        dir.path(),
+        &[
+            ("wanted", &[wanted.as_str()]),
+            ("excluded", &[excluded.as_str()]),
+            ("unrelated", &[unrelated.as_str()]),
+        ],
+    );
+
+    let out = recall(dir.path())
+        .args(["search", "authentication NOT deployment"])
+        .output()
+        .expect("spawn recall binary");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.contains("ID: wanted"),
+        "the session without the excluded word must be returned: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ID: excluded") && !stdout.contains("ID: unrelated"),
+        "sessions with the excluded word or without the first word must be absent: {stdout}"
+    );
+}

@@ -267,6 +267,11 @@ fn near_with_distance() {
 }
 
 #[test]
+fn near_group_ignores_parentheses_inside_a_phrase() {
+    assert_eq!(sanitize_fts_query("NEAR(\"x ) y\" z) hello"), ok("hello"));
+}
+
+#[test]
 fn near_unclosed_paren() {
     assert_eq!(
         sanitize_fts_query("NEAR(a b hello"),
@@ -361,5 +366,174 @@ fn drop_dangling_operators_drops_operator_at_position_zero() {
         result,
         vec!["foo", "bar"],
         "operator at index 0 has no left neighbour → must drop"
+    );
+}
+
+#[test]
+fn expand_quotes_a_phrase_once_as_a_whole() {
+    let conn = setup_fts_db();
+    let result = prepare_match_query(
+        &conn,
+        "\"login session\" audit",
+        "fts_chunks_vocab",
+        &no_norm(),
+    )
+    .unwrap();
+    assert_eq!(result.as_str(), "\"login session\" AND \"audit\"");
+}
+
+#[test]
+fn expand_quotes_a_hyphen_or_colon_term_once() {
+    let conn = setup_fts_db();
+    let result =
+        prepare_match_query(&conn, "rate-limit std::io", "fts_chunks_vocab", &no_norm()).unwrap();
+    assert_eq!(result.as_str(), "\"rate-limit\" AND \"std::io\"");
+}
+
+#[test]
+fn expand_passes_a_phrase_with_and_or_not_words_through_verbatim() {
+    let conn = setup_fts_db();
+    let result = prepare_match_query(
+        &conn,
+        "\"to be or not to be\"",
+        "fts_chunks_vocab",
+        &no_norm(),
+    )
+    .unwrap();
+    assert_eq!(result.as_str(), "\"to be or not to be\"");
+}
+
+#[test]
+fn expand_drops_the_parentheses_around_a_phrase() {
+    let conn = setup_fts_db();
+    let result =
+        prepare_match_query(&conn, "(\"login session\")", "fts_chunks_vocab", &no_norm()).unwrap();
+    assert_eq!(result.as_str(), "\"login session\"");
+}
+
+#[test]
+fn expand_splits_a_colon_word_from_the_phrase_attached_to_it() {
+    let conn = setup_fts_db();
+    let result = prepare_match_query(
+        &conn,
+        "key:\"some value\" (foo)",
+        "fts_chunks_vocab",
+        &no_norm(),
+    )
+    .unwrap();
+    assert_eq!(result.as_str(), "\"key:\" AND \"some value\" AND \"foo\"");
+}
+
+#[test]
+fn sanitize_keeps_a_hyphen_inside_a_phrase_unquoted() {
+    assert_eq!(
+        sanitize_fts_query("\"foo bar-baz\" qux"),
+        ok("\"foo bar-baz\" qux")
+    );
+}
+
+fn operator(query: &str) -> OperatorQuery {
+    prepare_operator_query(query).unwrap().unwrap()
+}
+
+#[test]
+fn operator_query_is_absent_without_uppercase_operators() {
+    assert_eq!(prepare_operator_query("tokio and async"), Ok(None));
+    assert_eq!(prepare_operator_query("\"cats AND dogs\""), Ok(None));
+}
+
+#[test]
+fn operator_query_gives_and_precedence_over_or_and_parentheses_over_both() {
+    assert_eq!(
+        operator("alpha OR beta AND gamma").match_query.as_deref(),
+        Some("(\"alpha\" OR (\"beta\" AND \"gamma\"))")
+    );
+    assert_eq!(
+        operator("(alpha OR beta) AND gamma").match_query.as_deref(),
+        Some("((\"alpha\" OR \"beta\") AND \"gamma\")")
+    );
+}
+
+#[test]
+fn operator_query_drops_short_terms_by_tree_position() {
+    assert_eq!(
+        operator("alpha AND zz").match_query.as_deref(),
+        Some("\"alpha\"")
+    );
+    assert_eq!(
+        operator("alpha OR zz").match_query.as_deref(),
+        Some("\"alpha\"")
+    );
+    let not_short = operator("alpha NOT zz");
+    assert_eq!(not_short.match_query.as_deref(), Some("\"alpha\""));
+    assert!(not_short.not_operands.is_empty());
+    assert_eq!(operator("zz AND yy").match_query, None);
+}
+
+#[test]
+fn operator_query_rejects_a_not_without_a_usable_left_side() {
+    assert!(prepare_operator_query("zz NOT beta").is_err());
+    assert!(prepare_operator_query("NOT beta").is_err());
+    assert!(prepare_operator_query("alpha AND NOT beta").is_err());
+}
+
+#[test]
+fn operator_query_keeps_not_operands_out_of_the_embedding_text() {
+    let query = operator("alpha NOT (beta OR gamma)");
+    assert_eq!(query.embed_text, "alpha");
+    assert_eq!(query.not_operands, ["(\"beta\" OR \"gamma\")".to_owned()]);
+}
+
+#[test]
+fn operator_query_records_a_not_operand_only_when_its_exclusion_covers_the_whole_query() {
+    assert_eq!(
+        operator("release AND (alpha NOT beta)").not_operands,
+        ["\"beta\""]
+    );
+    assert_eq!(
+        operator("(alpha NOT beta) NOT gamma").not_operands,
+        ["\"beta\"", "\"gamma\""]
+    );
+    assert_eq!(
+        operator("zz OR (alpha NOT beta)").not_operands,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        operator("(alpha NOT beta) OR gamma").not_operands,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        operator("alpha NOT (beta NOT gamma)").not_operands,
+        ["(\"beta\" NOT \"gamma\")"]
+    );
+}
+
+#[test]
+fn operator_query_renders_a_chain_of_nots_left_nested() {
+    let query = operator("alpha NOT beta NOT zz NOT gamma");
+    assert_eq!(
+        query.match_query.as_deref(),
+        Some("((\"alpha\" NOT \"beta\") NOT \"gamma\")")
+    );
+    assert_eq!(query.not_operands, ["\"beta\"", "\"gamma\""]);
+}
+
+#[test]
+fn operator_query_skips_empty_parentheses() {
+    assert_eq!(
+        operator("() ( ) alpha OR beta").match_query.as_deref(),
+        Some("(\"alpha\" OR \"beta\")")
+    );
+}
+
+#[test]
+fn operator_query_ignores_dangling_operators_and_closes_open_parentheses() {
+    assert_eq!(
+        operator("hello OR").match_query.as_deref(),
+        Some("\"hello\"")
+    );
+    assert_eq!(
+        operator("(alpha OR beta AND gamma").match_query.as_deref(),
+        Some("(\"alpha\" OR (\"beta\" AND \"gamma\"))")
     );
 }
