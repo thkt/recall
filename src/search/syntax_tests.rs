@@ -320,6 +320,35 @@ fn a_session_found_only_by_the_vector_search_stays_when_it_does_not_match_the_wo
 }
 
 #[test]
+fn a_session_found_only_by_the_vector_search_stays_when_the_not_sits_under_an_or() {
+    let (_dir, conn) = db_with_messages(&[
+        ("text-hit", "alpha release notes"),
+        ("vec-with-beta", "beta tag notes"),
+    ]);
+    add_embedded_chunk(&conn, 1, "vec-with-beta", "beta tag notes");
+
+    assert_eq!(
+        hybrid_matched_sessions(&conn, "(alpha NOT beta) OR gamma"),
+        ["text-hit", "vec-with-beta"]
+    );
+}
+
+#[test]
+fn a_session_found_only_by_the_vector_search_stays_when_it_matches_a_not_nested_after_another_not()
+{
+    let (_dir, conn) = db_with_messages(&[
+        ("text-hit", "alpha release notes"),
+        ("vec-with-gamma", "gamma tag notes"),
+    ]);
+    add_embedded_chunk(&conn, 1, "vec-with-gamma", "gamma tag notes");
+
+    assert_eq!(
+        hybrid_matched_sessions(&conn, "alpha NOT (beta NOT gamma)"),
+        ["text-hit", "vec-with-gamma"]
+    );
+}
+
+#[test]
 fn the_excluded_automated_count_includes_an_automated_session_matching_an_operator_query() {
     let (_dir, conn) = db_with_messages(&[
         ("auto-alpha", "alpha release notes"),

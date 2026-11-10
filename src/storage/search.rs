@@ -218,7 +218,8 @@ pub fn prepare_match_query(
 pub struct OperatorQuery {
     /// Final MATCH string, `None` when every term was shorter than 3 characters.
     pub match_query: Option<String>,
-    /// MATCH strings for the right side of every NOT.
+    /// MATCH strings for the right side of every NOT whose exclusion applies to
+    /// the whole query (see `Node::render`).
     pub not_operands: Vec<String>,
     /// Terms outside every NOT right side, for the embedder.
     pub embed_text: String,
@@ -365,44 +366,73 @@ impl Parser {
     }
 }
 
+fn join_group(mut parts: Vec<String>, separator: &str) -> Option<String> {
+    match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        _ => Some(format!("({})", parts.join(separator))),
+    }
+}
+
 impl Node {
-    fn render(&self, not_operands: &mut Vec<String>) -> Result<Option<String>, QuerySyntaxError> {
+    /// Renders the MATCH string of this node. `required` is true when every
+    /// match of the whole query must also match this node: the root, the
+    /// members of a required AND, the left side of a required NOT, and the only
+    /// branch left of a required OR. Only a required NOT records its right side
+    /// in `not_operands`, because only its exclusion applies to the whole query.
+    /// A NOT under an OR with two or more branches, or inside another NOT's
+    /// right side, records nothing. The vector leg then keeps a session that
+    /// such a NOT would exclude, which is preferred to dropping one the query
+    /// allows.
+    fn render(
+        &self,
+        required: bool,
+        not_operands: &mut Vec<String>,
+    ) -> Result<Option<String>, QuerySyntaxError> {
         match self {
             Self::Term(text) => {
                 Ok((text.chars().count() >= MIN_OPERATOR_TERM_CHARS).then(|| fts_quote(text)))
             }
-            Self::And(nodes) => Self::render_group(nodes, " AND ", not_operands),
-            Self::Or(nodes) => Self::render_group(nodes, " OR ", not_operands),
+            Self::And(nodes) => Ok(join_group(
+                Self::render_all(nodes, required, not_operands)?,
+                " AND ",
+            )),
+            Self::Or(nodes) => {
+                let mut branch_operands = Vec::new();
+                let parts = Self::render_all(nodes, required, &mut branch_operands)?;
+                if parts.len() == 1 {
+                    not_operands.append(&mut branch_operands);
+                }
+                Ok(join_group(parts, " OR "))
+            }
             Self::Not(left, right) => {
-                let Some(left) = left.render(not_operands)? else {
+                let Some(left) = left.render(required, not_operands)? else {
                     return Err(QuerySyntaxError(
                         "NOT needs a left term of at least 3 characters".to_owned(),
                     ));
                 };
-                let Some(right) = right.render(not_operands)? else {
+                let Some(right) = right.render(false, not_operands)? else {
                     return Ok(Some(left));
                 };
                 let rendered = format!("({left} NOT {right})");
-                not_operands.push(right);
+                if required {
+                    not_operands.push(right);
+                }
                 Ok(Some(rendered))
             }
         }
     }
 
-    fn render_group(
+    fn render_all(
         nodes: &[Self],
-        separator: &str,
+        required: bool,
         not_operands: &mut Vec<String>,
-    ) -> Result<Option<String>, QuerySyntaxError> {
+    ) -> Result<Vec<String>, QuerySyntaxError> {
         let mut parts = Vec::new();
         for node in nodes {
-            parts.extend(node.render(not_operands)?);
+            parts.extend(node.render(required, not_operands)?);
         }
-        Ok(match parts.len() {
-            0 => None,
-            1 => parts.pop(),
-            _ => Some(format!("({})", parts.join(separator))),
-        })
+        Ok(parts)
     }
 
     fn collect_embed_terms<'a>(&'a self, terms: &mut Vec<&'a str>) {
@@ -435,7 +465,7 @@ pub fn prepare_operator_query(query: &str) -> Result<Option<OperatorQuery>, Quer
         }));
     };
     let mut not_operands = Vec::new();
-    let match_query = tree.render(&mut not_operands)?;
+    let match_query = tree.render(true, &mut not_operands)?;
     let mut terms = Vec::new();
     tree.collect_embed_terms(&mut terms);
     Ok(Some(OperatorQuery {

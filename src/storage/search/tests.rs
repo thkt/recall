@@ -480,6 +480,30 @@ fn operator_query_keeps_not_operands_out_of_the_embedding_text() {
 }
 
 #[test]
+fn operator_query_records_a_not_operand_only_when_its_exclusion_covers_the_whole_query() {
+    assert_eq!(
+        operator("release AND (alpha NOT beta)").not_operands,
+        ["\"beta\""]
+    );
+    assert_eq!(
+        operator("(alpha NOT beta) NOT gamma").not_operands,
+        ["\"beta\"", "\"gamma\""]
+    );
+    assert_eq!(
+        operator("zz OR (alpha NOT beta)").not_operands,
+        ["\"beta\""]
+    );
+    assert_eq!(
+        operator("(alpha NOT beta) OR gamma").not_operands,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        operator("alpha NOT (beta NOT gamma)").not_operands,
+        ["(\"beta\" NOT \"gamma\")"]
+    );
+}
+
+#[test]
 fn operator_query_ignores_dangling_operators_and_closes_open_parentheses() {
     assert_eq!(
         operator("hello OR").match_query.as_deref(),
