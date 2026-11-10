@@ -865,17 +865,6 @@ fn a_slash_command_query_matches_the_command_in_a_message() {
 }
 
 #[test]
-fn a_column_filter_in_the_query_does_not_restrict_by_role() {
-    let (_dir, conn) = setup_test_db();
-    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
-    insert_message(&conn, "s1", "user", "some content about admin");
-
-    let results = search(&conn, "role:user", &SearchOptions::default()).unwrap();
-
-    assert_eq!(ids(&results), NONE);
-}
-
-#[test]
 fn a_no_space_query_splits_between_kanji_and_hiragana() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "both", "claude", "/proj", NOW_MS);

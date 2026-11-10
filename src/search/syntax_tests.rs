@@ -104,6 +104,18 @@ fn a_term_with_colons_finds_the_message_containing_it() {
 }
 
 #[test]
+fn a_term_shaped_like_a_column_filter_finds_only_the_message_containing_it() {
+    // Both messages are stored with role "user", so a "role:user" that reached
+    // the full-text index as a column filter would match both.
+    let (_dir, conn) = db_with_messages(&[
+        ("literal", "set role:user in the config"),
+        ("other", "the user asked about roles"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "role:user"), ["literal"]);
+}
+
+#[test]
 fn a_quoted_phrase_finds_the_message_with_those_words_adjacent_and_not_one_with_them_apart() {
     let (_dir, conn) = db_with_messages(&[
         ("adjacent", "restart the connection pool before deploy"),
