@@ -270,3 +270,29 @@ fn a_session_found_only_by_the_vector_search_stays_when_it_does_not_match_the_wo
         ["text-hit", "vec-without-beta"]
     );
 }
+
+#[test]
+fn the_excluded_automated_count_includes_an_automated_session_matching_an_operator_query() {
+    let (_dir, conn) = db_with_messages(&[
+        ("auto-alpha", "alpha release notes"),
+        ("auto-alpha-beta", "alpha release with beta tag"),
+        ("auto-gamma", "gamma release notes"),
+        ("human-alpha", "alpha deployment notes"),
+    ]);
+    for sid in ["auto-alpha", "auto-alpha-beta", "auto-gamma"] {
+        conn.execute(
+            "UPDATE sessions SET session_type = 'automated' WHERE session_id = ?1",
+            [sid],
+        )
+        .unwrap();
+    }
+
+    let count =
+        count_excluded_automated(&conn, Some("alpha NOT beta"), &SearchOptions::default())
+            .unwrap();
+
+    assert_eq!(
+        count, 1,
+        "only auto-alpha matches `alpha NOT beta` among the automated sessions"
+    );
+}

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,7 +7,9 @@ use crate::compat::filter::{
 };
 use crate::compat::{anon_placeholders, clean_for_trigram};
 use crate::embedding::Embed;
-use crate::storage::{MatchFtsQuery, QueryNormalizationConfig, SanitizeError, prepare_match_query};
+use crate::storage::{
+    QueryNormalizationConfig, SanitizeError, prepare_match_query, prepare_operator_query,
+};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
@@ -186,7 +188,7 @@ fn find_candidate_sessions(
     }
     if let Some(ref err_msg) = first_error {
         if ranked.is_empty() {
-            return Err(RecallError::DataError(format!(
+            return Err(RecallError::QuerySyntax(format!(
                 "Invalid search query: {err_msg}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
             ))
             .into());
@@ -527,7 +529,27 @@ fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
-fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> {
+/// What the keyword leg and the vector leg search for, built once per query so
+/// `search_with_embedder` and `count_excluded_automated` agree.
+struct KeywordQuery {
+    /// Final FTS5 MATCH string; `None` when no term is long enough for the trigram index.
+    fts: Option<String>,
+    /// MATCH strings for the right side of every NOT.
+    not_operands: Vec<String>,
+    /// Embedding input when it differs from the raw query.
+    embed_text: Option<String>,
+}
+
+fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>> {
+    if let Some(operator) =
+        prepare_operator_query(query).map_err(|e| RecallError::QuerySyntax(e.to_string()))?
+    {
+        return Ok(Some(KeywordQuery {
+            fts: operator.match_query,
+            not_operands: operator.not_operands,
+            embed_text: Some(operator.embed_text),
+        }));
+    }
     let segmented = segment_script_boundaries(query);
     let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
         segmented
@@ -540,7 +562,11 @@ fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> 
         "messages_vocab",
         &QueryNormalizationConfig::disabled(),
     ) {
-        Ok(m) => Ok(Some(m)),
+        Ok(m) => Ok(Some(KeywordQuery {
+            fts: clean_for_trigram(&m),
+            not_operands: Vec::new(),
+            embed_text: None,
+        })),
         Err(SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms) => {
             debug!(%query, "query produced no searchable terms");
             Ok(None)
@@ -549,6 +575,46 @@ fn match_query(conn: &Connection, query: &str) -> Result<Option<MatchFtsQuery>> 
             Err(e.into())
         }
     }
+}
+
+/// A session found only by the vector search never went through the keyword
+/// MATCH, so it is dropped here when one of its messages matches a NOT operand.
+/// Sessions the keyword search returned already satisfy the whole expression.
+fn drop_vec_only_sessions_matching_not(
+    conn: &Connection,
+    not_operands: &[String],
+    fts_ranked: &[(String, f64)],
+    merged: &mut Vec<(String, f64)>,
+) -> Result<()> {
+    if not_operands.is_empty() {
+        return Ok(());
+    }
+    let fts_ids: HashSet<&str> = fts_ranked.iter().map(|(sid, _)| sid.as_str()).collect();
+    let vec_only: Vec<&str> = merged
+        .iter()
+        .map(|(sid, _)| sid.as_str())
+        .filter(|sid| !fts_ids.contains(sid))
+        .collect();
+    if vec_only.is_empty() {
+        return Ok(());
+    }
+    let operands = not_operands.join(" OR ");
+    let sql = format!(
+        "SELECT DISTINCT session_id FROM messages \
+         WHERE messages MATCH ? AND session_id IN ({})",
+        anon_placeholders(vec_only.len())
+    );
+    let mut params: Vec<&dyn ToSql> = vec![&operands];
+    params.extend(vec_only.iter().map(|sid| sid as &dyn ToSql));
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare NOT filter query")?;
+    let excluded: HashSet<String> = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, String>(0))
+        .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
+        .context("NOT filter query failed")?;
+    merged.retain(|(sid, _)| !excluded.contains(sid));
+    Ok(())
 }
 
 /// Matches reachable only through the vector leg are not counted, so the count
@@ -569,8 +635,7 @@ pub fn count_excluded_automated(
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
     let (mut sql, column) = match query {
         Some(query) => {
-            let Some(fts_query) = match_query(conn, query)?.and_then(|m| clean_for_trigram(&m))
-            else {
+            let Some(fts_query) = keyword_query(conn, query)?.and_then(|k| k.fts) else {
                 return Ok(0);
             };
             params.push(Box::new(fts_query));
@@ -631,11 +696,10 @@ pub fn search_with_embedder<'q>(
     let Some(query) = query.into() else {
         return file_list_outcome(conn, opts, now_ms);
     };
-    let Some(matched) = match_query(conn, query)? else {
+    let Some(keyword) = keyword_query(conn, query)? else {
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
-    let fts_query = clean_for_trigram(&matched);
-    let fts_query = fts_query.as_deref();
+    let fts_query = keyword.fts.as_deref();
     let (fts_ranked, fts_skipped) = match fts_query {
         Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
         None => (Vec::new(), 0),
@@ -661,20 +725,27 @@ pub fn search_with_embedder<'q>(
 
     let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
 
-    let (vec_hits, vec_degraded) =
-        match vec_search(conn, embedder, query, candidate_limit, opts, now_ms) {
-            Ok(hits) => (hits, false),
-            Err(e) => {
-                warn!(error = %e, "vector search failed, using text search only");
-                (Vec::new(), true)
-            }
-        };
+    let (vec_hits, vec_degraded) = match vec_search(
+        conn,
+        embedder,
+        keyword.embed_text.as_deref().unwrap_or(query),
+        candidate_limit,
+        opts,
+        now_ms,
+    ) {
+        Ok(hits) => (hits, false),
+        Err(e) => {
+            warn!(error = %e, "vector search failed, using text search only");
+            (Vec::new(), true)
+        }
+    };
 
     let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
     let mut merged = rrf_merge_sessions(
         fts_ranked.iter().map(|(sid, _)| sid.as_str()),
         vec_hits.iter().map(|(sid, _)| sid.as_str()),
     );
+    drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ranked, &mut merged)?;
 
     if merged.is_empty() {
         return Ok(SearchOutcome {
