@@ -1,224 +1,244 @@
+use std::fs;
+
+use serde_json::json;
+
 use super::*;
 use crate::parser::{assert_classification_matches, write_test_jsonl as write_jsonl};
 
+/// Parses with the full reader and checks the classification reader agrees.
+fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
+    let parsed = super::parse_claude_session(path)?;
+    if let Some(full) = &parsed {
+        assert_classification_matches(path, Source::Claude, full);
+    }
+    Ok(parsed)
+}
+
+fn turns(parsed: &ParseResult) -> Vec<(Role, &str)> {
+    parsed
+        .messages
+        .iter()
+        .map(|m| (m.role, m.text.as_str()))
+        .collect()
+}
+
+/// Whether a Claude log stored at `relative` under a fresh directory, holding only
+/// `record`, reads as automated.
+fn automated_at(relative: &str, record: &Value) -> bool {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, record.to_string()).unwrap();
+    parse_claude_session(&path)
+        .unwrap()
+        .unwrap()
+        .origin
+        .automated
+}
+
 #[test]
-fn test_claude_text_string_content() {
+fn string_content_becomes_a_message() {
     let tmp = write_jsonl(&[
         r#"{"type":"user","cwd":"/home/me/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
     ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert_eq!(result.messages.len(), 1);
-    assert_eq!(result.messages[0].role, Role::User);
-    assert_eq!(result.messages[0].text, "hello world");
+
+    assert_eq!(
+        turns(&parse_claude_session(tmp.path()).unwrap().unwrap()),
+        [(Role::User, "hello world")]
+    );
 }
 
 #[test]
-fn test_claude_block_array_extracts_text_only() {
+fn only_the_text_blocks_of_an_answer_become_message_text() {
     let tmp = write_jsonl(&[
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answer"},{"type":"tool_use","id":"t1","name":"Bash","input":{}},{"type":"thinking","thinking":"hmm"}]},"timestamp":"2026-03-01T00:00:00Z"}"#,
     ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert_eq!(result.messages.len(), 1);
-    assert_eq!(result.messages[0].text, "answer");
+
+    assert_eq!(
+        turns(&parse_claude_session(tmp.path()).unwrap().unwrap()),
+        [(Role::Assistant, "answer")]
+    );
 }
 
 #[test]
-fn test_claude_skips_non_message_types() {
+fn records_that_are_not_turns_and_meta_turns_are_skipped() {
     let tmp = write_jsonl(&[
         r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#,
         r#"{"type":"progress","data":{"type":"hook_progress"}}"#,
+        r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         r#"{"type":"user","message":{"role":"user","content":"real message"},"timestamp":"2026-03-01T00:00:00Z"}"#,
     ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert_eq!(result.messages.len(), 1);
-    assert_eq!(result.messages[0].text, "real message");
+
+    assert_eq!(
+        turns(&parse_claude_session(tmp.path()).unwrap().unwrap()),
+        [(Role::User, "real message")]
+    );
 }
 
 #[test]
-fn test_claude_metadata_extraction() {
+fn session_metadata_comes_from_the_records() {
     let tmp = write_jsonl(&[
         r#"{"type":"user","cwd":"/home/me/project","slug":"my-session","message":{"role":"user","content":"hello"},"timestamp":"2026-03-01T12:00:00Z"}"#,
     ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert_eq!(result.metadata.source, Source::Claude);
-    assert_eq!(result.metadata.project, "/home/me/project");
-    assert_eq!(result.metadata.slug, "my-session");
-    assert!(result.metadata.timestamp.is_some_and(|ts| ts > 0));
+
+    let metadata = parse_claude_session(tmp.path()).unwrap().unwrap().metadata;
+
+    assert_eq!(metadata.source, Source::Claude);
+    assert_eq!(metadata.project, "/home/me/project");
+    assert_eq!(metadata.slug, "my-session");
+    assert_eq!(metadata.timestamp, Some(1_772_366_400_000));
 }
 
 #[test]
-fn test_claude_invalid_json_skipped() {
+fn invalid_json_lines_are_skipped_and_counted() {
     let tmp = write_jsonl(&[
         "not valid json",
         r#"{"type":"user","message":{"role":"user","content":"ok"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         "{broken",
     ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert_eq!(result.messages.len(), 1);
+
+    let parsed = parse_claude_session(tmp.path()).unwrap().unwrap();
+
+    assert_eq!(turns(&parsed), [(Role::User, "ok")]);
+    assert_eq!(parsed.diagnostics.invalid_json_lines, 2);
 }
 
 #[test]
-fn test_claude_slug_fallback_to_session_id() {
-    let tmp = write_jsonl(&[
+fn without_a_slug_the_start_of_the_session_id_becomes_the_slug() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("fallback-session-0001.jsonl");
+    fs::write(
+        &path,
         r#"{"type":"user","message":{"role":"user","content":"hi"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert!(!result.metadata.slug.is_empty());
-}
+    )
+    .unwrap();
 
-#[test]
-fn claude_empty_messages_are_retained_for_diagnostics() {
-    let tmp = write_jsonl(&[
-        r#"{"type":"progress","data":{"type":"hook_progress"}}"#,
-        r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#,
-    ]);
-    assert!(
-        parse_claude_session(tmp.path())
-            .unwrap()
-            .unwrap()
-            .messages
-            .is_empty()
+    assert_eq!(
+        parse_claude_session(&path).unwrap().unwrap().metadata.slug,
+        "fallback-ses"
     );
 }
 
 #[test]
-fn test_claude_scanned_files_deduped_within_session() {
+fn a_session_without_turns_is_kept_with_no_messages() {
+    let tmp = write_jsonl(&[
+        r#"{"type":"progress","data":{"type":"hook_progress"}}"#,
+        r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#,
+    ]);
+
+    assert_eq!(
+        turns(&parse_claude_session(tmp.path()).unwrap().unwrap()),
+        []
+    );
+}
+
+#[test]
+fn files_touched_by_tools_are_listed_once_in_first_seen_order() {
     let tmp = write_jsonl(&[
         r#"{"type":"user","message":{"role":"user","content":"edit the file twice"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/same.rs","old_string":"a","new_string":"b"}},{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"/proj/other.rs","content":"c"}}]},"timestamp":"2026-03-01T00:00:01Z"}"#,
         r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t3","name":"Edit","input":{"file_path":"/proj/same.rs","old_string":"b","new_string":"d"}}]},"timestamp":"2026-03-01T00:00:02Z"}"#,
     ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
+
     assert_eq!(
-        result.scanned_files,
-        vec!["/proj/same.rs".to_owned(), "/proj/other.rs".to_owned()],
-        "the repeated path is recorded once, in first-seen order, across both turns"
+        parse_claude_session(tmp.path())
+            .unwrap()
+            .unwrap()
+            .scanned_files,
+        ["/proj/same.rs", "/proj/other.rs"]
     );
 }
 
 #[test]
-fn test_claude_is_meta_skipped() {
-    let tmp = write_jsonl(&[
-        r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        r#"{"type":"user","message":{"role":"user","content":"real message"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    ]);
-    let result = parse_claude_session(tmp.path()).unwrap().unwrap();
-    assert_eq!(result.messages.len(), 1);
-    assert_eq!(result.messages[0].text, "real message");
-}
-
-#[test]
-fn provenance_requires_boolean_message_metadata_or_the_exact_subagent_layout() {
-    use serde_json::json;
-    use std::fs;
-    let root = tempfile::tempdir().unwrap();
+fn a_boolean_sidechain_flag_on_a_turn_or_the_subagent_layout_marks_the_session_automated() {
     let parent = "01234567-89ab-cdef-0123-456789abcdef";
-    for (relative, record, expected) in [
-        (
-            "session.jsonl".to_owned(),
-            json!({"type":"user","isSidechain":true,"message":{"content":"help"}}),
-            true,
-        ),
-        (
-            "session.jsonl".to_owned(),
-            json!({"type":"assistant","isSidechain":true,"message":{"content":[]}}),
-            true,
-        ),
-        (
-            "session.jsonl".to_owned(),
-            json!({"type":"user","isSidechain":"true","message":{"content":"help"}}),
-            false,
-        ),
-        (
-            "session.jsonl".to_owned(),
-            json!({"type":"summary","isSidechain":true}),
-            false,
-        ),
-        (
-            "session.jsonl".to_owned(),
-            json!({"type":"user","agentId":"agent-a","message":{"content":"Explain {\"isSidechain\":true}"}}),
-            false,
-        ),
-        (
-            format!("{parent}/subagents/agent-a.jsonl"),
-            json!({"type":"user","sessionId":parent,"message":{"content":"help"}}),
-            true,
-        ),
-        (
-            format!("{parent}/subagents/agent-a.jsonl"),
-            json!({"type":"user","sessionId":"other","message":{"content":"help"}}),
-            false,
-        ),
-        (
-            "subagents/agent-a.jsonl".to_owned(),
-            json!({"type":"user"}),
-            false,
-        ),
-        (
-            "project/subagents/agent-a.jsonl".to_owned(),
-            json!({"type":"user"}),
-            false,
-        ),
-        ("agent-a.jsonl".to_owned(), json!({"type":"user"}), false),
-        (
-            format!("{parent}/subagents/session.jsonl"),
-            json!({"type":"user"}),
-            false,
-        ),
-        (
-            format!("{parent}/subagents/agent-.jsonl"),
-            json!({"type":"user"}),
-            false,
-        ),
-        (
-            "session.jsonl".to_owned(),
-            json!({"role":"user","sessionId":"unrelated","isSidechain":true,"content":"human question"}),
-            false,
-        ),
-    ] {
-        let path = root.path().join(&relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, record.to_string()).unwrap();
-        let parsed = parse_claude_session(&path).unwrap().unwrap();
-        assert_eq!(parsed.origin.automated, expected, "{relative}: {record}");
-    }
+    assert!(automated_at(
+        "session.jsonl",
+        &json!({"type": "user", "isSidechain": true, "message": {"content": "help"}})
+    ));
+    assert!(automated_at(
+        "session.jsonl",
+        &json!({"type": "assistant", "isSidechain": true, "message": {"content": []}})
+    ));
+    assert!(automated_at(
+        &format!("{parent}/subagents/agent-a.jsonl"),
+        &json!({"type": "user", "sessionId": parent, "message": {"content": "help"}})
+    ));
 }
 
 #[test]
-fn legacy_agent_provenance_matches_the_filename_and_one_parent() {
-    use serde_json::json;
-    use std::fs;
+fn other_sidechain_values_and_near_miss_layouts_fail_open_as_human() {
+    let parent = "01234567-89ab-cdef-0123-456789abcdef";
+    assert!(!automated_at(
+        "session.jsonl",
+        &json!({"type": "user", "isSidechain": "true", "message": {"content": "help"}})
+    ));
+    assert!(!automated_at(
+        "session.jsonl",
+        &json!({"type": "summary", "isSidechain": true})
+    ));
+    assert!(!automated_at(
+        "session.jsonl",
+        &json!({"type": "user", "agentId": "agent-a", "message": {"content": "Explain {\"isSidechain\":true}"}})
+    ));
+    assert!(!automated_at(
+        "session.jsonl",
+        &json!({"role": "user", "sessionId": "unrelated", "isSidechain": true, "content": "human question"})
+    ));
+    assert!(!automated_at(
+        &format!("{parent}/subagents/agent-a.jsonl"),
+        &json!({"type": "user", "sessionId": "other", "message": {"content": "help"}})
+    ));
+    assert!(!automated_at(
+        "subagents/agent-a.jsonl",
+        &json!({"type": "user"})
+    ));
+    assert!(!automated_at(
+        "project/subagents/agent-a.jsonl",
+        &json!({"type": "user"})
+    ));
+    assert!(!automated_at("agent-a.jsonl", &json!({"type": "user"})));
+    assert!(!automated_at(
+        &format!("{parent}/subagents/session.jsonl"),
+        &json!({"type": "user"})
+    ));
+    assert!(!automated_at(
+        &format!("{parent}/subagents/agent-.jsonl"),
+        &json!({"type": "user"})
+    ));
+}
 
+const AGENT_TURN: &str = r#"{"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}}"#;
+const AGENT_ANSWER: &str = r#"{"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"role":"assistant","message":{"content":"The sample looks correct."}}"#;
+
+#[test]
+fn a_legacy_agent_log_is_automated_when_its_name_and_records_agree() {
     let root = tempfile::tempdir().unwrap();
-    let user = json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}});
-    let mut assistant = user.clone();
-    assistant.as_object_mut().unwrap().remove("type");
-    assistant["role"] = json!("assistant");
-    assistant["message"]["content"] = json!("The sample looks correct.");
-    for (relative, contents, count) in [
-        ("agent-example.jsonl", user.to_string(), 1),
-        (
-            "project/subagents/agent-example.jsonl",
-            format!("{user}\n{assistant}\n"),
-            2,
-        ),
-    ] {
-        let path = root.path().join(relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, contents).unwrap();
-        let parsed = parse_claude_session(&path).unwrap().unwrap();
-        assert!(parsed.origin.automated, "{relative}");
-        assert!(!parsed.origin.identity_conflict);
-        assert_eq!(parsed.metadata.session_id, "agent-example");
-        assert_eq!(parsed.messages.len(), count);
-    }
+    let alone = root.path().join("agent-example.jsonl");
+    let nested = root.path().join("project/subagents/agent-example.jsonl");
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    fs::write(&alone, AGENT_TURN).unwrap();
+    fs::write(&nested, format!("{AGENT_TURN}\n{AGENT_ANSWER}\n")).unwrap();
+
+    let alone = parse_claude_session(&alone).unwrap().unwrap();
+    let nested = parse_claude_session(&nested).unwrap().unwrap();
+
+    assert_eq!(
+        (alone.origin.automated, alone.origin.identity_conflict),
+        (true, false)
+    );
+    assert_eq!(alone.metadata.session_id, "agent-example");
+    assert_eq!(alone.messages.len(), 1);
+    assert_eq!(
+        (nested.origin.automated, nested.origin.identity_conflict),
+        (true, false)
+    );
+    assert_eq!(nested.metadata.session_id, "agent-example");
+    assert_eq!(nested.messages.len(), 2);
 }
 
 #[test]
 fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
-    use serde_json::json;
-    use std::fs;
-
     let root = tempfile::tempdir().unwrap();
     let valid = json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}});
     let mut invalid_records = Vec::new();
@@ -298,13 +318,8 @@ fn mixed_record_shapes_preserve_role_precedence_and_boolean_metadata() {
         r#"{"type":"user","isMeta":true,"cwd":"/ignored","timestamp":1,"message":"meta"}"#,
     ]);
     let parsed = parse_claude_session(tmp.path()).unwrap().unwrap();
-    let messages: Vec<_> = parsed
-        .messages
-        .iter()
-        .map(|m| (m.role, m.text.as_str()))
-        .collect();
     assert_eq!(
-        messages,
+        turns(&parsed),
         [
             (Role::User, "question"),
             (Role::User, "follow-up"),
@@ -317,12 +332,4 @@ fn mixed_record_shapes_preserve_role_precedence_and_boolean_metadata() {
     assert!(parsed.origin.has_records);
     assert!(!parsed.origin.automated);
     assert!(parsed.diagnostics.is_empty());
-}
-
-fn parse_claude_session(path: &Path) -> Result<Option<ParseResult>> {
-    let parsed = super::parse_claude_session(path)?;
-    if let Some(full) = &parsed {
-        assert_classification_matches(path, Source::Claude, full);
-    }
-    Ok(parsed)
 }
