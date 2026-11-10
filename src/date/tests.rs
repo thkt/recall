@@ -1,47 +1,42 @@
 use super::*;
 
 #[test]
-fn test_epoch() {
+fn days_since_the_unix_epoch_convert_to_calendar_dates_and_back() {
     assert_eq!(civil_from_days(0), (1970, 1, 1));
+    assert_eq!(civil_from_days(1), (1970, 1, 2));
+    assert_eq!(civil_from_days(365), (1971, 1, 1));
+    assert_eq!(civil_from_days(10_000), (1997, 5, 19));
+    assert_eq!(civil_from_days(19_783), (2024, 3, 1));
+    assert_eq!(civil_from_days(20_000), (2024, 10, 4));
+
     assert_eq!(days_from_civil(1970, 1, 1), Some(0));
+    assert_eq!(days_from_civil(1971, 1, 1), Some(365));
+    assert_eq!(days_from_civil(2024, 3, 1), Some(19_783));
+    assert_eq!(days_from_civil(2024, 10, 4), Some(20_000));
 }
 
 #[test]
-fn test_known_date() {
-    assert_eq!(civil_from_days(19783), (2024, 3, 1));
-    assert_eq!(days_from_civil(2024, 3, 1), Some(19783));
+fn dates_before_the_unix_epoch_have_negative_day_counts() {
+    assert_eq!(civil_from_days(-1), (1969, 12, 31));
+    assert_eq!(days_from_civil(1969, 12, 31), Some(-1));
+    assert_eq!(civil_from_days(-719_468), (0, 3, 1));
+    assert_eq!(days_from_civil(0, 3, 1), Some(-719_468));
 }
 
 #[test]
-fn test_roundtrip() {
-    for days in [0, 1, 365, 10000, 19783, 20000, -1, -719468] {
-        let (y, m, d) = civil_from_days(days);
-        assert_eq!(
-            days_from_civil(y, m, d),
-            Some(days),
-            "roundtrip failed for day {days}"
-        );
-    }
+fn a_leap_day_exists_only_in_leap_years() {
+    assert_eq!(days_from_civil(2024, 2, 29), Some(19_782));
+    assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    assert_eq!(days_from_civil(2023, 2, 29), None);
+    assert_eq!(days_from_civil(2024, 2, 30), None);
 }
 
 #[test]
-fn test_leap_year() {
-    let days = days_from_civil(2024, 2, 29).unwrap();
-    assert_eq!(civil_from_days(days), (2024, 2, 29));
-}
-
-#[test]
-fn test_invalid_month_day() {
+fn months_and_days_outside_the_calendar_are_rejected() {
     assert_eq!(days_from_civil(2024, 0, 1), None);
     assert_eq!(days_from_civil(2024, 13, 1), None);
     assert_eq!(days_from_civil(2024, 1, 0), None);
     assert_eq!(days_from_civil(2024, 1, 32), None);
-}
-
-#[test]
-fn test_invalid_day_per_month() {
-    assert_eq!(days_from_civil(2023, 2, 29), None);
-    assert_eq!(days_from_civil(2024, 2, 30), None);
     assert_eq!(days_from_civil(2024, 4, 31), None);
     assert_eq!(days_from_civil(2024, 6, 31), None);
     assert_eq!(days_from_civil(2024, 9, 31), None);

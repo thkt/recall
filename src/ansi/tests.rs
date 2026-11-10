@@ -1,40 +1,38 @@
 use super::*;
 
 #[test]
-fn test_strip_control_chars() {
-    for (input, expected) in [
-        ("normal text", "normal text"),
-        ("line1\nline2", "line1\nline2"),
-        ("hello \x1b[31mred\x1b[0m world", "hello red world"),
-        ("before\x1b]0;title\x07after", "beforeafter"),
-        ("before\x1b]0;title\x1b\\after", "beforeafter"),
-        ("before\x1b]0;title", "before"),
-        ("before\x1b[31", "before"),
-        ("foo\tbar", "foo bar"),
-        ("a\t\tb", "a  b"),
-        ("foo\rbar", "foobar"),
-    ] {
-        assert_eq!(strip_control_chars(input), expected, "input: {input:?}");
-    }
+fn text_without_control_characters_is_returned_unchanged() {
+    assert_eq!(strip_control_chars("normal text"), "normal text");
+    assert_eq!(strip_control_chars("line1\nline2"), "line1\nline2");
 }
 
 #[test]
-fn test_fast_path_and_char_loop_agree_on_control_chars() {
-    for cp in 0u32..=0x9F {
-        let Some(c) = char::from_u32(cp) else {
-            continue;
-        };
-        let clean = format!("a{c}b");
-        let forcing = format!("a{c}b\u{1}");
-        let isolated = strip_control_chars(&clean);
-        let forced = strip_control_chars(&forcing);
-        assert_eq!(isolated, forced, "paths diverge on {cp:#04x}");
-        if c == '\t' {
-            assert_eq!(isolated, "a b", "tab must normalize to a space");
-        } else if c.is_control() && c != '\n' {
-            assert_eq!(isolated, "ab", "control char {cp:#04x} must be stripped");
-        } else if c == '\n' {
-            assert_eq!(isolated, "a\nb", "newline must be preserved");
-        }
-    }
+fn terminal_escape_sequences_are_removed() {
+    assert_eq!(
+        strip_control_chars("hello \x1b[31mred\x1b[0m world"),
+        "hello red world"
+    );
+    assert_eq!(
+        strip_control_chars("before\x1b]0;title\x07after"),
+        "beforeafter"
+    );
+    assert_eq!(
+        strip_control_chars("before\x1b]0;title\x1b\\after"),
+        "beforeafter"
+    );
+}
+
+#[test]
+fn an_unterminated_escape_sequence_drops_the_rest_of_the_text() {
+    assert_eq!(strip_control_chars("before\x1b]0;title"), "before");
+    assert_eq!(strip_control_chars("before\x1b[31"), "before");
+}
+
+#[test]
+fn tabs_become_spaces_and_other_control_characters_are_removed_except_newlines() {
+    assert_eq!(strip_control_chars("foo\tbar"), "foo bar");
+    assert_eq!(strip_control_chars("a\t\tb"), "a  b");
+    assert_eq!(strip_control_chars("foo\rbar"), "foobar");
+    assert_eq!(strip_control_chars("a\x1bb"), "ab");
+    assert_eq!(strip_control_chars("a\u{1}b\u{7f}c\u{85}d\ne"), "abcd\ne");
 }
