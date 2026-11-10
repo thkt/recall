@@ -59,7 +59,7 @@ Eight tests in src/search/tests.rs cover the rule, the gate and the cap, each th
 - `a_quoted_cjk_span_is_not_split_into_separate_terms` checks that a quoted span stays verbatim: `"日本語ドキュメント"` does not reach a message holding `日本語` and `ドキュメント` apart.
 - `a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query` checks end-to-end #167 recall across Latin, Han and Katakana runs, plus parity with the spaced form.
 - `a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with_its_parts` checks that the gate keeps raw-phrase recall for `校正する`. Its split form expands to 16 × 16 = 256 combinations, so the test detects a missing gate only while `MAX_COMBINATIONS` stays below 256.
-- `a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session` checks the gate on `うーん`, whose split form expands to 6 × 6 × 5 = 180 combinations. Without the gate, the search finds nothing at a cap of 100 and also finds a decoy at 256.
+- `a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session` checks the gate on `うーん`, whose split form expands to 6 × 6 × 5 = 180 combinations. Without the gate, the search finds nothing while the cap is below 180 and also finds a decoy at 180 or more.
 - `a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone` checks the cap itself: `Rust校正する` overflows it, so only the anchor `Rust` is searched. The test fails if `MAX_COMBINATIONS` reaches 256 or the overflow check is removed.
 
 ## More Information
@@ -75,6 +75,6 @@ Eight tests in src/search/tests.rs cover the rule, the gate and the cap, each th
 
 The segmentation and the min-anchor gate above apply to plain queries only. A query containing an uppercase `AND`, `OR` or `NOT` outside quotes takes a separate path that skips both, as recorded in [DR 0015](0015-search-uppercase-fts5-operators-on-a-separate-path.md).
 
-The cap moved from amici's `MAX_COMBOS` into this crate as `MAX_COMBINATIONS` in src/compat.rs, still 100. In Context, Decision Drivers, Decision Outcome and Consequences, read each `MAX_COMBOS` as `MAX_COMBINATIONS`. Read each amici/src/storage/fts.rs path as src/compat.rs, where `clean_for_trigram` now lives. The search.rs line numbers in those sections are from the decision date. The code they cite is now in `classify_script`, `segment_script_boundaries` and `keyword_query` in src/search.rs.
+The cap moved from amici's `MAX_COMBOS` into this crate as `MAX_COMBINATIONS` in src/compat.rs. In Context, Decision Drivers, Decision Outcome and Consequences, read each `MAX_COMBOS` as `MAX_COMBINATIONS`. Read each amici/src/storage/fts.rs path as src/compat.rs, where `clean_for_trigram` now lives. The fts.rs line numbers do not carry over. amici's `fixed_only()` has no counterpart by name: on overflow, `clean_for_trigram` skips every OR-group and keeps only the fixed terms. The search.rs line numbers in those sections are from the decision date. The code they cite is now in `classify_script`, `segment_script_boundaries` and `keyword_query` in src/search.rs.
 
 The Bad consequence that nothing tool-enforces the link to the cap no longer holds. `a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone` fails if the cap reaches 256, the value at which the `校正する` gate test stops detecting a missing gate.
