@@ -566,18 +566,23 @@ fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() 
 
 #[test]
 fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order() {
-    // "z" is found only by text and "a" only by vector, each ranked first in
-    // its search, so their fused scores are equal.
+    // t1..t3 are found only by text and v1..v3 only by vector. Each search
+    // ranks its three sessions in id order, so t1 and v1, t2 and v2, and t3
+    // and v3 fuse to the same score.
     let (_dir, conn) = setup_test_db();
-    insert_session(&conn, "z", "claude", "/proj", NOW_MS);
-    insert_message(&conn, "z", "user", "authentication flow");
-    insert_session(&conn, "a", "claude", "/proj", NOW_MS);
-    insert_message(&conn, "a", "user", "unrelated weather topic");
-    insert_chunk(&conn, 1, "a", "authentication");
+    for sid in ["t1", "t2", "t3"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+    for (chunk_id, sid) in [(1, "v1"), (2, "v2"), (3, "v3")] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "unrelated weather topic");
+        insert_chunk(&conn, chunk_id, sid, "authentication");
+    }
 
     assert_eq!(
         hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
-        ["a", "z"]
+        ["t1", "v1", "t2", "v2", "t3", "v3"]
     );
 }
 
