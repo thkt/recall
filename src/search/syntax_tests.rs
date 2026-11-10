@@ -215,3 +215,58 @@ fn a_not_with_nothing_before_it_is_rejected_as_a_query_syntax_error() {
         crate::error::ErrorCode::DataError
     );
 }
+
+fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str) {
+    conn.execute(
+        "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![chunk_id, sid, content, TS],
+    )
+    .unwrap();
+    let embedding = crate::embedder::MockEmbedder::deterministic_vector(content);
+    conn.execute(
+        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+        rusqlite::params![chunk_id, f32_as_bytes(&embedding)],
+    )
+    .unwrap();
+}
+
+fn hybrid_matched_sessions(conn: &Connection, query: &str) -> Vec<String> {
+    let embedder = crate::embedder::MockEmbedder::new();
+    let opts = SearchOptions {
+        now_ms: Some(TS),
+        ..Default::default()
+    };
+    let mut ids: Vec<String> = search_with_embedder(conn, query, &opts, Some(&embedder))
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|r| r.session.session_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn a_session_found_only_by_the_vector_search_is_dropped_when_it_matches_the_word_after_not() {
+    let (_dir, conn) = db_with_messages(&[
+        ("text-hit", "alpha release notes"),
+        ("vec-with-beta", "beta tag notes"),
+    ]);
+    add_embedded_chunk(&conn, 1, "vec-with-beta", "beta tag notes");
+
+    assert_eq!(hybrid_matched_sessions(&conn, "alpha NOT beta"), ["text-hit"]);
+}
+
+#[test]
+fn a_session_found_only_by_the_vector_search_stays_when_it_does_not_match_the_word_after_not() {
+    let (_dir, conn) = db_with_messages(&[
+        ("text-hit", "alpha release notes"),
+        ("vec-without-beta", "gamma tag notes"),
+    ]);
+    add_embedded_chunk(&conn, 1, "vec-without-beta", "gamma tag notes");
+
+    assert_eq!(
+        hybrid_matched_sessions(&conn, "alpha NOT beta"),
+        ["text-hit", "vec-without-beta"]
+    );
+}
