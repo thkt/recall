@@ -61,3 +61,7 @@ Four tests in src/search/tests.rs cover the rule and the gate, each through `sea
 - A way is found to recover all-short no-space queries without `MAX_COMBOS` overflow: the gate currently declines to segment them (no ≥3-char token), keeping the raw query, so a dropped-particle all-short query like `校正する` against indexed `校正をする` still misses — a residual #167-class miss the gate trades for overflow safety, not a solved case
 - A pure single-script CJK segmenter (dictionary or model) is adopted: the script-boundary-only rule becomes a subset, and the no-anchor fallback for compounds like `機械学習日本語処理` can be revisited
 - The prolonged-sound-mark stranding class of bug recurs (ー/U+30FC classifies as Katakana, splitting うーん into sub-trigram runs): currently absorbed by the same no-anchor fallback (`a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session`), but a recurrence under a different script edge would signal the gate is masking, not fixing, a classification gap rather than the intended #167 recall win
+
+### Scope Note
+
+The segmentation and the min-anchor gate above apply to plain queries only. A query containing an uppercase `AND`, `OR` or `NOT` outside quotes takes a separate path that skips both, as recorded in [DR 0015](0015-search-uppercase-fts5-operators-on-a-separate-path.md).
