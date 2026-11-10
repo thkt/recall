@@ -52,7 +52,9 @@ impl RecallError {
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             Self::Usage(_) => ErrorCode::UsageError,
-            Self::DataError(_) | Self::QuerySyntax(_) | Self::DatabaseRead(_) => ErrorCode::DataError,
+            Self::DataError(_) | Self::QuerySyntax(_) | Self::DatabaseRead(_) => {
+                ErrorCode::DataError
+            }
             Self::Internal(_) => ErrorCode::Internal,
             Self::TempFailure(_) => ErrorCode::TempFailure,
         }
@@ -68,14 +70,14 @@ impl RecallError {
                 "See `recall --help`; if the index is missing, run `recall index` first."
                     .to_owned(),
             ),
-            Self::DataError(_) => Some(
-                "Revise the query: drop bare AND/OR/NOT operators and recheck the syntax."
+            Self::QuerySyntax(_) => Some(
+                "Supported query syntax: words, \"quoted phrases\", uppercase AND / OR / NOT between terms, and parentheses for grouping. NOT needs a left term of at least 3 characters."
                     .to_owned(),
             ),
             Self::TempFailure(_) => {
                 Some("Retry the command; the failure may be transient.".to_owned())
             }
-            Self::QuerySyntax(_) | Self::Internal(_) | Self::DatabaseRead(_) => None,
+            Self::DataError(_) | Self::Internal(_) | Self::DatabaseRead(_) => None,
         };
         ErrorEnvelope {
             error: ErrorPayload {
