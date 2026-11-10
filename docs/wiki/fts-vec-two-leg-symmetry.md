@@ -28,4 +28,4 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 - #357 全文・ベクトル・ファイル一覧のフィルターを共通の入口から適用するよう整理し、ベクトル単独の順位を確かめる回帰テストを足した
 - #376 automated 除外件数の絞り込みを `append_search_filters` で検索本体と揃え、ベクトルだけで一致するセッションを数えない非対称を Review focus に挙げた
 - [research:session-provenance-classification.md](../research/session-provenance-classification.md) 共有フィルターの維持を完了条件にし、このページを参照した
-- 現行コード: `src/search.rs` の `append_search_filters` (全フィルタの適用)、`build_fts_candidate_query` / `vec_search` / `file_list_outcome` (3 経路からの呼び出し)、`src/search/tests.rs` の `combined_filters_apply_to_fts_hybrid_and_file_list` と `assert_filter_symmetric` を用いたテスト (対称性固定)
+- 現行コード: `src/search.rs` の `append_search_filters` (全フィルタの適用)、`build_fts_candidate_query` / `vec_search` / `file_list_outcome` (3 経路からの呼び出し)、`src/search/tests.rs` の `combined_filters_apply_to_text_search` / `combined_filters_apply_to_hybrid_search` / `combined_filters_apply_to_the_file_list` (同じ fixture を 3 経路それぞれで検索) と `assert_filter_symmetric` を用いたテスト (対称性固定)
