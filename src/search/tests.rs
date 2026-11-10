@@ -563,14 +563,20 @@ fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
 #[test]
 fn a_session_without_a_timestamp_ranks_below_an_equally_matching_dated_one() {
     let (_dir, conn) = setup_test_db();
-    insert_undated_session(&conn, "undated");
-    insert_message(&conn, "undated", "user", "authentication flow");
-    insert_session(&conn, "dated", "claude", "/proj", NOW_MS - 30 * MS_PER_DAY);
-    insert_message(&conn, "dated", "user", "authentication flow");
+    insert_undated_session(&conn, "a-undated");
+    insert_message(&conn, "a-undated", "user", "authentication flow");
+    insert_session(
+        &conn,
+        "z-dated",
+        "claude",
+        "/proj",
+        NOW_MS - 365 * MS_PER_DAY,
+    );
+    insert_message(&conn, "z-dated", "user", "authentication flow");
 
     let results = search(&conn, "authentication", &at_now()).unwrap();
 
-    assert_eq!(ids(&results), ["dated", "undated"]);
+    assert_eq!(ids(&results), ["z-dated", "a-undated"]);
 }
 
 #[test]
