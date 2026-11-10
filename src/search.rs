@@ -471,7 +471,7 @@ fn vec_search(
     );
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_search_filters(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
-    sql.push_str(" GROUP BY c.session_id ORDER BY d");
+    sql.push_str(" GROUP BY c.session_id ORDER BY d, c.session_id");
 
     let limit_i64 = limit as i64;
     let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());

@@ -48,7 +48,7 @@ No single test asserts cross-path sign equality. Each path is covered on its own
 
 Each test pins one path's direction, and none runs both paths on one fixture to check that they agree. This ADR's invariant therefore still lacks a real confirmation. One would be a unit test that drives both paths over identical timestamped candidates and asserts newer-first in each. Another would be a release-active assertion on each path's base-score sign.
 
-Both paths break an exact score tie by session id. The hybrid path does it in `rrf_merge_sessions`, and the FTS path in `score_and_sort` and its candidate query. T-119b depends on the FTS tie-break when the blend is removed. `sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order` fails if either FTS tie-break is reversed. It still passes with both removed, because the bundled SQLite already returns tied groups in session id order.
+Both paths break an exact score tie by session id. The hybrid path does it in `rrf_merge_sessions`, and the FTS path in `score_and_sort` and its candidate query. T-119b depends on the FTS tie-break when the blend is removed. `sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order` fails if either FTS tie-break is reversed. It still passes with both removed, because the bundled SQLite already returns tied groups in session id order. The vector leg of the hybrid path lists equally distant sessions in session id order too, so their fused ranks follow that order. `sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order` fails if that order is reversed.
 
 ## More Information
 

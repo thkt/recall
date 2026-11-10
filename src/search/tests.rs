@@ -550,6 +550,21 @@ fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order()
 }
 
 #[test]
+fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() {
+    let (_dir, conn) = setup_test_db();
+    for (chunk_id, sid) in [(1, "m"), (2, "z"), (3, "a"), (4, "q")] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "unrelated weather topic");
+        insert_chunk(&conn, chunk_id, sid, "authentication");
+    }
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["a", "m", "q", "z"]
+    );
+}
+
+#[test]
 fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
     let (_dir, conn) = setup_test_db();
     seed_new_session_ranked_third_by_text(&conn);
