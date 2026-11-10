@@ -114,3 +114,43 @@ fn an_unclosed_quote_finds_the_message_containing_the_quoted_word() {
 
     assert_eq!(matched_sessions(&conn, "\"tokio"), ["quoted"]);
 }
+
+#[test]
+fn an_explicit_and_between_two_words_finds_the_message_containing_both() {
+    let (_dir, conn) = db_with_messages(&[
+        ("both", "alpha release with beta tag"),
+        ("alpha-only", "alpha release without the other"),
+        ("beta-only", "beta tag without the other"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "alpha AND beta"), ["both"]);
+}
+
+#[test]
+fn an_or_finds_a_message_containing_either_word() {
+    let (_dir, conn) = db_with_messages(&[
+        ("alpha-only", "alpha release notes"),
+        ("beta-only", "beta tag notes"),
+        ("neither", "gamma release notes"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "alpha OR beta"),
+        ["alpha-only", "beta-only"]
+    );
+}
+
+#[test]
+fn parentheses_group_an_or_before_the_and_that_follows_it() {
+    let (_dir, conn) = db_with_messages(&[
+        ("alpha-gamma", "alpha with gamma"),
+        ("beta-gamma", "beta with gamma"),
+        ("alpha-beta", "alpha with beta"),
+        ("gamma-only", "gamma on its own"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "(alpha OR beta) AND gamma"),
+        ["alpha-gamma", "beta-gamma"]
+    );
+}
