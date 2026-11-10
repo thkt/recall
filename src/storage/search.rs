@@ -4,21 +4,85 @@ use rusqlite::Connection;
 
 use super::query_normalize::{QueryNormalizationConfig, normalize_for_fts};
 
-fn strip_near_groups(query: &str) -> Vec<&str> {
+/// A quoted phrase or a bare word of a query. A phrase runs from a quote to the
+/// next quote, or to the end of the query when the quote is unclosed, and its
+/// text excludes the quotes.
+#[derive(Debug, Clone, Copy)]
+enum Piece<'a> {
+    Phrase(&'a str),
+    Word(&'a str),
+}
+
+/// Splits a query at whitespace outside quotes into tokens, each the phrases
+/// and words written with nothing between them. A word ends at whitespace or a
+/// quote; a char for which `stands_alone` is true also ends a word and becomes
+/// a one-char word of its own. The plain sanitizer, the short-term expansion
+/// and the operator tokenizer all read phrases through this function, so they
+/// agree on where a phrase starts and ends.
+fn scan_tokens(query: &str, stands_alone: fn(char) -> bool) -> Vec<Vec<Piece<'_>>> {
+    let mut tokens: Vec<Vec<Piece<'_>>> = Vec::new();
+    let mut rest = query;
+    loop {
+        let trimmed = rest.trim_start();
+        let attached = trimmed.len() == rest.len();
+        rest = trimmed;
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        let piece = if let Some(after_quote) = rest.strip_prefix('"') {
+            let end = after_quote.find('"').unwrap_or(after_quote.len());
+            rest = after_quote.get(end + 1..).unwrap_or("");
+            Piece::Phrase(&after_quote[..end])
+        } else {
+            let end = if stands_alone(c) {
+                c.len_utf8()
+            } else {
+                rest.find(|c: char| c.is_whitespace() || c == '"' || stands_alone(c))
+                    .unwrap_or(rest.len())
+            };
+            let word = &rest[..end];
+            rest = &rest[end..];
+            Piece::Word(word)
+        };
+        match tokens.last_mut() {
+            Some(token) if attached => token.push(piece),
+            _ => tokens.push(vec![piece]),
+        }
+    }
+    tokens
+}
+
+fn count_in_words(token: &[Piece<'_>], paren: char) -> usize {
+    token
+        .iter()
+        .map(|piece| match piece {
+            Piece::Word(word) => word.matches(paren).count(),
+            Piece::Phrase(_) => 0,
+        })
+        .sum()
+}
+
+fn strip_near_groups(query: &str) -> Vec<Vec<Piece<'_>>> {
     let mut tokens = Vec::new();
     let mut paren_depth: usize = 0;
-    for w in query.split_whitespace() {
-        let upper = w.to_ascii_uppercase();
-        if upper.starts_with("NEAR(") || upper.starts_with("NEAR/") {
-            paren_depth += w.chars().filter(|&c| c == '(').count();
-            paren_depth = paren_depth.saturating_sub(w.chars().filter(|&c| c == ')').count());
+    for token in scan_tokens(query, |_| false) {
+        let opens_near = match token.first() {
+            Some(Piece::Word(w)) => {
+                let upper = w.to_ascii_uppercase();
+                upper.starts_with("NEAR(") || upper.starts_with("NEAR/")
+            }
+            _ => false,
+        };
+        if opens_near {
+            paren_depth += count_in_words(&token, '(');
+            paren_depth = paren_depth.saturating_sub(count_in_words(&token, ')'));
             continue;
         }
         if paren_depth > 0 {
-            paren_depth = paren_depth.saturating_sub(w.chars().filter(|&c| c == ')').count());
+            paren_depth = paren_depth.saturating_sub(count_in_words(&token, ')'));
             continue;
         }
-        tokens.push(w);
+        tokens.push(token);
     }
     tokens
 }
@@ -81,38 +145,55 @@ pub(crate) fn sanitize_fts_query(query: &str) -> Result<SanitizedFtsQuery, Sanit
     if query.trim().is_empty() {
         return Err(SanitizeError::EmptyInput);
     }
-    let mut in_phrase = false;
     let tokens: Vec<String> = strip_near_groups(query)
-        .into_iter()
-        .map(|w| {
-            let was_in_phrase = in_phrase;
-            if w.matches('"').count() % 2 == 1 {
-                in_phrase = !in_phrase;
-            }
-            if was_in_phrase {
-                return w.to_owned();
-            }
-            let stripped = w.trim_start_matches(['^', '+', '-']);
-            let cleaned = stripped.trim_matches(['(', ')']);
-            if (cleaned.contains(':') || cleaned.contains('-')) && !cleaned.starts_with('"') {
-                let unquoted = cleaned.replace('"', "");
-                format!("\"{unquoted}\"")
-            } else {
-                cleaned.to_owned()
-            }
-        })
+        .iter()
+        .map(|token| clean_token(token))
         .filter(|w| !w.is_empty())
         .collect();
     let result = drop_dangling_operators(&tokens).join(" ");
     if result.is_empty() {
         return Err(SanitizeError::NoSearchableTerms);
     }
-    let quote_count = result.chars().filter(|&c| c == '"').count();
-    if quote_count % 2 != 0 {
-        Ok(SanitizedFtsQuery(format!("{result}\"")))
-    } else {
-        Ok(SanitizedFtsQuery(result))
+    Ok(SanitizedFtsQuery(result))
+}
+
+/// A lone word loses its `^` / `+` / `-` prefix and its outer parentheses. It is
+/// quoted when it holds `:` or `-`. A token holding a phrase keeps the phrase
+/// verbatim and closed, and only the words at its edges lose the prefix and
+/// parentheses. Such a token is never an operator, so `drop_dangling_operators`
+/// leaves the and / or / not words inside a phrase in place.
+fn clean_token(token: &[Piece<'_>]) -> String {
+    if let [Piece::Word(word)] = token {
+        let cleaned = word
+            .trim_start_matches(['^', '+', '-'])
+            .trim_matches(['(', ')']);
+        return if cleaned.contains([':', '-']) {
+            format!("\"{cleaned}\"")
+        } else {
+            cleaned.to_owned()
+        };
     }
+    let last = token.len() - 1;
+    token
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| match piece {
+            Piece::Phrase(text) => format!("\"{text}\""),
+            Piece::Word(word) => {
+                let word = if i == 0 {
+                    word.trim_start_matches(['^', '+', '-', '(', ')'])
+                } else {
+                    word
+                };
+                let word = if i == last {
+                    word.trim_end_matches(['(', ')'])
+                } else {
+                    word
+                };
+                word.to_owned()
+            }
+        })
+        .collect()
 }
 
 pub fn fts_quote(s: &str) -> String {
@@ -162,49 +243,31 @@ enum Token {
 fn tokenize_operator_query(query: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut depth: usize = 0;
-    let mut rest = query.trim_start();
-    while let Some(c) = rest.chars().next() {
-        match c {
-            '(' => {
+    let pieces = scan_tokens(query, |c| matches!(c, '(' | ')'));
+    for piece in pieces.into_iter().flatten() {
+        match piece {
+            Piece::Phrase("") => {}
+            Piece::Phrase(text) => tokens.push(Token::Term(text.to_owned())),
+            Piece::Word("(") => {
                 depth += 1;
                 tokens.push(Token::Open);
-                rest = &rest[1..];
             }
-            ')' => {
+            Piece::Word(")") => {
                 if depth > 0 {
                     depth -= 1;
                     tokens.push(Token::Close);
                 }
-                rest = &rest[1..];
             }
-            '"' => {
-                let after_quote = &rest[1..];
-                let end = after_quote.find('"').unwrap_or(after_quote.len());
-                if end > 0 {
-                    tokens.push(Token::Term(after_quote[..end].to_owned()));
-                }
-                rest = after_quote.get(end + 1..).unwrap_or("");
-            }
-            _ => {
-                let end = rest
-                    .find(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '"'))
-                    .unwrap_or(rest.len());
-                let word = &rest[..end];
-                rest = &rest[end..];
-                match word {
-                    "AND" => tokens.push(Token::And),
-                    "OR" => tokens.push(Token::Or),
-                    "NOT" => tokens.push(Token::Not),
-                    _ => {
-                        let term = word.trim_start_matches(['^', '+', '-']);
-                        if !term.is_empty() {
-                            tokens.push(Token::Term(term.to_owned()));
-                        }
-                    }
+            Piece::Word("AND") => tokens.push(Token::And),
+            Piece::Word("OR") => tokens.push(Token::Or),
+            Piece::Word("NOT") => tokens.push(Token::Not),
+            Piece::Word(word) => {
+                let term = word.trim_start_matches(['^', '+', '-']);
+                if !term.is_empty() {
+                    tokens.push(Token::Term(term.to_owned()));
                 }
             }
         }
-        rest = rest.trim_start();
     }
     tokens.extend(repeat_n(Token::Close, depth));
     tokens
@@ -421,31 +484,6 @@ fn is_valid_sql_identifier(value: &str) -> bool {
     head_ok && tail_ok
 }
 
-/// Splits a sanitized query into bare words and quoted phrases, so a phrase
-/// is quoted once as a whole instead of once per word. The flag is true for a
-/// quoted phrase, whose text comes back without its quotes.
-fn split_terms(query: &str) -> Vec<(bool, &str)> {
-    let mut terms = Vec::new();
-    let mut rest = query.trim_start();
-    while !rest.is_empty() {
-        if let Some(after_quote) = rest.strip_prefix('"') {
-            let end = after_quote.find('"').unwrap_or(after_quote.len());
-            if end > 0 {
-                terms.push((true, &after_quote[..end]));
-            }
-            rest = after_quote.get(end + 1..).unwrap_or("");
-        } else {
-            let end = rest
-                .find(|c: char| c.is_whitespace() || c == '"')
-                .unwrap_or(rest.len());
-            terms.push((false, &rest[..end]));
-            rest = &rest[end..];
-        }
-        rest = rest.trim_start();
-    }
-    terms
-}
-
 pub(crate) fn fts_expand_short_terms(
     conn: &Connection,
     query: &SanitizedFtsQuery,
@@ -466,8 +504,18 @@ pub(crate) fn fts_expand_short_terms(
     };
 
     let mut parts = Vec::new();
-    for (quoted, token) in split_terms(query.as_str()) {
-        if quoted || token.chars().count() >= 3 || is_fts5_operator(token) {
+    // A phrase is quoted once as a whole instead of once per word.
+    let pieces = scan_tokens(query.as_str(), |_| false);
+    for piece in pieces.into_iter().flatten() {
+        let token = match piece {
+            Piece::Phrase("") => continue,
+            Piece::Phrase(text) => {
+                parts.push(fts_quote(text));
+                continue;
+            }
+            Piece::Word(word) => word,
+        };
+        if token.chars().count() >= 3 || is_fts5_operator(token) {
             parts.push(fts_quote(token));
             continue;
         }

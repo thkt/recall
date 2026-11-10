@@ -386,6 +386,40 @@ fn expand_quotes_a_hyphen_or_colon_term_once() {
 }
 
 #[test]
+fn expand_passes_a_phrase_with_and_or_not_words_through_verbatim() {
+    let conn = setup_fts_db();
+    let result = prepare_match_query(
+        &conn,
+        "\"to be or not to be\"",
+        "fts_chunks_vocab",
+        &no_norm(),
+    )
+    .unwrap();
+    assert_eq!(result.as_str(), "\"to be or not to be\"");
+}
+
+#[test]
+fn expand_drops_the_parentheses_around_a_phrase() {
+    let conn = setup_fts_db();
+    let result =
+        prepare_match_query(&conn, "(\"login session\")", "fts_chunks_vocab", &no_norm()).unwrap();
+    assert_eq!(result.as_str(), "\"login session\"");
+}
+
+#[test]
+fn expand_splits_a_colon_word_from_the_phrase_attached_to_it() {
+    let conn = setup_fts_db();
+    let result = prepare_match_query(
+        &conn,
+        "key:\"some value\" (foo)",
+        "fts_chunks_vocab",
+        &no_norm(),
+    )
+    .unwrap();
+    assert_eq!(result.as_str(), "\"key:\" AND \"some value\" AND \"foo\"");
+}
+
+#[test]
 fn sanitize_keeps_a_hyphen_inside_a_phrase_unquoted() {
     assert_eq!(
         sanitize_fts_query("\"foo bar-baz\" qux"),

@@ -112,6 +112,51 @@ fn a_quoted_phrase_finds_the_message_with_those_words_adjacent_and_not_one_with_
 }
 
 #[test]
+fn a_quoted_phrase_keeps_the_and_or_not_words_inside_it() {
+    let (_dir, conn) = db_with_messages(&[
+        ("hamlet", "to be or not to be, that is the question"),
+        ("repeated", "to be to be continued"),
+        ("whether", "whether or not it works today"),
+        ("whether-short", "whether it works today"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "\"to be or not to be\""),
+        ["hamlet"]
+    );
+    assert_eq!(
+        matched_sessions(&conn, "\"whether or not it works\""),
+        ["whether"]
+    );
+}
+
+#[test]
+fn a_quoted_phrase_inside_parentheses_leaves_no_parenthesis_term_behind() {
+    let (_dir, conn) = db_with_messages(&[
+        ("adjacent", "restart the connection pool before deploy"),
+        ("parens", "call init(pool) twice"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "(\"connection pool\")"),
+        ["adjacent"]
+    );
+}
+
+#[test]
+fn a_quoted_phrase_attached_to_a_colon_term_keeps_its_boundaries() {
+    let (_dir, conn) = db_with_messages(&[
+        ("some-value", "set key:\"some value\" in the foo config"),
+        ("other-value", "set key:\"other value\" in the foo config"),
+    ]);
+
+    assert_eq!(
+        matched_sessions(&conn, "key:\"some value\" (foo)"),
+        ["some-value"]
+    );
+}
+
+#[test]
 fn an_unclosed_quote_finds_the_message_containing_the_quoted_word() {
     let (_dir, conn) = db_with_messages(&[
         ("quoted", "debugging the tokio scheduler"),
