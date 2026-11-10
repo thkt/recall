@@ -180,22 +180,38 @@ fn find_candidate_sessions(
             Ok(row) => ranked.push(row),
             Err(e) => {
                 if first_error.is_none() {
-                    first_error = Some(e.to_string());
+                    first_error = Some(e);
                 }
                 skipped += 1;
             }
         }
     }
-    if let Some(ref err_msg) = first_error {
+    if let Some(err) = first_error {
         if ranked.is_empty() {
-            return Err(RecallError::QuerySyntax(format!(
-                "Invalid search query: {err_msg}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
-            ))
+            return Err(if is_fts5_query_syntax_error(&err) {
+                RecallError::QuerySyntax(format!(
+                    "Invalid search query: {err}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
+                ))
+            } else {
+                RecallError::DataError(format!("Search failed: {err}"))
+            }
             .into());
         }
-        warn!(skipped, %err_msg, "rows skipped during search");
+        warn!(skipped, %err, "rows skipped during search");
     }
     Ok((ranked, skipped))
+}
+
+/// FTS5 reports a MATCH it cannot parse as a plain `SQLITE_ERROR` whose message
+/// starts with `fts5`, such as `fts5: syntax error near` or `fts5: parser
+/// stack overflow`. Corruption also starts with `fts5:` but carries
+/// `SQLITE_CORRUPT_VTAB`, and a busy or locked database carries its own code.
+fn is_fts5_query_syntax_error(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, Some(msg))
+            if e.code == rusqlite::ErrorCode::Unknown && msg.starts_with("fts5")
+    )
 }
 
 fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> {

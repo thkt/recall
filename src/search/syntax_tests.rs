@@ -208,7 +208,11 @@ fn parentheses_group_an_or_before_the_and_that_follows_it() {
 /// The `RecallError` a rejected query fails with, in its `Debug` form so a test
 /// can compare the variant and the message as one literal.
 fn rejection(conn: &Connection, query: &str) -> String {
-    match search(conn, query, &SearchOptions::default()) {
+    rejection_with(conn, query, &SearchOptions::default())
+}
+
+fn rejection_with(conn: &Connection, query: &str, opts: &SearchOptions) -> String {
+    match search(conn, query, opts) {
         Ok(results) => panic!(
             "query {query:?} should be rejected but matched {} sessions",
             results.len()
@@ -291,6 +295,25 @@ fn a_not_chain_too_long_for_the_full_text_index_is_rejected_as_a_query_syntax_er
     assert_eq!(
         rejection(&conn, &query),
         r#"QuerySyntax("Invalid search query: fts5: parser stack overflow. Use words, \"quoted phrases\", or AND/OR/NOT operators.")"#
+    );
+}
+
+#[test]
+fn a_search_failure_that_is_not_a_query_syntax_error_stays_a_data_error() {
+    let (_dir, conn) = db_with_messages(&[]);
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES (42, 'user', 'alpha notes')",
+        [],
+    )
+    .unwrap();
+    let opts = SearchOptions {
+        include_automated: true,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        rejection_with(&conn, "alpha", &opts),
+        r#"DataError("Search failed: Invalid column type Integer at index: 0, name: session_id")"#
     );
 }
 
