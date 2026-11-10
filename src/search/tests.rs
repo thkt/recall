@@ -582,6 +582,23 @@ fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() 
 }
 
 #[test]
+fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order() {
+    // "z" is found only by text and "a" only by vector, each ranked first in
+    // its search, so their fused scores are equal.
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "z", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "z", "user", "authentication flow");
+    insert_session(&conn, "a", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "a", "user", "unrelated weather topic");
+    insert_chunk(&conn, 1, "a", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["a", "z"]
+    );
+}
+
+#[test]
 fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
     let (_dir, conn) = setup_test_db();
     seed_new_session_ranked_third_by_text(&conn);
