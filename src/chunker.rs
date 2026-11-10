@@ -1,5 +1,6 @@
 use crate::parser::{Message, Role};
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) struct QAChunk {
     pub session_id: String,
     pub content: String,
