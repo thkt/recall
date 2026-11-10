@@ -51,14 +51,23 @@ The threshold of 3 is the trigram floor: a ≥3-char run is the shortest token t
 
 ### Confirmation
 
-Six tests in src/search/tests.rs cover the rule and the gate, each through `search`. `a_no_space_query_splits_between_kanji_and_hiragana` checks that a han↔hiragana split reaches a message whose two runs are not adjacent. `a_letter_digit_token_is_matched_whole` checks the letter↔digit non-split precision guard: `sha256` does not reach a message holding `sha` and `256` apart. `a_kanji_compound_in_a_query_is_matched_whole` checks that a single-script kanji run stays whole: `Rust機械学習` does not reach a message holding `機械` and `学習` apart. `a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query` checks end-to-end #167 recall across Latin, Han and Katakana runs, plus parity with the spaced form. `a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with_its_parts` checks the anchor gate: an all-short query over a vocabulary large enough to overflow `MAX_COMBINATIONS` keeps raw-phrase recall. The cap is `MAX_COMBINATIONS` (= 100) in src/compat.rs, and no test checks it directly. `a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with_its_parts` builds a vocabulary whose split query expands to 16 × 16 = 256 combinations. That test stops detecting a missing gate if the cap is raised to 256 or more. `a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session` checks the gate on `うーん`, whose split form expands to 6 × 6 × 5 = 180 combinations. Without the gate, it finds nothing at a cap of 100 and also finds a decoy at 256. It therefore detects a missing gate at either cap value. The 校正する fixture's dependence on the cap value is a code-review constraint, not a compile-time one.
+Eight tests in src/search/tests.rs cover the rule, the gate and the cap, each through `search`.
+
+- `a_no_space_query_splits_between_kanji_and_hiragana` checks that a han↔hiragana split reaches a message whose two runs are not adjacent.
+- `a_letter_digit_token_is_matched_whole` checks the letter↔digit precision guard: `sha256` does not reach a message holding `sha` and `256` apart.
+- `a_kanji_compound_in_a_query_is_matched_whole` checks that a single-script kanji run stays whole: `Rust機械学習` does not reach a message holding `機械` and `学習` apart.
+- `a_quoted_cjk_span_is_not_split_into_separate_terms` checks that a quoted span stays verbatim: `"日本語ドキュメント"` does not reach a message holding `日本語` and `ドキュメント` apart.
+- `a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query` checks end-to-end #167 recall across Latin, Han and Katakana runs, plus parity with the spaced form.
+- `a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with_its_parts` checks that the gate keeps raw-phrase recall for `校正する`. Its split form expands to 16 × 16 = 256 combinations, so the test detects a missing gate only while `MAX_COMBINATIONS` stays below 256.
+- `a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session` checks the gate on `うーん`, whose split form expands to 6 × 6 × 5 = 180 combinations. Without the gate, the search finds nothing at a cap of 100 and also finds a decoy at 256.
+- `a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone` checks the cap itself: `Rust校正する` overflows it, so only the anchor `Rust` is searched. The test fails if `MAX_COMBINATIONS` reaches 256 or the overflow check is removed.
 
 ## More Information
 
 ### Reassessment Triggers
 
-- amici changes `MAX_COMBOS` (raises, lowers, or removes it): the ≥3-char anchor gate's framing of "a fixed term survives the cap" no longer holds and must be re-derived against the new value (amici/src/storage/fts.rs:15)
-- A way is found to recover all-short no-space queries without `MAX_COMBOS` overflow: the gate currently declines to segment them (no ≥3-char token), keeping the raw query, so a dropped-particle all-short query like `校正する` against indexed `校正をする` still misses — a residual #167-class miss the gate trades for overflow safety, not a solved case
+- `MAX_COMBINATIONS` in src/compat.rs changes (raised, lowered, or removed): the ≥3-char anchor gate's framing of "a fixed term survives the cap" no longer holds and must be re-derived against the new value
+- A way is found to recover all-short no-space queries without `MAX_COMBINATIONS` overflow: the gate currently declines to segment them (no ≥3-char token), keeping the raw query, so a dropped-particle all-short query like `校正する` against indexed `校正をする` still misses — a residual #167-class miss the gate trades for overflow safety, not a solved case
 - A pure single-script CJK segmenter (dictionary or model) is adopted: the script-boundary-only rule becomes a subset, and the no-anchor fallback for compounds like `機械学習日本語処理` can be revisited
 - The prolonged-sound-mark stranding class of bug recurs (ー/U+30FC classifies as Katakana, splitting うーん into sub-trigram runs): currently absorbed by the same no-anchor fallback (`a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session`), but a recurrence under a different script edge would signal the gate is masking, not fixing, a classification gap rather than the intended #167 recall win
 
@@ -66,4 +75,6 @@ Six tests in src/search/tests.rs cover the rule and the gate, each through `sear
 
 The segmentation and the min-anchor gate above apply to plain queries only. A query containing an uppercase `AND`, `OR` or `NOT` outside quotes takes a separate path that skips both, as recorded in [DR 0015](0015-search-uppercase-fts5-operators-on-a-separate-path.md).
 
-The combination cap the gate guards against is now `MAX_COMBINATIONS` in src/compat.rs. The amici paths cited in the sections above record where the cap lived when this DR was written.
+The cap moved from amici's `MAX_COMBOS` into this crate as `MAX_COMBINATIONS` in src/compat.rs, still 100. In Context, Decision Drivers, Decision Outcome and Consequences, read each `MAX_COMBOS` as `MAX_COMBINATIONS`. Read each amici/src/storage/fts.rs path as src/compat.rs, where `clean_for_trigram` now lives. The search.rs line numbers in those sections are from the decision date. The code they cite is now in `classify_script`, `segment_script_boundaries` and `keyword_query` in src/search.rs.
+
+The Bad consequence that nothing tool-enforces the link to the cap no longer holds. `a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone` fails if the cap reaches 256, the value at which the `校正する` gate test stops detecting a missing gate.
