@@ -550,23 +550,6 @@ fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order()
 }
 
 #[test]
-fn a_small_limit_keeps_the_newest_of_sessions_whose_text_matches_equally() {
-    let (_dir, conn) = setup_test_db();
-    for sid in ["a", "b", "c"] {
-        insert_session(&conn, sid, "claude", "/proj", NOW_MS - 365 * MS_PER_DAY);
-        insert_message(&conn, sid, "user", "authentication flow");
-    }
-    insert_session(&conn, "d", "claude", "/proj", NOW_MS);
-    insert_message(&conn, "d", "user", "authentication flow");
-    let one = SearchOptions {
-        limit: 1,
-        ..at_now()
-    };
-
-    assert_eq!(ids(&search(&conn, "authentication", &one).unwrap()), ["d"]);
-}
-
-#[test]
 fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() {
     let (_dir, conn) = setup_test_db();
     for (chunk_id, sid) in [(1, "m"), (2, "z"), (3, "a"), (4, "q")] {

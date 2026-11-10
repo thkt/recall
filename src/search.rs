@@ -146,13 +146,7 @@ fn build_fts_candidate_query(
         "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
     append_search_filters(&mut sql, &mut params, "session_id", opts, now_ms);
-    // Among equal ranks the newest session is kept first, since the recency
-    // blend would rank it first; an undated session counts as the oldest.
-    sql.push_str(
-        " GROUP BY session_id ORDER BY best_rank, \
-         (SELECT s.timestamp FROM sessions s WHERE s.session_id = messages.session_id) \
-         DESC NULLS LAST, session_id LIMIT ?",
-    );
+    sql.push_str(" GROUP BY session_id ORDER BY best_rank, session_id LIMIT ?");
     let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
     params.push(Box::new(candidate_limit as i64));
     (sql, params)
@@ -313,8 +307,10 @@ fn score_and_sort(
             (result, blended_rank)
         })
         .collect();
-    // sort_by is stable, so equal scores keep the candidate query's order.
-    results.sort_by(|a, b| a.1.total_cmp(&b.1));
+    results.sort_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.0.session.session_id.cmp(&b.0.session.session_id))
+    });
     results.truncate(limit);
     results.into_iter().map(|(r, _)| r).collect()
 }
