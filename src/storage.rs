@@ -2,7 +2,7 @@ mod query_normalize;
 mod search;
 pub use query_normalize::QueryNormalizationConfig;
 use rusqlite::ffi::{SQLITE_OK, sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
-pub use search::{MatchFtsQuery, SanitizeError, prepare_match_query};
+pub use search::{MatchFtsQuery, SanitizeError, prepare_match_query, prepare_operator_query};
 use std::{ffi::c_char, mem::transmute, sync::OnceLock};
 
 #[allow(unsafe_code)]
