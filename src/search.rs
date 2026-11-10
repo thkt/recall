@@ -600,14 +600,16 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
 /// A session found only by the vector search never went through the keyword
 /// MATCH, so it is dropped here when one of its messages matches a NOT operand.
 /// Sessions the keyword search returned already satisfy the whole expression.
+/// When the NOT query fails, every vector-only session is dropped and the
+/// function returns true, so the caller reports the vector leg as degraded.
 fn drop_vec_only_sessions_matching_not(
     conn: &Connection,
     not_operands: &[String],
     fts_ranked: &[(String, f64)],
     merged: &mut Vec<(String, f64)>,
-) -> Result<()> {
+) -> bool {
     if not_operands.is_empty() {
-        return Ok(());
+        return false;
     }
     let fts_ids: HashSet<&str> = fts_ranked.iter().map(|(sid, _)| sid.as_str()).collect();
     let vec_only: Vec<&str> = merged
@@ -616,25 +618,40 @@ fn drop_vec_only_sessions_matching_not(
         .filter(|sid| !fts_ids.contains(sid))
         .collect();
     if vec_only.is_empty() {
-        return Ok(());
+        return false;
     }
-    let operands = not_operands.join(" OR ");
+    match sessions_matching_any(conn, not_operands, &vec_only) {
+        Ok(excluded) => {
+            merged.retain(|(sid, _)| !excluded.contains(sid));
+            false
+        }
+        Err(e) => {
+            warn!(error = %e, "NOT filter on vector results failed, using text search only");
+            merged.retain(|(sid, _)| fts_ids.contains(sid.as_str()));
+            true
+        }
+    }
+}
+
+fn sessions_matching_any(
+    conn: &Connection,
+    operands: &[String],
+    session_ids: &[&str],
+) -> Result<HashSet<String>> {
+    let operands = operands.join(" OR ");
     let sql = format!(
         "SELECT DISTINCT session_id FROM messages \
          WHERE messages MATCH ? AND session_id IN ({})",
-        anon_placeholders(vec_only.len())
+        anon_placeholders(session_ids.len())
     );
     let mut params: Vec<&dyn ToSql> = vec![&operands];
-    params.extend(vec_only.iter().map(|sid| sid as &dyn ToSql));
+    params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
     let mut stmt = conn
         .prepare(&sql)
         .context("Failed to prepare NOT filter query")?;
-    let excluded: HashSet<String> = stmt
-        .query_map(params.as_slice(), |row| row.get::<_, String>(0))
+    stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))
         .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
-        .context("NOT filter query failed")?;
-    merged.retain(|(sid, _)| !excluded.contains(sid));
-    Ok(())
+        .context("NOT filter query failed")
 }
 
 /// Matches reachable only through the vector leg are not counted, so the count
@@ -765,7 +782,9 @@ pub fn search_with_embedder<'q>(
         fts_ranked.iter().map(|(sid, _)| sid.as_str()),
         vec_hits.iter().map(|(sid, _)| sid.as_str()),
     );
-    drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ranked, &mut merged)?;
+    let not_filter_failed =
+        drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ranked, &mut merged);
+    let vec_degraded = vec_degraded || not_filter_failed;
 
     if merged.is_empty() {
         return Ok(SearchOutcome {

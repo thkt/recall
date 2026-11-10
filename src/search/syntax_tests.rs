@@ -1,6 +1,9 @@
+use std::path::PathBuf;
+
 use super::*;
 use crate::db::setup_test_db;
 use crate::embedder::MockEmbedder;
+use crate::embedding::{ChunkedEmbedding, EmbedError};
 
 const TS: i64 = 1709251200000;
 
@@ -402,6 +405,56 @@ fn a_session_found_only_by_the_vector_search_stays_when_it_matches_a_not_nested_
         hybrid_matched_sessions(&conn, "alpha NOT (beta NOT gamma)"),
         ["text-hit", "vec-with-gamma"]
     );
+}
+
+/// Embeds like `MockEmbedder`, but first drops the full-text index data through a
+/// second connection. Every MATCH after the vector search then fails, while the
+/// keyword search that ran before it has its rows.
+struct IndexBreakingEmbedder {
+    db_path: PathBuf,
+}
+
+impl Embed for IndexBreakingEmbedder {
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
+        Connection::open(&self.db_path)
+            .and_then(|other| other.execute_batch("DROP TABLE messages_data"))
+            .unwrap();
+        Ok(MockEmbedder::deterministic_vector(text))
+    }
+    fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+        unreachable!("search only calls embed_query")
+    }
+    fn embed_documents_batch(&self, _texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+        unreachable!("search only calls embed_query")
+    }
+    fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
+        unreachable!("search only calls embed_query")
+    }
+}
+
+#[test]
+fn a_failed_not_filter_drops_the_vector_only_sessions_and_marks_the_vector_search_degraded() {
+    let (dir, conn) = db_with_messages(&[
+        ("text-hit", "alpha release notes"),
+        ("vec-only", "gamma tag notes"),
+    ]);
+    add_embedded_chunk(&conn, 1, "vec-only", "gamma tag notes");
+    let embedder = IndexBreakingEmbedder {
+        db_path: dir.path().join("test.db"),
+    };
+    let opts = SearchOptions {
+        now_ms: Some(TS),
+        ..Default::default()
+    };
+
+    let outcome = search_with_embedder(&conn, "alpha NOT beta", &opts, Some(&embedder)).unwrap();
+
+    let ids: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|r| r.session.session_id.as_str())
+        .collect();
+    assert_eq!((ids, outcome.vec_degraded), (vec!["text-hit"], true));
 }
 
 fn hybrid_result_count_and_embed_calls(conn: &Connection, query: &str) -> (usize, usize) {
