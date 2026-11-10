@@ -1001,7 +1001,9 @@ fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with
     // into "校正 する", the query would expand to 16 × 16 = 256 combinations,
     // over MAX_COMBINATIONS (100, src/compat.rs), and find nothing. With a cap
     // of 256 or more the split query also returns only s1, and this test passes
-    // without the gate. The next test fails at such a cap.
+    // without the gate.
+    // a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone
+    // fails at such a cap.
     seed_fifteen_words_starting_with_kousei_and_suru(&conn);
 
     let results = search(&conn, "校正する", &at_now()).unwrap();
