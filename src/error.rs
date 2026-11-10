@@ -39,6 +39,8 @@ pub(crate) enum RecallError {
     #[error("{0}")]
     DataError(String),
     #[error("{0}")]
+    QuerySyntax(String),
+    #[error("{0}")]
     DatabaseRead(String),
     #[error("{0}")]
     Internal(String),
@@ -50,7 +52,7 @@ impl RecallError {
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             Self::Usage(_) => ErrorCode::UsageError,
-            Self::DataError(_) | Self::DatabaseRead(_) => ErrorCode::DataError,
+            Self::DataError(_) | Self::QuerySyntax(_) | Self::DatabaseRead(_) => ErrorCode::DataError,
             Self::Internal(_) => ErrorCode::Internal,
             Self::TempFailure(_) => ErrorCode::TempFailure,
         }
@@ -73,7 +75,7 @@ impl RecallError {
             Self::TempFailure(_) => {
                 Some("Retry the command; the failure may be transient.".to_owned())
             }
-            Self::Internal(_) | Self::DatabaseRead(_) => None,
+            Self::QuerySyntax(_) | Self::Internal(_) | Self::DatabaseRead(_) => None,
         };
         ErrorEnvelope {
             error: ErrorPayload {

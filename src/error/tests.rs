@@ -21,13 +21,37 @@ fn a_usage_error_exits_64_and_points_at_the_help() {
 }
 
 #[test]
-fn a_rejected_query_exits_65_and_asks_to_revise_it() {
+fn a_query_syntax_error_exits_65_and_lists_the_supported_query_syntax() {
     assert_eq!(
-        reported(&RecallError::DataError("unparseable query".into()).into()),
+        reported(&RecallError::QuerySyntax("unparseable query".into()).into()),
         (
             ExitCode::from(65),
-            r#"{"error":{"code":"DATA_ERROR","message":"unparseable query","next_step":"Revise the query: drop bare AND/OR/NOT operators and recheck the syntax.","retryable":false}}"#.to_owned()
+            r#"{"error":{"code":"DATA_ERROR","message":"unparseable query","next_step":"Supported query syntax: words, \"quoted phrases\", uppercase AND / OR / NOT between terms, and parentheses for grouping. NOT needs a left term of at least 3 characters.","retryable":false}}"#.to_owned()
         )
+    );
+}
+
+#[test]
+fn a_data_error_that_is_not_about_the_query_carries_no_query_hint() {
+    let stale_schema = RecallError::DataError(
+        "database schema is out of date; run `recall rebuild` to migrate it".into(),
+    );
+    let missing_scanned_files = RecallError::DataError(
+        "`--file` needs the scanned-files index; run `recall index` once to record it.".into(),
+    );
+
+    assert_eq!(
+        [stale_schema, missing_scanned_files].map(|e| reported(&e.into())),
+        [
+            (
+                ExitCode::from(65),
+                r#"{"error":{"code":"DATA_ERROR","message":"database schema is out of date; run `recall rebuild` to migrate it","retryable":false}}"#.to_owned()
+            ),
+            (
+                ExitCode::from(65),
+                r#"{"error":{"code":"DATA_ERROR","message":"`--file` needs the scanned-files index; run `recall index` once to record it.","retryable":false}}"#.to_owned()
+            ),
+        ]
     );
 }
 
