@@ -971,8 +971,12 @@ fn segment_falls_back_to_raw_when_no_anchor_term() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
-    // These messages give "校正" and "する" fifteen more trigrams each, enough to
-    // overflow MAX_COMBOS if the query were split into "校正 する".
+    // These messages add fifteen trigrams starting with "校正" and fifteen
+    // starting with "する", sixteen of each with s1. Split into "校正 する", the
+    // query would expand to 16 × 16 = 256 combinations, over MAX_COMBINATIONS
+    // (100, src/compat.rs), and find nothing. The test depends on that cap
+    // staying below 256. With a cap of 256 or more the split query also returns
+    // only s1, and the test passes without the gate.
     insert_session(&conn, "kousei", "claude", "/proj", NOW_MS);
     insert_message(
         &conn,
@@ -999,8 +1003,11 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "それはうーんと悩ましい問題だ");
     // ー is Katakana, so the query splits into three one-character runs. This
-    // message gives each run five more trigrams, enough to overflow MAX_COMBOS
-    // if the split form were searched instead of the raw word.
+    // message adds five trigrams starting with う, five starting with ー and
+    // four starting with ん, since んじ ends the message. The split form would
+    // expand to 6 × 6 × 5 = 180 combinations. Over MAX_COMBINATIONS (100,
+    // src/compat.rs) it finds nothing. With a cap of 180 or more it finds this
+    // message too. Either way the test fails without the gate.
     insert_session(&conn, "decoy", "claude", "/proj", NOW_MS);
     insert_message(
         &conn,
