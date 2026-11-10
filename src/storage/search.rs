@@ -398,13 +398,13 @@ fn join_group(mut parts: Vec<String>, separator: &str) -> Option<String> {
 impl Node {
     /// Renders the MATCH string of this node. `required` is true when every
     /// match of the whole query must also match this node: the root, the
-    /// members of a required AND, the left side of a required NOT, and the only
-    /// branch left of a required OR. Only a required NOT records its right side
-    /// in `not_operands`, because only its exclusion applies to the whole query.
-    /// A NOT under an OR with two or more branches, or inside another NOT's
-    /// right side, records nothing. The vector leg then keeps a session that
-    /// such a NOT would exclude, which is preferred to dropping one the query
-    /// allows.
+    /// members of a required AND, and the left side of a required NOT. Only a
+    /// required NOT records its right side in `not_operands`, because only its
+    /// exclusion applies to the whole query. A NOT under an OR, or inside
+    /// another NOT's right side, records nothing. That holds even when the OR's
+    /// other branches render no MATCH, because the embedder still searches for
+    /// their terms. The vector leg then keeps a session that such a NOT would
+    /// exclude, which is preferred to dropping one the query allows.
     fn render(
         &self,
         required: bool,
@@ -418,14 +418,10 @@ impl Node {
                 Self::render_all(nodes, required, not_operands)?,
                 " AND ",
             )),
-            Self::Or(nodes) => {
-                let mut branch_operands = Vec::new();
-                let parts = Self::render_all(nodes, required, &mut branch_operands)?;
-                if parts.len() == 1 {
-                    not_operands.append(&mut branch_operands);
-                }
-                Ok(join_group(parts, " OR "))
-            }
+            Self::Or(nodes) => Ok(join_group(
+                Self::render_all(nodes, false, not_operands)?,
+                " OR ",
+            )),
             Self::Not(left, excluded) => {
                 let Some(left) = left.render(required, not_operands)? else {
                     return Err(QuerySyntaxError(format!(

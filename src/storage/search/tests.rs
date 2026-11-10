@@ -496,7 +496,7 @@ fn operator_query_records_a_not_operand_only_when_its_exclusion_covers_the_whole
     );
     assert_eq!(
         operator("zz OR (alpha NOT beta)").not_operands,
-        ["\"beta\""]
+        Vec::<String>::new()
     );
     assert_eq!(
         operator("(alpha NOT beta) OR gamma").not_operands,
