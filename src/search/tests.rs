@@ -918,6 +918,22 @@ fn a_letter_digit_token_is_matched_whole() {
 }
 
 #[test]
+fn a_kanji_compound_in_a_query_is_matched_whole() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "whole", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "whole", "user", "Rustで機械学習を試す");
+    insert_session(&conn, "apart", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "apart", "user", "Rustで機械の学習を試す");
+    // "Rust" is a run of at least three characters, so the query is searched
+    // split at script boundaries. Without it the query would be searched as one
+    // phrase whether or not the kanji run were split.
+
+    let results = search(&conn, "Rust機械学習", &at_now()).unwrap();
+
+    assert_eq!(ids(&results), ["whole"]);
+}
+
+#[test]
 fn a_quoted_cjk_span_is_not_split_into_separate_terms() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "together", "claude", "/proj", NOW_MS);
