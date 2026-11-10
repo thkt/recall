@@ -221,7 +221,8 @@ pub struct OperatorQuery {
     /// MATCH strings for the right side of every NOT whose exclusion applies to
     /// the whole query (see `Node::render`).
     pub not_operands: Vec<String>,
-    /// Terms outside every NOT right side, for the embedder.
+    /// Terms outside every NOT right side, for the embedder. Empty only when
+    /// the query holds no term at all, such as `( AND )`.
     pub embed_text: String,
 }
 

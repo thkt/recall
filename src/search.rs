@@ -544,6 +544,10 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
     if let Some(operator) =
         prepare_operator_query(query).map_err(|e| RecallError::QuerySyntax(e.to_string()))?
     {
+        if operator.embed_text.is_empty() {
+            debug!(%query, "operator query holds no term");
+            return Ok(None);
+        }
         return Ok(Some(KeywordQuery {
             fts: operator.match_query,
             not_operands: operator.not_operands,

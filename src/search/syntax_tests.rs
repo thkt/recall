@@ -348,6 +348,31 @@ fn a_session_found_only_by_the_vector_search_stays_when_it_matches_a_not_nested_
     );
 }
 
+fn hybrid_result_count_and_embed_calls(conn: &Connection, query: &str) -> (usize, usize) {
+    let embedder = MockEmbedder::new();
+    let opts = SearchOptions {
+        now_ms: Some(TS),
+        ..Default::default()
+    };
+    let results = search_with_embedder(conn, query, &opts, Some(&embedder))
+        .unwrap()
+        .results;
+    (results.len(), embedder.calls())
+}
+
+#[test]
+fn a_query_of_only_operators_matches_no_session_and_embeds_nothing() {
+    let (_dir, conn) = db_with_messages(&[("vec-hit", "alpha release notes")]);
+    add_embedded_chunk(&conn, 1, "vec-hit", "alpha release notes");
+
+    assert_eq!(hybrid_result_count_and_embed_calls(&conn, "AND"), (0, 0));
+    assert_eq!(hybrid_result_count_and_embed_calls(&conn, "OR"), (0, 0));
+    assert_eq!(
+        hybrid_result_count_and_embed_calls(&conn, "( AND )"),
+        (0, 0)
+    );
+}
+
 #[test]
 fn the_excluded_automated_count_includes_an_automated_session_matching_an_operator_query() {
     let (_dir, conn) = db_with_messages(&[
