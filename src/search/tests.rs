@@ -1033,8 +1033,8 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
     insert_message(&conn, "s1", "user", "それはうーんと悩ましい問題だ");
     // ー is Katakana, so the query splits into three one-character runs. This
     // message adds five trigrams starting with う, five starting with ー and
-    // four starting with ん, since んじ ends the message. The split form would
-    // expand to 6 × 6 × 5 = 180 combinations. Over MAX_COMBINATIONS (100,
+    // four starting with ん, since んじ ends the message. s1 adds one of each,
+    // so the split form would expand to 6 × 6 × 5 = 180 combinations. Over MAX_COMBINATIONS (100,
     // src/compat.rs) it finds nothing. With a cap of 180 or more it finds this
     // message too. Either way the test fails without the gate.
     insert_session(&conn, "decoy", "claude", "/proj", NOW_MS);
