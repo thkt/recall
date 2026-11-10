@@ -121,6 +121,13 @@ fn found(results: &[SearchResult]) -> Vec<(&str, &str, Option<i64>)> {
         .collect()
 }
 
+/// `found` in session id order, for tests that check excerpts and not ranking.
+fn found_by_session(results: &[SearchResult]) -> Vec<(&str, &str, Option<i64>)> {
+    let mut found = found(results);
+    found.sort_unstable();
+    found
+}
+
 fn hybrid_search_ids(
     conn: &Connection,
     embedder: &MockEmbedder,
@@ -1114,7 +1121,7 @@ fn hybrid_search_returns_text_and_vector_matches_with_their_excerpts() {
     .unwrap();
 
     assert_eq!(
-        found(&outcome.results),
+        found_by_session(&outcome.results),
         [
             ("s1", "**authentication** flow di...", None),
             ("s2", "authentication", Some(1)),
@@ -1166,7 +1173,7 @@ fn a_vector_match_shows_its_closest_chunk() {
     .results;
 
     assert_eq!(
-        found(&results),
+        found_by_session(&results),
         [
             ("s1", "**authentication** flow di...", None),
             ("s2", "authentication", Some(2)),
