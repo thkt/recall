@@ -1,5 +1,7 @@
 use super::*;
 use crate::db::setup_test_db;
+use crate::embedder::MockEmbedder;
+use crate::error::{ErrorCode, error_envelope};
 
 const TS: i64 = 1709251200000;
 
@@ -45,10 +47,7 @@ fn lowercase_and_or_not_in_a_query_are_matched_as_ordinary_words() {
     assert_eq!(matched_sessions(&conn, "do not panic"), ["with-not"]);
     // "or" is under 3 characters, so it is dropped like any other short word
     // and both messages match on the remaining words.
-    assert_eq!(
-        matched_sessions(&conn, "red or blue"),
-        ["no-or", "with-or"]
-    );
+    assert_eq!(matched_sessions(&conn, "red or blue"), ["no-or", "with-or"]);
 }
 
 #[test]
@@ -60,6 +59,16 @@ fn a_short_query_term_matches_the_indexed_words_that_start_with_it() {
 
     assert_eq!(matched_sessions(&conn, "ku"), ["kube"]);
     assert_eq!(matched_sessions(&conn, "ku setup"), ["kube"]);
+}
+
+#[test]
+fn a_short_query_term_matches_an_indexed_word_that_holds_a_quote_character() {
+    let (_dir, conn) = db_with_messages(&[
+        ("quoted", "she said q\"uick replies"),
+        ("plain", "nothing to see here"),
+    ]);
+
+    assert_eq!(matched_sessions(&conn, "q"), ["quoted"]);
 }
 
 #[test]
@@ -99,10 +108,7 @@ fn a_quoted_phrase_finds_the_message_with_those_words_adjacent_and_not_one_with_
         ("apart", "the pool needs a connection restart before deploy"),
     ]);
 
-    assert_eq!(
-        matched_sessions(&conn, "\"connection pool\""),
-        ["adjacent"]
-    );
+    assert_eq!(matched_sessions(&conn, "\"connection pool\""), ["adjacent"]);
 }
 
 #[test]
@@ -155,13 +161,13 @@ fn parentheses_group_an_or_before_the_and_that_follows_it() {
     );
 }
 
-fn query_error_code(conn: &Connection, query: &str) -> crate::error::ErrorCode {
+fn query_error_code(conn: &Connection, query: &str) -> ErrorCode {
     match search(conn, query, &SearchOptions::default()) {
         Ok(results) => panic!(
             "query {query:?} should be rejected as a syntax error but matched {} sessions",
             results.len()
         ),
-        Err(err) => crate::error::error_envelope(&err).error.code,
+        Err(err) => error_envelope(&err).error.code,
     }
 }
 
@@ -197,10 +203,7 @@ fn a_short_word_before_not_is_rejected_as_a_query_syntax_error() {
         ("short-beta", "zz marker with beta tag"),
     ]);
 
-    assert_eq!(
-        query_error_code(&conn, "zz NOT beta"),
-        crate::error::ErrorCode::DataError
-    );
+    assert_eq!(query_error_code(&conn, "zz NOT beta"), ErrorCode::DataError);
 }
 
 #[test]
@@ -210,10 +213,7 @@ fn a_not_with_nothing_before_it_is_rejected_as_a_query_syntax_error() {
         ("alpha-beta", "alpha release with beta tag"),
     ]);
 
-    assert_eq!(
-        query_error_code(&conn, "NOT beta"),
-        crate::error::ErrorCode::DataError
-    );
+    assert_eq!(query_error_code(&conn, "NOT beta"), ErrorCode::DataError);
 }
 
 fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str) {
@@ -222,7 +222,7 @@ fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str
         rusqlite::params![chunk_id, sid, content, TS],
     )
     .unwrap();
-    let embedding = crate::embedder::MockEmbedder::deterministic_vector(content);
+    let embedding = MockEmbedder::deterministic_vector(content);
     conn.execute(
         "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
         rusqlite::params![chunk_id, f32_as_bytes(&embedding)],
@@ -231,7 +231,7 @@ fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str
 }
 
 fn hybrid_matched_sessions(conn: &Connection, query: &str) -> Vec<String> {
-    let embedder = crate::embedder::MockEmbedder::new();
+    let embedder = MockEmbedder::new();
     let opts = SearchOptions {
         now_ms: Some(TS),
         ..Default::default()
@@ -254,7 +254,10 @@ fn a_session_found_only_by_the_vector_search_is_dropped_when_it_matches_the_word
     ]);
     add_embedded_chunk(&conn, 1, "vec-with-beta", "beta tag notes");
 
-    assert_eq!(hybrid_matched_sessions(&conn, "alpha NOT beta"), ["text-hit"]);
+    assert_eq!(
+        hybrid_matched_sessions(&conn, "alpha NOT beta"),
+        ["text-hit"]
+    );
 }
 
 #[test]
@@ -288,8 +291,7 @@ fn the_excluded_automated_count_includes_an_automated_session_matching_an_operat
     }
 
     let count =
-        count_excluded_automated(&conn, Some("alpha NOT beta"), &SearchOptions::default())
-            .unwrap();
+        count_excluded_automated(&conn, Some("alpha NOT beta"), &SearchOptions::default()).unwrap();
 
     assert_eq!(
         count, 1,
