@@ -799,4 +799,6 @@ fn file_list_outcome(
 }
 
 #[cfg(test)]
+mod syntax_tests;
+#[cfg(test)]
 mod tests;
