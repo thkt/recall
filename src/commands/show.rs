@@ -281,16 +281,28 @@ pub(crate) fn run_show(
         );
     }
 
-    let (conn, _tier) = db::open_db_readonly(&path)?;
-    match db::schema_state(&conn)? {
+    let (conn, tier) = db::open_db_readonly(&path)?;
+    let wal_note = db::stale_wal_note(&path, tier);
+    let shown = match db::schema_state(&conn)? {
         db::SchemaState::Empty => Err(RecallError::Usage(
             "Database not found. Run `recall index` first.".to_owned(),
         )
         .into()),
-        state => {
-            require_current_schema(state)?;
-            show_session_windowed(&conn, session_id, verbose, chunk, window)
+        state => match require_current_schema(state) {
+            Ok(()) => show_session_windowed(&conn, session_id, verbose, chunk, window),
+            Err(e) => Err(e.into()),
+        },
+    };
+    match (shown, wal_note) {
+        (Ok(mut out), Some(note)) => {
+            out.degraded = true;
+            out.notes.push(note);
+            Ok(out)
         }
+        (Ok(out), None) => Ok(out),
+        // The missing schema, session or chunk may sit in the log this snapshot cannot read.
+        (Err(e), Some(note)) => Err(RecallError::DatabaseRead(format!("{e}; {note}")).into()),
+        (Err(e), None) => Err(e),
     }
 }
 

@@ -924,23 +924,142 @@ fn read_commands_work_in_readonly_directory() {
     }
 }
 
+/// Indexes one session, then leaves a nonempty `-wal` beside the DB the way an
+/// interrupted writer does, so a read from a read-only directory sees a stale snapshot.
+fn seed_stale_wal(dir: &Path) {
+    seed_indexed_session(dir);
+    let db = dir.join("recall.db");
+    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
+    fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+}
+
+/// Makes a directory read-only until dropped, so a failed assertion still leaves
+/// `TempDir` able to delete it.
+#[cfg(unix)]
+struct ReadOnlyDir<'a>(&'a Path);
+
+#[cfg(unix)]
+impl<'a> ReadOnlyDir<'a> {
+    fn new(dir: &'a Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
+        Self(dir)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnlyDir<'_> {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn show_on_an_immutable_open_with_stale_wal_surfaces_degraded_note() {
+    let dir = TempDir::new().unwrap();
+    seed_stale_wal(dir.path());
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let out = recall(dir.path())
+        .args(["show", "s1", "--json"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["degraded"], true, "{envelope}");
+    assert_eq!(
+        envelope["notes"].as_array().map(Vec::len),
+        Some(1),
+        "{envelope}"
+    );
+    root_skip::assert_copy_based_remedy(envelope["notes"][0].as_str().unwrap(), "show");
+}
+
+#[cfg(unix)]
+#[test]
+fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log() {
+    let dir = TempDir::new().unwrap();
+    seed_stale_wal(dir.path());
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let out = recall(dir.path())
+        .args(["show", "s2", "--json"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(out.status.code(), Some(65));
+    assert!(out.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "DATA_ERROR");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("No session found matching 's2'"),
+        "{message}"
+    );
+    root_skip::assert_copy_based_remedy(message, "show");
+}
+
+#[test]
+fn show_on_an_index_from_an_older_version_asks_for_a_rebuild() {
+    let dir = TempDir::new().unwrap();
+    rusqlite::Connection::open(dir.path().join("recall.db"))
+        .unwrap()
+        .execute_batch("CREATE TABLE sessions (session_id TEXT PRIMARY KEY);")
+        .unwrap();
+
+    let out = recall(dir.path())
+        .args(["show", "s1", "--json"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(out.status.code(), Some(65));
+    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "DATA_ERROR");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("run `recall rebuild`"), "{message}");
+}
+
+#[test]
+fn show_from_a_writable_directory_reads_the_write_ahead_log_without_a_note() {
+    let dir = TempDir::new().unwrap();
+    seed_stale_wal(dir.path());
+
+    let out = recall(dir.path())
+        .args(["show", "s1", "--json"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(envelope["degraded"], false, "{envelope}");
+    assert_eq!(envelope["notes"], serde_json::json!([]), "{envelope}");
+}
+
 #[cfg(unix)]
 #[test]
 fn immutable_open_with_stale_wal_surfaces_degraded_note() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = TempDir::new().unwrap();
-    seed_indexed_session(dir.path());
-
-    let db = dir.path().join("recall.db");
-    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
-    fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
-
-    let set_mode = |mode: u32| {
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
-    };
-    set_mode(0o555);
-
+    seed_stale_wal(dir.path());
+    let read_only = ReadOnlyDir::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -970,7 +1089,7 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
         .output()
         .expect("spawn recall binary");
 
-    set_mode(0o755);
+    drop(read_only);
 
     assert_eq!(
         classify_out.status.code(),

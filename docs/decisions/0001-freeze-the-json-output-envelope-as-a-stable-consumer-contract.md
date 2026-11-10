@@ -57,6 +57,8 @@ The no-model state is reported on two different axes by design, and this asymmet
 
 A contributor who tries to make all three commands agree on `degraded` for the no-model case would either wrongly mark `doctor`/`status` unhealthy or wrongly hide search's lost-coverage signal. The divergence is the contract.
 
+A stale snapshot is the one trigger every read command shares. When the index is opened immutable from a read-only directory while a nonempty write-ahead log sits beside it, `search`, `status`, `doctor` and `show` set `degraded:true` and carry the note from `db::stale_wal_note`. A `show` that fails on such a snapshot exits with a data error carrying the same note instead, since the missing session, chunk or schema may sit in the unread log (#400).
+
 ### Index parsing diagnostics
 
 [Issue #323](https://github.com/thkt/recall/issues/323) authorizes an additive index/rebuild payload extension while preserving the outer envelope and stdout contract. The envelope remains exactly `data`, `degraded`, and `notes`; successful partial indexing exits 0 and writes one JSON envelope to stdout. Human progress and warnings remain on stderr. The existing `embedded`, `failed_count`, `skipped_roots`, and `preserved_embedded` payload fields retain their meanings.
