@@ -954,7 +954,7 @@ fn a_quoted_cjk_span_is_not_split_into_separate_terms() {
 }
 
 #[test]
-fn degraded_no_space_cjk_query_reaches_session() {
+fn a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(
@@ -974,7 +974,7 @@ fn degraded_no_space_cjk_query_reaches_session() {
 }
 
 #[test]
-fn segment_falls_back_to_raw_when_no_anchor_term() {
+fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with_its_parts() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
