@@ -1,7 +1,6 @@
 use super::*;
 use crate::db::setup_test_db;
 use crate::embedder::MockEmbedder;
-use crate::error::{ErrorCode, error_envelope};
 
 const TS: i64 = 1709251200000;
 
@@ -206,13 +205,19 @@ fn parentheses_group_an_or_before_the_and_that_follows_it() {
     );
 }
 
-fn query_error_code(conn: &Connection, query: &str) -> ErrorCode {
+/// The `RecallError` a rejected query fails with, in its `Debug` form so a test
+/// can compare the variant and the message as one literal.
+fn rejection(conn: &Connection, query: &str) -> String {
     match search(conn, query, &SearchOptions::default()) {
         Ok(results) => panic!(
-            "query {query:?} should be rejected as a syntax error but matched {} sessions",
+            "query {query:?} should be rejected but matched {} sessions",
             results.len()
         ),
-        Err(err) => error_envelope(&err).error.code,
+        Err(err) => format!(
+            "{:?}",
+            err.downcast::<RecallError>()
+                .expect("a rejected query fails with a RecallError")
+        ),
     }
 }
 
@@ -248,7 +253,10 @@ fn a_short_word_before_not_is_rejected_as_a_query_syntax_error() {
         ("short-beta", "zz marker with beta tag"),
     ]);
 
-    assert_eq!(query_error_code(&conn, "zz NOT beta"), ErrorCode::DataError);
+    assert_eq!(
+        rejection(&conn, "zz NOT beta"),
+        r#"QuerySyntax("NOT needs a left term of at least 3 characters")"#
+    );
 }
 
 #[test]
@@ -258,7 +266,10 @@ fn a_not_with_nothing_before_it_is_rejected_as_a_query_syntax_error() {
         ("alpha-beta", "alpha release with beta tag"),
     ]);
 
-    assert_eq!(query_error_code(&conn, "NOT beta"), ErrorCode::DataError);
+    assert_eq!(
+        rejection(&conn, "NOT beta"),
+        r#"QuerySyntax("NOT needs a term on its left")"#
+    );
 }
 
 fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str) {
