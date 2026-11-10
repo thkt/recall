@@ -37,7 +37,7 @@ Chosen option: "fail open to interactive", because it is the only direction unde
 
 ### Confirmation
 
-Three classifier tests pin the heuristic: marker-prefixed turns (with injected leading whitespace) classify automated (classify/tests.rs:5-19,21-27), and a human turn plus empty/whitespace turns classify interactive (classify/tests.rs:29-41). The fail-open default is pinned separately at the SQL layer: `automated_sessions_are_hidden_by_default_and_unclassified_ones_stay` (src/search/tests.rs) inserts one automated row and one NULL-`session_type` row, then asserts that a search returns only the NULL row, exercising the `COALESCE(..., 'interactive')` branch. No test couples the producer literal and the default literal directly; review verifies they share the token per ADR-0002.
+Three classifier tests pin the heuristic: marker-prefixed turns (with injected leading whitespace) classify automated (classify/tests.rs:5-19,21-27), and a human turn plus empty/whitespace turns classify interactive (classify/tests.rs:29-41). The fail-open default is pinned separately at the SQL layer by `automated_sessions_are_hidden_by_default_and_unclassified_ones_stay` (src/search/tests.rs). That test inserts one automated row and one NULL-`session_type` row, then asserts that a search returns only the NULL row. The test thus exercises the `COALESCE(..., 'interactive')` branch. No test couples the producer literal and the default literal directly; review verifies they share the token per ADR-0002.
 
 ## More Information
 
