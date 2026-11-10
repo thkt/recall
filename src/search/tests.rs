@@ -973,35 +973,57 @@ fn a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query() 
     assert_eq!(ids(&spaced), ["s1"]);
 }
 
+/// Sessions "kousei" and "suru" add fifteen indexed trigrams starting with
+/// "校正" and fifteen starting with "する".
+fn seed_fifteen_words_starting_with_kousei_and_suru(conn: &Connection) {
+    insert_session(conn, "kousei", "claude", "/proj", NOW_MS);
+    insert_message(
+        conn,
+        "kousei",
+        "user",
+        "校正案 校正版 校正中 校正後 校正前 校正用 校正例 校正集 校正表 校正記 校正号 校正点 校正字 校正形 校正面",
+    );
+    insert_session(conn, "suru", "claude", "/proj", NOW_MS);
+    insert_message(
+        conn,
+        "suru",
+        "user",
+        "する案 する版 する中 する後 する前 する用 する例 する集 する表 する記 する号 する点 する字 する形 する面",
+    );
+}
+
 #[test]
 fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with_its_parts() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
-    // These messages add fifteen trigrams starting with "校正" and fifteen
-    // starting with "する", sixteen of each with s1. Split into "校正 する", the
-    // query would expand to 16 × 16 = 256 combinations, over MAX_COMBINATIONS
-    // (100, src/compat.rs), and find nothing. The test depends on that cap
-    // staying below 256. With a cap of 256 or more the split query also returns
-    // only s1, and the test passes without the gate.
-    insert_session(&conn, "kousei", "claude", "/proj", NOW_MS);
-    insert_message(
-        &conn,
-        "kousei",
-        "user",
-        "校正案 校正版 校正中 校正後 校正前 校正用 校正例 校正集 校正表 校正記 校正号 校正点 校正字 校正形 校正面",
-    );
-    insert_session(&conn, "suru", "claude", "/proj", NOW_MS);
-    insert_message(
-        &conn,
-        "suru",
-        "user",
-        "する案 する版 する中 する後 する前 する用 する例 する集 する表 する記 する号 する点 する字 する形 する面",
-    );
+    // With s1, sixteen trigrams start with "校正" and sixteen with "する". Split
+    // into "校正 する", the query would expand to 16 × 16 = 256 combinations,
+    // over MAX_COMBINATIONS (100, src/compat.rs), and find nothing. With a cap
+    // of 256 or more the split query also returns only s1, and this test passes
+    // without the gate. The next test fails at such a cap.
+    seed_fifteen_words_starting_with_kousei_and_suru(&conn);
 
     let results = search(&conn, "校正する", &at_now()).unwrap();
 
     assert_eq!(ids(&results), ["s1"]);
+}
+
+#[test]
+fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "both", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "both", "user", "Rustで校正する手順");
+    insert_session(&conn, "rust-only", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "rust-only", "user", "Rustの設定をまとめた");
+    // With "both", sixteen trigrams start with "校正" and sixteen with "する".
+    // "Rust 校正 する" would expand to 16 × 16 = 256 combinations, over
+    // MAX_COMBINATIONS (100, src/compat.rs), so only "Rust" is searched.
+    seed_fifteen_words_starting_with_kousei_and_suru(&conn);
+
+    let results = search(&conn, "Rust校正する", &at_now()).unwrap();
+
+    assert_eq!(ids(&results), ["both", "rust-only"]);
 }
 
 #[test]
