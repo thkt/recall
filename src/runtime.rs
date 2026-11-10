@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::process::ExitCode;
 use std::{env, ffi::OsString, io, path::PathBuf};
 use tracing_subscriber::EnvFilter;
 
@@ -14,10 +12,6 @@ pub mod codes {
     pub const IO_ERR: u8 = 74;
     pub const TEMP_FAIL: u8 = 75;
     pub const UNKNOWN: u8 = 104;
-}
-#[cfg(test)]
-pub trait CliError {
-    fn exit_code(&self) -> ExitCode;
 }
 pub fn done(message: &str) {
     eprintln!("{message}");

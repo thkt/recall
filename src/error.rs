@@ -2,8 +2,6 @@ use std::io;
 use std::process::ExitCode;
 
 use crate::model::ModelDownloadError;
-#[cfg(test)]
-use crate::runtime::CliError;
 use crate::runtime::codes;
 use crate::storage::SanitizeError;
 use serde::Serialize;
@@ -86,13 +84,6 @@ impl RecallError {
                 retryable: self.retryable(),
             },
         }
-    }
-}
-
-#[cfg(test)]
-impl CliError for RecallError {
-    fn exit_code(&self) -> ExitCode {
-        ExitCode::from(self.error_code().code())
     }
 }
 
