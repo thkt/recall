@@ -203,10 +203,11 @@ fn find_candidate_sessions(
     Ok((ranked, skipped))
 }
 
-/// FTS5 reports a MATCH it cannot parse as a plain `SQLITE_ERROR` whose message
-/// starts with `fts5`, such as `fts5: syntax error near` or `fts5: parser
-/// stack overflow`. Corruption also starts with `fts5:` but carries
-/// `SQLITE_CORRUPT_VTAB`, and a busy or locked database carries its own code.
+/// The MATCH strings search renders quote every term, so the FTS5 parse errors
+/// they can reach are plain `SQLITE_ERROR`s whose message starts with `fts5`,
+/// such as `fts5: syntax error near` or `fts5: parser stack overflow`.
+/// Corruption also starts with `fts5:` but carries `SQLITE_CORRUPT_VTAB`, and a
+/// busy or locked database carries its own code.
 fn is_fts5_query_syntax_error(err: &rusqlite::Error) -> bool {
     matches!(
         err,

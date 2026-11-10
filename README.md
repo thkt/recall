@@ -103,7 +103,7 @@ Query syntax:
 
 Matching is per message, for `NOT` as well as `AND`. `a AND b` finds a session only when one message contains both words, not when `a` and `b` appear in different messages. `a NOT b` finds a session when one of its messages contains `a` without `b`, even if another message contains `b`. Terms with `-` or `:` (such as `foo-bar` or `key:value`) are searched as one quoted phrase.
 
-Uppercase `AND`, `OR` and `NOT` are operators wherever they stand outside quotes, including in literal text such as `404 NOT FOUND` or `IS NOT NULL`. Quote such text to search it as written: `"IS NOT NULL"`.
+Uppercase `AND`, `OR` and `NOT` are operators whenever they stand as separate words outside quotes, including in literal text such as `404 NOT FOUND` or `IS NOT NULL`. Quote such text to search it as written: `"IS NOT NULL"`.
 
 Lowercase `and`, `or` and `not` are not operators. In a query without uppercase operators, they are searched as words. The search drops one at the start or end of the query, or next to another of the three.
 
