@@ -216,7 +216,8 @@ pub fn prepare_match_query(
 /// expansion. FTS5 evaluates the operators per message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorQuery {
-    /// Final MATCH string, `None` when every term was shorter than 3 characters.
+    /// Final MATCH string, `None` when every term is shorter than
+    /// `MIN_TRIGRAM_TERM_CHARS`.
     pub match_query: Option<String>,
     /// MATCH strings for the right side of every NOT whose exclusion applies to
     /// the whole query (see `Node::render`).
@@ -230,7 +231,9 @@ pub struct OperatorQuery {
 #[error("{0}")]
 pub struct QuerySyntaxError(String);
 
-const MIN_OPERATOR_TERM_CHARS: usize = 3;
+/// The trigram tokenizer indexes nothing shorter than 3 characters, so a
+/// shorter term cannot match on its own.
+pub const MIN_TRIGRAM_TERM_CHARS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
@@ -409,7 +412,7 @@ impl Node {
     ) -> Result<Option<String>, QuerySyntaxError> {
         match self {
             Self::Term(text) => {
-                Ok((text.chars().count() >= MIN_OPERATOR_TERM_CHARS).then(|| fts_quote(text)))
+                Ok((text.chars().count() >= MIN_TRIGRAM_TERM_CHARS).then(|| fts_quote(text)))
             }
             Self::And(nodes) => Ok(join_group(
                 Self::render_all(nodes, required, not_operands)?,
@@ -425,9 +428,9 @@ impl Node {
             }
             Self::Not(left, excluded) => {
                 let Some(left) = left.render(required, not_operands)? else {
-                    return Err(QuerySyntaxError(
-                        "NOT needs a left term of at least 3 characters".to_owned(),
-                    ));
+                    return Err(QuerySyntaxError(format!(
+                        "NOT needs a left term of at least {MIN_TRIGRAM_TERM_CHARS} characters"
+                    )));
                 };
                 let rights = Self::render_all(excluded, false, not_operands)?;
                 // `((left NOT a) NOT b)`, built in one pass instead of one copy per NOT.

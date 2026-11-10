@@ -8,7 +8,8 @@ use crate::compat::filter::{
 use crate::compat::{anon_placeholders, clean_for_trigram};
 use crate::embedding::Embed;
 use crate::storage::{
-    QueryNormalizationConfig, SanitizeError, prepare_match_query, prepare_operator_query,
+    MIN_TRIGRAM_TERM_CHARS, QueryNormalizationConfig, SanitizeError, prepare_match_query,
+    prepare_operator_query,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -545,8 +546,9 @@ fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
-/// What the keyword leg and the vector leg search for, built once per query so
-/// `search_with_embedder` and `count_excluded_automated` agree.
+/// What the keyword leg and the vector leg search for. `search_with_embedder`
+/// and `count_excluded_automated` each build it with `keyword_query`, so both
+/// agree on which sessions a query matches.
 struct KeywordQuery {
     /// Final FTS5 MATCH string; `None` when no term is long enough for the trigram index.
     fts: Option<String>,
@@ -571,7 +573,10 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
         }));
     }
     let segmented = segment_script_boundaries(query);
-    let fts_input = if segmented.split_whitespace().any(|t| t.chars().count() >= 3) {
+    let fts_input = if segmented
+        .split_whitespace()
+        .any(|t| t.chars().count() >= MIN_TRIGRAM_TERM_CHARS)
+    {
         segmented
     } else {
         query.to_owned()

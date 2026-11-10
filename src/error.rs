@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use crate::model::ModelDownloadError;
 use crate::runtime::codes;
-use crate::storage::SanitizeError;
+use crate::storage::{MIN_TRIGRAM_TERM_CHARS, SanitizeError};
 use serde::Serialize;
 
 use crate::envelope::{ErrorEnvelope, ErrorPayload};
@@ -70,10 +70,9 @@ impl RecallError {
                 "See `recall --help`; if the index is missing, run `recall index` first."
                     .to_owned(),
             ),
-            Self::QuerySyntax(_) => Some(
-                "Supported query syntax: words, \"quoted phrases\", uppercase AND / OR / NOT between terms, and parentheses for grouping. NOT needs a left term of at least 3 characters."
-                    .to_owned(),
-            ),
+            Self::QuerySyntax(_) => Some(format!(
+                "Supported query syntax: words, \"quoted phrases\", uppercase AND / OR / NOT between terms, and parentheses for grouping. NOT needs a left term of at least {MIN_TRIGRAM_TERM_CHARS} characters."
+            )),
             Self::TempFailure(_) => {
                 Some("Retry the command; the failure may be transient.".to_owned())
             }
