@@ -91,7 +91,19 @@ Backward compatible: `recall "query"` works as shorthand for `recall search "que
 | `--include-automated` | Include automated (hook/script/agent) sessions; excluded by default |
 | `-v`                  | Verbose output                                                      |
 
-Supports [FTS5 query syntax](https://www.sqlite.org/fts5.html#full_text_query_syntax) — bare words, `"quoted phrases"`, and `AND` / `OR` / `NOT`.
+Query syntax:
+
+| Syntax                | Meaning                                                                                                                      |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `word1 word2`         | Sessions with a message containing every word                                                                                |
+| `"quoted phrase"`     | Words adjacent and in order. An unclosed quote is closed at the end of the query                                             |
+| `a AND b`, `a OR b`   | Operators are uppercase only. Lowercase `and` / `or` / `not` are ordinary words                                              |
+| `a NOT b`             | `NOT` is binary: it needs a term on its left and excludes sessions with a message matching `b`. `NOT b` alone is a query error |
+| `(a OR b) AND c`      | Parentheses group operands                                                                                                   |
+
+Matching is per message: `a AND b` finds a session only when a single message contains both words, not when `a` and `b` appear in different messages. Terms with `-` or `:` (such as `foo-bar` or `key:value`) are searched as one quoted phrase.
+
+A query containing an operator skips CJK segmentation and short-term expansion (the prefix match that lets a term under 3 characters find indexed words starting with it). A short term to the left of `NOT` is a query error; a short term to its right is ignored.
 
 ### Index
 
