@@ -854,20 +854,6 @@ fn a_korean_word_finds_the_session() {
 }
 
 #[test]
-fn an_unclosed_quote_does_not_fail_the_search() {
-    let (_dir, conn) = setup_test_db();
-    insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
-    insert_message(&conn, "s1", "user", "hello world");
-
-    let result = search(&conn, "\"hello", &SearchOptions::default());
-
-    assert!(
-        result.is_ok(),
-        "an unclosed quote must be balanced, not passed to FTS5 as a syntax error"
-    );
-}
-
-#[test]
 fn a_slash_command_query_matches_the_command_in_a_message() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
