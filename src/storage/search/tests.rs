@@ -267,6 +267,11 @@ fn near_with_distance() {
 }
 
 #[test]
+fn near_group_ignores_parentheses_inside_a_phrase() {
+    assert_eq!(sanitize_fts_query("NEAR(\"x ) y\" z) hello"), ok("hello"));
+}
+
+#[test]
 fn near_unclosed_paren() {
     assert_eq!(
         sanitize_fts_query("NEAR(a b hello"),
