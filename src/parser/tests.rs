@@ -1,214 +1,235 @@
+use std::fs;
+
+use serde_json::json;
+
 use super::*;
 
+fn claude_session(lines: &[String]) -> ParseResult {
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let file = write_test_jsonl(&lines);
+    parse_session_including_empty(file.path(), Source::Claude)
+        .unwrap()
+        .unwrap()
+}
+
+fn user_line(content: &str) -> String {
+    json!({"type": "user", "message": {"role": "user", "content": content}}).to_string()
+}
+
+/// The session time a Claude log gets when its only entry carries `timestamp`.
+fn session_timestamp(timestamp: &Value) -> Option<i64> {
+    let line = json!({
+        "type": "user",
+        "timestamp": timestamp,
+        "message": {"role": "user", "content": "q"},
+    });
+    claude_session(&[line.to_string()]).metadata.timestamp
+}
+
 #[test]
-fn test_strip_noise_tags_table() {
-    let cases: &[(&str, &str, &str)] = &[
-        (
-            "T-003 command-name stripped",
-            "before<command-name>/clear</command-name>after",
+fn noise_tags_are_removed_from_messages_but_command_output_and_plain_text_stay() {
+    let session = claude_session(&[
+        user_line("before<command-name>/clear</command-name>after"),
+        user_line("start<local-command-caveat>Caveat: some warning</local-command-caveat>end"),
+        user_line("hello<system-reminder>internal instructions</system-reminder>world"),
+        user_line("prefix<local-command-stdout>output data</local-command-stdout>suffix"),
+        user_line("hello world"),
+        user_line("<command-name>no closing tag"),
+    ]);
+
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        [
             "beforeafter",
-        ),
-        (
-            "T-004 local-command-caveat stripped",
-            "start<local-command-caveat>Caveat: some warning text</local-command-caveat>end",
             "startend",
-        ),
-        (
-            "T-005 system-reminder stripped",
-            "hello<system-reminder>internal instructions here</system-reminder>world",
             "helloworld",
-        ),
-        (
-            "T-006 local-command-stdout preserved",
             "prefix<local-command-stdout>output data</local-command-stdout>suffix",
-            "prefix<local-command-stdout>output data</local-command-stdout>suffix",
-        ),
-        ("T-007 plain text unchanged", "hello world", "hello world"),
-        (
-            "T-008 unclosed tag left intact",
+            "hello world",
             "<command-name>no closing tag",
-            "<command-name>no closing tag",
-        ),
-    ];
-
-    for (label, input, expected) in cases {
-        assert_eq!(
-            strip_noise_tags(input.to_string()),
-            *expected,
-            "FAILED: {label} | input: {input:?}"
-        );
-    }
+        ]
+    );
 }
 
 #[test]
-fn test_parse_iso_timestamp_basics() {
-    let val = Value::Number(serde_json::Number::from(1709251200000_i64));
-    assert_eq!(parse_iso_timestamp(&val), Some(1709251200000));
-
-    assert_eq!(parse_iso_timestamp(&Value::Null), None);
-    assert_eq!(parse_iso_timestamp(&Value::String("2026".into())), None);
+fn iso_timestamps_set_the_session_time_in_utc_milliseconds() {
     assert_eq!(
-        parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Ü".into())),
-        None
+        session_timestamp(&json!("2026-03-01T00:00:00Z")),
+        Some(1_772_323_200_000)
     );
     assert_eq!(
-        parse_iso_timestamp(&Value::String("2026-03-01T24:00:00Z".into())),
-        None
+        session_timestamp(&json!("2026-03-01T12:30:45.123Z")),
+        Some(1_772_368_245_123)
     );
     assert_eq!(
-        parse_iso_timestamp(&Value::String("2026-03-01T12:60:00Z".into())),
-        None
+        session_timestamp(&json!("2026-03-01T12:30:45.5Z")),
+        Some(1_772_368_245_500)
     );
     assert_eq!(
-        parse_iso_timestamp(&Value::String("2026-03-01T12:00:60Z".into())),
-        None
+        session_timestamp(&json!("2026-03-01T12:30:45.12Z")),
+        Some(1_772_368_245_120)
     );
-
-    let ts = parse_iso_timestamp(&Value::String("2026-03-01T00:00:00Z".into())).unwrap();
-    let day_ms = date::days_from_civil(2026, 3, 1).unwrap() * date::MS_PER_DAY;
-    assert_eq!(ts, day_ms);
+    assert_eq!(
+        session_timestamp(&json!("2026-03-01T12:00:00+09:00")),
+        Some(1_772_334_000_000)
+    );
+    assert_eq!(
+        session_timestamp(&json!("2026-03-01T12:00:00+0900")),
+        Some(1_772_334_000_000)
+    );
+    assert_eq!(
+        session_timestamp(&json!("2026-03-01T12:00:00-05:00")),
+        Some(1_772_384_400_000)
+    );
+    assert_eq!(
+        session_timestamp(&json!("2026-03-01T12:00:00.500+09:00")),
+        Some(1_772_334_000_500)
+    );
 }
 
 #[test]
-fn test_parse_iso_timestamp_fractional_millis() {
-    let day_ms = date::days_from_civil(2026, 3, 1).unwrap() * date::MS_PER_DAY;
-    let base = day_ms + 12 * 3_600_000 + 30 * 60_000 + 45 * 1000;
-    for (frac, expected_ms) in [(".123", 123), (".5", 500), (".12", 120)] {
-        let s = format!("2026-03-01T12:30:45{frac}Z");
-        let ts = parse_iso_timestamp(&Value::String(s.clone())).unwrap();
-        assert_eq!(ts, base + expected_ms, "input: {s}");
-    }
+fn numeric_timestamps_are_taken_as_epoch_milliseconds() {
+    assert_eq!(
+        session_timestamp(&json!(1_709_251_200_000_i64)),
+        Some(1_709_251_200_000)
+    );
 }
 
 #[test]
-fn test_parse_iso_timestamp_offsets() {
-    let utc = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00Z".into())).unwrap();
-    for (offset_str, diff_ms) in [
-        ("+09:00", 9 * 3_600_000_i64),
-        ("+0900", 9 * 3_600_000),
-        ("-05:00", -5 * 3_600_000),
-    ] {
-        let s = format!("2026-03-01T12:00:00{offset_str}");
-        let with_offset = parse_iso_timestamp(&Value::String(s.clone())).unwrap();
-        assert_eq!(utc - with_offset, diff_ms, "input: {s}");
-    }
-    let utc_ms = parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500Z".into())).unwrap();
-    let off_ms =
-        parse_iso_timestamp(&Value::String("2026-03-01T12:00:00.500+09:00".into())).unwrap();
-    assert_eq!(utc_ms - off_ms, 9 * 3_600_000);
+fn malformed_timestamps_leave_the_session_without_a_time() {
+    assert_eq!(session_timestamp(&Value::Null), None);
+    assert_eq!(session_timestamp(&json!("2026")), None);
+    assert_eq!(session_timestamp(&json!("2026-03-01T00:00:00Ü")), None);
+    assert_eq!(session_timestamp(&json!("2026-03-01T24:00:00Z")), None);
+    assert_eq!(session_timestamp(&json!("2026-03-01T12:60:00Z")), None);
+    assert_eq!(session_timestamp(&json!("2026-03-01T12:00:60Z")), None);
 }
 
 #[test]
-fn test_role_from_db_known_values() {
+fn stored_role_names_map_back_to_roles() {
     assert_eq!(Role::from_db("user"), Some(Role::User));
     assert_eq!(Role::from_db("assistant"), Some(Role::Assistant));
-}
-
-#[test]
-fn test_role_from_db_unknown_returns_none() {
     assert_eq!(Role::from_db("system"), None);
     assert_eq!(Role::from_db(""), None);
     assert_eq!(Role::from_db("USER"), None);
 }
 
 #[test]
-fn test_source_from_db_roundtrips_every_variant() {
+fn every_source_round_trips_through_its_stored_name() {
     use clap::ValueEnum;
+    // DR 0002: a variant added later must round-trip too, so this walks every variant.
     for &variant in Source::value_variants() {
-        assert_eq!(
-            Source::from_db(variant.as_str()),
-            Some(variant),
-            "Source::from_db({:?}) must round-trip back to {variant:?}",
-            variant.as_str(),
-        );
+        assert_eq!(Source::from_db(variant.as_str()), Some(variant));
     }
-}
-
-#[test]
-fn test_source_from_db_unknown_returns_none() {
     assert_eq!(Source::from_db("gemini"), None);
     assert_eq!(Source::from_db(""), None);
     assert_eq!(Source::from_db("Claude"), None);
 }
 
-#[test]
-fn jsonl_diagnostics_distinguish_corruption_from_possible_incomplete_tails() {
-    use std::fs;
-
-    let cases: &[(&[u8], [i64; 3])] = &[
-        (b"{\"type\":\"progress\"}\n \t\r\n", [0, 0, 0]),
-        (b"{\"type\":\"progress\"}", [0, 0, 0]),
-        (b"{\"type\":", [0, 0, 1]),
-        (b"{\"type\":\n", [1, 0, 0]),
-        (b"{broken", [1, 0, 0]),
-        (b"\xff\n", [0, 1, 0]),
-        (b"\xff", [0, 1, 0]),
-        (b"{\"text\":\"\xe3\x81", [0, 0, 1]),
-        (b"{\"text\":\"\xe3\x81\n", [0, 1, 0]),
-    ];
-    for (input, expected) in cases {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        fs::write(file.path(), input).unwrap();
-        for source in [Source::Claude, Source::Codex] {
-            let parsed = parse_session_including_empty(file.path(), source)
-                .unwrap()
-                .unwrap();
-            assert!(parsed.messages.is_empty());
-            assert_classification_matches(file.path(), source, &parsed);
-            let d = parsed.diagnostics;
-            assert_eq!(
-                [
-                    d.invalid_json_lines,
-                    d.invalid_utf8_lines,
-                    d.incomplete_tail_lines
-                ],
-                *expected,
-                "{source}: {input:?}"
-            );
-        }
-    }
+/// Line diagnostics `[invalid JSON, invalid UTF-8, incomplete tail]` for a log holding `bytes`,
+/// read as `[Claude, Codex]`. The classification reader must report the same.
+fn diagnostics_of(bytes: &[u8]) -> [[i64; 3]; 2] {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), bytes).unwrap();
+    let claude = parse_session_including_empty(file.path(), Source::Claude)
+        .unwrap()
+        .unwrap();
+    let codex = parse_session_including_empty(file.path(), Source::Codex)
+        .unwrap()
+        .unwrap();
+    assert_classification_matches(file.path(), Source::Claude, &claude);
+    assert_classification_matches(file.path(), Source::Codex, &codex);
+    [claude.diagnostics, codex.diagnostics].map(|d| {
+        [
+            d.invalid_json_lines,
+            d.invalid_utf8_lines,
+            d.incomplete_tail_lines,
+        ]
+    })
 }
 
 #[test]
-fn classification_visits_identity_and_diagnostics_after_automated_evidence() {
-    use std::fs;
-    for source in [Source::Claude, Source::Codex] {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("sample.jsonl");
-        let (first, conflicting) = match source {
-            Source::Claude => (
-                r#"{"type":"user","sessionId":"sample","isSidechain":true,"message":"question"}"#,
-                r#"{"role":"assistant","sessionId":"other"}"#,
-            ),
-            Source::Codex => (
-                r#"{"type":"session_meta","payload":{"id":"sample","source":{"internal":"guardian"}}}"#,
-                r#"{"type":"session_meta","payload":{"id":"other"}}"#,
-            ),
-        };
-        for (tail, conflict, diagnostics) in [
-            (conflicting.as_bytes(), true, [0, 0, 0]),
-            (b"{bad\n".as_slice(), false, [1, 0, 0]),
-            (b"\xff\n".as_slice(), false, [0, 1, 0]),
-            (b"{\"type\":".as_slice(), false, [0, 0, 1]),
-        ] {
-            let mut input = format!("{first}\n").into_bytes();
-            input.extend_from_slice(tail);
-            fs::write(&path, input).unwrap();
-            let full = parse_session_including_empty(&path, source)
-                .unwrap()
-                .unwrap();
-            assert_classification_matches(&path, source, &full);
-            assert_eq!(full.origin.identity_conflict, conflict);
-            assert_eq!(full.origin.automated, !conflict);
-            let d = full.diagnostics;
-            assert_eq!(
-                [
-                    d.invalid_json_lines,
-                    d.invalid_utf8_lines,
-                    d.incomplete_tail_lines
-                ],
-                diagnostics
-            );
-        }
-    }
+fn line_diagnostics_tell_corrupt_lines_from_a_possibly_unfinished_last_line() {
+    assert_eq!(
+        diagnostics_of(b"{\"type\":\"progress\"}\n \t\r\n"),
+        [[0, 0, 0]; 2]
+    );
+    assert_eq!(diagnostics_of(b"{\"type\":\"progress\"}"), [[0, 0, 0]; 2]);
+    assert_eq!(diagnostics_of(b"{\"type\":"), [[0, 0, 1]; 2]);
+    assert_eq!(diagnostics_of(b"{\"type\":\n"), [[1, 0, 0]; 2]);
+    assert_eq!(diagnostics_of(b"{broken"), [[1, 0, 0]; 2]);
+    assert_eq!(diagnostics_of(b"\xff\n"), [[0, 1, 0]; 2]);
+    assert_eq!(diagnostics_of(b"\xff"), [[0, 1, 0]; 2]);
+    assert_eq!(diagnostics_of(b"{\"text\":\"\xe3\x81"), [[0, 0, 1]; 2]);
+    assert_eq!(diagnostics_of(b"{\"text\":\"\xe3\x81\n"), [[0, 1, 0]; 2]);
+}
+
+const CLAUDE_SIDECHAIN: &str =
+    r#"{"type":"user","sessionId":"sample","isSidechain":true,"message":"question"}"#;
+const CLAUDE_OTHER_ID: &str = r#"{"role":"assistant","sessionId":"other"}"#;
+const CODEX_GUARDIAN: &str =
+    r#"{"type":"session_meta","payload":{"id":"sample","source":{"internal":"guardian"}}}"#;
+const CODEX_OTHER_ID: &str = r#"{"type":"session_meta","payload":{"id":"other"}}"#;
+
+/// `(identity conflict, automated, line diagnostics)` for a log whose first line marks it
+/// automated and whose second line is `tail`. The classification reader must report the same.
+fn origin_after(source: Source, first: &str, tail: &[u8]) -> (bool, bool, [i64; 3]) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("sample.jsonl");
+    let mut input = format!("{first}\n").into_bytes();
+    input.extend_from_slice(tail);
+    fs::write(&path, input).unwrap();
+    let full = parse_session_including_empty(&path, source)
+        .unwrap()
+        .unwrap();
+    assert_classification_matches(&path, source, &full);
+    let d = full.diagnostics;
+    (
+        full.origin.identity_conflict,
+        full.origin.automated,
+        [
+            d.invalid_json_lines,
+            d.invalid_utf8_lines,
+            d.incomplete_tail_lines,
+        ],
+    )
+}
+
+#[test]
+fn a_conflicting_session_id_cancels_automated_evidence_but_bad_lines_do_not() {
+    assert_eq!(
+        origin_after(Source::Claude, CLAUDE_SIDECHAIN, CLAUDE_OTHER_ID.as_bytes()),
+        (true, false, [0, 0, 0])
+    );
+    assert_eq!(
+        origin_after(Source::Claude, CLAUDE_SIDECHAIN, b"{bad\n"),
+        (false, true, [1, 0, 0])
+    );
+    assert_eq!(
+        origin_after(Source::Claude, CLAUDE_SIDECHAIN, b"\xff\n"),
+        (false, true, [0, 1, 0])
+    );
+    assert_eq!(
+        origin_after(Source::Claude, CLAUDE_SIDECHAIN, b"{\"type\":"),
+        (false, true, [0, 0, 1])
+    );
+    assert_eq!(
+        origin_after(Source::Codex, CODEX_GUARDIAN, CODEX_OTHER_ID.as_bytes()),
+        (true, false, [0, 0, 0])
+    );
+    assert_eq!(
+        origin_after(Source::Codex, CODEX_GUARDIAN, b"{bad\n"),
+        (false, true, [1, 0, 0])
+    );
+    assert_eq!(
+        origin_after(Source::Codex, CODEX_GUARDIAN, b"\xff\n"),
+        (false, true, [0, 1, 0])
+    );
+    assert_eq!(
+        origin_after(Source::Codex, CODEX_GUARDIAN, b"{\"type\":"),
+        (false, true, [0, 0, 1])
+    );
 }
