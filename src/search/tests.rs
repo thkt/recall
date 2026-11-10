@@ -894,14 +894,9 @@ fn a_letter_digit_token_is_matched_whole() {
 fn a_quoted_cjk_span_is_not_split_into_separate_terms() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "together", "claude", "/proj", NOW_MS);
-    insert_message(&conn, "together", "user", "title: \"日本語ドキュメント\"");
+    insert_message(&conn, "together", "user", "日本語ドキュメントを校正した");
     insert_session(&conn, "apart", "claude", "/proj", NOW_MS);
-    insert_message(
-        &conn,
-        "apart",
-        "user",
-        "title: \"日本語の技術ドキュメント\"",
-    );
+    insert_message(&conn, "apart", "user", "日本語の技術ドキュメントを校正した");
 
     let results = search(&conn, "\"日本語ドキュメント\"", &at_now()).unwrap();
 
