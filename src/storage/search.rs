@@ -279,12 +279,18 @@ enum Node {
     Term(String),
     And(Vec<Node>),
     Or(Vec<Node>),
-    Not(Box<Node>, Box<Node>),
+    /// `left NOT a NOT b` keeps the chain flat, so its length adds no recursion.
+    Not(Box<Node>, Vec<Node>),
 }
+
+/// The parser recurses once per parenthesis level; this bound keeps a deeply
+/// nested query from overflowing the stack.
+const MAX_PAREN_DEPTH: usize = 32;
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 impl Parser {
@@ -332,37 +338,48 @@ impl Parser {
     }
 
     fn not(&mut self) -> Result<Option<Node>, QuerySyntaxError> {
-        let Some(mut left) = self.primary()? else {
+        let Some(left) = self.primary()? else {
             if self.peek() == Some(&Token::Not) {
                 return Err(QuerySyntaxError("NOT needs a term on its left".to_owned()));
             }
             return Ok(None);
         };
+        let mut excluded = Vec::new();
         while self.eat(&Token::Not) {
-            if let Some(right) = self.primary()? {
-                left = Node::Not(Box::new(left), Box::new(right));
-            }
+            excluded.extend(self.primary()?);
         }
-        Ok(Some(left))
+        Ok(Some(if excluded.is_empty() {
+            left
+        } else {
+            Node::Not(Box::new(left), excluded)
+        }))
     }
 
     fn primary(&mut self) -> Result<Option<Node>, QuerySyntaxError> {
-        match self.peek() {
-            Some(Token::Term(text)) => {
-                let node = Node::Term(text.clone());
-                self.pos += 1;
-                Ok(Some(node))
-            }
-            Some(Token::Open) => {
-                self.pos += 1;
-                let inner = self.or()?;
-                self.eat(&Token::Close);
-                match inner {
-                    Some(node) => Ok(Some(node)),
-                    None => self.primary(),
+        loop {
+            match self.peek() {
+                Some(Token::Term(text)) => {
+                    let node = Node::Term(text.clone());
+                    self.pos += 1;
+                    return Ok(Some(node));
                 }
+                Some(Token::Open) => {
+                    if self.depth == MAX_PAREN_DEPTH {
+                        return Err(QuerySyntaxError(format!(
+                            "parentheses nest deeper than {MAX_PAREN_DEPTH} levels"
+                        )));
+                    }
+                    self.pos += 1;
+                    self.depth += 1;
+                    let inner = self.or()?;
+                    self.depth -= 1;
+                    self.eat(&Token::Close);
+                    if inner.is_some() {
+                        return Ok(inner);
+                    }
+                }
+                _ => return Ok(None),
             }
-            _ => Ok(None),
         }
     }
 }
@@ -406,18 +423,23 @@ impl Node {
                 }
                 Ok(join_group(parts, " OR "))
             }
-            Self::Not(left, right) => {
+            Self::Not(left, excluded) => {
                 let Some(left) = left.render(required, not_operands)? else {
                     return Err(QuerySyntaxError(
                         "NOT needs a left term of at least 3 characters".to_owned(),
                     ));
                 };
-                let Some(right) = right.render(false, not_operands)? else {
-                    return Ok(Some(left));
-                };
-                let rendered = format!("({left} NOT {right})");
+                let rights = Self::render_all(excluded, false, not_operands)?;
+                // `((left NOT a) NOT b)`, built in one pass instead of one copy per NOT.
+                let mut rendered = "(".repeat(rights.len());
+                rendered.push_str(&left);
+                for right in &rights {
+                    rendered.push_str(" NOT ");
+                    rendered.push_str(right);
+                    rendered.push(')');
+                }
                 if required {
-                    not_operands.push(right);
+                    not_operands.extend(rights);
                 }
                 Ok(Some(rendered))
             }
@@ -457,7 +479,11 @@ pub fn prepare_operator_query(query: &str) -> Result<Option<OperatorQuery>, Quer
     {
         return Ok(None);
     }
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     let Some(tree) = parser.or()? else {
         return Ok(Some(OperatorQuery {
             match_query: None,

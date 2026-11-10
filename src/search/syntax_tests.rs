@@ -272,6 +272,28 @@ fn a_not_with_nothing_before_it_is_rejected_as_a_query_syntax_error() {
     );
 }
 
+#[test]
+fn deeply_nested_parentheses_are_rejected_as_a_query_syntax_error() {
+    let (_dir, conn) = db_with_messages(&[("alpha", "alpha release notes")]);
+    let query = format!("{}alpha OR beta", "(".repeat(5000));
+
+    assert_eq!(
+        rejection(&conn, &query),
+        r#"QuerySyntax("parentheses nest deeper than 32 levels")"#
+    );
+}
+
+#[test]
+fn a_not_chain_too_long_for_the_full_text_index_is_rejected_as_a_query_syntax_error() {
+    let (_dir, conn) = db_with_messages(&[("alpha", "alpha release notes")]);
+    let query = format!("alpha{}", " NOT beta".repeat(10_000));
+
+    assert_eq!(
+        rejection(&conn, &query),
+        r#"QuerySyntax("Invalid search query: fts5: parser stack overflow. Use words, \"quoted phrases\", or AND/OR/NOT operators.")"#
+    );
+}
+
 fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, ?2, ?3, ?4)",

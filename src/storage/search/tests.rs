@@ -504,6 +504,24 @@ fn operator_query_records_a_not_operand_only_when_its_exclusion_covers_the_whole
 }
 
 #[test]
+fn operator_query_renders_a_chain_of_nots_left_nested() {
+    let query = operator("alpha NOT beta NOT zz NOT gamma");
+    assert_eq!(
+        query.match_query.as_deref(),
+        Some("((\"alpha\" NOT \"beta\") NOT \"gamma\")")
+    );
+    assert_eq!(query.not_operands, ["\"beta\"", "\"gamma\""]);
+}
+
+#[test]
+fn operator_query_skips_empty_parentheses() {
+    assert_eq!(
+        operator("() ( ) alpha OR beta").match_query.as_deref(),
+        Some("(\"alpha\" OR \"beta\")")
+    );
+}
+
+#[test]
 fn operator_query_ignores_dangling_operators_and_closes_open_parentheses() {
     assert_eq!(
         operator("hello OR").match_query.as_deref(),
