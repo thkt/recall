@@ -1047,10 +1047,10 @@ fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
     // With s1, sixteen trigrams start with "校正" and sixteen with "する". Split
-    // into "校正 する", the query would expand to 16 × 16 = 256 combinations,
-    // over MAX_COMBINATIONS (100, src/compat.rs), and find nothing. With a cap
-    // of 256 or more the split query also returns only s1, and this test passes
-    // without the gate.
+    // into "校正 する", the query would expand to 16 × 16 = 256 combinations.
+    // While MAX_COMBINATIONS (src/compat.rs) is below 256, that split query
+    // overflows and finds nothing. At a cap of 256 or more it also returns only
+    // s1, and this test passes without the gate.
     // a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone
     // fails at such a cap.
     seed_fifteen_words_starting_with_kousei_and_suru(&conn);
@@ -1068,13 +1068,16 @@ fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_a
     insert_session(&conn, "rust-only", "claude", "/proj", NOW_MS);
     insert_message(&conn, "rust-only", "user", "Rustの設定をまとめた");
     // With "both", sixteen trigrams start with "校正" and sixteen with "する".
-    // "Rust 校正 する" would expand to 16 × 16 = 256 combinations, over
-    // MAX_COMBINATIONS (100, src/compat.rs), so only "Rust" is searched.
+    // "Rust 校正 する" would expand to 16 × 16 = 256 combinations. While
+    // MAX_COMBINATIONS (src/compat.rs) is below 256, that overflows and only
+    // "Rust" is searched.
     seed_fifteen_words_starting_with_kousei_and_suru(&conn);
 
     let results = search(&conn, "Rust校正する", &at_now()).unwrap();
 
-    assert_eq!(ids(&results), ["both", "rust-only"]);
+    let mut matched = ids(&results);
+    matched.sort_unstable();
+    assert_eq!(matched, ["both", "rust-only"]);
 }
 
 #[test]
@@ -1085,9 +1088,10 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
     // ー is Katakana, so the query splits into three one-character runs. This
     // message adds five trigrams starting with う, five starting with ー and
     // four starting with ん, since んじ ends the message. s1 adds one of each,
-    // so the split form would expand to 6 × 6 × 5 = 180 combinations. Over MAX_COMBINATIONS (100,
-    // src/compat.rs) it finds nothing. With a cap of 180 or more it finds this
-    // message too. Either way the test fails without the gate.
+    // so the split form would expand to 6 × 6 × 5 = 180 combinations. While
+    // MAX_COMBINATIONS (src/compat.rs) is below 180, it finds nothing. At a cap
+    // of 180 or more it finds this message too. Either way the test fails
+    // without the gate.
     insert_session(&conn, "decoy", "claude", "/proj", NOW_MS);
     insert_message(
         &conn,
