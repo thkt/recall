@@ -2211,28 +2211,27 @@ fn edit_and_write_file_paths_are_stored_as_touched_files_and_kept_out_of_message
     .unwrap();
     index_chunks(&mut conn, None).unwrap();
 
-    let paths = collect_strings(&conn, "SELECT path FROM session_files ORDER BY path");
     assert_eq!(
-        paths,
-        vec![
-            "/proj/alpha_marker.rs".to_owned(),
-            "/proj/beta_marker.rs".to_owned(),
+        collect_strings(
+            &conn,
+            "SELECT session_id || ' ' || path FROM session_files ORDER BY path"
+        ),
+        [
+            "edit_session /proj/alpha_marker.rs",
+            "edit_session /proj/beta_marker.rs"
         ],
-        "Edit and Write file_path values must land in session_files"
+        "Edit and Write file_path values are stored as the session's touched files"
     );
-
-    let message_texts = collect_strings(&conn, "SELECT text FROM messages");
-    let chunk_contents = collect_strings(&conn, "SELECT content FROM qa_chunks");
-    for marker in ["alpha_marker", "beta_marker", "filecontents"] {
-        assert!(
-            !message_texts.iter().any(|t| t.contains(marker)),
-            "tool_use text {marker:?} must not appear in messages"
-        );
-        assert!(
-            !chunk_contents.iter().any(|c| c.contains(marker)),
-            "tool_use text {marker:?} must not appear in qa_chunks"
-        );
-    }
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["please make the edits", "doing the edits"],
+        "messages hold the text blocks only, not the tool_use inputs"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["please make the edits\ndoing the edits"],
+        "chunks hold the text blocks only, not the tool_use inputs"
+    );
 }
 
 #[test]
