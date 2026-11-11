@@ -4468,25 +4468,25 @@ fn missing_archived_root_keeps_its_parse_diagnostics_and_still_clears_those_dele
     let deleted = roots.day.join(format!("{}.zst", rollout_name(3)));
     fs::write(&archived, &undecodable).unwrap();
     fs::write(&deleted, &undecodable).unwrap();
-    let diagnosed = |stats: &IndexStats| -> Vec<PathBuf> {
-        let mut paths: Vec<_> = stats
-            .parse_diagnostics
-            .iter()
-            .map(|d| d.file_path.clone())
-            .collect();
-        paths.sort();
-        paths
-    };
     let first = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-    let mut both = vec![archived.clone(), deleted.clone()];
-    both.sort();
-    assert_eq!(diagnosed(&first), both);
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        diagnosed_files(&first.parse_diagnostics),
+        [
+            (archived.clone(), Source::Codex, NO_LINE_ERRORS, true),
+            (deleted.clone(), Source::Codex, NO_LINE_ERRORS, true),
+        ]
+    );
 
     fs::remove_dir_all(&roots.archived).unwrap();
     fs::remove_file(&deleted).unwrap();
     let second = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    index_chunks(&mut conn).unwrap();
 
-    assert_eq!(diagnosed(&second), [archived]);
+    assert_eq!(
+        diagnosed_files(&second.parse_diagnostics),
+        [(archived, Source::Codex, NO_LINE_ERRORS, true)]
+    );
 }
 
 #[test]
