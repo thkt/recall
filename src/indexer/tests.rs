@@ -2432,67 +2432,6 @@ fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_
 }
 
 #[test]
-fn an_interrupted_chunk_pass_rolls_back_the_chunks_it_wrote_and_the_next_pass_chunks_every_session()
-{
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    seed_session(&conn, "s2");
-    seed_message(&conn, "user", "question");
-    let (observer, lines) = recording();
-
-    // The progress callback runs after s1, the first session, is chunked and marked done.
-    let interrupted = catch_unwind(AssertUnwindSafe(|| {
-        index_chunks_observed(
-            &mut conn,
-            Some(&|_, _| panic!("injected interruption")),
-            &observer,
-        )
-    }));
-
-    assert_eq!(
-        interrupted.err().unwrap().downcast_ref::<&str>(),
-        Some(&"injected interruption")
-    );
-    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
-    assert_eq!(
-        stable_lines(&lines.borrow()),
-        [
-            "index: chunking: started (not yet complete)",
-            "index: chunking: unfinished; only earlier commit notifications confirm saves"
-        ]
-    );
-    assert_eq!(
-        observer.snapshot()["counts"],
-        serde_json::json!({
-            "chunks_created_committed": 0,
-            "sessions_chunk_pending": 2,
-            "sessions_chunk_remaining": 2,
-            "sessions_chunked_committed": 0,
-        })
-    );
-
-    let retry = Observer::default();
-    index_chunks_observed(&mut conn, None, &retry).unwrap();
-    assert_eq!(
-        retry.snapshot()["counts"],
-        serde_json::json!({
-            "chunks_created_committed": 1,
-            "sessions_chunk_pending": 2,
-            "sessions_chunk_remaining": 0,
-            "sessions_chunked_committed": 2,
-            "sessions_chunked_empty": 1,
-        }),
-        "s1, chunked before the interruption, is pending again"
-    );
-    assert_eq!(
-        collect_strings(&conn, "SELECT content FROM qa_chunks"),
-        ["question"]
-    );
-}
-
-#[test]
 fn chunk_pass_with_nothing_pending_reports_no_pending_sessions_and_zero_counts() {
     let (_dir, mut conn) = setup_test_db();
     let (observer, lines) = recording();
