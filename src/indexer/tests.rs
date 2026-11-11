@@ -3806,7 +3806,8 @@ fn stored_vectors(conn: &Connection) -> Vec<String> {
 
 const ROLLOUT_META: &str = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
 
-/// The stored session's id, slug, project and start time: every column but the file path.
+/// The stored session's id, slug, project and start time. The file path is left out
+/// because compressing or archiving the log changes it.
 fn session_identity(conn: &Connection) -> Vec<String> {
     collect_strings(
         conn,
@@ -3969,7 +3970,9 @@ fn compressed_logs_are_indexed_only_from_codex_roots() {
     let codex_dir = tmp.path().join("codex_sessions");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::create_dir_all(&codex_dir).unwrap();
-    // Every file below holds a session that would be indexed if its name were collected.
+    // If collected, the Claude `a.jsonl.zst` and both `c.jsonl.gz` logs would be indexed as
+    // sessions. Both `b.zst` files would be read as plain text without decompression and
+    // would show up in parse_diagnostics.
     fs::write(
         claude_dir.join("a.jsonl.zst"),
         zstd::encode_all(FRESHNESS_QUESTION.as_bytes(), 0).unwrap(),
