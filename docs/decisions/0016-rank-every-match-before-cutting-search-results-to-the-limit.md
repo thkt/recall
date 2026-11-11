@@ -74,6 +74,7 @@ Keyword-only path:
 
 - `an_unknown_source_session_that_could_not_reach_the_results_leaves_them_complete` fails if the flag is set for a skipped session below the cut.
 - `a_session_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first` fails if the flag is missed for a skipped session that could rank.
+- `a_session_with_unreadable_metadata_that_matches_best_is_skipped_and_flags_incomplete` fails if a session whose `sessions` row cannot be decoded is dropped without being counted.
 - `an_unknown_source_session_that_could_not_reach_the_hybrid_results_leaves_them_complete` fails if hybrid search flags a pruned session whose fused score cannot reach the results.
 - `run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results` in `src/commands/search/tests.rs` fails if such a session marks the envelope degraded or adds a note.
 
@@ -97,7 +98,8 @@ No test covers a limit above 100 in hybrid search, so the stated range of the pr
 
 - Issue: #416. The cause was found in review of #414, whose tie-order change (b2aa6b1) was reverted because it did not fix near-ties and made recency count twice in hybrid search
 - DR 0009: the recency blend, its sign invariant, and the `recency_decay` bound that `MAX_BOOST_FACTOR` relies on. This record does not change that invariant and adds where the cut sits relative to the blend
-- `docs/wiki/fts-vec-two-leg-symmetry.md`: candidate-count constants are shared between the legs rather than recomputed per leg
+- DR 0009 names `score_and_sort`, which is now `rank_sessions`. The keyword-only path now orders ties only in `rank_sessions`. So `sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order` fails if that tie-break is reversed, but not if the SQL tie-break in `build_keyword_session_query` is. The SQL order still sets each session's keyword position in hybrid search, and `a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order` fails if it is reversed
+- `docs/wiki/fts-vec-two-leg-symmetry.md`: a change to candidate selection applies to both legs. Its fourth step now states this record's rule for both legs
 
 ### Reassessment Triggers
 
