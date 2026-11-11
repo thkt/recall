@@ -19,8 +19,8 @@ pub(crate) struct ChunkStats {
     pub messages_read: usize,
 }
 
-pub(super) const CHUNK_BATCH_SESSIONS: usize = 64;
-pub(super) const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
+const CHUNK_BATCH_SESSIONS: usize = 64;
+const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
 
 pub(super) const CREATE_CHUNK_MESSAGE_ROWS: &str = "CREATE TEMP TABLE chunk_message_rows (
          session_id TEXT NOT NULL,
