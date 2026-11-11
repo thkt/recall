@@ -215,14 +215,19 @@ fn build_keyword_session_query(
     opts: &SearchOptions,
     now_ms: i64,
 ) -> (String, Vec<Box<dyn ToSql>>) {
-    let mut sql = "SELECT messages.session_id, MIN(messages.rank) AS best_rank, \
-                   s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
-                   FROM messages LEFT JOIN sessions s ON s.session_id = messages.session_id \
-                   WHERE messages MATCH ?"
-        .to_owned();
+    // Grouping before the join looks up each session once, not once per
+    // matching message.
+    let mut inner =
+        "SELECT session_id, MIN(rank) AS best_rank FROM messages WHERE messages MATCH ?".to_owned();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
-    append_search_filters(&mut sql, &mut params, "messages.session_id", opts, now_ms);
-    sql.push_str(" GROUP BY messages.session_id ORDER BY best_rank, messages.session_id");
+    append_search_filters(&mut inner, &mut params, "session_id", opts, now_ms);
+    inner.push_str(" GROUP BY session_id");
+    let sql = format!(
+        "SELECT m.session_id, m.best_rank, \
+         s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
+         FROM ({inner}) m LEFT JOIN sessions s ON s.session_id = m.session_id \
+         ORDER BY m.best_rank, m.session_id"
+    );
     (sql, params)
 }
 

@@ -41,7 +41,7 @@ The rule: **truncate candidates to `limit` only after every later score transfor
 
 What follows from the rule:
 
-- **Keyword-only path.** `build_keyword_session_query` has no `LIMIT` and joins `sessions` in the same read, so one pass returns every matching session with its metadata. `rank_sessions` blends all of them, sorts by `(blended rank, session_id)`, and cuts to `limit`. Excerpts are fetched (`fetch_chunks`) only for the sessions that survive the cut.
+- **Keyword-only path.** `build_keyword_session_query` has no `LIMIT`. It groups the matches by session and then joins `sessions` in the same statement, so one pass returns every matching session with its metadata. `rank_sessions` blends all of them, sorts by `(blended rank, session_id)`, and cuts to `limit`. Excerpts are fetched (`fetch_chunks`) only for the sessions that survive the cut.
 - **Hybrid path, keyword leg.** `rrf_merge_sessions` receives every keyword session in the original `(best_rank, session_id)` order. A skipped session still takes its position in that order, so the sessions after it keep the RRF rank they had before.
 - **Hybrid path, vector leg.** Every search reads `VEC_CANDIDATE_COUNT` nearest chunks, three per result at the largest limit: `3 x MAX_LIMIT = 300`. `MAX_LIMIT` (100) is also the bound that `recall search` puts on `--limit`. Every limit therefore reads the same chunks, and the fused scores do not change with `limit`.
 - **Ceiling of 4096.** sqlite-vec rejects a vec0 query with `k > SQLITE_VEC_VEC0_K_MAX` (4096, `sqlite-vec-0.1.9/sqlite-vec.c:7111`). A compile-time assertion keeps `VEC_CANDIDATE_COUNT` at or below it. Raising `MAX_LIMIT` above 1365 then fails the build instead of the vector leg.
@@ -54,7 +54,7 @@ What follows from the rule:
 - Good, because `--limit N` returns the head of a larger limit on both paths, at every limit `recall search` accepts
 - Good, because a session lifted by the blend or the fusion is no longer cut beforehand, and a skipped session no longer takes one of the `limit` slots
 - Good, because `results_incomplete` (and the `degraded` flag and note that `src/commands/search.rs` derives from it) fires only when the omission could change the visible results, so an agent can trust it when it is set
-- Bad, because the keyword leg reads every matching session before cutting. A broad query over a large index reads and sorts all matches where it used to read `3 x limit`. On the index above without a model, the query took 0.134 s at p50 at `--limit 1` against 0.116 s on `main`. The cost grows with the number of matches; see the second Reassessment Trigger
+- Bad, because the keyword leg reads every matching session before cutting. A broad query over a large index reads and sorts all matches where it used to read `3 x limit`. On the index above without a model, the query took 0.134 s at p50 at `--limit 1` against 0.116 s on `main`. Joining `sessions` after grouping instead of before then took about 16 ms off the p50 at every limit, in 15 alternated runs. The cost grows with the number of matches; see the second Reassessment Trigger
 - Bad, because `MAX_RECENCY_FACTOR` couples the flag to DR 0009's non-negative, at-most-1.0 `recency_decay`. If the decay can exceed 1.0, the bound underestimates and a session that could rank is not flagged
 - Bad, because a session with no readable date counts with the largest factor. It can raise the flag when its real date would have kept it out of the results
 
