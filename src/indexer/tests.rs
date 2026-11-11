@@ -521,21 +521,45 @@ fn metadata_only_rewrite_of_the_same_session_marks_it_automated_and_clears_its_m
     );
 }
 
-#[test]
-fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
-    let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: root.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
-    fs::write(&file, FRESHNESS_QUESTION).unwrap();
-    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-    let existing = load_existing_sessions(&conn).unwrap();
+/// A Claude root and a Codex root under one temp dir. Only the root named `root` exists,
+/// and it holds the log `name`.
+struct OneLog {
+    _tmp: TempDir,
+    claude: PathBuf,
+    codex: PathBuf,
+    file: PathBuf,
+}
+
+impl OneLog {
+    fn new(root: &str, name: &str) -> Self {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(root)).unwrap();
+        Self {
+            claude: tmp.path().join("claude"),
+            codex: tmp.path().join("codex"),
+            file: tmp.path().join(root).join(name),
+            _tmp: tmp,
+        }
+    }
+
+    fn opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
+            force: false,
+            claude_dir: &self.claude,
+            codex_dir: &self.codex,
+            codex_archived_dir: None,
+        }
+    }
+}
+
+/// Runs the per-file step of an index run on the Claude log `file`, reading it with `parse`,
+/// and returns the open transaction so the caller decides what happens before the commit.
+fn index_claude_log_with_parser<'c>(
+    conn: &'c mut Connection,
+    file: &Path,
+    parse: impl FnOnce(&Path, Source) -> Result<Option<ParseResult>>,
+) -> Transaction<'c> {
+    let existing = load_existing_sessions(conn).unwrap();
     let tx = conn.transaction().unwrap();
     let ctx = IndexContext {
         tx: &tx,
@@ -543,115 +567,86 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         force: false,
         embedded_sessions: None,
     };
-    index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
-        rewrite_with_mtime(
-            path,
-            &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
-            mtime,
-        );
+    index_file_with_parser(&ctx, file, &Source::Claude, parse).unwrap();
+    tx
+}
+
+#[test]
+fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
+    let appended = format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}");
+
+    // The append lands before the log is read.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(&log.file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
+    index_claude_log_with_parser(&mut conn, &log.file, |path, source| {
+        rewrite_with_mtime(path, &appended, mtime);
         parse_session_including_empty(path, source)
     })
+    .commit()
     .unwrap();
-    tx.commit().unwrap();
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"],
         "precondition: the read saw the append"
     );
-
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
-}
 
-#[test]
-fn append_landing_while_a_log_is_read_is_indexed_by_the_next_run() {
+    // The append lands while the log is read.
     let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: root.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
-    fs::write(&file, FRESHNESS_QUESTION).unwrap();
-    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-    let existing = load_existing_sessions(&conn).unwrap();
-    let tx = conn.transaction().unwrap();
-    let ctx = IndexContext {
-        tx: &tx,
-        existing: &existing,
-        force: false,
-        embedded_sessions: None,
-    };
-    index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(&log.file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
+    index_claude_log_with_parser(&mut conn, &log.file, |path, source| {
         let parsed = parse_session_including_empty(path, source);
-        rewrite_with_mtime(
-            path,
-            &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
-            mtime,
-        );
+        rewrite_with_mtime(path, &appended, mtime);
         parsed
     })
+    .commit()
     .unwrap();
-    tx.commit().unwrap();
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question"],
         "precondition: the read finished before the append"
     );
-
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
-}
 
-#[test]
-fn append_landing_before_the_index_commits_is_indexed_by_the_next_run() {
+    // The append lands after the log is read, before the index commits.
     let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: root.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
-    fs::write(&file, FRESHNESS_QUESTION).unwrap();
-    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-    let existing = load_existing_sessions(&conn).unwrap();
-    let tx = conn.transaction().unwrap();
-    let ctx = IndexContext {
-        tx: &tx,
-        existing: &existing,
-        force: false,
-        embedded_sessions: None,
-    };
-    index_file_with_parser(&ctx, &file, &Source::Claude, parse_session_including_empty).unwrap();
-    rewrite_with_mtime(
-        &file,
-        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
-        mtime,
-    );
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(&log.file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
+    let tx = index_claude_log_with_parser(&mut conn, &log.file, parse_session_including_empty);
+    rewrite_with_mtime(&log.file, &appended, mtime);
     tx.commit().unwrap();
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
@@ -659,15 +654,18 @@ fn append_landing_before_the_index_commits_is_indexed_by_the_next_run() {
         ["original question"],
         "precondition: the read finished before the append"
     );
-
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
