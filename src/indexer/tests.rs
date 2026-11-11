@@ -2061,39 +2061,66 @@ fn claude_config_dir_projects_is_used_when_recall_claude_dir_is_unset() {
 
 #[test]
 fn session_root_that_is_not_an_absolute_path_is_not_read_and_keeps_its_sessions() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
     // `src` exists relative to the package root, where the test runner starts, and holds
     // no session logs: read as a root, it would look like every Claude session was deleted.
-    for relative in ["", "src"] {
-        let (_dir, mut conn) = setup_test_db();
-        let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: Path::new("src"),
+            codex_dir: &codex_dir,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
-        let stats = index_from_dirs(
-            &mut conn,
-            &IndexOptions {
-                force: false,
-                claude_dir: Path::new(relative),
-                codex_dir: &codex_dir,
-                codex_archived_dir: None,
-            },
-            true,
-        )
-        .unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
+        ["claude", "codex"]
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)]
+    );
+}
 
-        assert_eq!(
-            collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
-            ["claude", "codex"],
-            "{relative:?}"
-        );
-        assert_eq!(
-            stats
-                .skipped_roots
-                .iter()
-                .map(|s| (s.source, s.reason, s.preserved_sessions))
-                .collect::<Vec<_>>(),
-            [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)],
-            "{relative:?}"
-        );
-    }
+#[test]
+fn empty_session_root_path_is_not_read_and_keeps_its_sessions() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: Path::new(""),
+            codex_dir: &codex_dir,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
+        ["claude", "codex"]
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)]
+    );
 }
 
 #[test]
