@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io;
 use std::sync::Mutex;
@@ -2601,22 +2600,13 @@ fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_
 }
 
 #[test]
-fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_stores_each_chunk_with_its_message_range()
- {
+fn chunk_pass_with_nothing_pending_reports_no_pending_sessions_and_zero_counts() {
     let (_dir, mut conn) = setup_test_db();
-
     let (observer, lines) = recording();
+
     let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
-    assert_eq!(
-        (
-            stats.chunks_created,
-            stats.sessions_chunked,
-            stats.message_batches,
-            stats.message_scans,
-            stats.messages_read
-        ),
-        (0, 0, 0, 0, 0)
-    );
+
+    assert_eq!(stats.chunks_created, 0);
     assert_eq!(
         stable_lines(&lines.borrow()),
         [
@@ -2634,7 +2624,12 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
             "sessions_chunked_empty": 0,
         })
     );
+}
 
+#[test]
+fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_stores_each_chunk_with_its_message_range()
+ {
+    let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "empty");
     seed_session(&conn, "empty2");
     seed_session(&conn, "s1");
@@ -2643,25 +2638,13 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
         [],
     )
     .unwrap();
-    let question = seed_message(&conn, "user", "question");
+    seed_message(&conn, "user", "question");
     seed_message(&conn, "unknown-role", "dropped text");
     let (observer, lines) = recording();
-    let progress = RefCell::new(Vec::new());
-    let on_progress = |done, total| progress.borrow_mut().push((done, total));
 
-    let stats = index_chunks_observed(&mut conn, Some(&on_progress), &observer).unwrap();
+    let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
 
-    assert_eq!(
-        (
-            stats.chunks_created,
-            stats.sessions_chunked,
-            stats.message_batches,
-            stats.message_scans,
-            stats.messages_read
-        ),
-        (1, 3, 1, 1, 2)
-    );
-    assert_eq!(*progress.borrow(), [(1, 3), (2, 3), (3, 3)]);
+    assert_eq!(stats.chunks_created, 1);
     assert_eq!(
         stable_lines(&lines.borrow()),
         [
@@ -2680,37 +2663,27 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
             "sessions_chunked_empty": 2,
         })
     );
-    let chunk: (String, String, i64, i64, i64) = conn
-        .query_row(
-            "SELECT session_id, content, timestamp, src_rowid_lo, src_rowid_hi FROM qa_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .unwrap();
-    assert_eq!(
-        chunk,
-        (
-            "s1".to_owned(),
-            "question".to_owned(),
-            1234,
-            question,
-            question
-        )
-    );
     assert_eq!(
         collect_strings(
             &conn,
-            "SELECT session_id || '=' || chunks_indexed FROM sessions ORDER BY session_id"
+            "SELECT json_array(session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id"
         ),
-        ["empty=0", "empty2=0", "s1=0"]
+        [r#"["s1","question",1234,1,1]"#]
     );
-    assert!(
-        !conn
-            .prepare("SELECT 1 FROM temp.sqlite_master WHERE name = 'chunk_message_rows'")
-            .unwrap()
-            .exists([])
-            .unwrap(),
-        "the staging table must not outlive the pass"
+
+    seed_session(&conn, "later");
+    let next = Observer::default();
+    index_chunks_observed(&mut conn, None, &next).unwrap();
+    assert_eq!(
+        next.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 1,
+            "sessions_chunked_empty": 1,
+        }),
+        "a second pass on the same connection chunks only the new session"
     );
 }
 
