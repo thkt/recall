@@ -155,6 +155,37 @@ fn rewrite_with_mtime(path: &Path, body: &str, mtime: SystemTime) {
         .unwrap();
 }
 
+/// A Claude root and a Codex root under one temp dir. Only the root named `root` exists,
+/// and it holds the log `name`.
+struct OneLog {
+    _tmp: TempDir,
+    claude: PathBuf,
+    codex: PathBuf,
+    file: PathBuf,
+}
+
+impl OneLog {
+    fn new(root: &str, name: &str) -> Self {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(root)).unwrap();
+        Self {
+            claude: tmp.path().join("claude"),
+            codex: tmp.path().join("codex"),
+            file: tmp.path().join(root).join(name),
+            _tmp: tmp,
+        }
+    }
+
+    fn opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
+            force: false,
+            claude_dir: &self.claude,
+            codex_dir: &self.codex,
+            codex_archived_dir: None,
+        }
+    }
+}
+
 const CLAUDE_METADATA_ONLY: &str = r#"{"type":"system","cwd":"/proj"}"#;
 const CODEX_QUESTION: &str = concat!(
     r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
@@ -173,24 +204,19 @@ fn counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::
     observer.snapshot()["counts"].clone()
 }
 
-#[test]
-fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
+/// Indexes `question` in the log `s.jsonl` under the root named `root`, then changes the
+/// log's size at an equal mtime and at an mtime 500 microseconds later. An unfinished line
+/// must keep the stored messages, and each complete body must be re-indexed.
+fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
     let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: root.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
+    let log = OneLog::new(root, "s.jsonl");
+    let opts = log.opts();
     let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0);
+    rewrite_with_mtime(&log.file, question, t0);
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
 
-    rewrite_with_mtime(&file, "{", t0);
+    rewrite_with_mtime(&log.file, "{", t0);
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
@@ -199,11 +225,7 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
         "an unfinished line keeps the stored messages"
     );
 
-    rewrite_with_mtime(
-        &file,
-        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
-        t0,
-    );
+    rewrite_with_mtime(&log.file, &format!("{question}{answer}"), t0);
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
@@ -211,9 +233,9 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
         ["original question", "appended answer"]
     );
 
-    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0 + Duration::from_micros(500));
+    rewrite_with_mtime(&log.file, question, t0 + Duration::from_micros(500));
     assert_eq!(
-        fs::metadata(&file).unwrap().modified().unwrap(),
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
         t0 + Duration::from_micros(500),
         "precondition: the file system keeps a submillisecond mtime"
     );
@@ -230,51 +252,53 @@ fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
 }
 
 #[test]
+fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
+    assert_size_changes_are_reindexed("claude", FRESHNESS_QUESTION, FRESHNESS_ANSWER);
+}
+
+#[test]
 fn codex_log_whose_size_changes_with_an_equal_or_submillisecond_mtime_is_reindexed() {
+    assert_size_changes_are_reindexed("codex", CODEX_QUESTION, CODEX_ANSWER);
+}
+
+/// Indexes `question` in the log `s.jsonl` under the root named `root` and reduces the log
+/// to `metadata_only` at the same mtime. It then restores `question` 10 seconds later and
+/// empties the log 500 microseconds after that. Each step that removes the question must
+/// remove its stored message.
+fn assert_emptied_log_loses_its_stored_messages(root: &str, question: &str, metadata_only: &str) {
     let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &absent,
-        codex_dir: root.path(),
-        codex_archived_dir: None,
-    };
+    let log = OneLog::new(root, "s.jsonl");
+    let opts = log.opts();
     let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    rewrite_with_mtime(&file, CODEX_QUESTION, t0);
+    let t1 = t0 + Duration::from_secs(10);
+    rewrite_with_mtime(&log.file, question, t0);
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
 
-    rewrite_with_mtime(&file, "{", t0);
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+    rewrite_with_mtime(&log.file, metadata_only, t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+
+    rewrite_with_mtime(&log.file, question, t1);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["original question"],
-        "an unfinished line keeps the stored messages"
+        "precondition: the log holds a message again"
     );
 
-    rewrite_with_mtime(&file, &format!("{CODEX_QUESTION}{CODEX_ANSWER}"), t0);
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    rewrite_with_mtime(&log.file, "", t1 + Duration::from_micros(500));
     assert_eq!(
-        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-        ["original question", "appended answer"]
-    );
-
-    rewrite_with_mtime(&file, CODEX_QUESTION, t0 + Duration::from_micros(500));
-    assert_eq!(
-        fs::metadata(&file).unwrap().modified().unwrap(),
-        t0 + Duration::from_micros(500),
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
+        t1 + Duration::from_micros(500),
         "precondition: the file system keeps a submillisecond mtime"
     );
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
     index_chunks(&mut conn, None).unwrap();
-    assert_eq!(
-        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-        ["original question"]
-    );
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
 
     let counts = counts_of_a_rerun(&mut conn, &opts);
     assert_eq!(counts["files_updated"], 0);
@@ -283,99 +307,17 @@ fn codex_log_whose_size_changes_with_an_equal_or_submillisecond_mtime_is_reindex
 
 #[test]
 fn claude_log_emptied_or_reduced_to_metadata_with_an_unchanged_mtime_loses_its_stored_messages() {
-    let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: root.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
-    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let t1 = t0 + Duration::from_secs(10);
-    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0);
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-
-    rewrite_with_mtime(&file, CLAUDE_METADATA_ONLY, t0);
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
-    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
-
-    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t1);
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(
-        collect_strings(&conn, "SELECT text FROM messages"),
-        ["original question"],
-        "precondition: the log holds a message again"
+    assert_emptied_log_loses_its_stored_messages(
+        "claude",
+        FRESHNESS_QUESTION,
+        CLAUDE_METADATA_ONLY,
     );
-
-    rewrite_with_mtime(&file, "", t1 + Duration::from_micros(500));
-    assert_eq!(
-        fs::metadata(&file).unwrap().modified().unwrap(),
-        t1 + Duration::from_micros(500),
-        "precondition: the file system keeps a submillisecond mtime"
-    );
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
-    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
-    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
-
-    let counts = counts_of_a_rerun(&mut conn, &opts);
-    assert_eq!(counts["files_updated"], 0);
-    assert_eq!(counts["files_unchanged"], 1);
 }
 
 #[test]
 fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_its_stored_messages()
 {
-    let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let file = root.path().join("s.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &absent,
-        codex_dir: root.path(),
-        codex_archived_dir: None,
-    };
-    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let t1 = t0 + Duration::from_secs(10);
-    rewrite_with_mtime(&file, CODEX_QUESTION, t0);
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-
-    rewrite_with_mtime(&file, CODEX_METADATA_ONLY, t0);
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
-    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
-
-    rewrite_with_mtime(&file, CODEX_QUESTION, t1);
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(
-        collect_strings(&conn, "SELECT text FROM messages"),
-        ["original question"],
-        "precondition: the log holds a message again"
-    );
-
-    rewrite_with_mtime(&file, "", t1 + Duration::from_micros(500));
-    assert_eq!(
-        fs::metadata(&file).unwrap().modified().unwrap(),
-        t1 + Duration::from_micros(500),
-        "precondition: the file system keeps a submillisecond mtime"
-    );
-    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
-    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
-    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
-
-    let counts = counts_of_a_rerun(&mut conn, &opts);
-    assert_eq!(counts["files_updated"], 0);
-    assert_eq!(counts["files_unchanged"], 1);
+    assert_emptied_log_loses_its_stored_messages("codex", CODEX_QUESTION, CODEX_METADATA_ONLY);
 }
 
 const SESSION_A_LOG: &str = concat!(
@@ -546,37 +488,6 @@ fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
         ["automated"],
         "a log naming another session cannot reset the stored label"
     );
-}
-
-/// A Claude root and a Codex root under one temp dir. Only the root named `root` exists,
-/// and it holds the log `name`.
-struct OneLog {
-    _tmp: TempDir,
-    claude: PathBuf,
-    codex: PathBuf,
-    file: PathBuf,
-}
-
-impl OneLog {
-    fn new(root: &str, name: &str) -> Self {
-        let tmp = TempDir::new().unwrap();
-        fs::create_dir(tmp.path().join(root)).unwrap();
-        Self {
-            claude: tmp.path().join("claude"),
-            codex: tmp.path().join("codex"),
-            file: tmp.path().join(root).join(name),
-            _tmp: tmp,
-        }
-    }
-
-    fn opts(&self) -> IndexOptions<'_> {
-        IndexOptions {
-            force: false,
-            claude_dir: &self.claude,
-            codex_dir: &self.codex,
-            codex_archived_dir: None,
-        }
-    }
 }
 
 /// Runs the per-file step of an index run on the Claude log `file`, reading it with `parse`,
@@ -3778,8 +3689,9 @@ fn session_identity(conn: &Connection) -> Vec<String> {
     )
 }
 
-#[test]
-fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
+/// Indexes and embeds `body` as a Codex rollout, then compresses the log and removes the
+/// plain copy. The session must keep its identity and embeddings under the compressed path.
+fn assert_compressing_keeps_the_session_and_its_embeddings(body: &str) {
     let (_db, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -3787,7 +3699,7 @@ fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
     let day_dir = codex_dir.join("2026/04/27");
     fs::create_dir_all(&day_dir).unwrap();
     let plain = day_dir.join(ROLLOUT_NAME);
-    fs::write(&plain, format!("{ROLLOUT_META}\n{ROLLOUT_TURNS}")).unwrap();
+    fs::write(&plain, body).unwrap();
     let opts = IndexOptions {
         force: false,
         claude_dir: &claude_dir,
@@ -3820,44 +3732,15 @@ fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
 }
 
 #[test]
+fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
+    assert_compressing_keeps_the_session_and_its_embeddings(&format!(
+        "{ROLLOUT_META}\n{ROLLOUT_TURNS}"
+    ));
+}
+
+#[test]
 fn compressing_a_codex_log_that_has_no_session_meta_keeps_the_indexed_session_and_its_embeddings() {
-    let (_db, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-    let claude_dir = tmp.path().join("claude_projects");
-    let codex_dir = tmp.path().join("codex_sessions");
-    let day_dir = codex_dir.join("2026/04/27");
-    fs::create_dir_all(&day_dir).unwrap();
-    let plain = day_dir.join(ROLLOUT_NAME);
-    fs::write(&plain, ROLLOUT_TURNS).unwrap();
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(
-        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
-            .unwrap()
-            .embedded,
-        1
-    );
-    let identity_before = session_identity(&conn);
-    let vectors_before = stored_vectors(&conn);
-
-    let compressed = compress_log(&plain);
-    fs::remove_file(&plain).unwrap();
-    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-
-    assert_eq!(stats.total_sessions, 1);
-    assert_eq!(
-        collect_strings(&conn, "SELECT file_path FROM sessions"),
-        [compressed.to_str().unwrap()]
-    );
-    assert_eq!(session_identity(&conn), identity_before);
-    assert_eq!(stored_vectors(&conn), vectors_before);
-    assert!(stats.parse_diagnostics.is_empty());
+    assert_compressing_keeps_the_session_and_its_embeddings(ROLLOUT_TURNS);
 }
 
 #[test]
@@ -4074,12 +3957,13 @@ fn session_ids(conn: &Connection) -> Vec<String> {
     collect_strings(conn, "SELECT session_id FROM sessions ORDER BY session_id")
 }
 
-#[test]
-fn archiving_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
+/// Indexes and embeds `body` as a live Codex rollout, then moves its compressed copy into
+/// the archived root. The session must keep its identity and embeddings under the archived path.
+fn assert_archiving_keeps_the_session_and_its_embeddings(body: &str) {
     let (_db, mut conn) = setup_test_db();
     let roots = CodexRoots::new();
     let live = roots.day.join(ROLLOUT_NAME);
-    fs::write(&live, format!("{ROLLOUT_META}\n{ROLLOUT_TURNS}")).unwrap();
+    fs::write(&live, body).unwrap();
     index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
     index_chunks(&mut conn, None).unwrap();
     assert_eq!(
@@ -4112,40 +3996,15 @@ fn archiving_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
 }
 
 #[test]
+fn archiving_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
+    assert_archiving_keeps_the_session_and_its_embeddings(&format!(
+        "{ROLLOUT_META}\n{ROLLOUT_TURNS}"
+    ));
+}
+
+#[test]
 fn archiving_a_codex_log_that_has_no_session_meta_keeps_the_indexed_session_and_its_embeddings() {
-    let (_db, mut conn) = setup_test_db();
-    let roots = CodexRoots::new();
-    let live = roots.day.join(ROLLOUT_NAME);
-    fs::write(&live, ROLLOUT_TURNS).unwrap();
-    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(
-        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
-            .unwrap()
-            .embedded,
-        1
-    );
-    let identity_before = session_identity(&conn);
-    let vectors_before = stored_vectors(&conn);
-
-    let compressed = compress_log(&live);
-    let archived = roots.archived.join(compressed.file_name().unwrap());
-    fs::rename(&compressed, &archived).unwrap();
-    fs::remove_file(&live).unwrap();
-    let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-
-    assert_eq!(stats.total_sessions, 1);
-    assert_eq!(
-        collect_strings(&conn, "SELECT file_path FROM sessions"),
-        [archived.to_str().unwrap()]
-    );
-    assert_eq!(
-        session_identity(&conn),
-        identity_before,
-        "the slug keeps the session's date"
-    );
-    assert_eq!(stored_vectors(&conn), vectors_before);
-    assert!(stats.skipped_roots.is_empty());
+    assert_archiving_keeps_the_session_and_its_embeddings(ROLLOUT_TURNS);
 }
 
 #[test]
