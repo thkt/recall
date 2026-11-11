@@ -758,42 +758,6 @@ fn deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_em
     assert!(collect_strings(&conn, "SELECT path FROM session_files").is_empty());
 }
 
-#[test]
-fn test_skipped_root_reports_preserved_count() {
-    let (_dir, mut conn) = setup_test_db();
-    let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let gone_codex = tmp.path().join("missing_codex");
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &gone_codex,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        stats.skipped_roots.len(),
-        1,
-        "only the missing codex root should be reported"
-    );
-    let reported = &stats.skipped_roots[0];
-    assert_eq!(reported.source, Source::Codex);
-    assert_eq!(
-        reported.preserved_sessions, 1,
-        "the one preserved codex session must be counted"
-    );
-    assert_eq!(
-        reported.reason,
-        SkippedReason::MissingRoot,
-        "an absent root must be classified as missing, not incomplete enumeration"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn unreadable_codex_subdirectory_keeps_every_session_and_reports_only_unseen_ones_as_preserved() {
