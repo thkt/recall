@@ -2376,78 +2376,120 @@ fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_a
 
 #[test]
 fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_every_session() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "empty");
+    seed_session(&conn, "s1");
+    seed_message(&conn, "user", "question");
+    conn.execute_batch(
+        "CREATE TEMP TRIGGER fail_completion BEFORE UPDATE OF chunks_indexed ON sessions
+         WHEN NEW.session_id = 's1'
+         BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
+    )
+    .unwrap();
+    let (observer, lines) = recording();
+
+    let error = index_chunks_observed(&mut conn, None, &observer)
+        .err()
+        .unwrap();
+
+    assert_eq!(error.to_string(), "injected completion failure");
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: chunking: started (not yet complete)",
+            "index: chunking: unfinished; only earlier commit notifications confirm saves"
+        ]
+    );
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 2,
+            "sessions_chunk_remaining": 2,
+            "sessions_chunked_committed": 0,
+        })
+    );
+
+    conn.execute_batch("DROP TRIGGER fail_completion;").unwrap();
+    let retry = Observer::default();
+    index_chunks_observed(&mut conn, None, &retry).unwrap();
+    assert_eq!(
+        retry.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 1,
+            "sessions_chunk_pending": 2,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 2,
+            "sessions_chunked_empty": 1,
+        }),
+        "the empty session chunked before the failure is pending again"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["question"]
+    );
+}
+
+#[test]
+fn an_interrupted_chunk_pass_rolls_back_the_chunks_it_wrote_and_the_next_pass_chunks_every_session()
+{
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
-    for interrupt in [false, true] {
-        let (_dir, mut conn) = setup_test_db();
-        seed_session(&conn, "empty");
-        seed_session(&conn, "s1");
-        seed_message(&conn, "user", "question");
-        let (observer, lines) = recording();
-        if !interrupt {
-            conn.execute_batch(
-                "CREATE TEMP TRIGGER fail_completion BEFORE UPDATE OF chunks_indexed ON sessions
-                 WHEN NEW.session_id = 's1'
-                 BEGIN SELECT RAISE(ABORT, 'injected completion failure'); END;",
-            )
-            .unwrap();
-            let error = index_chunks_observed(&mut conn, None, &observer)
-                .err()
-                .unwrap();
-            assert!(error.to_string().contains("injected completion failure"));
-        } else {
-            assert!(
-                catch_unwind(AssertUnwindSafe(|| {
-                    index_chunks_observed(
-                        &mut conn,
-                        Some(&|done, _| {
-                            if done == 2 {
-                                panic!("injected interruption");
-                            }
-                        }),
-                        &observer,
-                    )
-                    .unwrap();
-                }))
-                .is_err()
-            );
-        }
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM qa_chunks", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM sessions WHERE chunks_indexed IS NOT NULL",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            observer.snapshot()["counts"]["sessions_chunked_committed"],
-            0
-        );
-        assert!(
-            lines
-                .borrow()
-                .iter()
-                .any(|line| line.contains("chunking: unfinished"))
-        );
-        assert!(
-            !lines
-                .borrow()
-                .iter()
-                .any(|line| line.contains("chunking: committed"))
-        );
-        conn.execute_batch("DROP TRIGGER IF EXISTS fail_completion;")
-            .unwrap();
-        let retried = index_chunks(&mut conn, None).unwrap();
-        assert_eq!((retried.chunks_created, retried.sessions_chunked), (1, 2));
-        assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
-    }
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    seed_session(&conn, "s2");
+    seed_message(&conn, "user", "question");
+    let (observer, lines) = recording();
+
+    // The progress callback runs after s1, the first session, is chunked and marked done.
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        index_chunks_observed(
+            &mut conn,
+            Some(&|_, _| panic!("injected interruption")),
+            &observer,
+        )
+    }));
+
+    assert_eq!(
+        interrupted.err().unwrap().downcast_ref::<&str>(),
+        Some(&"injected interruption")
+    );
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: chunking: started (not yet complete)",
+            "index: chunking: unfinished; only earlier commit notifications confirm saves"
+        ]
+    );
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 2,
+            "sessions_chunk_remaining": 2,
+            "sessions_chunked_committed": 0,
+        })
+    );
+
+    let retry = Observer::default();
+    index_chunks_observed(&mut conn, None, &retry).unwrap();
+    assert_eq!(
+        retry.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 1,
+            "sessions_chunk_pending": 2,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 2,
+            "sessions_chunked_empty": 1,
+        }),
+        "s1, chunked before the interruption, is pending again"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["question"]
+    );
 }
 
 #[test]
