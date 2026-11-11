@@ -3356,7 +3356,14 @@ fn continuing_the_last_answer_reuses_the_unchanged_chunks_and_infers_only_the_ex
         results[0].excerpt,
         "tail question\ntail answer\ncontinuation needle"
     );
-    assert_eq!(results[0].chunk_id, Some(4));
+    let extended: i64 = conn
+        .query_row(
+            "SELECT id FROM qa_chunks WHERE content = 'tail question\ntail answer\ncontinuation needle'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(results[0].chunk_id, Some(extended));
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
