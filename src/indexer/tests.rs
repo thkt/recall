@@ -1639,9 +1639,17 @@ fn embedded_session_and_a_log_reusing_its_id(conn: &mut Connection) -> Colliding
         ),
     )
     .unwrap();
-    index_from_dirs(conn, &logs.opts(), true).unwrap();
-    index_chunks(conn, None).unwrap();
-    embed_recent_chunks(conn, &MockEmbedder::new(), 100, None).unwrap();
+    assert_eq!(
+        index_from_dirs(conn, &logs.opts(), true).unwrap().indexed,
+        1
+    );
+    assert_eq!(index_chunks(conn, None).unwrap().chunks_created, 1);
+    assert_eq!(
+        embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
     seed_session_file(conn, "collision", "/proj/original.rs");
     fs::write(
         &logs.replacement,
@@ -1695,7 +1703,11 @@ fn assert_the_session_holds_only_the_replacement(conn: &mut Connection, replacem
         collect_strings(conn, "SELECT path FROM session_files").is_empty(),
         "the old touched file is removed"
     );
-    index_chunks(conn, None).unwrap();
+    assert_eq!(
+        index_chunks(conn, None).unwrap().chunks_created,
+        0,
+        "indexing the replacement already reconciled its chunks"
+    );
     assert_eq!(
         collect_strings(conn, "SELECT content FROM qa_chunks"),
         ["replacement question"]
