@@ -2688,10 +2688,15 @@ fn diagnosed_files(
         .collect()
 }
 
-const ONE_INVALID_JSON_LINE: LineDiagnostics = LineDiagnostics {
-    invalid_json_lines: 1,
+const NO_LINE_ERRORS: LineDiagnostics = LineDiagnostics {
+    invalid_json_lines: 0,
     invalid_utf8_lines: 0,
     incomplete_tail_lines: 0,
+};
+
+const ONE_INVALID_JSON_LINE: LineDiagnostics = LineDiagnostics {
+    invalid_json_lines: 1,
+    ..NO_LINE_ERRORS
 };
 
 #[test]
@@ -2859,7 +2864,10 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
 fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resolved() {
     use std::os::unix::ffi::OsStringExt;
 
-    fn observe(conn: &mut Connection, paths: &[PathBuf]) -> Vec<FileParseDiagnostics> {
+    /// Indexes `paths` as one run over a fully read Claude root does after enumeration, then
+    /// chunks and returns the diagnostics `--json` reports. The run skips enumeration because
+    /// APFS refuses the file names that are not UTF-8 this test needs.
+    fn index_paths(conn: &mut Connection, paths: &[PathBuf]) -> Vec<FileParseDiagnostics> {
         let existing = load_existing_sessions(conn).unwrap();
         let tx = conn.transaction().unwrap();
         let ctx = IndexContext {
@@ -2871,14 +2879,22 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         let sources: Vec<_> = paths.iter().cloned().map(|p| (p, Source::Claude)).collect();
         index_all(&ctx, &sources, &Observer::default()).unwrap();
         let source_paths = paths.iter().map(PathBuf::as_path).collect();
-        let diagnostics = cleanup_parse_diagnostics(
+        cleanup_parse_diagnostics(
             &tx,
             &source_paths,
             &RemovalGate::fully_read([Source::Claude]),
         )
         .unwrap();
         tx.commit().unwrap();
+        index_chunks(conn).unwrap();
+        load_parse_diagnostics(conn).unwrap()
+    }
+
+    fn display_paths(diagnostics: &[FileParseDiagnostics]) -> Vec<String> {
         diagnostics
+            .iter()
+            .map(FileParseDiagnostics::display_path)
+            .collect()
     }
 
     let (db_dir, mut conn) = setup_test_db();
@@ -2890,40 +2906,50 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
             .join(OsString::from_vec(b"bad-\xfe.jsonl".to_vec())),
         tmp.path().join("bad-\u{fffd}.jsonl"),
     ];
+    let shown = paths[2].to_str().unwrap();
     fs::write(&paths[2], "invalid JSON\n").unwrap();
-    let diagnostics = observe(&mut conn, &paths);
-    assert_eq!(diagnostics.len(), 3);
-    assert_eq!(diagnostics.iter().filter(|d| d.read_error).count(), 2);
-    assert!(
-        diagnostics
-            .iter()
-            .all(|d| { d.display_path() == paths[2].to_str().unwrap() })
+    let first = index_paths(&mut conn, &paths);
+    assert_eq!(
+        diagnosed_files(&first),
+        [
+            (
+                paths[2].clone(),
+                Source::Claude,
+                ONE_INVALID_JSON_LINE,
+                false
+            ),
+            (paths[1].clone(), Source::Claude, NO_LINE_ERRORS, true),
+            (paths[0].clone(), Source::Claude, NO_LINE_ERRORS, true),
+        ]
     );
     assert_eq!(
-        diagnostics
-            .iter()
-            .map(|d| d.lines.invalid_json_lines)
-            .sum::<i64>(),
-        1
+        display_paths(&first),
+        [shown, shown, shown],
+        "the three files show the same path"
     );
 
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     fs::write(&paths[2], "{\"type\":\"user\",\"message\":\"readable\"}\n").unwrap();
-    for _ in 0..2 {
-        let diagnostics = observe(&mut conn, &paths);
-
-        assert_eq!(diagnostics.len(), 2);
-        assert!(diagnostics.iter().all(|d| d.read_error));
-        let reported: HashSet<_> = diagnostics.iter().map(|d| &d.file_path).collect();
-        assert_eq!(reported, HashSet::from([&paths[0], &paths[1]]));
-    }
-    let diagnostics = observe(&mut conn, &paths[1..]);
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].file_path, paths[1]);
-    assert!(diagnostics[0].read_error);
-    let diagnostics = observe(&mut conn, &paths[2..]);
-    assert!(diagnostics.is_empty());
+    let unreadable_only = [
+        (paths[1].clone(), Source::Claude, NO_LINE_ERRORS, true),
+        (paths[0].clone(), Source::Claude, NO_LINE_ERRORS, true),
+    ];
+    assert_eq!(
+        diagnosed_files(&index_paths(&mut conn, &paths)),
+        unreadable_only,
+        "repairing the readable file clears only its diagnostics"
+    );
+    assert_eq!(
+        diagnosed_files(&index_paths(&mut conn, &paths)),
+        unreadable_only,
+        "a run that finds the repaired file unchanged keeps both read errors"
+    );
+    assert_eq!(
+        diagnosed_files(&index_paths(&mut conn, &paths[1..])),
+        [(paths[1].clone(), Source::Claude, NO_LINE_ERRORS, true)]
+    );
+    assert_eq!(diagnosed_files(&index_paths(&mut conn, &paths[2..])), []);
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["readable"]
