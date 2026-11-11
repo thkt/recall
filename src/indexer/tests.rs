@@ -1921,7 +1921,7 @@ fn unreadable_directory_entry_marks_the_root_incompletely_read_and_keeps_the_rea
 }
 
 #[test]
-fn test_011_index_chunks_incremental() {
+fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_log_gains_a_turn() {
     let (dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -2275,7 +2275,7 @@ fn seed_legacy_chunk(conn: &Connection, id: i64, content: &str) {
 }
 
 #[test]
-fn test_192e_backfill_populates_rowid_range_count_match() {
+fn rowid_backfill_links_a_legacy_chunk_to_its_messages_and_keeps_its_embedding() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
     let user_rowid = seed_message(&conn, "user", "how to rotate tokens");
@@ -2328,7 +2328,7 @@ fn test_192e_backfill_populates_rowid_range_count_match() {
 }
 
 #[test]
-fn test_192f_backfill_leaves_null_on_count_mismatch() {
+fn rowid_backfill_leaves_legacy_chunks_unlinked_when_rechunking_yields_a_different_count() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
     seed_message(&conn, "user", "single turn");
@@ -2355,7 +2355,8 @@ fn test_192f_backfill_leaves_null_on_count_mismatch() {
 }
 
 #[test]
-fn test_229b_backfill_skips_count_match_with_content_drift() {
+fn rowid_backfill_leaves_a_legacy_chunk_unlinked_when_rechunking_yields_the_same_count_but_different_content()
+ {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "s1");
     seed_message(&conn, "user", "how do i tune the cache");
@@ -2416,7 +2417,7 @@ fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
 }
 
 #[test]
-fn edit_write_の_file_path_が_session_files_に入る() {
+fn edit_and_write_file_paths_are_stored_as_touched_files_and_kept_out_of_messages_and_chunks() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -2470,7 +2471,7 @@ fn edit_write_の_file_path_が_session_files_に入る() {
 }
 
 #[test]
-fn 妥当でない値は捨てられる() {
+fn touched_file_paths_that_are_empty_too_long_or_contain_a_newline_are_dropped() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -2526,7 +2527,8 @@ fn 妥当でない値は捨てられる() {
 }
 
 #[test]
-fn 読めない_jsonl_のセッションはマーカーを立てず次回に再試行する() {
+fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_its_touched_files_once_the_log_is_readable()
+ {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "gone-session");
     let unmarked_before: i64 = conn
@@ -2575,7 +2577,8 @@ fn 読めない_jsonl_のセッションはマーカーを立てず次回に再�
 }
 
 #[test]
-fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再読しない() {
+fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_and_does_not_read_them_again()
+ {
     let (_dir, mut conn) = setup_test_db();
     conn.execute(
         "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL)",
@@ -2615,7 +2618,7 @@ fn 未知_source_と_空_jsonl_のセッションはマーカーを立てて再�
 }
 
 #[test]
-fn chunk_completion_rolls_back_with_chunks_and_retries() {
+fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_every_session() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     for interrupt in [false, true] {
@@ -2691,7 +2694,8 @@ fn chunk_completion_rolls_back_with_chunks_and_retries() {
 }
 
 #[test]
-fn chunk_pass_reports_stage_lines_counts_and_rows_with_and_without_pending_sessions() {
+fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_stores_each_chunk_with_its_message_range()
+ {
     let (_dir, mut conn) = setup_test_db();
 
     let (observer, lines) = recording();
@@ -3368,7 +3372,7 @@ fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
 }
 
 #[test]
-fn unchanged_chunks_reuse_vectors_and_changed_groups_match_a_fresh_rebuild() {
+fn appending_a_turn_reuses_every_stored_vector_and_infers_only_the_new_chunk() {
     let original = [
         ("user", "duplicate"),
         ("assistant", "same answer"),
