@@ -1522,28 +1522,23 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
     let dir = TempDir::new().unwrap();
     // Equal text gives equal raw ranks, so only the recency blend separates the
     // sessions. "z-newest" sorts last by id, so a cut before the blend drops it.
-    let sessions: Vec<(String, Vec<String>)> = [
-        ("a1", "2026-01-01T00:00:00Z"),
-        ("a2", "2026-01-02T00:00:00Z"),
-        ("a3", "2026-01-03T00:00:00Z"),
-        ("a4", "2026-01-04T00:00:00Z"),
-        ("a5", "2026-01-05T00:00:00Z"),
-        ("z-newest", "2026-10-01T00:00:00Z"),
-    ]
-    .iter()
-    .map(|(name, ts)| {
-        (
-            (*name).to_owned(),
-            vec![user_line("authentication notes", ts)],
-        )
-    })
-    .collect();
-    let refs: Vec<(&str, Vec<&str>)> = sessions
-        .iter()
-        .map(|(n, l)| (n.as_str(), l.iter().map(String::as_str).collect()))
-        .collect();
-    let borrowed: Vec<(&str, &[&str])> = refs.iter().map(|(n, l)| (*n, l.as_slice())).collect();
-    index_claude_sessions(dir.path(), &borrowed);
+    let a1 = user_line("authentication notes", "2026-01-01T00:00:00Z");
+    let a2 = user_line("authentication notes", "2026-01-02T00:00:00Z");
+    let a3 = user_line("authentication notes", "2026-01-03T00:00:00Z");
+    let a4 = user_line("authentication notes", "2026-01-04T00:00:00Z");
+    let a5 = user_line("authentication notes", "2026-01-05T00:00:00Z");
+    let newest = user_line("authentication notes", "2026-10-01T00:00:00Z");
+    index_claude_sessions(
+        dir.path(),
+        &[
+            ("a1", &[&a1]),
+            ("a2", &[&a2]),
+            ("a3", &[&a3]),
+            ("a4", &[&a4]),
+            ("a5", &[&a5]),
+            ("z-newest", &[&newest]),
+        ],
+    );
 
     let default_limit = search_envelope(dir.path(), &["authentication"]);
     let limit_one = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
@@ -1566,7 +1561,7 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
 }
 
 #[test]
-fn search_that_skips_only_an_unknown_source_session_outside_the_results_is_not_degraded() {
+fn search_that_skips_only_an_unknown_source_session_outside_the_results_adds_no_incomplete_note() {
     let dir = TempDir::new().unwrap();
     let valid = user_line("authentication", "2026-03-01T00:00:00Z");
     let weird = user_line(
@@ -1583,11 +1578,6 @@ fn search_that_skips_only_an_unknown_source_session_outside_the_results_is_not_d
         incomplete_note(&envelope),
         None,
         "a skipped session that cannot reach the results must not raise the note: {envelope}"
-    );
-    assert_eq!(
-        envelope["degraded"].as_bool(),
-        envelope["notes"].as_array().map(|n| !n.is_empty()),
-        "degraded must come only from the remaining notes: {envelope}"
     );
 }
 

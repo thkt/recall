@@ -1974,6 +1974,28 @@ fn an_unknown_source_vector_match_does_not_take_the_limit_slot() {
     assert!(outcome.results_incomplete);
 }
 
+#[test]
+fn an_unknown_source_session_that_could_not_reach_the_hybrid_results_leaves_them_complete() {
+    // "valid" is first by text and by vector. "weird" is second by text only,
+    // so even the largest recency boost leaves its fused score below "valid".
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication");
+    insert_chunk(&conn, 1, "valid", "authentication");
+    insert_session(&conn, "weird", "gemini", "/proj", NOW_MS);
+    insert_message(
+        &conn,
+        "weird",
+        "user",
+        "authentication retry logic for the session refresh path in the gateway service",
+    );
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(!outcome.results_incomplete);
+}
+
 /// One session reachable by both text and vector search.
 fn seed_filter_case(
     conn: &Connection,
