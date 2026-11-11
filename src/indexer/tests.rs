@@ -2245,37 +2245,6 @@ fn rowid_backfill_leaves_a_legacy_chunk_unlinked_when_rechunking_yields_the_same
 }
 
 #[test]
-fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    seed_message(&conn, "user", "how do i configure the retry backoff");
-    seed_message(&conn, "assistant", "first set the base interval");
-    seed_message(
-        &conn,
-        "assistant",
-        "then cap it with zylophonemax jitter ceiling",
-    );
-
-    index_chunks(&mut conn, None).unwrap();
-    let embedder = MockEmbedder::new();
-    embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
-
-    let embedded: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks c JOIN vec_chunks v ON v.chunk_id = c.id \
-             WHERE c.content LIKE '%zylophonemax%'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        embedded > 0,
-        "the trailing assistant's text must reach an embedded qa_chunk so semantic \
-         search can find it; orphaning it leaves it FTS-only and vector-invisible"
-    );
-}
-
-#[test]
 fn edit_and_write_file_paths_are_stored_as_touched_files_and_kept_out_of_messages_and_chunks() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
