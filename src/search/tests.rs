@@ -605,6 +605,120 @@ fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
     assert_eq!(ids(&results), ["new"]);
 }
 
+/// Four year-old sessions match "authentication" equally well, and one new
+/// session matches slightly worse. The new session ranks fifth by text alone,
+/// and the 20% that recency adds to a same-day session lifts it to the front.
+fn seed_new_session_ranked_fifth_by_text(conn: &Connection) {
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    for sid in ["old-a", "old-b", "old-c", "old-d"] {
+        insert_session(conn, sid, "claude", "/proj", year_ago);
+        insert_message(conn, sid, "user", "authentication notes");
+    }
+    insert_session(conn, "new", "claude", "/proj", NOW_MS);
+    insert_message(conn, "new", "user", "authentication notes kept");
+}
+
+#[test]
+fn a_limit_of_one_returns_a_new_session_that_matches_slightly_worse_than_older_ones() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fifth_by_text(&conn);
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(ids(&results), ["new"]);
+}
+
+#[test]
+fn a_limit_of_one_returns_the_newest_of_sessions_whose_text_matches_equally() {
+    let (_dir, conn) = setup_test_db();
+    // "e" is the newest and sorts last by id. Equal text makes the candidate
+    // query order the five sessions by id, so "e" falls outside the first three.
+    for (days_ago, sid) in [(4, "a"), (3, "b"), (2, "c"), (1, "d"), (0, "e")] {
+        insert_session(
+            &conn,
+            sid,
+            "claude",
+            "/proj",
+            NOW_MS - days_ago * MS_PER_DAY,
+        );
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(ids(&results), ["e"]);
+}
+
+#[test]
+fn results_for_a_smaller_limit_are_the_first_results_of_a_larger_limit() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fifth_by_text(&conn);
+    insert_session(&conn, "mid", "claude", "/proj", NOW_MS - 60 * MS_PER_DAY);
+    insert_message(&conn, "mid", "user", "authentication notes kept here");
+    let at_limit = |limit| {
+        let results = search(
+            &conn,
+            "authentication",
+            &SearchOptions { limit, ..at_now() },
+        )
+        .unwrap();
+        ids(&results)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let full = at_limit(10);
+
+    assert_eq!(full.len(), 6);
+    for limit in 1..full.len() {
+        assert_eq!(at_limit(limit), full[..limit], "limit {limit}");
+    }
+}
+
+#[test]
+fn an_unknown_source_session_ranked_first_does_not_leave_a_limit_of_one_empty() {
+    let (_dir, conn) = setup_test_db();
+    // Three unknown-source sessions match better than the valid one, so they
+    // fill the whole candidate window of a limit of one.
+    for sid in ["u1", "u2", "u3"] {
+        insert_session(&conn, sid, "mystery_source_v99", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication");
+    }
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication flow discussion");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(outcome.results_incomplete);
+}
+
 #[test]
 fn a_session_without_a_timestamp_ranks_below_an_equally_matching_dated_one() {
     let (_dir, conn) = setup_test_db();
@@ -646,6 +760,83 @@ fn recency_lifts_a_new_session_over_a_somewhat_better_older_match_in_hybrid_sear
     .results;
 
     assert_eq!(ids(&results), ["new", "old"]);
+}
+
+/// Three year-old sessions and one new one match "authentication" by text, in
+/// the order old-a, old-b, old-c, new (the new one matches slightly worse). A
+/// year-old session found only by vector search keeps the vector leg active.
+/// After fusion the new session scores 5% below the best old one, and the 20%
+/// that recency adds to a same-day session lifts it to the front.
+fn seed_new_session_ranked_fourth_by_text(conn: &Connection) {
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    for sid in ["old-a", "old-b", "old-c"] {
+        insert_session(conn, sid, "claude", "/proj", year_ago);
+        insert_message(conn, sid, "user", "authentication notes");
+    }
+    insert_session(conn, "new", "claude", "/proj", NOW_MS);
+    insert_message(conn, "new", "user", "authentication notes kept");
+    insert_session(conn, "vec-old", "claude", "/proj", year_ago);
+    insert_message(conn, "vec-old", "user", "unrelated weather topic");
+    insert_chunk(conn, 1, "vec-old", "authentication");
+}
+
+fn hybrid_search_at_limit(conn: &Connection, limit: usize) -> SearchOutcome {
+    search_with_embedder(
+        conn,
+        "authentication",
+        &SearchOptions { limit, ..at_now() },
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_text() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fourth_by_text(&conn);
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["new"]);
+}
+
+#[test]
+fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_vector() {
+    let (_dir, conn) = setup_test_db();
+    // No message matches the query, so only the vector leg ranks the sessions:
+    // old-a, old-b, old-c (identical to the query), then new (farther away).
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    for (chunk_id, sid) in [(1, "old-a"), (2, "old-b"), (3, "old-c")] {
+        insert_session(&conn, sid, "claude", "/proj", year_ago);
+        insert_message(&conn, sid, "user", "unrelated weather topic");
+        insert_chunk(&conn, chunk_id, sid, "authentication");
+    }
+    insert_session(&conn, "new", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "new", "user", "unrelated weather topic");
+    insert_chunk(&conn, 4, "new", "authentication flow discussion");
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["new"]);
+}
+
+#[test]
+fn hybrid_search_with_a_limit_of_one_returns_the_first_result_of_a_limit_of_ten() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fourth_by_text(&conn);
+    let at_limit = |limit| {
+        ids(&hybrid_search_at_limit(&conn, limit).results)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let full = at_limit(10);
+
+    assert_eq!(full.len(), 5);
+    for limit in 1..full.len() {
+        assert_eq!(at_limit(limit), full[..limit], "limit {limit}");
+    }
 }
 
 #[test]
@@ -1425,6 +1616,92 @@ fn text_search_drops_an_unknown_source_and_flags_incomplete() {
 }
 
 #[test]
+fn an_unknown_source_session_too_old_to_reach_the_results_leaves_them_complete() {
+    // Both sessions are a year old, so neither gets a recency boost. "weird"
+    // matches slightly worse by text and would reach the only slot only with
+    // the boost of a session dated today.
+    let (_dir, conn) = setup_test_db();
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    insert_session(&conn, "valid", "claude", "/proj", year_ago);
+    insert_message(&conn, "valid", "user", "authentication notes");
+    insert_session(&conn, "weird", "gemini", "/proj", year_ago);
+    insert_message(&conn, "weird", "user", "authentication notes kept");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(!outcome.results_incomplete);
+}
+
+#[test]
+fn an_unknown_source_session_that_could_not_reach_the_results_leaves_them_complete() {
+    let (_dir, conn) = setup_test_db();
+    // Both sessions are dated today, so they get the same recency boost. The
+    // unknown-source session matches worse by text, so even its full boost
+    // leaves it behind "valid" for the only slot.
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication");
+    insert_session(&conn, "weird", "gemini", "/proj", NOW_MS);
+    insert_message(
+        &conn,
+        "weird",
+        "user",
+        "authentication retry logic for the session refresh path in the gateway service",
+    );
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(!outcome.results_incomplete);
+}
+
+#[test]
+fn a_session_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first()
+{
+    let (_dir, conn) = setup_test_db();
+    // "valid" is a year old, so its recency boost is close to zero. "ghost" has
+    // no sessions row, so its date is unknown and it is scored with the full
+    // boost; its text match is slightly worse than "valid", yet that boost
+    // lifts it past "valid".
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS - 365 * MS_PER_DAY);
+    insert_message(&conn, "valid", "user", "authentication notes");
+    insert_message(&conn, "ghost", "user", "authentication notes kept");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            include_automated: true,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(outcome.results_incomplete);
+}
+
+#[test]
 fn an_unreadable_message_row_flags_incomplete_and_keeps_the_rest() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
@@ -1446,6 +1723,39 @@ fn an_unreadable_message_row_flags_incomplete_and_keeps_the_rest() {
 
     assert_eq!(ids(&outcome.results), ["s1"]);
     assert!(!outcome.vec_degraded);
+    assert!(outcome.results_incomplete);
+}
+
+#[test]
+fn a_session_with_unreadable_metadata_that_matches_best_is_skipped_and_flags_incomplete() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    insert_message(
+        &conn,
+        "s1",
+        "user",
+        "authentication flow notes for the gateway",
+    );
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+         VALUES ('garbled', 'claude', '', '/proj', 'garbled', 'yesterday', 0.0)",
+        [],
+    )
+    .unwrap();
+    insert_message(&conn, "garbled", "user", "authentication");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["s1"]);
     assert!(outcome.results_incomplete);
 }
 
@@ -1708,6 +2018,72 @@ fn an_unknown_source_vector_match_does_not_take_the_limit_slot() {
 
     assert_eq!(ids(&outcome.results), ["s_valid"]);
     assert!(outcome.results_incomplete);
+}
+
+#[test]
+fn a_vector_match_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first()
+ {
+    // "valid" is first by text and "ghost" is first by vector, so both fuse to
+    // the same score. "valid" is dated today. "ghost" has no sessions row, so
+    // its date is unknown and it counts with the full boost, which ties.
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication flow discussion");
+    insert_chunk(&conn, 1, "ghost", "authentication");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            include_automated: true,
+            ..at_now()
+        },
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(outcome.results_incomplete);
+}
+
+#[test]
+fn an_unknown_source_vector_match_too_old_to_reach_the_results_leaves_them_complete() {
+    // "valid" is first by text and "old" is first by vector, so both fuse to
+    // the same score. Only "valid" is dated today and gets the recency boost.
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication flow discussion");
+    insert_session(&conn, "old", "gemini", "/proj", NOW_MS - 365 * MS_PER_DAY);
+    insert_message(&conn, "old", "user", "unrelated topic");
+    insert_chunk(&conn, 1, "old", "authentication");
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(!outcome.results_incomplete);
+}
+
+#[test]
+fn an_unknown_source_session_that_could_not_reach_the_hybrid_results_leaves_them_complete() {
+    // "valid" is first by text and by vector. "weird" is second by text only,
+    // so even the largest recency boost leaves its fused score below "valid".
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication");
+    insert_chunk(&conn, 1, "valid", "authentication");
+    insert_session(&conn, "weird", "gemini", "/proj", NOW_MS);
+    insert_message(
+        &conn,
+        "weird",
+        "user",
+        "authentication retry logic for the session refresh path in the gateway service",
+    );
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(!outcome.results_incomplete);
 }
 
 /// One session reachable by both text and vector search.

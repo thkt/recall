@@ -279,7 +279,7 @@ Add to `~/.claude/settings.json`:
 
 **Embedding** — EmbeddingGemma 2 BF16 uses fixed artifact checksums and llama.cpp/Metal, projected 768-dimensional mean-pooled/L2-normalized embeddings. Queries start at a 512-token context and grow to 8192; over-limit queries preserve EOS. Documents use tokenizer-aligned windows of at most 8192 tokens with 2048-token overlap. Generation-checked saves and pending-page bounds remain unchanged. Without verified model artifacts, indexing builds FTS5 and search falls back to keyword ranking.
 
-**Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close. Sessions with equal scores are listed in session ID order.
+**Ranking** — When embeddings are available, search uses Reciprocal Rank Fusion (RRF) to blend FTS5 keyword scores with vector similarity. A recency boost favors newer sessions when scores are close. Sessions with equal scores are listed in session ID order. `--limit N` returns the first N results of any larger limit. Hybrid search keeps this because its vector search reads the same 300 candidates at every limit.
 
 ## Architecture
 

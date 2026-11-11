@@ -21,11 +21,18 @@ use crate::date::MS_PER_DAY;
 use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
-use crate::hybrid::{self, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
+use crate::hybrid::{self, MAX_RECENCY_FACTOR, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
 use crate::model;
 use crate::parser::{SessionData, Source};
 
-const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
+/// The largest `--limit` that `recall search` accepts.
+pub(crate) const MAX_LIMIT: u16 = 100;
+/// Every hybrid search reads this many nearest chunks, whatever its `limit`,
+/// so the fused order does not change with `limit`. It is three chunks per
+/// result at the largest limit.
+const VEC_CANDIDATE_COUNT: usize = 3 * MAX_LIMIT as usize;
+// sqlite-vec rejects a KNN query whose k exceeds SQLITE_VEC_VEC0_K_MAX (4096).
+const _: () = assert!(VEC_CANDIDATE_COUNT <= 4096);
 
 pub struct SearchResult {
     pub session: SessionData,
@@ -137,70 +144,15 @@ fn append_search_filters(
     }
 }
 
-fn build_fts_candidate_query(
-    fts_query: &str,
-    opts: &SearchOptions,
-    now_ms: i64,
-) -> (String, Vec<Box<dyn ToSql>>) {
-    let mut sql =
-        "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
-    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
-    append_search_filters(&mut sql, &mut params, "session_id", opts, now_ms);
-    sql.push_str(" GROUP BY session_id ORDER BY best_rank, session_id LIMIT ?");
-    let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
-    params.push(Box::new(candidate_limit as i64));
-    (sql, params)
-}
-
-fn find_candidate_sessions(
-    conn: &Connection,
-    opts: &SearchOptions,
-    fts_query: &str,
-    now_ms: i64,
-) -> Result<(Vec<(String, f64)>, usize)> {
-    let (sql, params) = build_fts_candidate_query(fts_query, opts, now_ms);
-    debug_assert_eq!(
-        params.len(),
-        sql.matches('?').count(),
-        "param count must match SQL placeholder count"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("Failed to prepare search query")?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })
-        .context("Search query failed")?;
-
-    let mut ranked = Vec::new();
-    let mut first_error = None;
-    let mut skipped = 0;
-    for r in rows {
-        match r {
-            Ok(row) => ranked.push(row),
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-                skipped += 1;
-            }
-        }
+fn candidate_query_error(err: &rusqlite::Error) -> anyhow::Error {
+    if is_fts5_query_syntax_error(err) {
+        RecallError::QuerySyntax(format!(
+            "Invalid search query: {err}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
+        ))
+    } else {
+        RecallError::DataError(format!("Search failed: {err}"))
     }
-    if let Some(err) = first_error {
-        if ranked.is_empty() {
-            return Err(if is_fts5_query_syntax_error(&err) {
-                RecallError::QuerySyntax(format!(
-                    "Invalid search query: {err}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
-                ))
-            } else {
-                RecallError::DataError(format!("Search failed: {err}"))
-            }
-            .into());
-        }
-        warn!(skipped, %err, "rows skipped during search");
-    }
-    Ok((ranked, skipped))
+    .into()
 }
 
 /// The MATCH strings search renders quote every term, so the FTS5 parse errors
@@ -216,44 +168,226 @@ fn is_fts5_query_syntax_error(err: &rusqlite::Error) -> bool {
     )
 }
 
+/// A `sessions` row as search reads it.
+enum DecodedSession {
+    Known(SessionData),
+    /// The row names a source this build does not know. Its date is still
+    /// read, so the incomplete check can use the boost the session would get.
+    UnknownSource {
+        session_id: String,
+        timestamp: Option<i64>,
+    },
+}
+
 fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> {
-    let session_id: String = row.get(0)?;
-    let source_str: String = row.get(1)?;
+    Ok(match decode_session_at(row, 0)? {
+        DecodedSession::Known(session) => Some(session),
+        DecodedSession::UnknownSource { .. } => None,
+    })
+}
+
+/// Reads the six `sessions` columns that start at column `first`.
+fn decode_session_at(row: &rusqlite::Row, first: usize) -> rusqlite::Result<DecodedSession> {
+    let session_id: String = row.get(first)?;
+    let source_str: String = row.get(first + 1)?;
+    let timestamp = row.get(first + 5)?;
     let Some(source) = Source::from_db(&source_str) else {
-        warn!(source = %source_str, session_id, "unknown source");
-        return Ok(None);
+        return Ok(DecodedSession::UnknownSource {
+            session_id,
+            timestamp,
+        });
     };
-    Ok(Some(SessionData {
+    Ok(DecodedSession::Known(SessionData {
         session_id,
         source,
-        file_path: row.get(2)?,
-        project: row.get(3)?,
-        slug: row.get(4)?,
-        timestamp: row.get(5)?,
+        file_path: row.get(first + 2)?,
+        project: row.get(first + 3)?,
+        slug: row.get(first + 4)?,
+        timestamp,
     }))
 }
 
-fn fetch_session_metadata(
+/// Search reads every matching session, with its `sessions` row joined in,
+/// because the recency blend can move any of them to the front. The cut to
+/// `limit` comes after the blend, in `rank_sessions` or the hybrid fusion.
+fn build_keyword_session_query(
+    fts_query: &str,
+    opts: &SearchOptions,
+    now_ms: i64,
+) -> (String, Vec<Box<dyn ToSql>>) {
+    // Grouping before the join looks up each session once, not once per
+    // matching message.
+    let mut inner =
+        "SELECT session_id, MIN(rank) AS best_rank FROM messages WHERE messages MATCH ?".to_owned();
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
+    append_search_filters(&mut inner, &mut params, "session_id", opts, now_ms);
+    inner.push_str(" GROUP BY session_id");
+    let sql = format!(
+        "SELECT m.session_id, m.best_rank, \
+         s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
+         FROM ({inner}) m LEFT JOIN sessions s ON s.session_id = m.session_id \
+         ORDER BY m.best_rank, m.session_id"
+    );
+    (sql, params)
+}
+
+/// A matching session left out of the results, with the largest factor the
+/// recency blend could have multiplied its score by.
+struct SkippedSession {
+    session_id: String,
+    rank: f64,
+    best_factor: f64,
+}
+
+#[derive(Default)]
+struct KeywordSessions {
+    /// Every matching session id in `(best_rank, session_id)` order, skipped
+    /// ones included, so fusion gives a skipped session the rank it holds.
+    order: Vec<String>,
+    ranked: Vec<(f64, SessionData)>,
+    /// Sessions skipped for a missing `sessions` row, an unknown source, or
+    /// unreadable metadata.
+    skipped: Vec<SkippedSession>,
+    /// A row that could not be read at all has no rank to estimate from.
+    unreadable_rows: bool,
+}
+
+/// A session with no `sessions` row or an unknown source is skipped, so it
+/// never takes one of the `limit` slots. `keyword_only_outcome` flags the
+/// results incomplete when that session could have ranked within `limit`.
+fn find_keyword_sessions(
     conn: &Connection,
-    ranked: &[(String, f64)],
-) -> Result<HashMap<String, SessionData>> {
-    let placeholders = anon_placeholders(ranked.len());
+    opts: &SearchOptions,
+    fts_query: &str,
+    now_ms: i64,
+) -> Result<KeywordSessions> {
+    let (sql, params) = build_keyword_session_query(fts_query, opts, now_ms);
+    debug_assert_eq!(
+        params.len(),
+        sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare search query")?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let session_id: String = row.get(0)?;
+            let best_rank: f64 = row.get(1)?;
+            let session = match row.get::<_, Option<String>>(2)? {
+                Some(_) => decode_session_at(row, 2).map(Some),
+                None => Ok(None),
+            };
+            Ok((session_id, best_rank, session))
+        })
+        .context("Search query failed")?;
+
+    let mut order = Vec::new();
+    let mut ranked = Vec::new();
+    let mut first_error = None;
+    let mut row_errors = 0;
+    let mut skipped = Vec::new();
+    let (mut missing_row, mut unknown_source, mut unreadable_metadata) = (0, 0, 0);
+    let mut first_metadata_error = None;
+    let mut rows_read = 0;
+    for r in rows {
+        match r {
+            Ok((session_id, best_rank, session)) => {
+                rows_read += 1;
+                order.push(session_id.clone());
+                // A session whose date was read keeps its own recency factor;
+                // otherwise it counts with the largest one.
+                let best_factor = match session {
+                    Ok(Some(DecodedSession::Known(session))) => {
+                        ranked.push((best_rank, session));
+                        continue;
+                    }
+                    Ok(Some(DecodedSession::UnknownSource { timestamp, .. })) => {
+                        unknown_source += 1;
+                        hybrid::recency_factor(now_ms, timestamp)
+                    }
+                    Ok(None) => {
+                        missing_row += 1;
+                        MAX_RECENCY_FACTOR
+                    }
+                    Err(e) => {
+                        first_metadata_error.get_or_insert(e);
+                        unreadable_metadata += 1;
+                        MAX_RECENCY_FACTOR
+                    }
+                };
+                skipped.push(SkippedSession {
+                    session_id,
+                    rank: best_rank,
+                    best_factor,
+                });
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+                row_errors += 1;
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        if rows_read == 0 {
+            return Err(candidate_query_error(&err));
+        }
+        warn!(row_errors, %err, "rows skipped during search");
+    }
+    // One line per search: every match is read, so a line per session would
+    // repeat for each skipped session on every search.
+    if !skipped.is_empty() {
+        let first_error = first_metadata_error
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        warn!(
+            missing_row,
+            unknown_source, unreadable_metadata, first_error, "matching sessions skipped"
+        );
+    }
+    Ok(KeywordSessions {
+        order,
+        ranked,
+        skipped,
+        unreadable_rows: row_errors > 0,
+    })
+}
+
+/// The `sessions` rows of some sessions. A row with an unknown source is left
+/// out of `sessions`, and its date goes to `unknown_source_dates`.
+#[derive(Default)]
+struct SessionRows {
+    sessions: HashMap<String, SessionData>,
+    unknown_source_dates: HashMap<String, Option<i64>>,
+}
+
+fn fetch_session_metadata(conn: &Connection, session_ids: &[&str]) -> Result<SessionRows> {
+    if session_ids.is_empty() {
+        return Ok(SessionRows::default());
+    }
+    let placeholders = anon_placeholders(session_ids.len());
     let sql = format!(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id IN ({placeholders})"
     );
-    let params = rusqlite::params_from_iter(ranked.iter().map(|(sid, _)| sid));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params, decode_session)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(session_ids), |row| {
+        decode_session_at(row, 0)
+    })?;
 
-    let mut map = HashMap::new();
+    let mut found = SessionRows::default();
     let mut db_errors = 0;
     for r in rows {
         match r {
-            Ok(Some(session)) => {
-                map.insert(session.session_id.clone(), session);
+            Ok(DecodedSession::Known(session)) => {
+                found.sessions.insert(session.session_id.clone(), session);
             }
-            Ok(None) => {}
+            Ok(DecodedSession::UnknownSource {
+                session_id,
+                timestamp,
+            }) => {
+                found.unknown_source_dates.insert(session_id, timestamp);
+            }
             Err(e) => {
                 if db_errors == 0 {
                     warn!(error = %e, "metadata query error");
@@ -265,7 +399,13 @@ fn fetch_session_metadata(
     if db_errors > 1 {
         warn!(db_errors, "metadata rows failed");
     }
-    Ok(map)
+    if !found.unknown_source_dates.is_empty() {
+        warn!(
+            unknown_source = found.unknown_source_dates.len(),
+            "vector matches skipped"
+        );
+    }
+    Ok(found)
 }
 
 fn build_candidates(
@@ -290,29 +430,65 @@ fn build_candidates(
         .collect()
 }
 
-fn score_and_sort(
-    candidates: Vec<(f64, SearchResult)>,
-    now_ms: i64,
-    limit: usize,
-) -> Vec<SearchResult> {
-    let mut results: Vec<(SearchResult, f64)> = candidates
+struct RankedSessions {
+    ranked: Vec<(String, f64)>,
+    meta_map: HashMap<String, SessionData>,
+    /// Blended rank of the `limit`-th session, or `None` when fewer than
+    /// `limit` sessions were ranked.
+    limit_rank: Option<f64>,
+}
+
+/// Applies the recency blend to every session, sorts, and only then cuts to
+/// `limit`, so a session the blend lifts to the front is not cut beforehand.
+fn rank_sessions(sessions: Vec<(f64, SessionData)>, now_ms: i64, limit: usize) -> RankedSessions {
+    let mut scored: Vec<(f64, SessionData)> = sessions
         .into_iter()
-        .map(|(rank, result)| {
+        .map(|(rank, session)| {
             debug_assert!(
                 rank < 0.0,
                 "FTS bm25 rank must be negative; rank={rank} would nullify the recency blend or invert ordering"
             );
-            let recency_boost = hybrid::recency_decay(now_ms, result.session.timestamp);
-            let blended_rank = rank * (1.0 + RECENCY_BOOST_WEIGHT * recency_boost);
-            (result, blended_rank)
+            (rank * hybrid::recency_factor(now_ms, session.timestamp), session)
         })
         .collect();
-    results.sort_by(|a, b| {
-        a.1.total_cmp(&b.1)
-            .then_with(|| a.0.session.session_id.cmp(&b.0.session.session_id))
+    scored.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.session_id.cmp(&b.1.session_id))
     });
-    results.truncate(limit);
-    results.into_iter().map(|(r, _)| r).collect()
+    let limit_rank = at_limit(&scored, limit).map(|s| s.0);
+    scored.truncate(limit);
+    let ranked = scored
+        .iter()
+        .map(|(rank, session)| (session.session_id.clone(), *rank))
+        .collect();
+    let meta_map = scored
+        .into_iter()
+        .map(|(_, session)| (session.session_id.clone(), session))
+        .collect();
+    RankedSessions {
+        ranked,
+        meta_map,
+        limit_rank,
+    }
+}
+
+/// The `limit`-th item, or `None` when there are fewer than `limit`.
+fn at_limit<T>(items: &[T], limit: usize) -> Option<&T> {
+    limit.checked_sub(1).and_then(|i| items.get(i))
+}
+
+/// A left-out session could have reached the results when its best possible
+/// score ties or beats the `limit`-th score, or when a slot is still free.
+/// Higher scores rank first.
+fn left_out_session_could_rank(
+    best_scores: impl IntoIterator<Item = f64>,
+    limit_score: Option<f64>,
+) -> bool {
+    let mut best_scores = best_scores.into_iter();
+    match limit_score {
+        Some(cut) => best_scores.any(|s| s >= cut),
+        None => best_scores.next().is_some(),
+    }
 }
 
 fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T> {
@@ -614,13 +790,12 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
 fn drop_vec_only_sessions_matching_not(
     conn: &Connection,
     not_operands: &[String],
-    fts_ranked: &[(String, f64)],
+    fts_ids: &HashSet<&str>,
     merged: &mut Vec<(String, f64)>,
 ) -> bool {
     if not_operands.is_empty() {
         return false;
     }
-    let fts_ids: HashSet<&str> = fts_ranked.iter().map(|(sid, _)| sid.as_str()).collect();
     let vec_only: Vec<&str> = merged
         .iter()
         .map(|(sid, _)| sid.as_str())
@@ -746,36 +921,33 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
-    let (fts_ranked, fts_skipped) = match fts_query {
-        Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
-        None => (Vec::new(), 0),
-    };
-    let incomplete = fts_skipped > 0;
 
     let run_hybrid = match embedder {
         Some(_) => match has_vec_data(conn) {
             Ok(has_data) => has_data,
             Err(e) => {
                 warn!(error = %e, "vec_chunks probe failed, using text search only");
-                return fts_only_outcome(
-                    conn, fts_query, fts_ranked, opts, now_ms, true, incomplete,
-                );
+                return keyword_only_outcome(conn, fts_query, opts, now_ms, true);
             }
         },
         None => false,
     };
 
     let Some(embedder) = embedder.filter(|_| run_hybrid) else {
-        return fts_only_outcome(conn, fts_query, fts_ranked, opts, now_ms, false, incomplete);
+        return keyword_only_outcome(conn, fts_query, opts, now_ms, false);
     };
 
-    let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
+    let found = match fts_query {
+        Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
+        None => KeywordSessions::default(),
+    };
+    let incomplete = found.unreadable_rows;
 
     let (vec_hits, vec_degraded) = match vec_search(
         conn,
         embedder,
         keyword.embed_text.as_deref().unwrap_or(query),
-        candidate_limit,
+        VEC_CANDIDATE_COUNT,
         opts,
         now_ms,
     ) {
@@ -788,11 +960,12 @@ pub fn search_with_embedder<'q>(
 
     let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
     let mut merged = rrf_merge_sessions(
-        fts_ranked.iter().map(|(sid, _)| sid.as_str()),
+        found.order.iter().map(String::as_str),
         vec_hits.iter().map(|(sid, _)| sid.as_str()),
     );
+    let fts_ids: HashSet<&str> = found.order.iter().map(String::as_str).collect();
     let not_filter_failed =
-        drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ranked, &mut merged);
+        drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
     let vec_degraded = vec_degraded || not_filter_failed;
 
     if merged.is_empty() {
@@ -803,17 +976,53 @@ pub fn search_with_embedder<'q>(
         });
     }
 
-    let mut meta_map = fetch_session_metadata(conn, &merged)?;
+    // The keyword read already carries each session's row; only sessions the
+    // vector search alone found need a metadata query.
+    let vec_only: Vec<&str> = merged
+        .iter()
+        .map(|(sid, _)| sid.as_str())
+        .filter(|sid| !fts_ids.contains(sid))
+        .collect();
+    let rows = fetch_session_metadata(conn, &vec_only)?;
+    let mut meta_map = rows.sessions;
+    meta_map.extend(
+        found
+            .ranked
+            .into_iter()
+            .map(|(_, session)| (session.session_id.clone(), session)),
+    );
 
-    let before_prune = merged.len();
-    merged.retain(|(sid, _)| meta_map.contains_key(sid));
-    let incomplete = incomplete || merged.len() < before_prune;
+    let (kept, pruned): (Vec<_>, Vec<_>) = merged
+        .into_iter()
+        .partition(|(sid, _)| meta_map.contains_key(sid));
+    merged = kept;
+    // A pruned session counts with the largest recency factor it could get.
+    let skipped_factors: HashMap<&str, f64> = found
+        .skipped
+        .iter()
+        .map(|s| (s.session_id.as_str(), s.best_factor))
+        .chain(
+            rows.unknown_source_dates
+                .iter()
+                .map(|(sid, ts)| (sid.as_str(), hybrid::recency_factor(now_ms, *ts))),
+        )
+        .collect();
+    let pruned_best: Vec<f64> = pruned
+        .iter()
+        .map(|(sid, score)| {
+            score
+                * skipped_factors
+                    .get(sid.as_str())
+                    .copied()
+                    .unwrap_or(MAX_RECENCY_FACTOR)
+        })
+        .collect();
 
     if merged.is_empty() {
         return Ok(SearchOutcome {
             results: Vec::new(),
             vec_degraded,
-            results_incomplete: incomplete,
+            results_incomplete: incomplete || left_out_session_could_rank(pruned_best, None),
         });
     }
 
@@ -823,6 +1032,8 @@ pub fn search_with_embedder<'q>(
         now_ms,
         RECENCY_BOOST_WEIGHT,
     );
+    let limit_score = at_limit(&merged, opts.limit).map(|(_, score)| *score);
+    let incomplete = incomplete || left_out_session_could_rank(pruned_best, limit_score);
     merged.truncate(opts.limit);
 
     let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
@@ -833,30 +1044,47 @@ pub fn search_with_embedder<'q>(
     })
 }
 
-fn fts_only_outcome(
+fn keyword_only_outcome(
     conn: &Connection,
     fts_query: Option<&str>,
-    fts_ranked: Vec<(String, f64)>,
     opts: &SearchOptions,
     now_ms: i64,
     vec_degraded: bool,
-    incomplete: bool,
 ) -> Result<SearchOutcome> {
-    if fts_ranked.is_empty() {
+    let Some(q) = fts_query else {
         return Ok(SearchOutcome {
             results: Vec::new(),
             vec_degraded,
-            results_incomplete: incomplete,
+            results_incomplete: false,
+        });
+    };
+    let found = find_keyword_sessions(conn, opts, q, now_ms)?;
+    let mut ranking = rank_sessions(found.ranked, now_ms, opts.limit);
+    // bm25 ranks are negative and lower ranks first, so they are negated into
+    // scores that rank higher first.
+    let results_incomplete = found.unreadable_rows
+        || left_out_session_could_rank(
+            found.skipped.iter().map(|s| -(s.rank * s.best_factor)),
+            ranking.limit_rank.map(|r| -r),
+        );
+    if ranking.ranked.is_empty() {
+        return Ok(SearchOutcome {
+            results: Vec::new(),
+            vec_degraded,
+            results_incomplete,
         });
     }
-    let requested = fts_ranked.len();
-    let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
-    let incomplete = incomplete || meta_map.len() < requested;
-    let candidates = fetch_chunks(conn, fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
+    let candidates = fetch_chunks(
+        conn,
+        fts_query,
+        ranking.ranked,
+        &mut ranking.meta_map,
+        &HashMap::new(),
+    )?;
     Ok(SearchOutcome {
-        results: score_and_sort(candidates, now_ms, opts.limit),
+        results: candidates.into_iter().map(|(_, r)| r).collect(),
         vec_degraded,
-        results_incomplete: incomplete,
+        results_incomplete,
     })
 }
 

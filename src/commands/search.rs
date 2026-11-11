@@ -48,7 +48,7 @@ pub(crate) struct SearchArgs {
     pub(crate) file: Option<String>,
 
     /// Max results (1..=100)
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=100))]
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..=i64::from(search::MAX_LIMIT)))]
     pub(crate) limit: u16,
 
     /// Exclude the invoking Claude Code session from results. Default when
@@ -237,7 +237,7 @@ where
     if outcome.results_incomplete {
         degraded = true;
         notes.push(
-            "results may be incomplete: some matched sessions were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
+            "results may be incomplete: some matched sessions that could have ranked in these results were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
                 .to_owned(),
         );
     }

@@ -17,6 +17,14 @@ pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
     }
 }
 
+/// What the recency blend multiplies a score by.
+pub(crate) fn recency_factor(now_ms: i64, ts: Option<i64>) -> f64 {
+    1.0 + RECENCY_BOOST_WEIGHT * recency_decay(now_ms, ts)
+}
+
+/// `recency_decay` is at most 1.0, so no score is multiplied by more than this.
+pub(crate) const MAX_RECENCY_FACTOR: f64 = 1.0 + RECENCY_BOOST_WEIGHT;
+
 pub(crate) fn apply_recency_boost(
     results: &mut [(String, f64)],
     get_timestamp: impl Fn(&str) -> Option<i64>,

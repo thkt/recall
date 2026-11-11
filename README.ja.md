@@ -261,7 +261,7 @@ recall doctor           # 壊れたインデックスを診断する。報告の
 
 **Embedding** — EmbeddingGemma 2 BF16を固定SHA・固定llama.cpp/Metalで実行し、768次元のmean pooling・L2正規化を使います。queryの初期512 token容量は8192まで拡張し、超過時はEOSを維持します。文書は8192 token以下・2048 token重複のtoken境界で分割します。既存の世代照合保存・未処理本文のページ制限を維持し、モデル未導入時はFTS5へフォールバックします。`--token-budget` はwindowのpackingを制御し、8192を実効上限とします。小さいbudgetでも単一の双方向attention windowは切り詰めず単独処理し、指定budgetを超えることがあります。
 
-**ランキング** — embeddingがあればReciprocal Rank Fusion (RRF) でFTS5キーワードスコアとベクトル類似度を統合します。スコアが近い場合は新しいセッションにrecency boostがかかります。スコアが同じセッションはセッションIDの順に並びます。
+**ランキング** — embeddingがあればReciprocal Rank Fusion (RRF) でFTS5キーワードスコアとベクトル類似度を統合します。スコアが近い場合は新しいセッションにrecency boostがかかります。スコアが同じセッションはセッションIDの順に並びます。`--limit N` の結果は、より大きい limit の結果の先頭 N 件と一致します。hybrid 検索でも、ベクトル検索が limit によらず同じ 300 件を読むため一致します。
 
 ## アーキテクチャ
 
