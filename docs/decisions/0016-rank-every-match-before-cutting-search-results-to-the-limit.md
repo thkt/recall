@@ -43,9 +43,10 @@ What follows from the rule:
 
 - **Keyword-only path.** `build_keyword_session_query` has no `LIMIT` and joins `sessions` in the same read, so one pass returns every matching session with its metadata. `rank_sessions` blends all of them, sorts by `(blended rank, session_id)`, and cuts to `limit`. Excerpts are fetched (`fetch_chunks`) only for the sessions that survive the cut.
 - **Hybrid path, keyword leg.** `rrf_merge_sessions` receives every keyword session in the original `(best_rank, session_id)` order. A skipped session still takes its position in that order, so the sessions after it keep the RRF rank they had before.
-- **Hybrid path, vector leg.** The depth is `vec_candidate_count(limit) = clamp(3 x limit, 300, 4096)`. The floor of 300 means every `limit` up to 100 reads the same 300 nearest chunks, so the fused scores do not change between those limits. Above 100, the depth grows with `limit`, and the head of a larger limit can differ from a smaller one's.
+- **Hybrid path, vector leg.** The depth is `vec_candidate_count(limit) = clamp(3 x limit, 300, 4096)`. The floor of 300 means every `limit` up to 100 reads the same 300 nearest chunks, so the fused scores do not change between those limits. Above 100, the depth grows with `limit`, and the head of a larger limit can differ from a smaller one's. Only a library caller can pass such a limit, because `recall search` accepts `--limit` 1 to 100 (`src/commands/search.rs`).
 - **Ceiling of 4096.** sqlite-vec rejects a vec0 query with `k > SQLITE_VEC_VEC0_K_MAX` (4096, `sqlite-vec-0.1.9/sqlite-vec.c:7111`). Without the clamp, every `limit` above 1365 (`3 x 1366 = 4098`) would fail the vector leg and degrade to text-only results.
-- **The floor of 300 is provisional.** It is a starting value, not a measured one. Issue #416 requires measuring the vector search cost at candidate floors and recording the chosen value here. That measurement was not part of this change, so the value is revisited under the first Reassessment Trigger.
+- **The floor of 300 is the smallest that covers every CLI limit.** The largest `--limit` is 100, and `3 x 100 = 300`. A lower floor breaks the prefix property for limits above a third of it. A higher floor reads more chunks without changing any CLI result.
+- **The floor costs 45 ms at `--limit 1`.** On a synthetic index of 6,000 sessions and 24,000 chunks embedded with the real model, a query matching about 90% of the sessions took 0.788 s at p50 with this change. `main`, which reads 3 chunks at that limit, took 0.743 s. Each build ran 7 times, alternated. At `--limit 100`, where both read 300 chunks, the two took 0.792 s and 0.790 s.
 - **`results_incomplete` means a skipped session could have ranked.** The flag is set when a row could not be read at all (its rank cannot be estimated), or when a skipped session scored with the largest boost still reaches the `limit`-th result: its raw score times `MAX_BOOST_FACTOR` (`1 + RECENCY_BOOST_WEIGHT`) ties or beats the cut, or the results have a free slot. It is not set when every skipped session falls below the cut even at the largest boost. A skipped session has no known date, so it is judged at the largest boost (the `recency_decay` of a session dated now), which can only over-flag, never miss. Hybrid search runs the same check on the fused scores of sessions pruned for missing metadata (`pruned_hybrid_session_could_rank`).
 
 ### Consequences
@@ -53,8 +54,8 @@ What follows from the rule:
 - Good, because `--limit N` returns the head of a larger limit for the keyword-only path at every limit, and for the hybrid path at every limit up to 100
 - Good, because a session lifted by the blend or the fusion is no longer cut beforehand, and a skipped session no longer takes one of the `limit` slots
 - Good, because `results_incomplete` (and the `degraded` flag and note that `src/commands/search.rs` derives from it) fires only when the omission could change the visible results, so an agent can trust it when it is set
-- Bad, because the keyword leg reads every matching session before cutting. A broad query over a large index reads and sorts all matches where it used to read `3 x limit`. The cost against the 2-second indicator is not recorded here; see the second Reassessment Trigger
-- Bad, because the hybrid prefix property stops at `limit` 100. Above that, the vector depth is `3 x limit`, and the same two sessions can swap order between two limits, the failure this record removes for smaller limits
+- Bad, because the keyword leg reads every matching session before cutting. A broad query over a large index reads and sorts all matches where it used to read `3 x limit`. On the index above without a model, the query took 0.134 s at p50 at `--limit 1` against 0.116 s on `main`. The cost grows with the number of matches; see the second Reassessment Trigger
+- Bad, because the hybrid prefix property stops at `limit` 100 for library callers. Above that, the vector depth is `3 x limit`, and the same two sessions can swap order between two limits. The CLI cannot ask for more than 100
 - Bad, because `MAX_BOOST_FACTOR` couples the flag to DR 0009's non-negative, at-most-1.0 `recency_decay`. If the decay can exceed 1.0, the bound underestimates and a session that could rank is not flagged
 - Bad, because a skipped session judged at the largest boost can raise the flag when its real date would have kept it out of the results
 
@@ -73,6 +74,8 @@ Keyword-only path:
 
 - `an_unknown_source_session_that_could_not_reach_the_results_leaves_them_complete` fails if the flag is set for a skipped session below the cut.
 - `a_session_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first` fails if the flag is missed for a skipped session that could rank.
+- `an_unknown_source_session_that_could_not_reach_the_hybrid_results_leaves_them_complete` fails if hybrid search flags a pruned session whose fused score cannot reach the results.
+- `run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results` in `src/commands/search/tests.rs` fails if such a session marks the envelope degraded or adds a note.
 
 Hybrid path:
 
@@ -98,7 +101,7 @@ No test covers a limit above 100 in hybrid search, so the stated range of the pr
 
 ### Reassessment Triggers
 
-- The vector search cost at the floor of 300, measured against `main` on a real model and index, shows a different floor is better: change `VEC_CANDIDATE_FLOOR` and record the measured value here, which also moves the `limit` range of the hybrid prefix property
+- The largest `--limit` of `recall search` changes from 100: set `VEC_CANDIDATE_FLOOR` to three times the new largest limit, and measure the hybrid cost again
 - A broad keyword query exceeds the 2-second Time indicator on a 6,000-session index: add an early stop that does not read rows below the blended `limit`-th rank, which Issue #416 lists as a backlog candidate
 - A new score transform is added after the cut, or `recency_decay` can return more than 1.0: move the cut behind the transform or recompute `MAX_BOOST_FACTOR`, and recheck `results_incomplete` against the new bound
 - A user needs the head property above `limit` 100 in hybrid search: make the vector depth independent of `limit` up to the ceiling, and weigh the sqlite-vec cost recorded for the floor
