@@ -2551,6 +2551,11 @@ fn chunk_batches_limit_session_count_and_source_bytes() {
     );
 }
 
+/// Returns the single integer `sql` selects, such as a `COUNT(*)`.
+fn count_rows(conn: &Connection, sql: &str) -> i64 {
+    conn.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
 /// Returns the detail column of `EXPLAIN QUERY PLAN` for `sql` bound to `params`.
 fn query_plan(conn: &Connection, sql: &str, params: &[&str]) -> Vec<String> {
     conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
@@ -2604,6 +2609,25 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
         ],
         "the first and last session of the first batch and the session of the second batch \
          each keep only their own turns, the two answers merged, and their own rowid range"
+    );
+    assert_eq!(
+        count_rows(
+            &conn,
+            "SELECT COUNT(*) FROM qa_chunks c WHERE c.content IS NOT (
+               SELECT group_concat(m.text, char(10) ORDER BY m.rowid) FROM messages m
+               WHERE m.session_id = c.session_id AND m.role IN ('user', 'assistant'))"
+        ),
+        0,
+        "every chunk holds its own session's question and answers, newline-joined in rowid order"
+    );
+    assert_eq!(
+        count_rows(
+            &conn,
+            "SELECT COUNT(*) FROM qa_chunks c WHERE (c.src_rowid_lo, c.src_rowid_hi) IS NOT (
+               SELECT min(m.rowid), max(m.rowid) FROM messages m WHERE m.session_id = c.session_id)"
+        ),
+        0,
+        "every chunk's rowid range runs from its own session's first message to its last"
     );
     // Performance guard (docs/audit/2026-09-20-chunk-index.md): one FTS scan stages every
     // pending message, the 65 sessions are read in two body batches, and each of the 260
