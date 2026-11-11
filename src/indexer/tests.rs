@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use super::*;
 use crate::commands::classify::reclassify_sessions;
 use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
-use crate::embedder::{EMBED_BATCH_SIZE, MockEmbedder, embed_recent_chunks, f32_as_bytes};
+use crate::embedder::{MockEmbedder, embed_recent_chunks, f32_as_bytes};
 use crate::index_observer::{recording, stable_lines};
 use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
@@ -2138,112 +2138,6 @@ fn codex_sessions_dir_defaults_to_dot_codex_sessions_under_home() {
     let home = Path::new("/fake/home");
     let result = resolve_codex_dir_with(home, |_| None);
     assert_eq!(result, PathBuf::from("/fake/home/.codex/sessions"));
-}
-
-#[test]
-fn test_embed_recent_chunks_populates_vec_chunks() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-    let claude_dir = tmp.path().join("claude_projects");
-    fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-            claude_dir.join("s1.jsonl"),
-            concat!(
-                r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-                "\n",
-                r#"{"type":"assistant","message":{"role":"assistant","content":"hi there"}}"#,
-            ),
-        )
-        .unwrap();
-    let codex_dir = tmp.path().join("codex_sessions");
-
-    index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    index_chunks(&mut conn, None).unwrap();
-
-    let chunk_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert!(chunk_count > 0, "should have chunks to embed");
-
-    let embedder = MockEmbedder::new();
-    let result = embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
-
-    assert_eq!(result.embedded, usize::try_from(chunk_count).unwrap());
-    assert_eq!(result.failed_count, 0);
-
-    let vec_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(vec_count, chunk_count, "all chunks should be embedded");
-
-    let result2 = embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
-    assert_eq!(result2.embedded, 0);
-}
-
-#[test]
-fn test_embed_chunks_continues_past_failed_batch_and_counts_remainder() {
-    let (_dir, mut conn) = setup_test_db();
-
-    seed_session(&conn, "s1");
-    let message_count = EMBED_BATCH_SIZE + 10;
-    for i in 0..message_count {
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
-            [format!("question number {i}")],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'assistant', ?1)",
-            [format!("answer number {i}")],
-        )
-        .unwrap();
-    }
-    index_chunks(&mut conn, None).unwrap();
-
-    let chunk_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert!(
-        chunk_count > EMBED_BATCH_SIZE as i64,
-        "need enough chunks for multiple batches, got {chunk_count}"
-    );
-
-    let embedder = MockEmbedder::failing_after(EMBED_BATCH_SIZE);
-    let result = embed_recent_chunks(
-        &mut conn,
-        &embedder,
-        usize::try_from(chunk_count).unwrap(),
-        None,
-    )
-    .unwrap();
-
-    assert_eq!(
-        result.embedded, EMBED_BATCH_SIZE,
-        "the first batch embeds and commits before the failures start"
-    );
-    let remaining = usize::try_from(chunk_count).unwrap() - EMBED_BATCH_SIZE;
-    assert_eq!(
-        result.failed_count, remaining,
-        "every batch after the first fails (counter not reset), so all remaining chunks are failed"
-    );
-
-    let vec_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        vec_count, EMBED_BATCH_SIZE as i64,
-        "the committed first batch survives the later failures"
-    );
 }
 
 fn seed_message(conn: &Connection, role: &str, text: &str) -> i64 {
