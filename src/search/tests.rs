@@ -1539,6 +1539,65 @@ fn text_search_drops_an_unknown_source_and_flags_incomplete() {
 }
 
 #[test]
+fn an_unknown_source_session_that_could_not_reach_the_results_leaves_them_complete() {
+    let (_dir, conn) = setup_test_db();
+    // Both sessions are dated today, so they get the same recency boost. The
+    // unknown-source session matches worse by text, so even its full boost
+    // leaves it behind "valid" for the only slot.
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication");
+    insert_session(&conn, "weird", "gemini", "/proj", NOW_MS);
+    insert_message(
+        &conn,
+        "weird",
+        "user",
+        "authentication retry logic for the session refresh path in the gateway service",
+    );
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(!outcome.results_incomplete);
+}
+
+#[test]
+fn a_session_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first()
+{
+    let (_dir, conn) = setup_test_db();
+    // "valid" is a year old, so its recency boost is close to zero. "ghost" has
+    // no sessions row, so its date is unknown and it is scored with the full
+    // boost; its text match is slightly worse than "valid", yet that boost
+    // lifts it past "valid".
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS - 365 * MS_PER_DAY);
+    insert_message(&conn, "valid", "user", "authentication notes");
+    insert_message(&conn, "ghost", "user", "authentication notes kept");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            include_automated: true,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(outcome.results_incomplete);
+}
+
+#[test]
 fn an_unreadable_message_row_flags_incomplete_and_keeps_the_rest() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);

@@ -27,6 +27,10 @@ use crate::parser::{SessionData, Source};
 
 const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
 
+/// A skipped session's date is unknown, so it is judged with the largest
+/// recency boost a session can get (`recency_decay` of a session dated now).
+const MAX_BOOST_FACTOR: f64 = 1.0 + RECENCY_BOOST_WEIGHT;
+
 pub struct SearchResult {
     pub session: SessionData,
     pub excerpt: String,
@@ -263,11 +267,16 @@ fn build_keyword_session_query(
 
 struct KeywordSessions {
     ranked: Vec<(f64, SessionData)>,
-    incomplete: bool,
+    /// Best FTS rank of each session skipped for a missing `sessions` row, an
+    /// unknown source, or unreadable metadata.
+    skipped_ranks: Vec<f64>,
+    /// A row that could not be read at all has no rank to estimate from.
+    unreadable_rows: bool,
 }
 
-/// A session with no `sessions` row or an unknown source is skipped and flags
-/// the results incomplete, so it never takes one of the `limit` slots.
+/// A session with no `sessions` row or an unknown source is skipped, so it
+/// never takes one of the `limit` slots. `keyword_only_outcome` flags the
+/// results incomplete when that session could have ranked within `limit`.
 fn find_keyword_sessions(
     conn: &Connection,
     opts: &SearchOptions,
@@ -298,7 +307,7 @@ fn find_keyword_sessions(
     let mut ranked = Vec::new();
     let mut first_error = None;
     let mut row_errors = 0;
-    let mut skipped = 0;
+    let mut skipped_ranks = Vec::new();
     let mut rows_read = 0;
     for r in rows {
         match r {
@@ -311,11 +320,11 @@ fn find_keyword_sessions(
                             session_id,
                             "session skipped: no sessions row or unknown source"
                         );
-                        skipped += 1;
+                        skipped_ranks.push(best_rank);
                     }
                     Err(e) => {
                         warn!(error = %e, session_id, "session metadata unreadable");
-                        skipped += 1;
+                        skipped_ranks.push(best_rank);
                     }
                 }
             }
@@ -333,7 +342,8 @@ fn find_keyword_sessions(
     }
     Ok(KeywordSessions {
         ranked,
-        incomplete: skipped + row_errors > 0,
+        skipped_ranks,
+        unreadable_rows: row_errors > 0,
     })
 }
 
@@ -394,13 +404,17 @@ fn build_candidates(
         .collect()
 }
 
+struct RankedSessions {
+    ranked: Vec<(String, f64)>,
+    meta_map: HashMap<String, SessionData>,
+    /// Blended rank of the `limit`-th session, or `None` when fewer than
+    /// `limit` sessions were ranked.
+    limit_rank: Option<f64>,
+}
+
 /// Applies the recency blend to every session, sorts, and only then cuts to
 /// `limit`, so a session the blend lifts to the front is not cut beforehand.
-fn rank_sessions(
-    sessions: Vec<(f64, SessionData)>,
-    now_ms: i64,
-    limit: usize,
-) -> (Vec<(String, f64)>, HashMap<String, SessionData>) {
+fn rank_sessions(sessions: Vec<(f64, SessionData)>, now_ms: i64, limit: usize) -> RankedSessions {
     let mut scored: Vec<(f64, SessionData)> = sessions
         .into_iter()
         .map(|(rank, session)| {
@@ -416,6 +430,10 @@ fn rank_sessions(
         a.0.total_cmp(&b.0)
             .then_with(|| a.1.session_id.cmp(&b.1.session_id))
     });
+    let limit_rank = limit
+        .checked_sub(1)
+        .and_then(|i| scored.get(i))
+        .map(|s| s.0);
     scored.truncate(limit);
     let ranked = scored
         .iter()
@@ -425,7 +443,29 @@ fn rank_sessions(
         .into_iter()
         .map(|(_, session)| (session.session_id.clone(), session))
         .collect();
-    (ranked, meta_map)
+    RankedSessions {
+        ranked,
+        meta_map,
+        limit_rank,
+    }
+}
+
+/// A skipped session scored with the largest boost reaches the results when it
+/// ties or beats the `limit`-th blended rank (lower is better), or when the
+/// results still have a free slot.
+fn skipped_keyword_session_could_rank(skipped_ranks: &[f64], limit_rank: Option<f64>) -> bool {
+    match limit_rank {
+        Some(cut) => skipped_ranks.iter().any(|r| r * MAX_BOOST_FACTOR <= cut),
+        None => !skipped_ranks.is_empty(),
+    }
+}
+
+/// Same check after fusion (higher is better).
+fn pruned_hybrid_session_could_rank(pruned_scores: &[f64], limit_score: Option<f64>) -> bool {
+    match limit_score {
+        Some(cut) => pruned_scores.iter().any(|s| s * MAX_BOOST_FACTOR >= cut),
+        None => !pruned_scores.is_empty(),
+    }
 }
 
 fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T> {
@@ -917,15 +957,17 @@ pub fn search_with_embedder<'q>(
 
     let mut meta_map = fetch_session_metadata(conn, &merged)?;
 
-    let before_prune = merged.len();
-    merged.retain(|(sid, _)| meta_map.contains_key(sid));
-    let incomplete = incomplete || merged.len() < before_prune;
+    let (kept, pruned): (Vec<_>, Vec<_>) = merged
+        .into_iter()
+        .partition(|(sid, _)| meta_map.contains_key(sid));
+    merged = kept;
+    let pruned_scores: Vec<f64> = pruned.into_iter().map(|(_, score)| score).collect();
 
     if merged.is_empty() {
         return Ok(SearchOutcome {
             results: Vec::new(),
             vec_degraded,
-            results_incomplete: incomplete,
+            results_incomplete: incomplete || !pruned_scores.is_empty(),
         });
     }
 
@@ -935,6 +977,8 @@ pub fn search_with_embedder<'q>(
         now_ms,
         RECENCY_BOOST_WEIGHT,
     );
+    let limit_score = merged.get(opts.limit - 1).map(|(_, score)| *score);
+    let incomplete = incomplete || pruned_hybrid_session_could_rank(&pruned_scores, limit_score);
     merged.truncate(opts.limit);
 
     let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
@@ -960,12 +1004,23 @@ fn keyword_only_outcome(
         });
     };
     let found = find_keyword_sessions(conn, opts, q, now_ms)?;
-    let (ranked, mut meta_map) = rank_sessions(found.ranked, now_ms, opts.limit);
-    let candidates = fetch_chunks(conn, fts_query, ranked, &mut meta_map, &HashMap::new())?;
+    let incomplete = |limit_rank| {
+        found.unreadable_rows
+            || skipped_keyword_session_could_rank(&found.skipped_ranks, limit_rank)
+    };
+    let mut ranking = rank_sessions(found.ranked, now_ms, opts.limit);
+    let results_incomplete = incomplete(ranking.limit_rank);
+    let candidates = fetch_chunks(
+        conn,
+        fts_query,
+        ranking.ranked,
+        &mut ranking.meta_map,
+        &HashMap::new(),
+    )?;
     Ok(SearchOutcome {
         results: candidates.into_iter().map(|(_, r)| r).collect(),
         vec_degraded,
-        results_incomplete: found.incomplete,
+        results_incomplete,
     })
 }
 
