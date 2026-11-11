@@ -833,57 +833,39 @@ fn unreadable_codex_subdirectory_keeps_every_session_and_reports_only_unseen_one
 
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
     fs::write(
-            codex_dir.join("top.jsonl"),
-            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-top\",\"cwd\":\"/proj\"}}\n{\"timestamp\":\"2026-05-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex top turn\"}]}}",
-        )
-        .unwrap();
-    index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
+        codex_dir.join("top.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-top","cwd":"/proj"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-01T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"codex top turn"}]}}"#,
+        ),
     )
     .unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
 
     let locked_subdir = codex_dir.join("2026");
-    let orig = fs::metadata(&locked_subdir).unwrap().permissions();
-    let mut zero = orig.clone();
-    zero.set_mode(0o000);
-    fs::set_permissions(&locked_subdir, zero).unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    );
-
-    fs::set_permissions(&locked_subdir, orig).unwrap();
+    let permissions = fs::metadata(&locked_subdir).unwrap().permissions();
+    fs::set_permissions(&locked_subdir, fs::Permissions::from_mode(0o000)).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true);
+    fs::set_permissions(&locked_subdir, permissions).unwrap();
     let stats = stats.unwrap();
 
-    let codex = stats
-        .skipped_roots
-        .iter()
-        .find(|s| s.source == Source::Codex)
-        .expect("codex tree was not fully scanned, so it must be reported");
+    assert_eq!(stats.total_sessions, 3, "the unseen s1 session is kept");
     assert_eq!(
-        codex.preserved_sessions, 1,
-        "only the file-absent s1 row is at risk; the re-indexed top row must not inflate the count"
-    );
-    assert_eq!(
-        codex.reason,
-        SkippedReason::IncompleteEnumeration,
-        "a present root whose subtree could not be read is incomplete enumeration, not a missing root"
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)],
+        "only the unseen s1 session counts as preserved; the re-read top session does not"
     );
 }
 
