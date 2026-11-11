@@ -80,7 +80,7 @@ fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
             )
             .unwrap();
         assert_eq!(complete, 1);
-        let stats = index_chunks(&mut conn, None).unwrap();
+        let stats = index_chunks(&mut conn).unwrap();
         assert_eq!(stats.sessions_chunked, if pass == 0 { 2 } else { 0 });
         assert_eq!(stats.chunks_created, if pass == 0 { 1 } else { 0 });
         let original: (String, Option<i64>, Option<i64>) = conn

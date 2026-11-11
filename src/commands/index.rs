@@ -196,7 +196,7 @@ where
     report_indexed_sessions(&stats);
     let skipped_roots = stats.skipped_roots;
 
-    let chunk_stats = indexer::index_chunks_observed(&mut conn, None, observer)?;
+    let chunk_stats = indexer::index_chunks_observed(&mut conn, observer)?;
     let parse_diagnostics = run_legacy_backfill(&mut conn, observer)?;
     if chunk_stats.chunks_created > 0 {
         done(&format!("Created {} chunks", chunk_stats.chunks_created));

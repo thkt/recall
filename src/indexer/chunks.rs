@@ -19,9 +19,15 @@ pub(crate) struct ChunkStats {
     pub messages_read: usize,
 }
 
-pub(super) const CHUNK_BATCH_SESSIONS: usize = 64;
-pub(super) const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
+const CHUNK_BATCH_SESSIONS: usize = 64;
+const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
 
+pub(super) const CREATE_CHUNK_MESSAGE_ROWS: &str = "CREATE TEMP TABLE chunk_message_rows (
+         session_id TEXT NOT NULL,
+         message_rowid INTEGER NOT NULL,
+         text_bytes INTEGER NOT NULL,
+         PRIMARY KEY (session_id, message_rowid)
+     ) WITHOUT ROWID;";
 pub(super) const STAGE_CHUNK_MESSAGES: &str =
     "INSERT INTO chunk_message_rows (session_id, message_rowid, text_bytes)
      SELECT m.session_id, m.rowid, length(CAST(m.text AS BLOB))
@@ -48,16 +54,12 @@ pub(super) fn chunk_batch_len(sessions: &[PendingChunkSession]) -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn index_chunks(
-    conn: &mut Connection,
-    on_progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<ChunkStats> {
-    index_chunks_observed(conn, on_progress, &Observer::default())
+pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
+    index_chunks_observed(conn, &Observer::default())
 }
 
 pub(crate) fn index_chunks_observed(
     conn: &mut Connection,
-    on_progress: Option<&dyn Fn(usize, usize)>,
     observer: &Observer,
 ) -> Result<ChunkStats> {
     let stage = observer.stage("chunking");
@@ -102,9 +104,6 @@ pub(crate) fn index_chunks_observed(
             store_session_chunks(&tx, session_id, &chunks, &mut stats)?;
             stats.sessions_chunked += 1;
             stage.progress(stats.sessions_chunked, total, 0);
-            if let Some(cb) = on_progress {
-                cb(stats.sessions_chunked, total);
-            }
         }
         remaining = rest;
     }
@@ -126,14 +125,7 @@ pub(crate) fn index_chunks_observed(
 }
 
 fn stage_pending_sessions(tx: &Transaction) -> Result<Vec<PendingChunkSession>> {
-    tx.execute_batch(
-        "CREATE TEMP TABLE chunk_message_rows (
-            session_id TEXT NOT NULL,
-            message_rowid INTEGER NOT NULL,
-            text_bytes INTEGER NOT NULL,
-            PRIMARY KEY (session_id, message_rowid)
-        ) WITHOUT ROWID;",
-    )?;
+    tx.execute_batch(CREATE_CHUNK_MESSAGE_ROWS)?;
     tx.execute(STAGE_CHUNK_MESSAGES, [])?;
     let sessions: Vec<PendingChunkSession> = {
         let mut stmt = tx.prepare(

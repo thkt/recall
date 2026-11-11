@@ -3,17 +3,12 @@ mod chunks;
 mod diagnostics;
 mod scan;
 
-#[cfg(test)]
-use backfill::read_session_messages;
 pub(crate) use backfill::{backfill_rowid_ranges, backfill_session_files};
 #[cfg(test)]
 pub(crate) use chunks::index_chunks;
 pub(crate) use chunks::index_chunks_observed;
 #[cfg(test)]
-use chunks::{
-    CHUNK_BATCH_BYTES, CHUNK_BATCH_SESSIONS, READ_CHUNK_BATCH, STAGE_CHUNK_MESSAGES,
-    chunk_batch_len,
-};
+use chunks::{CREATE_CHUNK_MESSAGE_ROWS, READ_CHUNK_BATCH, STAGE_CHUNK_MESSAGES, chunk_batch_len};
 pub use diagnostics::FileParseDiagnostics;
 pub(crate) use diagnostics::load_parse_diagnostics;
 use diagnostics::{cleanup_parse_diagnostics, save_parse_diagnostics, save_read_error};

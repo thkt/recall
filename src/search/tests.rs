@@ -362,7 +362,7 @@ fn chunks_built_by_the_indexer_show_the_question_and_reply() {
         "assistant",
         "the closest orbital point — APSIS_REPLY_BODY",
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     let results = search(&conn, "perihelion", &SearchOptions::default()).unwrap();
 
@@ -1345,7 +1345,7 @@ fn reindexing_unchanged_logs_keeps_one_result_with_its_chunk() {
     let logs = tempfile::TempDir::new().unwrap();
     write_two_claude_logs(logs.path());
     index_claude_logs(&mut conn, logs.path());
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     index_claude_logs(&mut conn, logs.path());
 
     let results = search(&conn, "authentication", &SearchOptions::default()).unwrap();
