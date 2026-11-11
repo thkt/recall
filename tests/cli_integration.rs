@@ -1522,12 +1522,14 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
     let dir = TempDir::new().unwrap();
     // Equal text gives equal raw ranks, so only the recency blend separates the
     // sessions. "z-newest" sorts last by id, so a cut before the blend drops it.
+    // It is dated in the future, which always gets the largest boost, so the
+    // order holds however late the test runs.
     let a1 = user_line("authentication notes", "2026-01-01T00:00:00Z");
     let a2 = user_line("authentication notes", "2026-01-02T00:00:00Z");
     let a3 = user_line("authentication notes", "2026-01-03T00:00:00Z");
     let a4 = user_line("authentication notes", "2026-01-04T00:00:00Z");
     let a5 = user_line("authentication notes", "2026-01-05T00:00:00Z");
-    let newest = user_line("authentication notes", "2026-10-01T00:00:00Z");
+    let newest = user_line("authentication notes", "2999-01-01T00:00:00Z");
     index_claude_sessions(
         dir.path(),
         &[
