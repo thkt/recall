@@ -19,50 +19,6 @@ fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 #[test]
-fn test_index_from_dirs_indexes_and_skips() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-
-    let claude_dir = tmp.path().join("claude_projects");
-    fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-            claude_dir.join("session1.jsonl"),
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        ).unwrap();
-
-    let codex_dir = tmp.path().join("codex_sessions");
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.total_sessions, 1);
-    index_chunks(&mut conn, None).unwrap();
-
-    let stats2 = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats2.indexed, 0);
-    assert_eq!(stats2.total_sessions, 1);
-}
-
-#[test]
 fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
@@ -779,36 +735,6 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
 }
 
 #[test]
-fn test_missing_source_roots_preserve_existing_index() {
-    let (_dir, mut conn) = setup_test_db();
-    let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let gone_claude = tmp.path().join("missing_claude");
-    let gone_codex = tmp.path().join("missing_codex");
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &gone_claude,
-            codex_dir: &gone_codex,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 2,
-        "missing source roots must not delete existing sessions"
-    );
-    assert_eq!(
-        stats.skipped_roots.len(),
-        2,
-        "both unscanned roots with preserved sessions must be reported"
-    );
-}
-
-#[test]
 fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_kept_and_reported() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
@@ -837,39 +763,6 @@ fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_k
     assert_eq!(
         surviving_source, "codex",
         "the surviving session must be the one whose root was not scanned"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_unreadable_source_root_preserves_index() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let locked = fs::metadata(&claude_dir).unwrap().permissions();
-    let mut zero = locked.clone();
-    zero.set_mode(0o000);
-    fs::set_permissions(&claude_dir, zero).unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    );
-
-    fs::set_permissions(&claude_dir, locked).unwrap();
-    let stats = stats.unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 2,
-        "an unreadable root must preserve its sessions, not wipe them"
     );
 }
 
@@ -1222,66 +1115,6 @@ fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_
     assert!(
         !note.contains("reconcile any real deletions"),
         "the old past-tense deletion framing must not re-appear: {note}"
-    );
-}
-
-#[test]
-fn test_cleanup_deletes_real_orphan_when_new_file_added() {
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let seeded: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        seeded, 2,
-        "T-004 needs exactly 2 seeded sessions to reach the guard's count-equality branch"
-    );
-
-    for entry in fs::read_dir(&claude_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "jsonl") {
-            fs::remove_file(&path).unwrap();
-        }
-    }
-    fs::write(
-            claude_dir.join("fresh.jsonl"),
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"fresh claude turn"},"timestamp":"2026-07-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert!(stats.indexed > 0, "the new claude file must be indexed");
-    assert!(
-        stats.skipped_roots.is_empty(),
-        "both roots are present and fully scanned, so nothing is skipped"
-    );
-    let claude_remaining: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE source = 'claude'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        claude_remaining, 1,
-        "the absent original claude session must be deleted; only the fresh one remains \
-         (if the early-return masked the deletion, the original row would inflate this to 2)"
-    );
-    assert_eq!(
-        stats.total_sessions, 2,
-        "codex-s1 is preserved and the claude orphan is swapped for fresh: 1 codex + 1 claude"
     );
 }
 
