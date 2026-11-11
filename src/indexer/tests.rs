@@ -2617,21 +2617,30 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
         (1, 2, 260)
     );
     // Performance guard (same audit): staging keeps FTS as the single outer scan and probes
-    // sessions by primary key, and each batch reads message bodies by rowid equality.
+    // sessions by key. Each batch reads message bodies by rowid equality. No other row scans
+    // messages or sessions. Index names and the FTS5 index string change with the SQLite
+    // version and the schema, so the asserts read only the access and the table. A virtual
+    // table row always reads SCAN, and FTS5 marks a rowid equality with `=` in its index string.
     conn.execute_batch("CREATE TEMP TABLE chunk_message_rows (session_id TEXT, message_rowid INTEGER, text_bytes INTEGER, PRIMARY KEY(session_id, message_rowid)) WITHOUT ROWID;").unwrap();
-    assert_eq!(
-        query_plan(&conn, STAGE_CHUNK_MESSAGES, &[]),
-        [
-            "SCAN m VIRTUAL TABLE INDEX 0:",
-            "SEARCH s USING INDEX sqlite_autoindex_sessions_1 (session_id=?)"
-        ]
+    let stage = query_plan(&conn, STAGE_CHUNK_MESSAGES, &[]);
+    assert_eq!(stage.len(), 2, "{stage:?}");
+    assert!(
+        stage[0].starts_with("SCAN m VIRTUAL TABLE "),
+        "FTS is the single outer scan: {stage:?}"
     );
-    assert_eq!(
-        query_plan(&conn, READ_CHUNK_BATCH, &["s000", "s064"]),
-        [
-            "SEARCH r USING PRIMARY KEY (session_id>? AND session_id<?)",
-            "SCAN m VIRTUAL TABLE INDEX 0:="
-        ]
+    assert!(
+        stage[1].starts_with("SEARCH s ") && stage[1].ends_with("(session_id=?)"),
+        "each staged message probes sessions by key: {stage:?}"
+    );
+    let read = query_plan(&conn, READ_CHUNK_BATCH, &["s000", "s064"]);
+    assert_eq!(read.len(), 2, "{read:?}");
+    assert!(
+        read[0].starts_with("SEARCH r USING PRIMARY KEY "),
+        "a batch reads its sessions' staged rows by key range: {read:?}"
+    );
+    assert!(
+        read[1].starts_with("SCAN m VIRTUAL TABLE ") && read[1].contains('='),
+        "each staged row reads its message body by rowid equality: {read:?}"
     );
 }
 
