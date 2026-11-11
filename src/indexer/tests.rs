@@ -358,67 +358,167 @@ fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_it
     assert_eq!(counts["files_unchanged"], 1);
 }
 
+const SESSION_A_LOG: &str = concat!(
+    r#"{"type":"session_meta","payload":{"id":"session-a","source":"exec"}}"#,
+    "\n",
+    r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
+);
+const SESSION_A_SUBAGENT_METADATA: &str =
+    r#"{"type":"session_meta","payload":{"id":"session-a","source":{"subagent":"review"}}}"#;
+const SESSION_B_SUBAGENT_METADATA: &str =
+    r#"{"type":"session_meta","payload":{"id":"session-b","source":{"subagent":"review"}}}"#;
+
+/// The session ids, session types and message texts that search and show read.
+fn ids_types_and_messages(conn: &Connection) -> [Vec<String>; 3] {
+    [
+        collect_strings(conn, "SELECT session_id FROM sessions"),
+        collect_strings(conn, "SELECT session_type FROM sessions"),
+        collect_strings(conn, "SELECT text FROM messages ORDER BY rowid"),
+    ]
+}
+
 #[test]
 fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
-    for initial_type in ["interactive", "automated"] {
-        for replacement_id in ["session-a", "session-b"] {
-            let (_db_dir, mut conn) = setup_test_db();
-            let root = TempDir::new().unwrap();
-            let file = root.path().join("rollout-test.jsonl");
-            let absent = root.path().join("absent");
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: &absent,
-                codex_dir: root.path(),
-                codex_archived_dir: None,
-            };
-            let initial = format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"session-a\",\"source\":\"exec\"}}}}\n{}",
-                r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
-            );
-            fs::write(&file, &initial).unwrap();
-            index_from_dirs(&mut conn, &opts, true).unwrap();
-            index_chunks(&mut conn, None).unwrap();
-            conn.execute("UPDATE sessions SET session_type = ?", [initial_type])
-                .unwrap();
-            let replacement = format!(
-                r#"{{"type":"session_meta","payload":{{"id":"{replacement_id}","source":{{"subagent":"review"}}}}}}"#,
-            );
-            assert_ne!(initial.len(), replacement.len(), "force a freshness miss");
-            fs::write(&file, replacement).unwrap();
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let log = root.path().join("rollout-test.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &absent,
+        codex_dir: root.path(),
+        codex_archived_dir: None,
+    };
+    fs::write(&log, SESSION_A_LOG).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    conn.execute("UPDATE sessions SET session_type = 'interactive'", [])
+        .unwrap();
+    fs::write(&log, SESSION_B_SUBAGENT_METADATA).unwrap();
 
-            let matches = replacement_id == "session-a";
-            for attempt in 0..2 {
-                let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-                index_chunks(&mut conn, None).unwrap();
-                assert_eq!(
-                    collect_strings(&conn, "SELECT session_id FROM sessions"),
-                    ["session-a"]
-                );
-                assert_eq!(
-                    collect_strings(&conn, "SELECT session_type FROM sessions"),
-                    [if matches { "automated" } else { initial_type }],
-                    "replacement {replacement_id}, initial {initial_type}, attempt {attempt}"
-                );
-                assert_eq!(stats.indexed, usize::from(matches && attempt == 0));
-                assert_eq!(
-                    collect_strings(&conn, "SELECT text FROM messages"),
-                    if matches {
-                        vec![]
-                    } else {
-                        vec!["original question"]
-                    },
-                    "another session's metadata cannot establish that this body is empty"
-                );
-                reclassify_sessions(&mut conn, true, false).unwrap();
-                assert_eq!(
-                    collect_strings(&conn, "SELECT session_type FROM sessions"),
-                    [if matches { "automated" } else { initial_type }],
-                    "explicit reclassification must agree with indexing"
-                );
-            }
-        }
-    }
+    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(first.indexed, 0);
+    assert_eq!(
+        ids_types_and_messages(&conn),
+        [
+            vec!["session-a"],
+            vec!["interactive"],
+            vec!["original question"]
+        ],
+        "another session's metadata cannot establish that this body is empty"
+    );
+    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(second.indexed, 0);
+    assert_eq!(
+        ids_types_and_messages(&conn),
+        [
+            vec!["session-a"],
+            vec!["interactive"],
+            vec!["original question"]
+        ]
+    );
+
+    reclassify_sessions(&mut conn, true, false).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_type FROM sessions"),
+        ["interactive"],
+        "explicit reclassification must agree with indexing"
+    );
+}
+
+#[test]
+fn metadata_only_rewrite_naming_another_session_keeps_an_automated_label_through_reclassification()
+{
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let log = root.path().join("rollout-test.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &absent,
+        codex_dir: root.path(),
+        codex_archived_dir: None,
+    };
+    fs::write(&log, SESSION_A_LOG).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    conn.execute("UPDATE sessions SET session_type = 'automated'", [])
+        .unwrap();
+    fs::write(&log, SESSION_B_SUBAGENT_METADATA).unwrap();
+
+    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(first.indexed, 0);
+    assert_eq!(
+        ids_types_and_messages(&conn),
+        [
+            vec!["session-a"],
+            vec!["automated"],
+            vec!["original question"]
+        ]
+    );
+    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(second.indexed, 0);
+    assert_eq!(
+        ids_types_and_messages(&conn),
+        [
+            vec!["session-a"],
+            vec!["automated"],
+            vec!["original question"]
+        ]
+    );
+
+    reclassify_sessions(&mut conn, true, false).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_type FROM sessions"),
+        ["automated"],
+        "a log naming another session cannot reset the stored label"
+    );
+}
+
+#[test]
+fn metadata_only_rewrite_of_the_same_session_marks_it_automated_and_clears_its_messages() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let log = root.path().join("rollout-test.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &absent,
+        codex_dir: root.path(),
+        codex_archived_dir: None,
+    };
+    fs::write(&log, SESSION_A_LOG).unwrap();
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    conn.execute("UPDATE sessions SET session_type = 'interactive'", [])
+        .unwrap();
+    fs::write(&log, SESSION_A_SUBAGENT_METADATA).unwrap();
+
+    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(first.indexed, 1);
+    assert_eq!(
+        ids_types_and_messages(&conn),
+        [vec!["session-a"], vec!["automated"], vec![]]
+    );
+    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(second.indexed, 0);
+    assert_eq!(
+        ids_types_and_messages(&conn),
+        [vec!["session-a"], vec!["automated"], vec![]]
+    );
+
+    reclassify_sessions(&mut conn, true, false).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_type FROM sessions"),
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
 }
 
 #[test]
