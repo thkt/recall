@@ -762,6 +762,97 @@ fn recency_lifts_a_new_session_over_a_somewhat_better_older_match_in_hybrid_sear
     assert_eq!(ids(&results), ["new", "old"]);
 }
 
+/// Three year-old sessions and one new one match "authentication" by text, in
+/// the order old-a, old-b, old-c, new (the new one matches slightly worse). A
+/// year-old session found only by vector search keeps the vector leg active.
+/// After fusion the new session scores 5% below the best old one, and the 20%
+/// that recency adds to a same-day session lifts it to the front.
+fn seed_new_session_ranked_fourth_by_text(conn: &Connection) {
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    for sid in ["old-a", "old-b", "old-c"] {
+        insert_session(conn, sid, "claude", "/proj", year_ago);
+        insert_message(conn, sid, "user", "authentication notes");
+    }
+    insert_session(conn, "new", "claude", "/proj", NOW_MS);
+    insert_message(conn, "new", "user", "authentication notes kept");
+    insert_session(conn, "vec-old", "claude", "/proj", year_ago);
+    insert_message(conn, "vec-old", "user", "unrelated weather topic");
+    insert_chunk(conn, 1, "vec-old", "authentication");
+}
+
+fn hybrid_search_at_limit(conn: &Connection, limit: usize) -> SearchOutcome {
+    search_with_embedder(
+        conn,
+        "authentication",
+        &SearchOptions { limit, ..at_now() },
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_text() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fourth_by_text(&conn);
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["new"]);
+}
+
+#[test]
+fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_vector() {
+    let (_dir, conn) = setup_test_db();
+    // No message matches the query, so only the vector leg ranks the sessions:
+    // old-a, old-b, old-c (identical to the query), then new (farther away).
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    for (chunk_id, sid) in [(1, "old-a"), (2, "old-b"), (3, "old-c")] {
+        insert_session(&conn, sid, "claude", "/proj", year_ago);
+        insert_message(&conn, sid, "user", "unrelated weather topic");
+        insert_chunk(&conn, chunk_id, sid, "authentication");
+    }
+    insert_session(&conn, "new", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "new", "user", "unrelated weather topic");
+    insert_chunk(&conn, 4, "new", "authentication flow discussion");
+
+    let outcome = hybrid_search_at_limit(&conn, 1);
+
+    assert_eq!(ids(&outcome.results), ["new"]);
+}
+
+#[test]
+fn hybrid_search_with_a_limit_above_1365_still_returns_vector_matches() {
+    let (_dir, conn) = setup_test_db();
+    // 3 x 1366 is 4098, past the 4096 neighbours a vector query can request.
+    insert_session(&conn, "vec-only", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "vec-only", "user", "unrelated weather topic");
+    insert_chunk(&conn, 1, "vec-only", "authentication");
+
+    let outcome = hybrid_search_at_limit(&conn, 1366);
+
+    assert_eq!(ids(&outcome.results), ["vec-only"]);
+    assert!(!outcome.vec_degraded);
+}
+
+#[test]
+fn hybrid_search_with_a_limit_of_one_returns_the_first_result_of_a_limit_of_ten() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fourth_by_text(&conn);
+    let at_limit = |limit| {
+        ids(&hybrid_search_at_limit(&conn, limit).results)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let full = at_limit(10);
+
+    assert_eq!(full.len(), 5);
+    for limit in 1..full.len() {
+        assert_eq!(at_limit(limit), full[..limit], "limit {limit}");
+    }
+}
+
 #[test]
 fn a_percent_sign_in_the_project_filter_is_matched_literally() {
     let (_dir, conn) = setup_test_db();

@@ -25,7 +25,12 @@ use crate::hybrid::{self, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
 use crate::model;
 use crate::parser::{SessionData, Source};
 
-const CANDIDATE_LIMIT_MULTIPLIER: usize = 3;
+const VEC_CANDIDATE_MULTIPLIER: usize = 3;
+/// Floor of the vector candidate count, so a small `limit` still reads past the
+/// few nearest chunks and the recency blend can lift a newer session into view.
+const VEC_CANDIDATE_FLOOR: usize = 300;
+/// Most neighbours a single vec0 query can return.
+const VEC_CANDIDATE_CEILING: usize = 4096;
 
 /// A skipped session's date is unknown, so it is judged with the largest
 /// recency boost a session can get (`recency_decay` of a session dated now).
@@ -141,65 +146,6 @@ fn append_search_filters(
     }
 }
 
-fn build_fts_candidate_query(
-    fts_query: &str,
-    opts: &SearchOptions,
-    now_ms: i64,
-) -> (String, Vec<Box<dyn ToSql>>) {
-    let mut sql =
-        "SELECT session_id, MIN(rank) as best_rank FROM messages WHERE messages MATCH ?".to_owned();
-    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
-    append_search_filters(&mut sql, &mut params, "session_id", opts, now_ms);
-    sql.push_str(" GROUP BY session_id ORDER BY best_rank, session_id LIMIT ?");
-    let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
-    params.push(Box::new(candidate_limit as i64));
-    (sql, params)
-}
-
-fn find_candidate_sessions(
-    conn: &Connection,
-    opts: &SearchOptions,
-    fts_query: &str,
-    now_ms: i64,
-) -> Result<(Vec<(String, f64)>, usize)> {
-    let (sql, params) = build_fts_candidate_query(fts_query, opts, now_ms);
-    debug_assert_eq!(
-        params.len(),
-        sql.matches('?').count(),
-        "param count must match SQL placeholder count"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("Failed to prepare search query")?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-        })
-        .context("Search query failed")?;
-
-    let mut ranked = Vec::new();
-    let mut first_error = None;
-    let mut skipped = 0;
-    for r in rows {
-        match r {
-            Ok(row) => ranked.push(row),
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-                skipped += 1;
-            }
-        }
-    }
-    if let Some(err) = first_error {
-        if ranked.is_empty() {
-            return Err(candidate_query_error(&err));
-        }
-        warn!(skipped, %err, "rows skipped during search");
-    }
-    Ok((ranked, skipped))
-}
-
 fn candidate_query_error(err: &rusqlite::Error) -> anyhow::Error {
     if is_fts5_query_syntax_error(err) {
         RecallError::QuerySyntax(format!(
@@ -246,9 +192,9 @@ fn decode_session_at(row: &rusqlite::Row, first: usize) -> rusqlite::Result<Opti
     }))
 }
 
-/// Keyword-only search reads every matching session, with its `sessions` row
-/// joined in, because the recency blend can move any of them to the front. The
-/// cut to `limit` comes after the blend, in `rank_sessions`.
+/// Search reads every matching session, with its `sessions` row joined in,
+/// because the recency blend can move any of them to the front. The cut to
+/// `limit` comes after the blend, in `rank_sessions` or the hybrid fusion.
 fn build_keyword_session_query(
     fts_query: &str,
     opts: &SearchOptions,
@@ -266,12 +212,26 @@ fn build_keyword_session_query(
 }
 
 struct KeywordSessions {
+    /// Every matching session id in `(best_rank, session_id)` order, skipped
+    /// ones included, so fusion gives a skipped session the rank it holds.
+    order: Vec<String>,
     ranked: Vec<(f64, SessionData)>,
     /// Best FTS rank of each session skipped for a missing `sessions` row, an
     /// unknown source, or unreadable metadata.
     skipped_ranks: Vec<f64>,
     /// A row that could not be read at all has no rank to estimate from.
     unreadable_rows: bool,
+}
+
+impl KeywordSessions {
+    fn empty() -> Self {
+        Self {
+            order: Vec::new(),
+            ranked: Vec::new(),
+            skipped_ranks: Vec::new(),
+            unreadable_rows: false,
+        }
+    }
 }
 
 /// A session with no `sessions` row or an unknown source is skipped, so it
@@ -304,6 +264,7 @@ fn find_keyword_sessions(
         })
         .context("Search query failed")?;
 
+    let mut order = Vec::new();
     let mut ranked = Vec::new();
     let mut first_error = None;
     let mut row_errors = 0;
@@ -313,6 +274,7 @@ fn find_keyword_sessions(
         match r {
             Ok((session_id, best_rank, session)) => {
                 rows_read += 1;
+                order.push(session_id.clone());
                 match session {
                     Ok(Some(session)) => ranked.push((best_rank, session)),
                     Ok(None) => {
@@ -341,6 +303,7 @@ fn find_keyword_sessions(
         warn!(row_errors, %err, "rows skipped during search");
     }
     Ok(KeywordSessions {
+        order,
         ranked,
         skipped_ranks,
         unreadable_rows: row_errors > 0,
@@ -349,16 +312,18 @@ fn find_keyword_sessions(
 
 fn fetch_session_metadata(
     conn: &Connection,
-    ranked: &[(String, f64)],
+    session_ids: &[&str],
 ) -> Result<HashMap<String, SessionData>> {
-    let placeholders = anon_placeholders(ranked.len());
+    if session_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = anon_placeholders(session_ids.len());
     let sql = format!(
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id IN ({placeholders})"
     );
-    let params = rusqlite::params_from_iter(ranked.iter().map(|(sid, _)| sid));
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params, decode_session)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(session_ids), decode_session)?;
 
     let mut map = HashMap::new();
     let mut db_errors = 0;
@@ -600,6 +565,12 @@ fn has_vec_data(conn: &Connection) -> Result<bool> {
         .is_some())
 }
 
+fn vec_candidate_count(limit: usize) -> usize {
+    limit
+        .saturating_mul(VEC_CANDIDATE_MULTIPLIER)
+        .clamp(VEC_CANDIDATE_FLOOR, VEC_CANDIDATE_CEILING)
+}
+
 fn vec_search(
     conn: &Connection,
     embedder: &dyn Embed,
@@ -767,13 +738,12 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
 fn drop_vec_only_sessions_matching_not(
     conn: &Connection,
     not_operands: &[String],
-    fts_ranked: &[(String, f64)],
+    fts_ids: &HashSet<&str>,
     merged: &mut Vec<(String, f64)>,
 ) -> bool {
     if not_operands.is_empty() {
         return false;
     }
-    let fts_ids: HashSet<&str> = fts_ranked.iter().map(|(sid, _)| sid.as_str()).collect();
     let vec_only: Vec<&str> = merged
         .iter()
         .map(|(sid, _)| sid.as_str())
@@ -915,19 +885,17 @@ pub fn search_with_embedder<'q>(
         return keyword_only_outcome(conn, fts_query, opts, now_ms, false);
     };
 
-    let (fts_ranked, fts_skipped) = match fts_query {
-        Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
-        None => (Vec::new(), 0),
+    let found = match fts_query {
+        Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
+        None => KeywordSessions::empty(),
     };
-    let incomplete = fts_skipped > 0;
-
-    let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
+    let incomplete = found.unreadable_rows;
 
     let (vec_hits, vec_degraded) = match vec_search(
         conn,
         embedder,
         keyword.embed_text.as_deref().unwrap_or(query),
-        candidate_limit,
+        vec_candidate_count(opts.limit),
         opts,
         now_ms,
     ) {
@@ -940,11 +908,12 @@ pub fn search_with_embedder<'q>(
 
     let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
     let mut merged = rrf_merge_sessions(
-        fts_ranked.iter().map(|(sid, _)| sid.as_str()),
+        found.order.iter().map(String::as_str),
         vec_hits.iter().map(|(sid, _)| sid.as_str()),
     );
+    let fts_ids: HashSet<&str> = found.order.iter().map(String::as_str).collect();
     let not_filter_failed =
-        drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ranked, &mut merged);
+        drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
     let vec_degraded = vec_degraded || not_filter_failed;
 
     if merged.is_empty() {
@@ -955,7 +924,20 @@ pub fn search_with_embedder<'q>(
         });
     }
 
-    let mut meta_map = fetch_session_metadata(conn, &merged)?;
+    // The keyword read already carries each session's row; only sessions the
+    // vector search alone found need a metadata query.
+    let vec_only: Vec<&str> = merged
+        .iter()
+        .map(|(sid, _)| sid.as_str())
+        .filter(|sid| !fts_ids.contains(sid))
+        .collect();
+    let mut meta_map = fetch_session_metadata(conn, &vec_only)?;
+    meta_map.extend(
+        found
+            .ranked
+            .into_iter()
+            .map(|(_, session)| (session.session_id.clone(), session)),
+    );
 
     let (kept, pruned): (Vec<_>, Vec<_>) = merged
         .into_iter()
