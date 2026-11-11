@@ -1159,33 +1159,22 @@ fn missing_roots_without_stored_sessions_are_not_reported() {
 }
 
 #[test]
-fn test_skipped_reason_note_and_tag_differ_per_variant() {
-    let missing = SkippedReason::MissingRoot.note("codex", 3);
-    assert!(
-        missing.contains("once the root is back"),
-        "a missing root must advise waiting for the root to return: {missing}"
+fn missing_root_note_says_nothing_was_deleted_and_to_rerun_once_the_root_is_back() {
+    let skipped = SkippedRoot {
+        source: Source::Codex,
+        preserved_sessions: 3,
+        reason: SkippedReason::MissingRoot,
+        other_roots_reconciled: false,
+    };
+
+    assert_eq!(
+        skipped.note(),
+        "codex root unavailable — preserved 3 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions"
     );
-    assert!(
-        !missing.contains("reconcile any real deletions"),
-        "the missing-root note must use forward-looking framing, not past-tense deletions (#187): {missing}"
-    );
-    assert!(
-        missing.contains("none deleted this run"),
-        "the missing-root note must state nothing was deleted this run (#187): {missing}"
-    );
-    assert!(
-        missing.contains("full scan can reconcile"),
-        "the missing-root note must frame reconcile as a future full scan (#187): {missing}"
-    );
-    let incomplete = SkippedReason::IncompleteEnumeration.note("claude", 2);
-    assert!(
-        incomplete.contains("permissions and access"),
-        "incomplete enumeration must advise fixing access, not waiting: {incomplete}"
-    );
-    assert!(
-        !incomplete.contains("once the root is back"),
-        "incomplete enumeration must not reuse the missing-root remedy"
-    );
+}
+
+#[test]
+fn skipped_root_reasons_are_reported_as_missing_root_and_incomplete_enumeration() {
     assert_eq!(SkippedReason::MissingRoot.as_str(), "missing_root");
     assert_eq!(
         SkippedReason::IncompleteEnumeration.as_str(),
@@ -1195,39 +1184,31 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
 
 #[test]
 fn incomplete_root_note_without_preserved_sessions_warns_that_sessions_may_be_missing() {
-    let note = SkippedReason::IncompleteEnumeration.note("claude", 0);
-    assert!(
-        note.contains("some sessions may be missing"),
-        "a zero-preserved partial read must warn about missing sessions: {note}"
-    );
-    assert!(
-        note.contains("permissions and access"),
-        "it must still advise fixing access: {note}"
-    );
-    assert!(
-        !note.contains("reconcile any real deletions"),
-        "with nothing preserved there are no deletions to reconcile: {note}"
-    );
-    assert!(
-        !note.contains("preserved 0"),
-        "the self-contradictory 'preserved 0' phrasing must not appear: {note}"
+    let skipped = SkippedRoot {
+        source: Source::Claude,
+        preserved_sessions: 0,
+        reason: SkippedReason::IncompleteEnumeration,
+        other_roots_reconciled: false,
+    };
+
+    assert_eq!(
+        skipped.note(),
+        "claude root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`"
     );
 }
 
 #[test]
 fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_fix_access() {
-    let note = SkippedReason::IncompleteEnumeration.note("claude", 2);
-    assert!(
-        note.contains("none deleted this run"),
-        "a preserved partial read must state nothing was deleted this run: {note}"
-    );
-    assert!(
-        note.contains("next full scan"),
-        "the reconcile must be framed as a future scan, not a past deletion: {note}"
-    );
-    assert!(
-        !note.contains("reconcile any real deletions"),
-        "the old past-tense deletion framing must not re-appear: {note}"
+    let skipped = SkippedRoot {
+        source: Source::Claude,
+        preserved_sessions: 2,
+        reason: SkippedReason::IncompleteEnumeration,
+        other_roots_reconciled: false,
+    };
+
+    assert_eq!(
+        skipped.note(),
+        "claude root could not be fully read — preserved 2 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions"
     );
 }
 
