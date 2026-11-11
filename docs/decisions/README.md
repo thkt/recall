@@ -20,6 +20,8 @@ This directory contains important decisions about the project's architecture.
 | [0012](0012-adopt-no-prefix-descriptive-test-names-repo-wide.md)                         | Adopt No-Prefix Descriptive Test Names Repo-Wide                         | accepted | 2026-07-19 |
 | [0013](0013-skip-the-isolated-model-probe-on-search-in-a-verified-environment.md)      | Skip the Isolated Model Probe on Search in a Verified Environment        | accepted | 2026-11-02 |
 | [0014](0014-apply-upstream-llama-cpp-fixes-as-build-time-patches-on-the-pinned-submodule.md)| Apply Upstream llama.cpp Fixes as Build-Time Patches on the Pinned Submodule| accepted | 2026-11-03 |
+| [0015](0015-search-uppercase-fts5-operators-on-a-separate-path.md) | Search Uppercase FTS5 Operators on a Separate Path | accepted | 2026-11-10 |
+| [0016](0016-rank-every-match-before-cutting-search-results-to-the-limit.md) | Rank Every Match Before Cutting Search Results to the Limit | accepted | 2026-11-11 |
 
 ## By Status
 
@@ -39,6 +41,8 @@ This directory contains important decisions about the project's architecture.
 - **0012**: Adopt No-Prefix Descriptive Test Names Repo-Wide
 - **0013**: Skip the Isolated Model Probe on Search in a Verified Environment
 - **0014**: Apply Upstream llama.cpp Fixes as Build-Time Patches on the Pinned Submodule
+- **0015**: Search Uppercase FTS5 Operators on a Separate Path
+- **0016**: Rank Every Match Before Cutting Search Results to the Limit
 
 ## About MADR Format
 
