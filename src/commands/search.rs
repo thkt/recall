@@ -237,7 +237,7 @@ where
     if outcome.results_incomplete {
         degraded = true;
         notes.push(
-            "results may be incomplete: some matched sessions were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
+            "results may be incomplete: some matched sessions that could have ranked in these results were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
                 .to_owned(),
         );
     }

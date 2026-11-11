@@ -430,6 +430,50 @@ fn run_search_reports_degraded_when_results_incomplete() {
 }
 
 #[test]
+fn run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results() {
+    // "weird" has an unknown source and a much longer message, so even the
+    // largest recency boost leaves it below "s1" at a limit of one.
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    {
+        let conn = open_or_create_db(&db_path).unwrap();
+        db::seed_session(&conn, "s1");
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'authentication')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('weird', 'user', 'authentication retry logic for the session refresh path in the gateway service')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let out = run_search_with(
+        SearchArgs {
+            limit: 1,
+            ..search_command("authentication")
+        },
+        &Some(db_path),
+        mock_loader,
+    )
+    .unwrap();
+
+    assert_eq!(out.data["results"][0]["session_id"], "s1", "{}", out.data);
+    assert_eq!(
+        (out.degraded, out.notes),
+        (false, Vec::<String>::new()),
+        "a skipped session below the results must not mark the envelope degraded"
+    );
+}
+
+#[test]
 fn freeze_search_payload_key_set_both_branches() {
     let empty_dir = tempfile::TempDir::new().unwrap();
     let empty_path = empty_dir.path().join("empty.db");
