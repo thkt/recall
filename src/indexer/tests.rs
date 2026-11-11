@@ -3001,23 +3001,34 @@ fn failed_fts_transaction_never_reports_saved_files() {
     let error = index_from_dirs_observed(&mut conn, &opts, true, &observer)
         .err()
         .unwrap();
-    assert!(error.to_string().contains("injected FTS failure"));
-    assert_eq!(observer.snapshot()["counts"]["files_updated_committed"], 0);
-    assert!(collect_strings(&conn, "SELECT session_id FROM sessions").is_empty());
-    assert!(
-        !lines
-            .borrow()
-            .iter()
-            .any(|line| line.contains("fts_transaction: committed"))
+    assert_eq!(error.to_string(), "injected FTS failure");
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "files_discovered": 1,
+            "files_remaining": 1,
+            "files_updated_committed": 0,
+        }),
+        "the file whose save failed stays remaining and none counts as committed"
     );
-    assert!(
-        lines
-            .borrow()
-            .iter()
-            .any(|line| line.contains("fts_transaction: unfinished"))
+    assert!(collect_strings(&conn, "SELECT session_id FROM sessions").is_empty());
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: fts_transaction: started (not yet complete)",
+            "index: enumeration: started (not yet complete)",
+            "index: enumeration: complete; unavailable roots reported separately",
+            "index: index_prepare: started (not yet complete)",
+            "index: index_prepare: complete",
+            "index: parse_fts: started (not yet complete)",
+            "index: parse_fts: unfinished; only earlier commit notifications confirm saves",
+            "index: fts_transaction: unfinished; only earlier commit notifications confirm saves"
+        ],
+        "the FTS transaction is reported unfinished, never committed"
     );
     conn.execute_batch("DROP TRIGGER fail_session;").unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn).unwrap();
 }
 
 /// Runs one index and the chunk pass after it, as `recall index` does, and returns the counts
