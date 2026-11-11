@@ -3,8 +3,6 @@ mod chunks;
 mod diagnostics;
 mod scan;
 
-#[cfg(test)]
-use backfill::read_session_messages;
 pub(crate) use backfill::{backfill_rowid_ranges, backfill_session_files};
 #[cfg(test)]
 pub(crate) use chunks::index_chunks;
