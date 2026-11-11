@@ -1021,6 +1021,15 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     (tmp, claude_dir, codex_dir)
 }
 
+/// The (source, reason, preserved_sessions) of each root an index run reports as skipped.
+fn skipped_roots(stats: &IndexStats) -> Vec<(Source, SkippedReason, usize)> {
+    stats
+        .skipped_roots
+        .iter()
+        .map(|s| (s.source, s.reason, s.preserved_sessions))
+        .collect()
+}
+
 #[test]
 fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_kept_and_reported() {
     let (_dir, mut conn) = setup_test_db();
@@ -1046,11 +1055,7 @@ fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_k
         ["codex"]
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::MissingRoot, 1)]
     );
 }
@@ -1160,11 +1165,7 @@ fn unreadable_codex_subdirectory_keeps_every_session_and_reports_only_unseen_one
 
     assert_eq!(stats.total_sessions, 3, "the unseen s1 session is kept");
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)],
         "only the unseen s1 session counts as preserved; the re-read top session does not"
     );
@@ -1207,11 +1208,7 @@ fn codex_root_that_cannot_be_fully_read_is_reported_even_with_no_stored_sessions
     let stats = stats.unwrap();
 
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 0)],
         "an incompletely enumerated root must surface even with nothing preserved"
     );
@@ -1423,27 +1420,13 @@ fn deleted_claude_log_replaced_by_an_unreadable_log_is_removed_and_the_read_fail
     assert_eq!((first.indexed, first.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(first.skipped_roots.is_empty());
-    assert_eq!(
-        first
-            .parse_diagnostics
-            .iter()
-            .map(|d| (d.file_path.as_path(), d.read_error))
-            .collect::<Vec<_>>(),
-        [(fresh.as_path(), true)]
-    );
+    assert_eq!(read_errors_by_file(&first), [(fresh.as_path(), true)]);
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
     assert_eq!((second.indexed, second.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(second.skipped_roots.is_empty());
-    assert_eq!(
-        second
-            .parse_diagnostics
-            .iter()
-            .map(|d| (d.file_path.as_path(), d.read_error))
-            .collect::<Vec<_>>(),
-        [(fresh.as_path(), true)]
-    );
+    assert_eq!(read_errors_by_file(&second), [(fresh.as_path(), true)]);
 }
 
 #[test]
@@ -1474,11 +1457,7 @@ fn codex_session_nested_past_the_depth_limit_is_kept_and_reported_while_a_delete
     assert_eq!((first.indexed, first.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert_eq!(
-        first
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&first),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
     );
     assert!(first.parse_diagnostics.is_empty());
@@ -1487,11 +1466,7 @@ fn codex_session_nested_past_the_depth_limit_is_kept_and_reported_while_a_delete
     assert_eq!((second.indexed, second.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert_eq!(
-        second
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&second),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
     );
     assert!(second.parse_diagnostics.is_empty());
@@ -1584,11 +1559,7 @@ fn rebuild_with_a_missing_codex_root_keeps_its_session_and_embeddings_and_report
         "the present root is rebuilt: its chunks are cleared for re-embed"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::MissingRoot, 1)],
         "the missing codex root must be reported as preserved"
     );
@@ -1633,11 +1604,7 @@ fn rebuild_with_every_root_missing_keeps_all_sessions_and_embeddings() {
         "every embedding must survive a force rebuild with both roots missing"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [
             (Source::Claude, SkippedReason::MissingRoot, 1),
             (Source::Codex, SkippedReason::MissingRoot, 1)
@@ -1789,6 +1756,14 @@ fn invalid_json_lines_by_file(stats: &IndexStats) -> Vec<(PathBuf, i64)> {
         .parse_diagnostics
         .iter()
         .map(|d| (d.file_path.clone(), d.lines.invalid_json_lines))
+        .collect()
+}
+
+fn read_errors_by_file(stats: &IndexStats) -> Vec<(&Path, bool)> {
+    stats
+        .parse_diagnostics
+        .iter()
+        .map(|d| (d.file_path.as_path(), d.read_error))
         .collect()
 }
 
@@ -1959,11 +1934,7 @@ fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_report
         "a log nested nine directories deep is still indexed"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Claude, SkippedReason::IncompleteEnumeration, 0)]
     );
 }
@@ -2197,11 +2168,7 @@ fn session_root_that_is_not_an_absolute_path_is_not_read_and_keeps_its_sessions(
         ["claude", "codex"]
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)]
     );
 }
@@ -2228,11 +2195,7 @@ fn empty_session_root_path_is_not_read_and_keeps_its_sessions() {
         ["claude", "codex"]
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)]
     );
 }
@@ -4233,11 +4196,7 @@ fn missing_archived_root_keeps_its_sessions_and_still_removes_sessions_deleted_e
         ]
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::MissingRoot, 1)]
     );
     assert_eq!(
@@ -4313,11 +4272,7 @@ fn unreadable_archived_root_keeps_every_codex_session() {
         "a session moved into an unreadable root survives"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 2)]
     );
     drop(roots.tmp);
@@ -4354,11 +4309,7 @@ fn archived_root_whose_parent_cannot_be_searched_keeps_every_codex_session() {
         "a session moved into a root that cannot be inspected survives"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
     );
 }
