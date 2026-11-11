@@ -44,7 +44,7 @@ fn timed_pass(conn: &mut Connection, legacy: bool, scenario: &str, run: usize) -
     let stats = if legacy {
         legacy_chunk_pass(conn)
     } else {
-        index_chunks(conn, None).unwrap()
+        index_chunks(conn).unwrap()
     };
     let elapsed = start.elapsed().as_secs_f64();
     println!(
@@ -105,7 +105,7 @@ fn chunk_index_scale() {
         "seed sessions=20580 messages={messages} text_bytes={bytes} sqlite={}",
         rusqlite::version()
     );
-    let initial = index_chunks(&mut conn, None).unwrap();
+    let initial = index_chunks(&mut conn).unwrap();
     assert_eq!(
         (
             initial.sessions_chunked,

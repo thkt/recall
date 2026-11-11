@@ -48,16 +48,12 @@ pub(super) fn chunk_batch_len(sessions: &[PendingChunkSession]) -> usize {
 }
 
 #[cfg(test)]
-pub(crate) fn index_chunks(
-    conn: &mut Connection,
-    on_progress: Option<&dyn Fn(usize, usize)>,
-) -> Result<ChunkStats> {
-    index_chunks_observed(conn, on_progress, &Observer::default())
+pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
+    index_chunks_observed(conn, &Observer::default())
 }
 
 pub(crate) fn index_chunks_observed(
     conn: &mut Connection,
-    on_progress: Option<&dyn Fn(usize, usize)>,
     observer: &Observer,
 ) -> Result<ChunkStats> {
     let stage = observer.stage("chunking");
@@ -102,9 +98,6 @@ pub(crate) fn index_chunks_observed(
             store_session_chunks(&tx, session_id, &chunks, &mut stats)?;
             stats.sessions_chunked += 1;
             stage.progress(stats.sessions_chunked, total, 0);
-            if let Some(cb) = on_progress {
-                cb(stats.sessions_chunked, total);
-            }
         }
         remaining = rest;
     }

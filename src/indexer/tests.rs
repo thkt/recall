@@ -42,7 +42,7 @@ fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() 
     };
 
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     let counts = |conn: &Connection| -> (i64, i64, i64, i64) {
         let m = conn
             .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
@@ -61,7 +61,7 @@ fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() 
     let before = counts(&conn);
 
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(stats.indexed, 0, "an unchanged tree re-parses nothing");
     assert_eq!(
@@ -214,11 +214,11 @@ fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
     let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     rewrite_with_mtime(&log.file, question, t0);
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     rewrite_with_mtime(&log.file, "{", t0);
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["original question"],
@@ -227,7 +227,7 @@ fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
 
     rewrite_with_mtime(&log.file, &format!("{question}{answer}"), t0);
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
@@ -240,7 +240,7 @@ fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
         "precondition: the file system keeps a submillisecond mtime"
     );
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question"]
@@ -273,16 +273,16 @@ fn assert_emptied_log_loses_its_stored_messages(root: &str, question: &str, meta
     let t1 = t0 + Duration::from_secs(10);
     rewrite_with_mtime(&log.file, question, t0);
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     rewrite_with_mtime(&log.file, metadata_only, t0);
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
 
     rewrite_with_mtime(&log.file, question, t1);
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["original question"],
@@ -296,7 +296,7 @@ fn assert_emptied_log_loses_its_stored_messages(root: &str, question: &str, meta
         "precondition: the file system keeps a submillisecond mtime"
     );
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
     assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
 
@@ -351,7 +351,7 @@ fn session_a_labelled_then_rewritten(
     let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
     rewrite_with_mtime(&log.file, SESSION_A_LOG, t0);
     index_from_dirs(conn, &log.opts(), true).unwrap();
-    index_chunks(conn, None).unwrap();
+    index_chunks(conn).unwrap();
     conn.execute("UPDATE sessions SET session_type = ?", [label])
         .unwrap();
     rewrite_with_mtime(&log.file, replacement, t0 + Duration::from_secs(10));
@@ -366,7 +366,7 @@ fn reindex_then_reclassify(
     opts: &IndexOptions,
 ) -> (usize, [Vec<String>; 3], Vec<String>) {
     let indexed = index_from_dirs(conn, opts, true).unwrap().indexed;
-    index_chunks(conn, None).unwrap();
+    index_chunks(conn).unwrap();
     let stored = ids_types_and_messages(conn);
     reclassify_sessions(conn, true, false).unwrap();
     let reclassified = collect_strings(conn, "SELECT session_type FROM sessions");
@@ -524,7 +524,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
     })
     .commit()
     .unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"],
@@ -536,7 +536,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
             .indexed,
         1
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
@@ -557,7 +557,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
     })
     .commit()
     .unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question"],
@@ -569,7 +569,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
             .indexed,
         1
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
@@ -586,7 +586,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
     let tx = index_claude_log_with_parser(&mut conn, &log.file, parse_session_including_empty);
     rewrite_with_mtime(&log.file, &appended, mtime);
     tx.commit().unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question"],
@@ -598,7 +598,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
             .indexed,
         1
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
@@ -636,7 +636,7 @@ fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
     })
     .commit()
     .unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         fs::metadata(&log.file).unwrap().modified().unwrap(),
         t0 + Duration::from_micros(500),
@@ -654,7 +654,7 @@ fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
             .indexed,
         1
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["modified question"]
@@ -685,7 +685,7 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -721,21 +721,21 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
 
     let mut conn = open_db(&db_path).unwrap();
     let first = index_from_dirs(&mut conn, &opts, false).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!((first.indexed, first.preserved_embedded), (0, 1));
     assert_eq!(snapshot(&conn), before);
     drop(conn);
 
     let mut conn = open_db(&db_path).unwrap();
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!((second.indexed, second.preserved_embedded), (0, 1));
     assert_eq!(snapshot(&conn), before);
     drop(conn);
 
     let mut conn = open_db(&db_path).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
@@ -811,7 +811,7 @@ fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
     )
     .unwrap();
     assert_eq!(stats1.indexed, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     let s2 = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"codex-s2","cwd":"/proj"}}
 {"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"second codex session"}]}}"#;
@@ -942,7 +942,7 @@ fn deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_em
         codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -1143,7 +1143,7 @@ fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_
 /// session `s1`, and records one touched file for each.
 fn embedded_claude_and_codex_sessions(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     let seeded = seed_claude_and_codex(conn);
-    index_chunks(conn, None).unwrap();
+    index_chunks(conn).unwrap();
     assert_eq!(
         embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -1348,7 +1348,7 @@ fn rebuild_with_a_missing_codex_root_keeps_its_session_and_embeddings_and_report
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     let embedder = MockEmbedder::new();
     embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
     let codex_vecs_before: i64 = conn
@@ -1416,7 +1416,7 @@ fn rebuild_with_every_root_missing_keeps_all_sessions_and_embeddings() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     let embedder = MockEmbedder::new();
     embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
     let vecs_before: i64 = conn
@@ -1578,7 +1578,7 @@ fn embedded_session_and_a_log_reusing_its_id(conn: &mut Connection) -> Colliding
         index_from_dirs(conn, &logs.opts(), true).unwrap().indexed,
         1
     );
-    assert_eq!(index_chunks(conn, None).unwrap().chunks_created, 1);
+    assert_eq!(index_chunks(conn).unwrap().chunks_created, 1);
     assert_eq!(
         embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -1639,7 +1639,7 @@ fn assert_the_session_holds_only_the_replacement(conn: &mut Connection, replacem
         "the old touched file is removed"
     );
     assert_eq!(
-        index_chunks(conn, None).unwrap().chunks_created,
+        index_chunks(conn).unwrap().chunks_created,
         0,
         "indexing the replacement already reconciled its chunks"
     );
@@ -1874,7 +1874,7 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
     };
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
     let first = Observer::default();
-    index_chunks_observed(&mut conn, None, &first).unwrap();
+    index_chunks_observed(&mut conn, &first).unwrap();
     assert_eq!(
         first.snapshot()["counts"],
         serde_json::json!({
@@ -1891,7 +1891,7 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
     let mut conn = open_db(&dir.path().join("test.db")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
     let (unchanged, lines) = recording();
-    let stats = index_chunks_observed(&mut conn, None, &unchanged).unwrap();
+    let stats = index_chunks_observed(&mut conn, &unchanged).unwrap();
     // Performance guard (docs/audit/2026-09-20-chunk-index.md): a session already chunked to
     // nothing costs no FTS scan, no body batch and no message read.
     assert_eq!(
@@ -1923,7 +1923,7 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
     fs::write(&path, format!("{answer}\n{question}")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
     let appended = Observer::default();
-    index_chunks_observed(&mut conn, None, &appended).unwrap();
+    index_chunks_observed(&mut conn, &appended).unwrap();
     assert_eq!(
         appended.snapshot()["counts"],
         serde_json::json!({
@@ -2209,7 +2209,7 @@ fn edit_and_write_file_paths_are_stored_as_touched_files_and_kept_out_of_message
         true,
     )
     .unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(
         collect_strings(
@@ -2388,9 +2388,7 @@ fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_
     .unwrap();
     let (observer, lines) = recording();
 
-    let error = index_chunks_observed(&mut conn, None, &observer)
-        .err()
-        .unwrap();
+    let error = index_chunks_observed(&mut conn, &observer).err().unwrap();
 
     assert_eq!(error.to_string(), "injected completion failure");
     assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
@@ -2413,7 +2411,7 @@ fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_
 
     conn.execute_batch("DROP TRIGGER fail_completion;").unwrap();
     let retry = Observer::default();
-    index_chunks_observed(&mut conn, None, &retry).unwrap();
+    index_chunks_observed(&mut conn, &retry).unwrap();
     assert_eq!(
         retry.snapshot()["counts"],
         serde_json::json!({
@@ -2436,7 +2434,7 @@ fn chunk_pass_with_nothing_pending_reports_no_pending_sessions_and_zero_counts()
     let (_dir, mut conn) = setup_test_db();
     let (observer, lines) = recording();
 
-    let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
+    let stats = index_chunks_observed(&mut conn, &observer).unwrap();
 
     assert_eq!(stats.chunks_created, 0);
     assert_eq!(
@@ -2474,7 +2472,7 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
     seed_message(&conn, "unknown-role", "dropped text");
     let (observer, lines) = recording();
 
-    let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
+    let stats = index_chunks_observed(&mut conn, &observer).unwrap();
 
     assert_eq!(stats.chunks_created, 1);
     assert_eq!(
@@ -2505,7 +2503,7 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
 
     seed_session(&conn, "later");
     let next = Observer::default();
-    index_chunks_observed(&mut conn, None, &next).unwrap();
+    index_chunks_observed(&mut conn, &next).unwrap();
     assert_eq!(
         next.snapshot()["counts"],
         serde_json::json!({
@@ -2582,7 +2580,7 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     .unwrap();
     let observer = Observer::default();
 
-    let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
+    let stats = index_chunks_observed(&mut conn, &observer).unwrap();
 
     assert_eq!(
         observer.snapshot()["counts"],
@@ -2656,7 +2654,7 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
     assert_eq!(stats.indexed, 1);
     assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
     let chunks = collect_strings(
         &conn,
@@ -2938,7 +2936,7 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
         assert_eq!(counts["files_unchanged"], usize::from(pass == 1));
         assert_eq!(counts["files_deferred"], usize::from(pass == 2));
         assert_eq!(counts["files_remaining"], 0);
-        index_chunks(&mut conn, None).unwrap();
+        index_chunks(&mut conn).unwrap();
         if pass == 1 {
             embed_recent_chunks(&mut conn, &MockEmbedder::new(), usize::MAX, None).unwrap();
             fs::write(
@@ -2954,7 +2952,7 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     let unembedded = source.path().join("unembedded.jsonl");
     write_reuse_conversation(&unembedded, &[("user", "pending question")]);
     index_from_dirs(&mut conn, &opts, false).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     let before = collect_strings(
         &conn,
         "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded'",
@@ -2971,7 +2969,7 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     assert_eq!(counts["chunks_matched_committed"], 1);
     assert_eq!(counts["embeddings_reused_committed"], 0);
     assert_eq!(counts["chunks_reconciled_created_committed"], 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
+    assert_eq!(index_chunks(&mut conn).unwrap().sessions_chunked, 0);
     assert_eq!(chunk_vectors(&conn), protected);
     let after = collect_strings(
         &conn,
@@ -3040,7 +3038,7 @@ fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
                 codex_archived_dir: None,
             };
             index_from_dirs(&mut writer, &opts, true)?;
-            index_chunks(&mut writer, None)?;
+            index_chunks(&mut writer)?;
             assert_eq!(
                 embed_recent_chunks(&mut writer, &MockEmbedder::new(), 100, None)?.embedded,
                 1
@@ -3146,7 +3144,7 @@ impl ReuseLog {
 fn embedded_reuse_conversation(conn: &mut Connection) -> ReuseLog {
     let log = ReuseLog::new();
     assert_eq!(index_from_dirs(conn, &log.opts(), true).unwrap().indexed, 1);
-    assert_eq!(index_chunks(conn, None).unwrap().chunks_created, 3);
+    assert_eq!(index_chunks(conn).unwrap().chunks_created, 3);
     assert_eq!(
         embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -3224,7 +3222,7 @@ fn inference_chunks_of_an_embed(conn: &mut Connection) -> u64 {
 fn assert_vectors_match_a_rebuild(conn: &mut Connection, log: &ReuseLog) {
     let kept = chunk_vectors(conn);
     index_from_dirs(conn, &log.rebuild_opts(), true).unwrap();
-    index_chunks(conn, None).unwrap();
+    index_chunks(conn).unwrap();
     embed_recent_chunks(conn, &MockEmbedder::new(), 100, None).unwrap();
     assert_eq!(
         chunk_vectors(conn),
@@ -3262,7 +3260,7 @@ fn appending_a_turn_reuses_every_stored_vector_and_infers_only_the_new_chunk() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(
@@ -3306,7 +3304,7 @@ fn continuing_the_last_answer_reuses_the_unchanged_chunks_and_infers_only_the_ex
             "chunks_removed_committed": 1,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..2]);
     assert_eq!(
@@ -3345,7 +3343,7 @@ fn touching_a_log_without_changing_it_reuses_every_vector_and_infers_nothing() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(
@@ -3380,7 +3378,7 @@ fn truncating_a_log_keeps_the_vector_of_the_remaining_chunk_and_infers_nothing()
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
@@ -3413,7 +3411,7 @@ fn truncating_to_a_duplicated_turn_keeps_the_copy_that_has_a_vector() {
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
@@ -3446,7 +3444,7 @@ fn replacing_the_opening_turns_keeps_the_vector_of_the_surviving_turn_and_infers
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[2..]);
     assert_eq!(
@@ -3478,7 +3476,7 @@ fn a_session_chunked_under_other_rules_reuses_no_vector_and_infers_every_chunk()
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(
@@ -3516,9 +3514,9 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
         skipped_roots(&missing),
         [(Source::Claude, SkippedReason::MissingRoot, 1)]
     );
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 3);
+    assert_eq!(index_chunks(&mut conn).unwrap().chunks_created, 3);
     assert_eq!(
-        index_chunks(&mut conn, None).unwrap().chunks_created,
+        index_chunks(&mut conn).unwrap().chunks_created,
         0,
         "chunking the stored text completes the session"
     );
@@ -3552,7 +3550,7 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(
@@ -3599,7 +3597,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
             .indexed,
         0
     );
-    assert_eq!(index_chunks(&mut resumed, None).unwrap().chunks_created, 3);
+    assert_eq!(index_chunks(&mut resumed).unwrap().chunks_created, 3);
     fs::rename(&offline, &log.root).unwrap();
     assert_eq!(
         index_from_dirs(&mut conn, &log.opts(), true)
@@ -3608,7 +3606,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
         0,
         "the log was already parsed under the current rules"
     );
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
+    assert_eq!(index_chunks(&mut conn).unwrap().chunks_created, 0);
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -3629,7 +3627,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(
@@ -3660,7 +3658,7 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(
@@ -3699,7 +3697,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         ],
     );
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     let old_pending = pending_chunks(&conn, 100).unwrap();
     let stable = conn
         .query_row(
@@ -3743,7 +3741,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         index_from_dirs(&mut writer, &opts, true).unwrap().indexed,
         1
     );
-    index_chunks(&mut writer, None).unwrap();
+    index_chunks(&mut writer).unwrap();
     assert_eq!(chunk_vectors(&conn), before);
     let stale = embed_chunks(
         &mut conn,
@@ -3766,7 +3764,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     drop(writer);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -3843,7 +3841,7 @@ fn assert_compressing_keeps_the_session_and_its_embeddings(body: &str) {
         codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
@@ -3898,7 +3896,7 @@ fn plain_codex_log_is_indexed_once_when_its_compressed_copy_sits_beside_it() {
     };
 
     let first = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     let second = index_from_dirs(&mut conn, &opts, true).unwrap();
 
     assert_eq!((first.indexed, first.total_sessions), (1, 1));
@@ -3931,7 +3929,7 @@ fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_
         codex_archived_dir: None,
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
     let row_before = session_row(&conn);
     let vectors_before = stored_vectors(&conn);
@@ -4101,7 +4099,7 @@ fn assert_archiving_keeps_the_session_and_its_embeddings(body: &str) {
     let live = roots.day.join(ROLLOUT_NAME);
     fs::write(&live, body).unwrap();
     index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
