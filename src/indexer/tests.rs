@@ -2996,95 +2996,189 @@ fn failed_fts_transaction_never_reports_saved_files() {
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
 }
 
+/// Runs one index and the chunk pass after it, as `recall index` does, and returns the counts
+/// the index reports in `--json`.
+fn counts_of_an_index(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+    embed_capable: bool,
+) -> serde_json::Value {
+    let observer = Observer::default();
+    index_from_dirs_observed(conn, opts, embed_capable, &observer).unwrap();
+    index_chunks(conn).unwrap();
+    observer.snapshot()["counts"].clone()
+}
+
 #[test]
 fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     let (_dir, mut conn) = setup_test_db();
-    let source = TempDir::new().unwrap();
+    let log = OneLog::new("claude", "good.jsonl");
+    let opts = log.opts();
     let body = r#"{"type":"user","message":{"role":"user","content":"question"}}"#;
-    let absent = source.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: source.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
-    let observer = Observer::default();
-    index_from_dirs_observed(&mut conn, &opts, true, &observer).unwrap();
-    let counts = observer.snapshot()["counts"].clone();
-    for key in [
-        "files_discovered",
-        "files_updated",
-        "files_unchanged",
-        "files_empty",
-        "files_failed",
-        "files_deferred",
-        "files_remaining",
-        "files_updated_committed",
-    ] {
-        assert_eq!(counts[key], 0, "empty source: {key}");
-    }
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, true),
+        serde_json::json!({
+            "files_discovered": 0,
+            "files_updated": 0,
+            "files_unchanged": 0,
+            "files_empty": 0,
+            "files_failed": 0,
+            "files_deferred": 0,
+            "files_remaining": 0,
+            "files_updated_committed": 0,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+        }),
+        "a root with no logs reports every file outcome as zero"
+    );
 
-    fs::write(source.path().join("good.jsonl"), body).unwrap();
-    fs::write(source.path().join("empty.jsonl"), "\n").unwrap();
-    fs::write(source.path().join("broken.jsonl"), "{broken}\n").unwrap();
-    for pass in 0..3 {
-        let observer = Observer::default();
-        index_from_dirs_observed(&mut conn, &opts, pass != 2, &observer).unwrap();
-        let counts = observer.snapshot()["counts"].clone();
-        assert_eq!(counts["files_discovered"], 3);
-        assert_eq!(counts["files_empty"], 1);
-        assert_eq!(counts["files_failed"], 1);
-        assert_eq!(counts["files_updated"], usize::from(pass == 0));
-        assert_eq!(counts["files_unchanged"], usize::from(pass == 1));
-        assert_eq!(counts["files_deferred"], usize::from(pass == 2));
-        assert_eq!(counts["files_remaining"], 0);
-        index_chunks(&mut conn).unwrap();
-        if pass == 1 {
-            embed_recent_chunks(&mut conn, &MockEmbedder::new(), usize::MAX, None).unwrap();
-            fs::write(
-                source.path().join("good.jsonl"),
-                format!("{body}\n{body}\n"),
-            )
-            .unwrap();
-        }
-    }
+    fs::write(&log.file, body).unwrap();
+    fs::write(log.claude.join("empty.jsonl"), "\n").unwrap();
+    fs::write(log.claude.join("broken.jsonl"), "{broken}\n").unwrap();
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, true),
+        serde_json::json!({
+            "files_discovered": 3,
+            "files_updated": 1,
+            "files_unchanged": 0,
+            "files_empty": 1,
+            "files_failed": 1,
+            "files_deferred": 0,
+            "files_remaining": 0,
+            "files_updated_committed": 1,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+        })
+    );
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, true),
+        serde_json::json!({
+            "files_discovered": 3,
+            "files_updated": 0,
+            "files_unchanged": 1,
+            "files_empty": 1,
+            "files_failed": 1,
+            "files_deferred": 0,
+            "files_remaining": 0,
+            "files_updated_committed": 0,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+        }),
+        "the empty and broken logs are read again because no session holds them"
+    );
 
-    let protected = chunk_vectors(&conn);
-    assert_eq!(protected.len(), 1);
-    let unembedded = source.path().join("unembedded.jsonl");
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    fs::write(&log.file, format!("{body}\n{body}\n")).unwrap();
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, false),
+        serde_json::json!({
+            "files_discovered": 3,
+            "files_updated": 0,
+            "files_unchanged": 0,
+            "files_empty": 1,
+            "files_failed": 1,
+            "files_deferred": 1,
+            "files_remaining": 0,
+            "files_updated_committed": 0,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+        }),
+        "a run without the model defers the changed log of an embedded session"
+    );
+}
+
+#[test]
+fn a_model_absent_run_reconciles_an_unembedded_log_that_grew_and_defers_the_embedded_one() {
+    let (_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "embedded.jsonl");
+    let opts = log.opts();
+    write_reuse_conversation(&log.file, &[("user", "embedded question")]);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    let embedded = vector_rows(&conn);
+    write_reuse_conversation(
+        &log.file,
+        &[
+            ("user", "embedded question"),
+            ("user", "embedded follow-up"),
+        ],
+    );
+    let unembedded = log.claude.join("unembedded.jsonl");
     write_reuse_conversation(&unembedded, &[("user", "pending question")]);
     index_from_dirs(&mut conn, &opts, false).unwrap();
     index_chunks(&mut conn).unwrap();
-    let before = collect_strings(
-        &conn,
-        "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded'",
+    let chunks_sql = "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded' ORDER BY id";
+    assert_eq!(
+        collect_strings(&conn, chunks_sql),
+        [r#"[2,2,"pending question"]"#]
     );
+
     write_reuse_conversation(
         &unembedded,
         &[("user", "pending question"), ("user", "appended question")],
     );
     let observer = Observer::default();
     let stats = index_from_dirs_observed(&mut conn, &opts, false, &observer).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.preserved_embedded, 1);
-    let counts = observer.snapshot()["counts"].clone();
-    assert_eq!(counts["chunks_matched_committed"], 1);
-    assert_eq!(counts["embeddings_reused_committed"], 0);
-    assert_eq!(counts["chunks_reconciled_created_committed"], 1);
-    assert_eq!(index_chunks(&mut conn).unwrap().sessions_chunked, 0);
-    assert_eq!(chunk_vectors(&conn), protected);
-    let after = collect_strings(
-        &conn,
-        "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded' ORDER BY id",
+    let chunk_pass = Observer::default();
+    index_chunks_observed(&mut conn, &chunk_pass).unwrap();
+
+    assert_eq!((stats.indexed, stats.preserved_embedded), (1, 1));
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "files_discovered": 2,
+            "files_updated": 1,
+            "files_unchanged": 0,
+            "files_empty": 0,
+            "files_failed": 0,
+            "files_deferred": 1,
+            "files_remaining": 0,
+            "files_updated_committed": 1,
+            "chunks_matched_committed": 1,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 1,
+            "chunks_removed_committed": 0,
+        })
     );
-    assert_eq!(after.len(), 2);
-    assert_eq!(after[..1], before);
+    assert_eq!(
+        chunk_pass.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 0,
+            "sessions_chunked_empty": 0,
+        }),
+        "the index already reconciled the chunks of the grown log"
+    );
+    assert_eq!(
+        collect_strings(&conn, chunks_sql),
+        [
+            r#"[2,2,"pending question"]"#,
+            r#"[3,3,"appended question"]"#
+        ],
+        "the matched chunk keeps its id and generation"
+    );
     assert_eq!(
         collect_strings(
             &conn,
             "SELECT text FROM messages WHERE session_id = 'unembedded' ORDER BY rowid"
         ),
         ["pending question", "appended question"]
+    );
+    assert_eq!(
+        vector_rows(&conn),
+        embedded,
+        "the deferred session keeps its chunk and vector rows"
     );
 }
 
