@@ -1836,22 +1836,39 @@ fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then
 #[test]
 fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_reported_as_incompletely_read()
  {
+    let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let deep_dir = claude_dir.join("d0/d1/d2/d3/d4/d5/d6/d7/d8/d9");
+    fs::create_dir_all(&deep_dir).unwrap();
+    fs::write(claude_dir.join("shallow.jsonl"), FRESHNESS_QUESTION).unwrap();
+    fs::write(deep_dir.join("deep.jsonl"), FRESHNESS_QUESTION).unwrap();
+    let absent_codex = tmp.path().join("codex_sessions");
 
-    let mut deep = tmp.path().to_path_buf();
-    for i in 0..MAX_DIR_DEPTH {
-        deep = deep.join(format!("d{i}"));
-    }
-    fs::create_dir_all(&deep).unwrap();
-    fs::write(deep.join("deep.jsonl"), "{}").unwrap();
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &absent_codex,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
-    fs::write(tmp.path().join("shallow.jsonl"), "{}").unwrap();
-
-    let mut files = Vec::new();
-    collect_jsonl_files(tmp.path(), &mut files, Source::Claude);
-
-    assert_eq!(files.len(), 1);
-    assert!(files[0].0.ends_with("shallow.jsonl"));
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["shallow"]
+    );
+    assert_eq!(
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Claude, SkippedReason::IncompleteEnumeration, 0)]
+    );
 }
 
 #[cfg(unix)]

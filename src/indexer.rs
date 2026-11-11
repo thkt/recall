@@ -17,12 +17,12 @@ use chunks::{
 pub use diagnostics::FileParseDiagnostics;
 pub(crate) use diagnostics::load_parse_diagnostics;
 use diagnostics::{cleanup_parse_diagnostics, save_parse_diagnostics, save_read_error};
+use scan::{RemovalGate, collect_sources};
 #[cfg(test)]
 use scan::{
-    MAX_DIR_DEPTH, collect_from_entries, collect_jsonl_files, resolve_claude_dir_with,
-    resolve_codex_archived_dir_with, resolve_codex_dir_with,
+    collect_from_entries, resolve_claude_dir_with, resolve_codex_archived_dir_with,
+    resolve_codex_dir_with,
 };
-use scan::{RemovalGate, collect_sources};
 pub(crate) use scan::{resolve_claude_dir, resolve_codex_archived_dir, resolve_codex_dir};
 
 use std::collections::{HashMap, HashSet};
