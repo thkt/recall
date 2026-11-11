@@ -211,6 +211,7 @@ fn build_keyword_session_query(
     (sql, params)
 }
 
+#[derive(Default)]
 struct KeywordSessions {
     /// Every matching session id in `(best_rank, session_id)` order, skipped
     /// ones included, so fusion gives a skipped session the rank it holds.
@@ -221,17 +222,6 @@ struct KeywordSessions {
     skipped_ranks: Vec<f64>,
     /// A row that could not be read at all has no rank to estimate from.
     unreadable_rows: bool,
-}
-
-impl KeywordSessions {
-    fn empty() -> Self {
-        Self {
-            order: Vec::new(),
-            ranked: Vec::new(),
-            skipped_ranks: Vec::new(),
-            unreadable_rows: false,
-        }
-    }
 }
 
 /// A session with no `sessions` row or an unknown source is skipped, so it
@@ -258,7 +248,10 @@ fn find_keyword_sessions(
             let best_rank: f64 = row.get(1)?;
             let session = match row.get::<_, Option<String>>(2)? {
                 Some(_) => decode_session_at(row, 2),
-                None => Ok(None),
+                None => {
+                    warn!(session_id, "session skipped: no sessions row");
+                    Ok(None)
+                }
             };
             Ok((session_id, best_rank, session))
         })
@@ -277,13 +270,7 @@ fn find_keyword_sessions(
                 order.push(session_id.clone());
                 match session {
                     Ok(Some(session)) => ranked.push((best_rank, session)),
-                    Ok(None) => {
-                        warn!(
-                            session_id,
-                            "session skipped: no sessions row or unknown source"
-                        );
-                        skipped_ranks.push(best_rank);
-                    }
+                    Ok(None) => skipped_ranks.push(best_rank),
                     Err(e) => {
                         warn!(error = %e, session_id, "session metadata unreadable");
                         skipped_ranks.push(best_rank);
@@ -887,7 +874,7 @@ pub fn search_with_embedder<'q>(
 
     let found = match fts_query {
         Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
-        None => KeywordSessions::empty(),
+        None => KeywordSessions::default(),
     };
     let incomplete = found.unreadable_rows;
 
@@ -959,7 +946,11 @@ pub fn search_with_embedder<'q>(
         now_ms,
         RECENCY_BOOST_WEIGHT,
     );
-    let limit_score = merged.get(opts.limit - 1).map(|(_, score)| *score);
+    let limit_score = opts
+        .limit
+        .checked_sub(1)
+        .and_then(|i| merged.get(i))
+        .map(|(_, score)| *score);
     let incomplete = incomplete || pruned_hybrid_session_could_rank(&pruned_scores, limit_score);
     merged.truncate(opts.limit);
 
@@ -986,12 +977,9 @@ fn keyword_only_outcome(
         });
     };
     let found = find_keyword_sessions(conn, opts, q, now_ms)?;
-    let incomplete = |limit_rank| {
-        found.unreadable_rows
-            || skipped_keyword_session_could_rank(&found.skipped_ranks, limit_rank)
-    };
     let mut ranking = rank_sessions(found.ranked, now_ms, opts.limit);
-    let results_incomplete = incomplete(ranking.limit_rank);
+    let results_incomplete = found.unreadable_rows
+        || skipped_keyword_session_could_rank(&found.skipped_ranks, ranking.limit_rank);
     let candidates = fetch_chunks(
         conn,
         fts_query,
