@@ -1859,19 +1859,32 @@ fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_report
 fn symlinked_session_log_is_not_indexed_as_a_second_session() {
     use std::os::unix::fs::symlink;
 
+    let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+    let real = claude_dir.join("real.jsonl");
+    fs::write(&real, FRESHNESS_QUESTION).unwrap();
+    symlink(&real, claude_dir.join("link.jsonl")).unwrap();
+    let absent_codex = tmp.path().join("codex_sessions");
 
-    let real_file = tmp.path().join("real.jsonl");
-    fs::write(&real_file, "{}").unwrap();
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &absent_codex,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
-    let link = tmp.path().join("link.jsonl");
-    symlink(&real_file, &link).unwrap();
-
-    let mut files = Vec::new();
-    collect_jsonl_files(tmp.path(), &mut files, Source::Claude);
-
-    assert_eq!(files.len(), 1);
-    assert!(files[0].0.ends_with("real.jsonl"));
+    assert_eq!((stats.indexed, stats.total_sessions), (1, 1));
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["real"]
+    );
 }
 
 #[test]
