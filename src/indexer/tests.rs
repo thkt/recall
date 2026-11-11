@@ -523,84 +523,153 @@ fn metadata_only_rewrite_of_the_same_session_marks_it_automated_and_clears_its_m
 
 #[test]
 fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
-    for order in 0..3 {
-        let (_db_dir, mut conn) = setup_test_db();
-        let root = TempDir::new().unwrap();
-        let file = root.path().join("s.jsonl");
-        fs::write(&file, FRESHNESS_QUESTION).unwrap();
-        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-        let append = || {
-            rewrite_with_mtime(
-                &file,
-                &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
-                mtime,
-            )
-        };
-        let existing = load_existing_sessions(&conn).unwrap();
-        let tx = conn.transaction().unwrap();
-        let ctx = IndexContext {
-            tx: &tx,
-            existing: &existing,
-            force: false,
-            embedded_sessions: None,
-        };
-        let outcome = index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
-            if order == 0 {
-                append();
-            }
-            let parsed = parse_session_including_empty(path, source);
-            if order == 1 {
-                append();
-            }
-            parsed
-        })
-        .unwrap();
-        assert!(matches!(outcome, IndexOutcome::Indexed(_)));
-        if order == 2 {
-            append();
-        }
-        tx.commit().unwrap();
-        let saved: Option<i64> = conn
-            .query_row("SELECT file_size FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            saved,
-            if order == 2 {
-                Some(i64::try_from(FRESHNESS_QUESTION.len()).unwrap())
-            } else {
-                None
-            }
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: root.path(),
+        codex_dir: &absent,
+        codex_archived_dir: None,
+    };
+    fs::write(&file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let existing = load_existing_sessions(&conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    let ctx = IndexContext {
+        tx: &tx,
+        existing: &existing,
+        force: false,
+        embedded_sessions: None,
+    };
+    index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
+        rewrite_with_mtime(
+            path,
+            &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+            mtime,
         );
+        parse_session_including_empty(path, source)
+    })
+    .unwrap();
+    tx.commit().unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"],
+        "precondition: the read saw the append"
+    );
 
-        let absent = root.path().join("absent");
-        let opts = IndexOptions {
-            force: false,
-            claude_dir: root.path(),
-            codex_dir: &absent,
-            codex_archived_dir: None,
-        };
-        assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-        assert_eq!(
-            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-            ["original question", "appended answer"]
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn append_landing_while_a_log_is_read_is_indexed_by_the_next_run() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: root.path(),
+        codex_dir: &absent,
+        codex_archived_dir: None,
+    };
+    fs::write(&file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let existing = load_existing_sessions(&conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    let ctx = IndexContext {
+        tx: &tx,
+        existing: &existing,
+        force: false,
+        embedded_sessions: None,
+    };
+    index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
+        let parsed = parse_session_including_empty(path, source);
+        rewrite_with_mtime(
+            path,
+            &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+            mtime,
         );
-        index_chunks(&mut conn, None).unwrap();
-        let existing = load_existing_sessions(&conn).unwrap();
-        let tx = conn.transaction().unwrap();
-        let ctx = IndexContext {
-            tx: &tx,
-            existing: &existing,
-            force: false,
-            embedded_sessions: None,
-        };
-        assert!(matches!(
-            index_file_with_parser(&ctx, &file, &Source::Claude, |_, _| panic!(
-                "unchanged body must not be parsed"
-            ))
-            .unwrap(),
-            IndexOutcome::Unchanged
-        ));
-    }
+        parsed
+    })
+    .unwrap();
+    tx.commit().unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"],
+        "precondition: the read finished before the append"
+    );
+
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn append_landing_before_the_index_commits_is_indexed_by_the_next_run() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: root.path(),
+        codex_dir: &absent,
+        codex_archived_dir: None,
+    };
+    fs::write(&file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&file).unwrap().modified().unwrap();
+    let existing = load_existing_sessions(&conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    let ctx = IndexContext {
+        tx: &tx,
+        existing: &existing,
+        force: false,
+        embedded_sessions: None,
+    };
+    index_file_with_parser(&ctx, &file, &Source::Claude, parse_session_including_empty).unwrap();
+    rewrite_with_mtime(
+        &file,
+        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+        mtime,
+    );
+    tx.commit().unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"],
+        "precondition: the read finished before the append"
+    );
+
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
 }
 
 #[test]
