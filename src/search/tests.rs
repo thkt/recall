@@ -1714,6 +1714,39 @@ fn an_unreadable_message_row_flags_incomplete_and_keeps_the_rest() {
 }
 
 #[test]
+fn a_session_with_unreadable_metadata_that_matches_best_is_skipped_and_flags_incomplete() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    insert_message(
+        &conn,
+        "s1",
+        "user",
+        "authentication flow notes for the gateway",
+    );
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
+         VALUES ('garbled', 'claude', '', '/proj', 'garbled', 'yesterday', 0.0)",
+        [],
+    )
+    .unwrap();
+    insert_message(&conn, "garbled", "user", "authentication");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["s1"]);
+    assert!(outcome.results_incomplete);
+}
+
+#[test]
 fn automated_sessions_are_hidden_by_default_and_unclassified_ones_stay() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "auto", "claude", "/proj", 1709251200000);
