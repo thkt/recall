@@ -19,51 +19,7 @@ fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
 }
 
 #[test]
-fn test_index_from_dirs_indexes_and_skips() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-
-    let claude_dir = tmp.path().join("claude_projects");
-    fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-            claude_dir.join("session1.jsonl"),
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        ).unwrap();
-
-    let codex_dir = tmp.path().join("codex_sessions");
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.total_sessions, 1);
-    index_chunks(&mut conn, None).unwrap();
-
-    let stats2 = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats2.indexed, 0);
-    assert_eq!(stats2.total_sessions, 1);
-}
-
-#[test]
-fn test_index_from_dirs_steady_state_keeps_db_stable() {
+fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -199,247 +155,517 @@ fn rewrite_with_mtime(path: &Path, body: &str, mtime: SystemTime) {
         .unwrap();
 }
 
-#[test]
-fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
-    for (source, question, answer, metadata) in [
-        (
-            Source::Claude,
-            FRESHNESS_QUESTION,
-            FRESHNESS_ANSWER,
-            r#"{"type":"system","cwd":"/proj"}"#,
-        ),
-        (
-            Source::Codex,
-            "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"original question\"}}\n",
-            "{\"type\":\"response_item\",\"payload\":{\"role\":\"assistant\",\"content\":\"appended answer\"}}\n",
-            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#,
-        ),
-    ] {
-        for offset in [Duration::ZERO, Duration::from_micros(500)] {
-            let (_db_dir, mut conn) = setup_test_db();
-            let root = TempDir::new().unwrap();
-            let file = root.path().join("s.jsonl");
-            let absent = root.path().join("absent");
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: if source == Source::Claude {
-                    root.path()
-                } else {
-                    &absent
-                },
-                codex_dir: if source == Source::Codex {
-                    root.path()
-                } else {
-                    &absent
-                },
-                codex_archived_dir: None,
-            };
-            let initial = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-            rewrite_with_mtime(&file, question, initial);
-            index_from_dirs(&mut conn, &opts, true).unwrap();
+/// A Claude root and a Codex root under one temp dir. Only the root named `root` exists,
+/// and it holds the log `name`.
+struct OneLog {
+    _tmp: TempDir,
+    claude: PathBuf,
+    codex: PathBuf,
+    file: PathBuf,
+}
 
-            rewrite_with_mtime(
-                &file,
-                &question.replace("original", "modified"),
-                initial + Duration::from_secs(2),
-            );
-            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-            assert_eq!(
-                collect_strings(&conn, "SELECT text FROM messages"),
-                ["modified question"]
-            );
-            rewrite_with_mtime(&file, "{", initial + Duration::from_secs(2));
-            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-            assert_eq!(
-                collect_strings(&conn, "SELECT text FROM messages"),
-                ["modified question"]
-            );
-            let appended = format!("{question}{answer}");
-            for (body, expected) in [
-                (
-                    appended.as_str(),
-                    vec!["original question", "appended answer"],
-                ),
-                (question, vec!["original question"]),
-                (metadata, vec![]),
-                ("", vec![]),
-            ] {
-                let old = fs::metadata(&file).unwrap().modified().unwrap();
-                rewrite_with_mtime(&file, body, old + offset);
-                let observed = fs::metadata(&file).unwrap().modified().unwrap();
-                assert_eq!(observed.duration_since(old).unwrap(), offset);
-                assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-                index_chunks(&mut conn, None).unwrap();
-                assert_eq!(
-                    collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-                    expected
-                );
-                assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-            }
-            let existing = load_existing_sessions(&conn).unwrap();
-            let tx = conn.transaction().unwrap();
-            let ctx = IndexContext {
-                tx: &tx,
-                existing: &existing,
-                force: false,
-                embedded_sessions: None,
-            };
-            assert!(matches!(
-                index_file_with_parser(&ctx, &file, &source, |_, _| panic!(
-                    "unchanged empty body must not be parsed"
-                ))
-                .unwrap(),
-                IndexOutcome::Unchanged
-            ));
-            drop(tx);
-            assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+impl OneLog {
+    fn new(root: &str, name: &str) -> Self {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join(root)).unwrap();
+        Self {
+            claude: tmp.path().join("claude"),
+            codex: tmp.path().join("codex"),
+            file: tmp.path().join(root).join(name),
+            _tmp: tmp,
         }
     }
+
+    fn opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
+            force: false,
+            claude_dir: &self.claude,
+            codex_dir: &self.codex,
+            codex_archived_dir: None,
+        }
+    }
+}
+
+const CLAUDE_METADATA_ONLY: &str = r#"{"type":"system","cwd":"/proj"}"#;
+const CODEX_QUESTION: &str = concat!(
+    r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
+    "\n",
+);
+const CODEX_ANSWER: &str = concat!(
+    r#"{"type":"response_item","payload":{"role":"assistant","content":"appended answer"}}"#,
+    "\n",
+);
+const CODEX_METADATA_ONLY: &str = r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#;
+
+/// Runs one more index and returns the observed counts that `--json` reports.
+fn counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::Value {
+    let observer = Observer::default();
+    index_from_dirs_observed(conn, opts, true, &observer).unwrap();
+    observer.snapshot()["counts"].clone()
+}
+
+/// Indexes `question` in the log `s.jsonl` under the root named `root`, then changes the
+/// log's size at an equal mtime and at an mtime 500 microseconds later. An unfinished line
+/// must keep the stored messages, and each complete body must be re-indexed.
+fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new(root, "s.jsonl");
+    let opts = log.opts();
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, question, t0);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+
+    rewrite_with_mtime(&log.file, "{", t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "an unfinished line keeps the stored messages"
+    );
+
+    rewrite_with_mtime(&log.file, &format!("{question}{answer}"), t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+
+    rewrite_with_mtime(&log.file, question, t0 + Duration::from_micros(500));
+    assert_eq!(
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"]
+    );
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
+    assert_size_changes_are_reindexed("claude", FRESHNESS_QUESTION, FRESHNESS_ANSWER);
+}
+
+#[test]
+fn codex_log_whose_size_changes_with_an_equal_or_submillisecond_mtime_is_reindexed() {
+    assert_size_changes_are_reindexed("codex", CODEX_QUESTION, CODEX_ANSWER);
+}
+
+/// Indexes `question` in the log `s.jsonl` under the root named `root` and reduces the log
+/// to `metadata_only` at the same mtime. It then restores `question` 10 seconds later and
+/// empties the log 500 microseconds after that. Each step that removes the question must
+/// remove its stored message.
+fn assert_emptied_log_loses_its_stored_messages(root: &str, question: &str, metadata_only: &str) {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new(root, "s.jsonl");
+    let opts = log.opts();
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let t1 = t0 + Duration::from_secs(10);
+    rewrite_with_mtime(&log.file, question, t0);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+
+    rewrite_with_mtime(&log.file, metadata_only, t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+
+    rewrite_with_mtime(&log.file, question, t1);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "precondition: the log holds a message again"
+    );
+
+    rewrite_with_mtime(&log.file, "", t1 + Duration::from_micros(500));
+    assert_eq!(
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
+        t1 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn claude_log_emptied_or_reduced_to_metadata_with_an_unchanged_mtime_loses_its_stored_messages() {
+    assert_emptied_log_loses_its_stored_messages(
+        "claude",
+        FRESHNESS_QUESTION,
+        CLAUDE_METADATA_ONLY,
+    );
+}
+
+#[test]
+fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_its_stored_messages()
+{
+    assert_emptied_log_loses_its_stored_messages("codex", CODEX_QUESTION, CODEX_METADATA_ONLY);
+}
+
+const SESSION_A_LOG: &str = concat!(
+    r#"{"type":"session_meta","payload":{"id":"session-a","source":"exec"}}"#,
+    "\n",
+    r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
+);
+const SESSION_A_SUBAGENT_METADATA: &str =
+    r#"{"type":"session_meta","payload":{"id":"session-a","source":{"subagent":"review"}}}"#;
+const SESSION_B_SUBAGENT_METADATA: &str =
+    r#"{"type":"session_meta","payload":{"id":"session-b","source":{"subagent":"review"}}}"#;
+
+/// The session ids, session types and message texts that search and show read.
+fn ids_types_and_messages(conn: &Connection) -> [Vec<String>; 3] {
+    [
+        collect_strings(conn, "SELECT session_id FROM sessions"),
+        collect_strings(conn, "SELECT session_type FROM sessions"),
+        collect_strings(conn, "SELECT text FROM messages ORDER BY rowid"),
+    ]
+}
+
+/// Indexes SESSION_A_LOG written at T0 under a Codex root, labels the session `label`, and
+/// rewrites the log with `replacement` at T0 plus 10 seconds, so the next run reads it
+/// whatever the two bodies' sizes are.
+fn session_a_labelled_then_rewritten(
+    conn: &mut Connection,
+    label: &str,
+    replacement: &str,
+) -> OneLog {
+    let log = OneLog::new("codex", "rollout-test.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, SESSION_A_LOG, t0);
+    index_from_dirs(conn, &log.opts(), true).unwrap();
+    index_chunks(conn, None).unwrap();
+    conn.execute("UPDATE sessions SET session_type = ?", [label])
+        .unwrap();
+    rewrite_with_mtime(&log.file, replacement, t0 + Duration::from_secs(10));
+    log
+}
+
+/// Runs the index and chunk passes, then reclassifies every session. Returns how many logs
+/// the index re-parsed, the stored ids, types and messages after it, and the session types
+/// after the reclassification.
+fn reindex_then_reclassify(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+) -> (usize, [Vec<String>; 3], Vec<String>) {
+    let indexed = index_from_dirs(conn, opts, true).unwrap().indexed;
+    index_chunks(conn, None).unwrap();
+    let stored = ids_types_and_messages(conn);
+    reclassify_sessions(conn, true, false).unwrap();
+    let reclassified = collect_strings(conn, "SELECT session_type FROM sessions");
+    (indexed, stored, reclassified)
 }
 
 #[test]
 fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
-    for initial_type in ["interactive", "automated"] {
-        for replacement_id in ["session-a", "session-b"] {
-            let (_db_dir, mut conn) = setup_test_db();
-            let root = TempDir::new().unwrap();
-            let file = root.path().join("rollout-test.jsonl");
-            let absent = root.path().join("absent");
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: &absent,
-                codex_dir: root.path(),
-                codex_archived_dir: None,
-            };
-            let initial = format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"session-a\",\"source\":\"exec\"}}}}\n{}",
-                r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
-            );
-            fs::write(&file, &initial).unwrap();
-            index_from_dirs(&mut conn, &opts, true).unwrap();
-            index_chunks(&mut conn, None).unwrap();
-            conn.execute("UPDATE sessions SET session_type = ?", [initial_type])
-                .unwrap();
-            let replacement = format!(
-                r#"{{"type":"session_meta","payload":{{"id":"{replacement_id}","source":{{"subagent":"review"}}}}}}"#,
-            );
-            assert_ne!(initial.len(), replacement.len(), "force a freshness miss");
-            fs::write(&file, replacement).unwrap();
+    // The same session's metadata replaces an interactive session's body.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "interactive", SESSION_A_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 1);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
 
-            let matches = replacement_id == "session-a";
-            for attempt in 0..2 {
-                let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-                index_chunks(&mut conn, None).unwrap();
-                assert_eq!(
-                    collect_strings(&conn, "SELECT session_id FROM sessions"),
-                    ["session-a"]
-                );
-                assert_eq!(
-                    collect_strings(&conn, "SELECT session_type FROM sessions"),
-                    [if matches { "automated" } else { initial_type }],
-                    "replacement {replacement_id}, initial {initial_type}, attempt {attempt}"
-                );
-                assert_eq!(stats.indexed, usize::from(matches && attempt == 0));
-                assert_eq!(
-                    collect_strings(&conn, "SELECT text FROM messages"),
-                    if matches {
-                        vec![]
-                    } else {
-                        vec!["original question"]
-                    },
-                    "another session's metadata cannot establish that this body is empty"
-                );
-                reclassify_sessions(&mut conn, true, false).unwrap();
-                assert_eq!(
-                    collect_strings(&conn, "SELECT session_type FROM sessions"),
-                    [if matches { "automated" } else { initial_type }],
-                    "explicit reclassification must agree with indexing"
-                );
-            }
-        }
-    }
+    // Another session's metadata replaces an interactive session's body.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "interactive", SESSION_B_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
+        [
+            vec!["session-a"],
+            vec!["interactive"],
+            vec!["original question"]
+        ],
+        "another session's metadata cannot establish that this body is empty"
+    );
+    assert_eq!(
+        reclassified,
+        ["interactive"],
+        "explicit reclassification must agree with indexing"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
+        [
+            vec!["session-a"],
+            vec!["interactive"],
+            vec!["original question"]
+        ]
+    );
+    assert_eq!(
+        reclassified,
+        ["interactive"],
+        "explicit reclassification must agree with indexing"
+    );
+
+    // The same session's metadata replaces an automated session's body.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "automated", SESSION_A_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 1);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+
+    // Another session's metadata replaces an automated session's body.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "automated", SESSION_B_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
+        [
+            vec!["session-a"],
+            vec!["automated"],
+            vec!["original question"]
+        ],
+        "another session's metadata cannot establish that this body is empty"
+    );
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "a log naming another session cannot reset the stored label"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
+        [
+            vec!["session-a"],
+            vec!["automated"],
+            vec!["original question"]
+        ]
+    );
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "a log naming another session cannot reset the stored label"
+    );
+}
+
+/// Runs the per-file step of an index run on the Claude log `file`, reading it with `parse`,
+/// and returns the open transaction so the caller decides what happens before the commit.
+fn index_claude_log_with_parser<'c>(
+    conn: &'c mut Connection,
+    file: &Path,
+    parse: impl FnOnce(&Path, Source) -> Result<Option<ParseResult>>,
+) -> Transaction<'c> {
+    let existing = load_existing_sessions(conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    let ctx = IndexContext {
+        tx: &tx,
+        existing: &existing,
+        force: false,
+        embedded_sessions: None,
+    };
+    index_file_with_parser(&ctx, file, &Source::Claude, parse).unwrap();
+    tx
 }
 
 #[test]
 fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
-    for order in 0..3 {
-        let (_db_dir, mut conn) = setup_test_db();
-        let root = TempDir::new().unwrap();
-        let file = root.path().join("s.jsonl");
-        fs::write(&file, FRESHNESS_QUESTION).unwrap();
-        let mtime = fs::metadata(&file).unwrap().modified().unwrap();
-        let append = || {
-            rewrite_with_mtime(
-                &file,
-                &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
-                mtime,
-            )
-        };
-        let existing = load_existing_sessions(&conn).unwrap();
-        let tx = conn.transaction().unwrap();
-        let ctx = IndexContext {
-            tx: &tx,
-            existing: &existing,
-            force: false,
-            embedded_sessions: None,
-        };
-        let outcome = index_file_with_parser(&ctx, &file, &Source::Claude, |path, source| {
-            if order == 0 {
-                append();
-            }
-            let parsed = parse_session_including_empty(path, source);
-            if order == 1 {
-                append();
-            }
-            parsed
-        })
-        .unwrap();
-        assert!(matches!(outcome, IndexOutcome::Indexed(_)));
-        if order == 2 {
-            append();
-        }
-        tx.commit().unwrap();
-        let saved: Option<i64> = conn
-            .query_row("SELECT file_size FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(
-            saved,
-            if order == 2 {
-                Some(i64::try_from(FRESHNESS_QUESTION.len()).unwrap())
-            } else {
-                None
-            }
-        );
+    let appended = format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}");
 
-        let absent = root.path().join("absent");
-        let opts = IndexOptions {
-            force: false,
-            claude_dir: root.path(),
-            codex_dir: &absent,
-            codex_archived_dir: None,
-        };
-        assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-        assert_eq!(
-            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-            ["original question", "appended answer"]
+    // The append lands before the log is read.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(&log.file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
+    index_claude_log_with_parser(&mut conn, &log.file, |path, source| {
+        rewrite_with_mtime(path, &appended, mtime);
+        parse_session_including_empty(path, source)
+    })
+    .commit()
+    .unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"],
+        "precondition: the read saw the append"
+    );
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+
+    // The append lands while the log is read.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(&log.file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
+    index_claude_log_with_parser(&mut conn, &log.file, |path, source| {
+        let parsed = parse_session_including_empty(path, source);
+        rewrite_with_mtime(path, &appended, mtime);
+        parsed
+    })
+    .commit()
+    .unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"],
+        "precondition: the read finished before the append"
+    );
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+
+    // The append lands after the log is read, before the index commits.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(&log.file, FRESHNESS_QUESTION).unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
+    let tx = index_claude_log_with_parser(&mut conn, &log.file, parse_session_including_empty);
+    rewrite_with_mtime(&log.file, &appended, mtime);
+    tx.commit().unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"],
+        "precondition: the read finished before the append"
+    );
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+/// FRESHNESS_QUESTION with another word of the same byte length.
+const FRESHNESS_SAME_SIZE_QUESTION: &str = concat!(
+    r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"modified question"}}"#,
+    "\n",
+);
+
+#[test]
+fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
+    assert_eq!(
+        FRESHNESS_SAME_SIZE_QUESTION.len(),
+        FRESHNESS_QUESTION.len(),
+        "precondition: the rewrite keeps the byte length"
+    );
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, FRESHNESS_QUESTION, t0);
+    index_claude_log_with_parser(&mut conn, &log.file, |path, source| {
+        let parsed = parse_session_including_empty(path, source);
+        rewrite_with_mtime(
+            path,
+            FRESHNESS_SAME_SIZE_QUESTION,
+            t0 + Duration::from_micros(500),
         );
-        index_chunks(&mut conn, None).unwrap();
-        let existing = load_existing_sessions(&conn).unwrap();
-        let tx = conn.transaction().unwrap();
-        let ctx = IndexContext {
-            tx: &tx,
-            existing: &existing,
-            force: false,
-            embedded_sessions: None,
-        };
-        assert!(matches!(
-            index_file_with_parser(&ctx, &file, &Source::Claude, |_, _| panic!(
-                "unchanged body must not be parsed"
-            ))
-            .unwrap(),
-            IndexOutcome::Unchanged
-        ));
-    }
+        parsed
+    })
+    .commit()
+    .unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "precondition: the read finished before the rewrite"
+    );
+
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["modified question"]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["modified question"]
+    );
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
 }
 
 #[test]
@@ -460,7 +686,12 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
-    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
     let snapshot = |conn: &Connection| {
         [
             collect_strings(
@@ -479,7 +710,6 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         ]
     };
     let before = snapshot(&conn);
-    assert!(!before[3].is_empty());
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN file_size;")
         .unwrap();
     drop(conn);
@@ -488,24 +718,30 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
         mtime,
     );
-    for _ in 0..2 {
-        let mut conn = open_db(&db_path).unwrap();
-        assert_eq!(snapshot(&conn), before);
-        let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-        assert_eq!((stats.indexed, stats.preserved_embedded), (0, 1));
-        assert_eq!(snapshot(&conn), before);
-        let size: Option<i64> = conn
-            .query_row("SELECT file_size FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(size, None);
-    }
+
+    let mut conn = open_db(&db_path).unwrap();
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!((first.indexed, first.preserved_embedded), (0, 1));
+    assert_eq!(snapshot(&conn), before);
+    drop(conn);
+
+    let mut conn = open_db(&db_path).unwrap();
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!((second.indexed, second.preserved_embedded), (0, 1));
+    assert_eq!(snapshot(&conn), before);
+    drop(conn);
+
     let mut conn = open_db(&db_path).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
     drop(conn);
+
     let mut conn = open_db(&db_path).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
 }
@@ -536,7 +772,7 @@ fn index_one_claude_session(content: &str) -> Option<String> {
 }
 
 #[test]
-fn test_ingest_tags_session_type_from_first_user_turn() {
+fn slash_command_first_turn_is_stored_as_automated_and_human_first_turn_as_interactive() {
     assert_eq!(
         index_one_claude_session("<command-message>clear</command-message>").as_deref(),
         Some("automated"),
@@ -664,88 +900,6 @@ fn test_index_from_dirs_force_reindexes() {
     assert_eq!(vec_after, 0, "force reindex should clear vec_chunks");
 }
 
-#[test]
-fn test_orphan_cleanup_removes_deleted_files() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-
-    let claude_dir = tmp.path().join("claude_projects");
-    fs::create_dir_all(&claude_dir).unwrap();
-    let f1 = claude_dir.join("session1.jsonl");
-    let f2 = claude_dir.join("session2.jsonl");
-    fs::write(&f1, r#"{"type":"user","message":{"role":"user","content":"one"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
-    fs::write(&f2, r#"{"type":"user","message":{"role":"user","content":"two"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
-
-    let codex_dir = tmp.path().join("codex_sessions");
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats.indexed, 2);
-    assert_eq!(stats.total_sessions, 2);
-
-    index_chunks(&mut conn, None).unwrap();
-    let embedder = MockEmbedder::new();
-    embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
-    let chunks_before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(chunks_before > 0, "session2 should have chunks");
-    let vecs_before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert!(
-        vecs_before > 0,
-        "should have vec_chunks before orphan cleanup"
-    );
-
-    fs::remove_file(&f2).unwrap();
-    let stats2 = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats2.total_sessions, 1);
-
-    let chunks_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        chunks_after, 0,
-        "orphan cleanup should cascade to qa_chunks"
-    );
-
-    let vecs_for_session1: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert!(
-        vecs_for_session1 < vecs_before,
-        "orphan cleanup should remove session2 vec_chunks: before={vecs_before}, after={vecs_for_session1}"
-    );
-}
-
 fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -778,309 +932,159 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     (tmp, claude_dir, codex_dir)
 }
 
-#[test]
-fn test_missing_source_roots_preserve_existing_index() {
-    let (_dir, mut conn) = setup_test_db();
-    let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let gone_claude = tmp.path().join("missing_claude");
-    let gone_codex = tmp.path().join("missing_codex");
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &gone_claude,
-            codex_dir: &gone_codex,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 2,
-        "missing source roots must not delete existing sessions"
-    );
-    assert_eq!(
-        stats.skipped_roots.len(),
-        2,
-        "both unscanned roots with preserved sessions must be reported"
-    );
-}
-
-#[test]
-fn test_partial_missing_root_preserves_unscanned_source_only() {
-    let (_dir, mut conn) = setup_test_db();
-    let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
-
-    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
-    let gone_codex = tmp.path().join("missing_codex");
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &gone_codex,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 1,
-        "the deleted claude file is cleaned, the unscanned codex session is kept"
-    );
-    let surviving_source: String = conn
-        .query_row("SELECT source FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        surviving_source, "codex",
-        "the surviving session must be the one whose root was not scanned"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_unreadable_source_root_preserves_index() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let locked = fs::metadata(&claude_dir).unwrap().permissions();
-    let mut zero = locked.clone();
-    zero.set_mode(0o000);
-    fs::set_permissions(&claude_dir, zero).unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    );
-
-    fs::set_permissions(&claude_dir, locked).unwrap();
-    let stats = stats.unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 2,
-        "an unreadable root must preserve its sessions, not wipe them"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_unreadable_child_subdir_preserves_source() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let locked_subdir = codex_dir.join("2026");
-    let orig = fs::metadata(&locked_subdir).unwrap().permissions();
-    let mut zero = orig.clone();
-    zero.set_mode(0o000);
-    fs::set_permissions(&locked_subdir, zero).unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    );
-
-    fs::set_permissions(&locked_subdir, orig).unwrap();
-    let stats = stats.unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 2,
-        "an unreadable nested subdir must preserve the whole source's rows"
-    );
-}
-
-#[test]
-fn test_deleted_file_under_scanned_root_cascades_cleanup() {
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let claude_sid: String = conn
-        .query_row(
-            "SELECT session_id FROM sessions WHERE source = 'claude'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let msgs_before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            [&claude_sid],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        msgs_before > 0,
-        "seed should leave messages for the session"
-    );
-
-    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 1,
-        "the deleted file's session must be cleaned when its root was scanned"
-    );
-    let surviving_source: String = conn
-        .query_row("SELECT source FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(surviving_source, "codex", "only the codex session survives");
-
-    let msgs_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            [&claude_sid],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        msgs_after, 0,
-        "cleanup must cascade to the session's messages"
-    );
-    let chunks_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = ?",
-            [&claude_sid],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        chunks_after, 0,
-        "cleanup must cascade to the session's qa_chunks"
-    );
-    assert!(
-        stats.skipped_roots.is_empty(),
-        "no root was skipped, so nothing should be reported as preserved"
-    );
-}
-
-#[test]
-fn test_skipped_root_reports_preserved_count() {
-    let (_dir, mut conn) = setup_test_db();
-    let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let gone_codex = tmp.path().join("missing_codex");
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &gone_codex,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        stats.skipped_roots.len(),
-        1,
-        "only the missing codex root should be reported"
-    );
-    let reported = &stats.skipped_roots[0];
-    assert_eq!(reported.source, Source::Codex);
-    assert_eq!(
-        reported.preserved_sessions, 1,
-        "the one preserved codex session must be counted"
-    );
-    assert_eq!(
-        reported.reason,
-        SkippedReason::MissingRoot,
-        "an absent root must be classified as missing, not incomplete enumeration"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_skipped_root_counts_only_file_absent_rows() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    fs::write(
-            codex_dir.join("top.jsonl"),
-            "{\"timestamp\":\"2026-05-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-top\",\"cwd\":\"/proj\"}}\n{\"timestamp\":\"2026-05-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"codex top turn\"}]}}",
-        )
-        .unwrap();
-    index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-
-    let locked_subdir = codex_dir.join("2026");
-    let orig = fs::metadata(&locked_subdir).unwrap().permissions();
-    let mut zero = orig.clone();
-    zero.set_mode(0o000);
-    fs::set_permissions(&locked_subdir, zero).unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    );
-
-    fs::set_permissions(&locked_subdir, orig).unwrap();
-    let stats = stats.unwrap();
-
-    let codex = stats
+/// The (source, reason, preserved_sessions) of each root an index run reports as skipped.
+fn skipped_roots(stats: &IndexStats) -> Vec<(Source, SkippedReason, usize)> {
+    stats
         .skipped_roots
         .iter()
-        .find(|s| s.source == Source::Codex)
-        .expect("codex tree was not fully scanned, so it must be reported");
+        .map(|s| (s.source, s.reason, s.preserved_sessions))
+        .collect()
+}
+
+#[test]
+fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_kept_and_reported() {
+    let (_dir, mut conn) = setup_test_db();
+    let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    let missing_codex = tmp.path().join("missing_codex");
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &missing_codex,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(stats.total_sessions, 1);
     assert_eq!(
-        codex.preserved_sessions, 1,
-        "only the file-absent s1 row is at risk; the re-indexed top row must not inflate the count"
+        collect_strings(&conn, "SELECT source FROM sessions"),
+        ["codex"]
     );
     assert_eq!(
-        codex.reason,
-        SkippedReason::IncompleteEnumeration,
-        "a present root whose subtree could not be read is incomplete enumeration, not a missing root"
+        skipped_roots(&stats),
+        [(Source::Codex, SkippedReason::MissingRoot, 1)]
+    );
+}
+
+#[test]
+fn deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_embeddings_and_touched_files()
+ {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+    let claude_log = claude_dir.join("c.jsonl");
+    fs::write(
+        &claude_log,
+        concat!(
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"claude turn"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":[{"type":"text","text":"editing"},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/c.rs","old_string":"x","new_string":"y"}}]},"timestamp":"2026-03-01T00:00:01Z"}"#,
+        ),
+    )
+    .unwrap();
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    fs::write(
+        day_dir.join("s1.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"codex-s1","cwd":"/proj"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"codex turn"}]}}"#,
+        ),
+    )
+    .unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        2
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT path FROM session_files"),
+        ["/proj/c.rs"]
+    );
+
+    fs::remove_file(&claude_log).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    assert_eq!(stats.total_sessions, 1);
+    assert!(stats.skipped_roots.is_empty());
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["s1"]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT DISTINCT session_id FROM messages"),
+        ["s1"]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT DISTINCT session_id FROM qa_chunks"),
+        ["s1"]
+    );
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vectors, 1, "the deleted session's embedding is removed");
+    assert!(collect_strings(&conn, "SELECT path FROM session_files").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_codex_subdirectory_keeps_every_session_and_reports_only_unseen_ones_as_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+    fs::write(
+        codex_dir.join("top.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-05-01T00:00:00Z","type":"session_meta","payload":{"id":"codex-top","cwd":"/proj"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-01T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"codex top turn"}]}}"#,
+        ),
+    )
+    .unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    let locked_subdir = codex_dir.join("2026");
+    let permissions = fs::metadata(&locked_subdir).unwrap().permissions();
+    fs::set_permissions(&locked_subdir, fs::Permissions::from_mode(0o000)).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true);
+    fs::set_permissions(&locked_subdir, permissions).unwrap();
+    let stats = stats.unwrap();
+
+    assert_eq!(stats.total_sessions, 3, "the unseen s1 session is kept");
+    assert_eq!(
+        skipped_roots(&stats),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)],
+        "only the unseen s1 session counts as preserved; the re-read top session does not"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_incomplete_enumeration_surfaces_with_empty_db() {
+fn codex_root_that_cannot_be_fully_read_is_reported_even_with_no_stored_sessions() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_dir, mut conn) = setup_test_db();
@@ -1114,20 +1118,15 @@ fn test_incomplete_enumeration_surfaces_with_empty_db() {
     fs::set_permissions(&locked_subdir, orig).unwrap();
     let stats = stats.unwrap();
 
-    let codex = stats
-        .skipped_roots
-        .iter()
-        .find(|s| s.source == Source::Codex)
-        .expect("an incompletely enumerated root must surface even with nothing preserved");
     assert_eq!(
-        codex.preserved_sessions, 0,
-        "an empty DB has no rows to preserve"
+        skipped_roots(&stats),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 0)],
+        "an incompletely enumerated root must surface even with nothing preserved"
     );
-    assert_eq!(codex.reason, SkippedReason::IncompleteEnumeration);
 }
 
 #[test]
-fn test_missing_root_with_no_preserved_rows_is_silent() {
+fn missing_roots_without_stored_sessions_are_not_reported() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let gone_claude = tmp.path().join("missing_claude");
@@ -1152,33 +1151,22 @@ fn test_missing_root_with_no_preserved_rows_is_silent() {
 }
 
 #[test]
-fn test_skipped_reason_note_and_tag_differ_per_variant() {
-    let missing = SkippedReason::MissingRoot.note("codex", 3);
-    assert!(
-        missing.contains("once the root is back"),
-        "a missing root must advise waiting for the root to return: {missing}"
+fn missing_root_note_says_nothing_was_deleted_and_to_rerun_once_the_root_is_back() {
+    let skipped = SkippedRoot {
+        source: Source::Codex,
+        preserved_sessions: 3,
+        reason: SkippedReason::MissingRoot,
+        other_roots_reconciled: false,
+    };
+
+    assert_eq!(
+        skipped.note(),
+        "codex root unavailable — preserved 3 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions"
     );
-    assert!(
-        !missing.contains("reconcile any real deletions"),
-        "the missing-root note must use forward-looking framing, not past-tense deletions (#187): {missing}"
-    );
-    assert!(
-        missing.contains("none deleted this run"),
-        "the missing-root note must state nothing was deleted this run (#187): {missing}"
-    );
-    assert!(
-        missing.contains("full scan can reconcile"),
-        "the missing-root note must frame reconcile as a future full scan (#187): {missing}"
-    );
-    let incomplete = SkippedReason::IncompleteEnumeration.note("claude", 2);
-    assert!(
-        incomplete.contains("permissions and access"),
-        "incomplete enumeration must advise fixing access, not waiting: {incomplete}"
-    );
-    assert!(
-        !incomplete.contains("once the root is back"),
-        "incomplete enumeration must not reuse the missing-root remedy"
-    );
+}
+
+#[test]
+fn skipped_root_reasons_are_reported_as_missing_root_and_incomplete_enumeration() {
     assert_eq!(SkippedReason::MissingRoot.as_str(), "missing_root");
     assert_eq!(
         SkippedReason::IncompleteEnumeration.as_str(),
@@ -1187,208 +1175,212 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
 }
 
 #[test]
-fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
-    let note = SkippedReason::IncompleteEnumeration.note("claude", 0);
-    assert!(
-        note.contains("some sessions may be missing"),
-        "a zero-preserved partial read must warn about missing sessions: {note}"
-    );
-    assert!(
-        note.contains("permissions and access"),
-        "it must still advise fixing access: {note}"
-    );
-    assert!(
-        !note.contains("reconcile any real deletions"),
-        "with nothing preserved there are no deletions to reconcile: {note}"
-    );
-    assert!(
-        !note.contains("preserved 0"),
-        "the self-contradictory 'preserved 0' phrasing must not appear: {note}"
+fn incomplete_root_note_without_preserved_sessions_warns_that_sessions_may_be_missing() {
+    let skipped = SkippedRoot {
+        source: Source::Claude,
+        preserved_sessions: 0,
+        reason: SkippedReason::IncompleteEnumeration,
+        other_roots_reconciled: false,
+    };
+
+    assert_eq!(
+        skipped.note(),
+        "claude root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`"
     );
 }
 
 #[test]
-fn test_incomplete_note_at_nonzero_preserved_frames_reconcile_as_future() {
-    let note = SkippedReason::IncompleteEnumeration.note("claude", 2);
-    assert!(
-        note.contains("none deleted this run"),
-        "a preserved partial read must state nothing was deleted this run: {note}"
-    );
-    assert!(
-        note.contains("next full scan"),
-        "the reconcile must be framed as a future scan, not a past deletion: {note}"
-    );
-    assert!(
-        !note.contains("reconcile any real deletions"),
-        "the old past-tense deletion framing must not re-appear: {note}"
+fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_fix_access() {
+    let skipped = SkippedRoot {
+        source: Source::Claude,
+        preserved_sessions: 2,
+        reason: SkippedReason::IncompleteEnumeration,
+        other_roots_reconciled: false,
+    };
+
+    assert_eq!(
+        skipped.note(),
+        "claude root could not be fully read — preserved 2 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions"
     );
 }
 
+/// Runs seed_claude_and_codex, chunks and embeds the Claude session `c` and the Codex
+/// session `s1`, and records one touched file for each.
+fn embedded_claude_and_codex_sessions(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
+    let seeded = seed_claude_and_codex(conn);
+    index_chunks(conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        2
+    );
+    seed_session_file(conn, "c", "/proj/c.rs");
+    seed_session_file(conn, "s1", "/proj/s1.rs");
+    seeded
+}
+
+/// Every stored row of the Codex session `s1`: session, messages, chunks, vectors and
+/// touched files.
+fn codex_session_rows(conn: &Connection) -> [Vec<String>; 5] {
+    [
+        "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions WHERE session_id = 's1'",
+        "SELECT json_array(rowid, role, text) FROM messages WHERE session_id = 's1' ORDER BY rowid",
+        "SELECT json_array(id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks WHERE session_id = 's1' ORDER BY id",
+        "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = 's1') ORDER BY rowid",
+        "SELECT path FROM session_files WHERE session_id = 's1' ORDER BY path",
+    ]
+    .map(|sql| collect_strings(conn, sql))
+}
+
+fn assert_only_the_unchanged_codex_session_remains(conn: &Connection, before: &[Vec<String>; 5]) {
+    assert_eq!(codex_session_rows(conn), *before);
+    assert_eq!(
+        collect_strings(conn, "SELECT DISTINCT session_id FROM messages"),
+        ["s1"]
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT DISTINCT session_id FROM qa_chunks"),
+        ["s1"]
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT DISTINCT session_id FROM session_files"),
+        ["s1"]
+    );
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vectors, 1);
+}
+
 #[test]
-fn test_cleanup_deletes_real_orphan_when_new_file_added() {
+fn deleted_claude_log_replaced_by_an_empty_log_is_removed_without_touching_the_codex_session() {
     let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    fs::write(claude_dir.join("fresh.jsonl"), "").unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
 
-    let seeded: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        seeded, 2,
-        "T-004 needs exactly 2 seeded sessions to reach the guard's count-equality branch"
-    );
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(first.skipped_roots.is_empty());
+    assert!(first.parse_diagnostics.is_empty());
 
-    for entry in fs::read_dir(&claude_dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.extension().is_some_and(|e| e == "jsonl") {
-            fs::remove_file(&path).unwrap();
-        }
-    }
-    fs::write(
-            claude_dir.join("fresh.jsonl"),
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"fresh claude turn"},"timestamp":"2026-07-01T00:00:00Z"}"#,
-        )
-        .unwrap();
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(second.skipped_roots.is_empty());
+    assert!(second.parse_diagnostics.is_empty());
+}
 
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
+#[test]
+fn deleted_claude_log_replaced_by_an_invalid_log_is_removed_without_touching_the_codex_session() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    let fresh = claude_dir.join("fresh.jsonl");
+    fs::write(&fresh, "invalid JSON\n").unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
 
-    assert!(stats.indexed > 0, "the new claude file must be indexed");
-    assert!(
-        stats.skipped_roots.is_empty(),
-        "both roots are present and fully scanned, so nothing is skipped"
-    );
-    let claude_remaining: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE source = 'claude'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        claude_remaining, 1,
-        "the absent original claude session must be deleted; only the fresh one remains \
-         (if the early-return masked the deletion, the original row would inflate this to 2)"
-    );
-    assert_eq!(
-        stats.total_sessions, 2,
-        "codex-s1 is preserved and the claude orphan is swapped for fresh: 1 codex + 1 claude"
-    );
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(first.skipped_roots.is_empty());
+    assert_eq!(invalid_json_lines_by_file(&first), [(fresh.clone(), 1)]);
+
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(second.skipped_roots.is_empty());
+    assert_eq!(invalid_json_lines_by_file(&second), [(fresh, 1)]);
 }
 
 #[cfg(unix)]
 #[test]
-fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
+fn deleted_claude_log_replaced_by_an_unreadable_log_is_removed_and_the_read_failure_is_reported() {
     use std::os::unix::fs::PermissionsExt;
 
-    for (replacement, unreadable) in [("", false), ("invalid JSON\n", false), ("", true)] {
-        for incomplete_codex in [false, true] {
-            let (_dir, mut conn) = setup_test_db();
-            let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-            index_chunks(&mut conn, None).unwrap();
-            let embedder = MockEmbedder::new();
-            assert_eq!(
-                embed_recent_chunks(&mut conn, &embedder, 100, None)
-                    .unwrap()
-                    .embedded,
-                2
-            );
-            for sid in ["c", "s1"] {
-                seed_session_file(&conn, sid, &format!("/proj/{sid}.rs"));
-            }
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    let fresh = claude_dir.join("fresh.jsonl");
+    fs::write(&fresh, "").unwrap();
+    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
 
-            let snapshot = |conn: &Connection, sid: &str| {
-                [
-                    "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions WHERE session_id = ? ORDER BY session_id",
-                    "SELECT json_array(rowid, role, text) FROM messages WHERE session_id = ? ORDER BY rowid",
-                    "SELECT json_array(id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks WHERE session_id = ? ORDER BY id",
-                    "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?) ORDER BY rowid",
-                    "SELECT path FROM session_files WHERE session_id = ? ORDER BY path",
-                ]
-                .map(|sql| {
-                    conn.prepare(sql)
-                        .unwrap()
-                        .query_map([sid], |row| row.get::<_, String>(0))
-                        .unwrap()
-                        .map(Result::unwrap)
-                        .collect::<Vec<_>>()
-                })
-            };
-            let survivor = snapshot(&conn, "s1");
-            assert!(
-                survivor.iter().all(|rows| rows.len() == 1),
-                "survivor row counts: {:?}",
-                survivor.each_ref().map(Vec::len)
-            );
-            assert!(snapshot(&conn, "c").iter().all(|rows| rows.len() == 1));
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(first.skipped_roots.is_empty());
+    assert_eq!(read_errors_by_file(&first), [(fresh.as_path(), true)]);
 
-            if incomplete_codex {
-                let mut deep = codex_dir.clone();
-                for _ in 0..MAX_DIR_DEPTH {
-                    deep = deep.join("nested");
-                }
-                fs::create_dir_all(&deep).unwrap();
-                fs::rename(codex_dir.join("2026/04/27/s1.jsonl"), deep.join("s1.jsonl")).unwrap();
-                fs::write(codex_dir.join("empty.jsonl"), "").unwrap();
-            }
-            fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
-            let fresh = claude_dir.join("fresh.jsonl");
-            fs::write(&fresh, replacement).unwrap();
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: &claude_dir,
-                codex_dir: &codex_dir,
-                codex_archived_dir: None,
-            };
-            assert_eq!(collect_sources(&opts).sources.len(), 2);
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(second.skipped_roots.is_empty());
+    assert_eq!(read_errors_by_file(&second), [(fresh.as_path(), true)]);
+}
 
-            for _ in 0..2 {
-                let permissions = fs::metadata(&fresh).unwrap().permissions();
-                if unreadable {
-                    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
-                }
-                let stats = index_from_dirs(&mut conn, &opts, false);
-                fs::set_permissions(&fresh, permissions).unwrap();
-                let stats = stats.unwrap();
-                assert_eq!(stats.indexed, 0);
-                assert_eq!(
-                    stats
-                        .parse_diagnostics
-                        .iter()
-                        .filter(|d| d.read_error)
-                        .count(),
-                    usize::from(unreadable)
-                );
-                assert_eq!(
-                    stats.total_sessions, 1,
-                    "exactly the Claude orphan is deleted"
-                );
-                assert_eq!(snapshot(&conn, "s1"), survivor);
-                assert!(snapshot(&conn, "c").iter().all(Vec::is_empty));
-                for table in ["messages", "qa_chunks", "vec_chunks", "session_files"] {
-                    let count: i64 = conn
-                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                        .unwrap();
-                    assert_eq!(count, 1, "only the survivor's data remains in {table}");
-                }
-                assert_eq!(stats.skipped_roots.len(), usize::from(incomplete_codex));
-                if incomplete_codex {
-                    let skipped = &stats.skipped_roots[0];
-                    assert_eq!(skipped.source, Source::Codex);
-                    assert_eq!(skipped.reason, SkippedReason::IncompleteEnumeration);
-                    assert_eq!(skipped.preserved_sessions, 1);
-                }
-            }
-        }
-    }
+#[test]
+fn codex_session_nested_past_the_depth_limit_is_kept_and_reported_while_a_deleted_claude_log_is_removed()
+ {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    let too_deep =
+        codex_dir.join("nested/nested/nested/nested/nested/nested/nested/nested/nested/nested");
+    fs::create_dir_all(&too_deep).unwrap();
+    fs::rename(
+        codex_dir.join("2026/04/27/s1.jsonl"),
+        too_deep.join("s1.jsonl"),
+    )
+    .unwrap();
+    fs::write(codex_dir.join("empty.jsonl"), "").unwrap();
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    fs::write(claude_dir.join("fresh.jsonl"), "").unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert_eq!(
+        skipped_roots(&first),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
+    );
+    assert!(first.parse_diagnostics.is_empty());
+
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert_eq!(
+        skipped_roots(&second),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
+    );
+    assert!(second.parse_diagnostics.is_empty());
 }
 
 #[test]
@@ -1417,7 +1409,7 @@ fn complete_scan_preserves_sessions_with_unknown_source() {
 }
 
 #[test]
-fn test_force_rebuild_preserves_missing_source_root() {
+fn rebuild_with_a_missing_codex_root_keeps_its_session_and_embeddings_and_reports_it() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1478,15 +1470,14 @@ fn test_force_rebuild_preserves_missing_source_root() {
         "the present root is rebuilt: its chunks are cleared for re-embed"
     );
     assert_eq!(
-        stats.skipped_roots.len(),
-        1,
+        skipped_roots(&stats),
+        [(Source::Codex, SkippedReason::MissingRoot, 1)],
         "the missing codex root must be reported as preserved"
     );
-    assert_eq!(stats.skipped_roots[0].source, Source::Codex);
 }
 
 #[test]
-fn test_force_rebuild_all_roots_missing_preserves_index() {
+fn rebuild_with_every_root_missing_keeps_all_sessions_and_embeddings() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1524,14 +1515,17 @@ fn test_force_rebuild_all_roots_missing_preserves_index() {
         "every embedding must survive a force rebuild with both roots missing"
     );
     assert_eq!(
-        stats.skipped_roots.len(),
-        2,
+        skipped_roots(&stats),
+        [
+            (Source::Claude, SkippedReason::MissingRoot, 1),
+            (Source::Codex, SkippedReason::MissingRoot, 1)
+        ],
         "both missing roots must be reported as preserved"
     );
 }
 
 #[test]
-fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
+fn rebuild_removes_the_session_of_a_log_deleted_under_a_fully_read_root() {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1604,215 +1598,305 @@ fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
     );
 }
 
+struct CollidingLogs {
+    _tmp: TempDir,
+    claude_dir: PathBuf,
+    codex_dir: PathBuf,
+    original: PathBuf,
+    replacement: PathBuf,
+}
+
+impl CollidingLogs {
+    fn opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
+            force: false,
+            claude_dir: &self.claude_dir,
+            codex_dir: &self.codex_dir,
+            codex_archived_dir: None,
+        }
+    }
+}
+
+/// Indexes and embeds `a/collision.jsonl` (one question plus one invalid line), records a
+/// touched file for it, then writes `b/collision.jsonl`, which carries the same session id.
+fn embedded_session_and_a_log_reusing_its_id(conn: &mut Connection) -> CollidingLogs {
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude");
+    fs::create_dir_all(claude_dir.join("a")).unwrap();
+    fs::create_dir_all(claude_dir.join("b")).unwrap();
+    let logs = CollidingLogs {
+        claude_dir: claude_dir.clone(),
+        codex_dir: tmp.path().join("codex"),
+        original: claude_dir.join("a/collision.jsonl"),
+        replacement: claude_dir.join("b/collision.jsonl"),
+        _tmp: tmp,
+    };
+    fs::write(
+        &logs.original,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            "\ninvalid JSON\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        index_from_dirs(conn, &logs.opts(), true).unwrap().indexed,
+        1
+    );
+    assert_eq!(index_chunks(conn, None).unwrap().chunks_created, 1);
+    assert_eq!(
+        embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    seed_session_file(conn, "collision", "/proj/original.rs");
+    fs::write(
+        &logs.replacement,
+        r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
+    )
+    .unwrap();
+    logs
+}
+
+fn collision_snapshot(conn: &Connection) -> [Vec<String>; 5] {
+    [
+        "SELECT json_array(session_id, file_path, mtime, file_size, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
+        "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
+        "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
+        "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
+        "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
+    ]
+    .map(|sql| collect_strings(conn, sql))
+}
+
+fn invalid_json_lines_by_file(stats: &IndexStats) -> Vec<(PathBuf, i64)> {
+    stats
+        .parse_diagnostics
+        .iter()
+        .map(|d| (d.file_path.clone(), d.lines.invalid_json_lines))
+        .collect()
+}
+
+fn read_errors_by_file(stats: &IndexStats) -> Vec<(&Path, bool)> {
+    stats
+        .parse_diagnostics
+        .iter()
+        .map(|d| (d.file_path.as_path(), d.read_error))
+        .collect()
+}
+
+fn assert_the_session_holds_only_the_replacement(conn: &mut Connection, replacement: &Path) {
+    assert_eq!(
+        collect_strings(conn, "SELECT file_path FROM sessions"),
+        [replacement.to_str().unwrap()]
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["replacement question"]
+    );
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vectors, 0, "the old embedding is removed");
+    assert!(
+        collect_strings(conn, "SELECT path FROM session_files").is_empty(),
+        "the old touched file is removed"
+    );
+    assert_eq!(
+        index_chunks(conn, None).unwrap().chunks_created,
+        0,
+        "indexing the replacement already reconciled its chunks"
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT content FROM qa_chunks"),
+        ["replacement question"]
+    );
+}
+
 #[test]
-fn test_session_id_collision_cleans_old_messages() {
+fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_session() {
+    let (_dir, mut conn) = setup_test_db();
+    let logs = embedded_session_and_a_log_reusing_its_id(&mut conn);
+    let before = collision_snapshot(&conn);
+
+    let first = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            first.indexed,
+            first.preserved_embedded,
+            first.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&first),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+    let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            second.indexed,
+            second.preserved_embedded,
+            second.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&second),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+
+    let with_model = index_from_dirs(&mut conn, &logs.opts(), true).unwrap();
+    assert_eq!(
+        (
+            with_model.indexed,
+            with_model.preserved_embedded,
+            with_model.total_sessions
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&with_model),
+        [(logs.original.clone(), 1)]
+    );
+    assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
+
+    fs::remove_file(&logs.original).unwrap();
+    fs::remove_file(&logs.replacement).unwrap();
+    let emptied = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(emptied.total_sessions, 0);
+    assert!(emptied.parse_diagnostics.is_empty());
+}
+
+#[test]
+fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then_replaces_it() {
+    let (_dir, mut conn) = setup_test_db();
+    let logs = embedded_session_and_a_log_reusing_its_id(&mut conn);
+    let before = collision_snapshot(&conn);
+    fs::remove_file(&logs.original).unwrap();
+
+    let first = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            first.indexed,
+            first.preserved_embedded,
+            first.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&first),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+    let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            second.indexed,
+            second.preserved_embedded,
+            second.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&second),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+
+    let with_model = index_from_dirs(&mut conn, &logs.opts(), true).unwrap();
+    assert_eq!(
+        (
+            with_model.indexed,
+            with_model.preserved_embedded,
+            with_model.total_sessions
+        ),
+        (1, 0, 1)
+    );
+    assert!(with_model.parse_diagnostics.is_empty());
+    assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
+
+    fs::remove_file(&logs.replacement).unwrap();
+    let emptied = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(emptied.total_sessions, 0);
+    assert!(emptied.parse_diagnostics.is_empty());
+}
+
+#[test]
+fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_reported_as_incompletely_read()
+ {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
-
-    let dir_a = tmp.path().join("claude_a");
-    let dir_b = tmp.path().join("claude_b");
-    fs::create_dir_all(&dir_a).unwrap();
-    fs::create_dir_all(&dir_b).unwrap();
-    fs::write(
-            dir_a.join("collision.jsonl"),
-            r#"{"type":"user","message":{"role":"user","content":"from dir a"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        ).unwrap();
-    fs::write(
-            dir_b.join("collision.jsonl"),
-            r#"{"type":"user","message":{"role":"user","content":"from dir b"},"timestamp":"2026-03-02T00:00:00Z"}"#,
-        ).unwrap();
-
-    let empty_dir = tmp.path().join("empty");
+    let claude_dir = tmp.path().join("claude_projects");
+    let edge_dir = claude_dir.join("d0/d1/d2/d3/d4/d5/d6/d7/d8");
+    let deep_dir = claude_dir.join("d0/d1/d2/d3/d4/d5/d6/d7/d8/d9");
+    fs::create_dir_all(&deep_dir).unwrap();
+    fs::write(claude_dir.join("shallow.jsonl"), FRESHNESS_QUESTION).unwrap();
+    fs::write(edge_dir.join("edge.jsonl"), FRESHNESS_QUESTION).unwrap();
+    fs::write(deep_dir.join("deep.jsonl"), FRESHNESS_QUESTION).unwrap();
+    let absent_codex = tmp.path().join("codex_sessions");
 
     let stats = index_from_dirs(
         &mut conn,
         &IndexOptions {
             force: false,
-            claude_dir: &dir_a,
-            codex_dir: &empty_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
-
-    let stats2 = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &dir_b,
-            codex_dir: &empty_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats2.indexed, 1);
-
-    let msg_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = 'collision'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(msg_count, 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
-    assert_eq!(
-        collect_strings(&conn, "SELECT content FROM qa_chunks"),
-        ["from dir b"]
-    );
-}
-
-#[test]
-fn model_absent_session_id_collision_preserves_data_until_embedding_is_available() {
-    for remove_original in [false, true] {
-        let (_dir, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let claude_dir = tmp.path().join("claude");
-        let dir_a = claude_dir.join("a");
-        let dir_b = claude_dir.join("b");
-        fs::create_dir_all(&dir_a).unwrap();
-        fs::create_dir_all(&dir_b).unwrap();
-        let original = dir_a.join("collision.jsonl");
-        fs::write(
-            &original,
-            concat!(
-                r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-                "\ninvalid JSON\n",
-            ),
-        )
-        .unwrap();
-        let codex_dir = tmp.path().join("codex");
-        let opts = IndexOptions {
-            force: false,
             claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
+            codex_dir: &absent_codex,
             codex_archived_dir: None,
-        };
-        assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
-        let embedder = MockEmbedder::new();
-        assert_eq!(
-            embed_recent_chunks(&mut conn, &embedder, 8192, None)
-                .unwrap()
-                .embedded,
-            1
-        );
+        },
+        true,
+    )
+    .unwrap();
 
-        let snapshot = |conn: &Connection| {
-            [
-                "SELECT json_array(session_id, file_path, mtime, file_size, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
-                "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
-                "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
-                "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
-                "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
-            ]
-            .map(|sql| collect_strings(conn, sql))
-        };
-        seed_session_file(&conn, "collision", "/proj/original.rs");
-        let before = snapshot(&conn);
-        let replacement = dir_b.join("collision.jsonl");
-        fs::write(
-            &replacement,
-            r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
-        )
-        .unwrap();
-
-        assert!(original.is_file());
-        if remove_original {
-            fs::remove_file(&original).unwrap();
-        }
-        for _ in 0..2 {
-            let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-            assert_eq!(stats.indexed, 0);
-            assert_eq!(stats.preserved_embedded, 1);
-            assert_eq!(stats.total_sessions, 1);
-            assert_eq!(stats.parse_diagnostics.len(), 1);
-            assert_eq!(stats.parse_diagnostics[0].file_path, original);
-            assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
-            assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
-            assert_eq!(snapshot(&conn), before);
-        }
-
-        let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-        assert_eq!(stats.indexed, 1);
-        assert_eq!(stats.preserved_embedded, 0);
-        assert_eq!(stats.parse_diagnostics.len(), usize::from(!remove_original));
-        assert_eq!(stats.total_sessions, 1);
-        assert_eq!(
-            collect_strings(&conn, "SELECT file_path FROM sessions"),
-            [replacement.to_str().unwrap()]
-        );
-        assert_eq!(
-            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-            ["replacement question"]
-        );
-        for table in ["vec_chunks", "session_files"] {
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(count, 0, "old {table} must be removed on replacement");
-        }
-        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
-        assert_eq!(
-            collect_strings(&conn, "SELECT content FROM qa_chunks"),
-            ["replacement question"]
-        );
-        fs::remove_file(&replacement).unwrap();
-        if !remove_original {
-            fs::remove_file(&original).unwrap();
-        }
-        let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-        assert_eq!(stats.total_sessions, 0);
-        assert!(stats.parse_diagnostics.is_empty());
-    }
-}
-
-#[test]
-fn test_collect_depth_limit() {
-    let tmp = TempDir::new().unwrap();
-
-    let mut deep = tmp.path().to_path_buf();
-    for i in 0..MAX_DIR_DEPTH {
-        deep = deep.join(format!("d{i}"));
-    }
-    fs::create_dir_all(&deep).unwrap();
-    fs::write(deep.join("deep.jsonl"), "{}").unwrap();
-
-    fs::write(tmp.path().join("shallow.jsonl"), "{}").unwrap();
-
-    let mut files = Vec::new();
-    collect_jsonl_files(tmp.path(), &mut files, Source::Claude);
-
-    assert_eq!(files.len(), 1);
-    assert!(files[0].0.ends_with("shallow.jsonl"));
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions ORDER BY session_id"),
+        ["edge", "shallow"],
+        "a log nested nine directories deep is still indexed"
+    );
+    assert_eq!(
+        skipped_roots(&stats),
+        [(Source::Claude, SkippedReason::IncompleteEnumeration, 0)]
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_collect_skips_symlinks() {
+fn symlinked_session_log_is_not_indexed_as_a_second_session() {
     use std::os::unix::fs::symlink;
 
+    let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+    let real = claude_dir.join("real.jsonl");
+    fs::write(&real, FRESHNESS_QUESTION).unwrap();
+    symlink(&real, claude_dir.join("link.jsonl")).unwrap();
+    let absent_codex = tmp.path().join("codex_sessions");
 
-    let real_file = tmp.path().join("real.jsonl");
-    fs::write(&real_file, "{}").unwrap();
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &absent_codex,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
-    let link = tmp.path().join("link.jsonl");
-    symlink(&real_file, &link).unwrap();
-
-    let mut files = Vec::new();
-    collect_jsonl_files(tmp.path(), &mut files, Source::Claude);
-
-    assert_eq!(files.len(), 1);
-    assert!(files[0].0.ends_with("real.jsonl"));
+    assert_eq!((stats.indexed, stats.total_sessions), (1, 1));
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["real"]
+    );
 }
 
 #[test]
-fn test_collect_from_entries_incomplete_on_entry_error_still_collects() {
+fn unreadable_directory_entry_marks_the_root_incompletely_read_and_keeps_the_readable_logs() {
     use std::{io, iter};
 
     let tmp = TempDir::new().unwrap();
@@ -1955,7 +2039,7 @@ fn test_index_chunks_progress_callback_silent_when_all_chunked() {
 }
 
 #[test]
-fn test_009_recall_claude_dir_overrides_claude_config_dir() {
+fn recall_claude_dir_takes_priority_over_claude_config_dir() {
     let home = Path::new("/fake/home");
     let result = resolve_claude_dir_with(home, |key| match key {
         "RECALL_CLAUDE_DIR" => Some(OsString::from("/custom/recall/dir")),
@@ -1970,7 +2054,7 @@ fn test_009_recall_claude_dir_overrides_claude_config_dir() {
 }
 
 #[test]
-fn test_010_claude_config_dir_used_as_fallback() {
+fn claude_config_dir_projects_is_used_when_recall_claude_dir_is_unset() {
     let home = Path::new("/fake/home");
     let result = resolve_claude_dir_with(home, |key| match key {
         "CLAUDE_CONFIG_DIR" => Some(OsString::from("/custom/config")),
@@ -1985,43 +2069,62 @@ fn test_010_claude_config_dir_used_as_fallback() {
 
 #[test]
 fn session_root_that_is_not_an_absolute_path_is_not_read_and_keeps_its_sessions() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
     // `src` exists relative to the package root, where the test runner starts, and holds
     // no session logs: read as a root, it would look like every Claude session was deleted.
-    for relative in ["", "src"] {
-        let (_dir, mut conn) = setup_test_db();
-        let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: Path::new("src"),
+            codex_dir: &codex_dir,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
-        let stats = index_from_dirs(
-            &mut conn,
-            &IndexOptions {
-                force: false,
-                claude_dir: Path::new(relative),
-                codex_dir: &codex_dir,
-                codex_archived_dir: None,
-            },
-            true,
-        )
-        .unwrap();
-
-        assert_eq!(
-            collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
-            ["claude", "codex"],
-            "{relative:?}"
-        );
-        assert_eq!(
-            stats
-                .skipped_roots
-                .iter()
-                .map(|s| (s.source, s.reason, s.preserved_sessions))
-                .collect::<Vec<_>>(),
-            [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)],
-            "{relative:?}"
-        );
-    }
+    assert_eq!(
+        collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
+        ["claude", "codex"]
+    );
+    assert_eq!(
+        skipped_roots(&stats),
+        [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)]
+    );
 }
 
 #[test]
-fn test_codex_dir_env_override() {
+fn empty_session_root_path_is_not_read_and_keeps_its_sessions() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, _claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
+
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: Path::new(""),
+            codex_dir: &codex_dir,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, "SELECT source FROM sessions ORDER BY source"),
+        ["claude", "codex"]
+    );
+    assert_eq!(
+        skipped_roots(&stats),
+        [(Source::Claude, SkippedReason::IncompleteEnumeration, 1)]
+    );
+}
+
+#[test]
+fn recall_codex_dir_replaces_the_default_codex_sessions_dir() {
     let home = Path::new("/fake/home");
     let result = resolve_codex_dir_with(home, |key| match key {
         "RECALL_CODEX_DIR" => Some(OsString::from("/custom/codex/sessions")),
@@ -2031,7 +2134,7 @@ fn test_codex_dir_env_override() {
 }
 
 #[test]
-fn test_codex_dir_default() {
+fn codex_sessions_dir_defaults_to_dot_codex_sessions_under_home() {
     let home = Path::new("/fake/home");
     let result = resolve_codex_dir_with(home, |_| None);
     assert_eq!(result, PathBuf::from("/fake/home/.codex/sessions"));
@@ -2309,33 +2412,6 @@ fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
         embedded > 0,
         "the trailing assistant's text must reach an embedded qa_chunk so semantic \
          search can find it; orphaning it leaves it FTS-only and vector-invisible"
-    );
-}
-
-#[test]
-fn セッション削除で_session_files_の行も消える() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    conn.execute(
-        "INSERT INTO session_files (session_id, path) VALUES ('s1', '/proj/s1.jsonl')",
-        [],
-    )
-    .unwrap();
-
-    let tx = conn.transaction().unwrap();
-    delete_session_dependents(&tx, "s1").unwrap();
-    tx.commit().unwrap();
-
-    let remaining: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM session_files WHERE session_id = 's1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        remaining, 0,
-        "session_files rows must be deleted together with the session"
     );
 }
 
@@ -3614,46 +3690,69 @@ fn stored_vectors(conn: &Connection) -> Vec<String> {
     )
 }
 
+const ROLLOUT_META: &str = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
+
+/// The stored session's id, slug, project and start time. The file path is left out
+/// because compressing or archiving the log changes it.
+fn session_identity(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT json_array(session_id, slug, project, timestamp) FROM sessions",
+    )
+}
+
+/// Indexes and embeds `body` as a Codex rollout, then compresses the log and removes the
+/// plain copy. The session must keep its identity and embeddings under the compressed path.
+fn assert_compressing_keeps_the_session_and_its_embeddings(body: &str) {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    let plain = day_dir.join(ROLLOUT_NAME);
+    fs::write(&plain, body).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    let identity_before = session_identity(&conn);
+    let vectors_before = stored_vectors(&conn);
+
+    let compressed = compress_log(&plain);
+    fs::remove_file(&plain).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [compressed.to_str().unwrap()]
+    );
+    assert_eq!(session_identity(&conn), identity_before);
+    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert!(stats.parse_diagnostics.is_empty());
+}
+
 #[test]
 fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
-    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
-    for body in [format!("{meta}\n{ROLLOUT_TURNS}"), ROLLOUT_TURNS.to_owned()] {
-        let (_db, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let claude_dir = tmp.path().join("claude_projects");
-        let codex_dir = tmp.path().join("codex_sessions");
-        let day_dir = codex_dir.join("2026/04/27");
-        fs::create_dir_all(&day_dir).unwrap();
-        let plain = day_dir.join(ROLLOUT_NAME);
-        fs::write(&plain, &body).unwrap();
-        let opts = IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        };
-        index_from_dirs(&mut conn, &opts, true).unwrap();
-        index_chunks(&mut conn, None).unwrap();
-        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
-        let row_before = session_row(&conn);
-        let vectors_before = stored_vectors(&conn);
-        assert_eq!(row_before.len(), 1);
-        assert!(!vectors_before.is_empty());
+    assert_compressing_keeps_the_session_and_its_embeddings(&format!(
+        "{ROLLOUT_META}\n{ROLLOUT_TURNS}"
+    ));
+}
 
-        let compressed = compress_log(&plain);
-        fs::remove_file(&plain).unwrap();
-        let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-
-        assert_eq!(stats.total_sessions, 1, "{body}");
-        let row_after = session_row(&conn);
-        assert_eq!(
-            row_after,
-            [row_before[0].replace(plain.to_str().unwrap(), compressed.to_str().unwrap())],
-            "only the file path changes"
-        );
-        assert_eq!(stored_vectors(&conn), vectors_before);
-        assert!(stats.parse_diagnostics.is_empty());
-    }
+#[test]
+fn compressing_a_codex_log_that_has_no_session_meta_keeps_the_indexed_session_and_its_embeddings() {
+    assert_compressing_keeps_the_session_and_its_embeddings(ROLLOUT_TURNS);
 }
 
 #[test]
@@ -3722,38 +3821,62 @@ fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_
 }
 
 #[test]
-fn compressed_logs_are_collected_from_the_codex_root_only() {
+fn compressed_logs_are_indexed_only_from_codex_roots() {
+    let (_db, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
     let codex_dir = tmp.path().join("codex_sessions");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::create_dir_all(&codex_dir).unwrap();
-    for dir in [&claude_dir, &codex_dir] {
-        fs::write(
-            dir.join("a.jsonl.zst"),
-            zstd::encode_all(&b"{}\n"[..], 0).unwrap(),
-        )
-        .unwrap();
-        fs::write(dir.join("b.zst"), "").unwrap();
-        fs::write(dir.join("c.jsonl.gz"), "").unwrap();
-    }
+    // If collected, the Claude `a.jsonl.zst` and both `c.jsonl.gz` logs would be indexed as
+    // sessions. Both `b.zst` files would be read as plain text without decompression and
+    // would show up in parse_diagnostics.
+    fs::write(
+        claude_dir.join("a.jsonl.zst"),
+        zstd::encode_all(FRESHNESS_QUESTION.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        claude_dir.join("b.zst"),
+        zstd::encode_all(FRESHNESS_QUESTION.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(claude_dir.join("c.jsonl.gz"), FRESHNESS_QUESTION).unwrap();
+    let codex_log = codex_dir
+        .join("rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000002.jsonl.zst");
+    fs::write(
+        &codex_log,
+        zstd::encode_all(rollout_body(2, "compressed").as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("b.zst"),
+        zstd::encode_all(rollout_body(3, "bare zst").as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(codex_dir.join("c.jsonl.gz"), rollout_body(4, "gz")).unwrap();
 
-    let mut found: Vec<_> = collect_sources(&IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    })
-    .sources
-    .into_iter()
-    .map(|(path, source)| (path.strip_prefix(tmp.path()).unwrap().to_owned(), source))
-    .collect();
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
     assert_eq!(
-        found,
-        [(PathBuf::from("codex_sessions/a.jsonl.zst"), Source::Codex)]
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["01900000-0000-7000-8000-000000000002"]
     );
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [codex_log.to_str().unwrap()]
+    );
+    assert!(stats.parse_diagnostics.is_empty());
 }
 
 #[test]
@@ -3846,36 +3969,54 @@ fn session_ids(conn: &Connection) -> Vec<String> {
     collect_strings(conn, "SELECT session_id FROM sessions ORDER BY session_id")
 }
 
+/// Indexes and embeds `body` as a live Codex rollout, then moves its compressed copy into
+/// the archived root. The session must keep its identity and embeddings under the archived path.
+fn assert_archiving_keeps_the_session_and_its_embeddings(body: &str) {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let live = roots.day.join(ROLLOUT_NAME);
+    fs::write(&live, body).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    let identity_before = session_identity(&conn);
+    let vectors_before = stored_vectors(&conn);
+
+    let compressed = compress_log(&live);
+    let archived = roots.archived.join(compressed.file_name().unwrap());
+    fs::rename(&compressed, &archived).unwrap();
+    fs::remove_file(&live).unwrap();
+    let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [archived.to_str().unwrap()]
+    );
+    assert_eq!(
+        session_identity(&conn),
+        identity_before,
+        "the slug keeps the session's date"
+    );
+    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert!(stats.skipped_roots.is_empty());
+}
+
 #[test]
 fn archiving_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
-    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
-    for body in [format!("{meta}\n{ROLLOUT_TURNS}"), ROLLOUT_TURNS.to_owned()] {
-        let (_db, mut conn) = setup_test_db();
-        let roots = CodexRoots::new();
-        let live = roots.day.join(ROLLOUT_NAME);
-        fs::write(&live, &body).unwrap();
-        index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-        index_chunks(&mut conn, None).unwrap();
-        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
-        let row_before = session_row(&conn);
-        let vectors_before = stored_vectors(&conn);
-        assert!(!vectors_before.is_empty());
+    assert_archiving_keeps_the_session_and_its_embeddings(&format!(
+        "{ROLLOUT_META}\n{ROLLOUT_TURNS}"
+    ));
+}
 
-        let compressed = compress_log(&live);
-        let archived = roots.archived.join(compressed.file_name().unwrap());
-        fs::rename(&compressed, &archived).unwrap();
-        fs::remove_file(&live).unwrap();
-        let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-
-        assert_eq!(stats.total_sessions, 1, "{body}");
-        assert_eq!(
-            session_row(&conn),
-            [row_before[0].replace(live.to_str().unwrap(), archived.to_str().unwrap())],
-            "only the file path changes; the slug keeps the session's date"
-        );
-        assert_eq!(stored_vectors(&conn), vectors_before);
-        assert!(stats.skipped_roots.is_empty());
-    }
+#[test]
+fn archiving_a_codex_log_that_has_no_session_meta_keeps_the_indexed_session_and_its_embeddings() {
+    assert_archiving_keeps_the_session_and_its_embeddings(ROLLOUT_TURNS);
 }
 
 #[test]
@@ -3926,17 +4067,13 @@ fn missing_archived_root_keeps_its_sessions_and_still_removes_sessions_deleted_e
         ]
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::MissingRoot, 1)]
     );
-    let note = stats.skipped_roots[0].note();
-    assert!(
-        note.contains("reconciled the rest") && !note.contains("none deleted this run"),
-        "the other Codex root was cleaned, so the note must not claim nothing was deleted: {note}"
+    assert_eq!(
+        stats.skipped_roots[0].note(),
+        "a codex root is unavailable — preserved 1 existing session(s) under it and reconciled the rest; re-run `recall index` once the root is back so a full scan can reconcile them",
+        "the other Codex root was cleaned, so the note must not claim nothing was deleted"
     );
 }
 
@@ -4006,11 +4143,7 @@ fn unreadable_archived_root_keeps_every_codex_session() {
         "a session moved into an unreadable root survives"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 2)]
     );
     drop(roots.tmp);
@@ -4047,11 +4180,7 @@ fn archived_root_whose_parent_cannot_be_searched_keeps_every_codex_session() {
         "a session moved into a root that cannot be inspected survives"
     );
     assert_eq!(
-        stats
-            .skipped_roots
-            .iter()
-            .map(|s| (s.source, s.reason, s.preserved_sessions))
-            .collect::<Vec<_>>(),
+        skipped_roots(&stats),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
     );
 }
