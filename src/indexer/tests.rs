@@ -3849,37 +3849,59 @@ fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_
 
 #[test]
 fn compressed_logs_are_indexed_only_from_codex_roots() {
+    let (_db, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
     let codex_dir = tmp.path().join("codex_sessions");
     fs::create_dir_all(&claude_dir).unwrap();
     fs::create_dir_all(&codex_dir).unwrap();
-    for dir in [&claude_dir, &codex_dir] {
-        fs::write(
-            dir.join("a.jsonl.zst"),
-            zstd::encode_all(&b"{}\n"[..], 0).unwrap(),
-        )
-        .unwrap();
-        fs::write(dir.join("b.zst"), "").unwrap();
-        fs::write(dir.join("c.jsonl.gz"), "").unwrap();
-    }
+    // Every file below holds a session that would be indexed if its name were collected.
+    fs::write(
+        claude_dir.join("a.jsonl.zst"),
+        zstd::encode_all(FRESHNESS_QUESTION.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        claude_dir.join("b.zst"),
+        zstd::encode_all(FRESHNESS_QUESTION.as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(claude_dir.join("c.jsonl.gz"), FRESHNESS_QUESTION).unwrap();
+    let codex_log = codex_dir
+        .join("rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000002.jsonl.zst");
+    fs::write(
+        &codex_log,
+        zstd::encode_all(rollout_body(2, "compressed").as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        codex_dir.join("b.zst"),
+        zstd::encode_all(rollout_body(3, "bare zst").as_bytes(), 0).unwrap(),
+    )
+    .unwrap();
+    fs::write(codex_dir.join("c.jsonl.gz"), rollout_body(4, "gz")).unwrap();
 
-    let mut found: Vec<_> = collect_sources(&IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    })
-    .sources
-    .into_iter()
-    .map(|(path, source)| (path.strip_prefix(tmp.path()).unwrap().to_owned(), source))
-    .collect();
-    found.sort_by(|a, b| a.0.cmp(&b.0));
+    let stats = index_from_dirs(
+        &mut conn,
+        &IndexOptions {
+            force: false,
+            claude_dir: &claude_dir,
+            codex_dir: &codex_dir,
+            codex_archived_dir: None,
+        },
+        true,
+    )
+    .unwrap();
 
     assert_eq!(
-        found,
-        [(PathBuf::from("codex_sessions/a.jsonl.zst"), Source::Codex)]
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["01900000-0000-7000-8000-000000000002"]
     );
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [codex_log.to_str().unwrap()]
+    );
+    assert!(stats.parse_diagnostics.is_empty());
 }
 
 #[test]
