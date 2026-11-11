@@ -3236,8 +3236,9 @@ fn chunk_ranges(conn: &Connection) -> Vec<String> {
     )
 }
 
-/// Embeds every pending chunk and returns how many chunks the model was given.
-fn inference_chunks_of_an_embed(conn: &mut Connection) -> u64 {
+/// Embeds every pending chunk and returns the --json counts of the chunks the model was given
+/// and of the vectors the embed saved.
+fn inference_counts_of_an_embed(conn: &mut Connection) -> serde_json::Value {
     let observer = Observer::default();
     embed_pending_observed(
         conn,
@@ -3247,9 +3248,11 @@ fn inference_chunks_of_an_embed(conn: &mut Connection) -> u64 {
         &observer,
     )
     .unwrap();
-    observer.snapshot()["counts"]["inference_chunks"]
-        .as_u64()
-        .unwrap()
+    let counts = observer.snapshot()["counts"].clone();
+    serde_json::json!({
+        "inference_chunks": counts["inference_chunks"],
+        "chunks_saved": counts["chunks_saved"],
+    })
 }
 
 /// Rebuilds the index from the log and asserts it stores the same chunks and vectors.
@@ -3306,7 +3309,10 @@ fn appending_a_turn_reuses_every_stored_vector_and_infers_only_the_new_chunk() {
             r#"["appended question\nappended answer",14,15]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 1);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 1, "chunks_saved": 1})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3349,7 +3355,10 @@ fn continuing_the_last_answer_reuses_the_unchanged_chunks_and_infers_only_the_ex
             r#"["tail question\ntail answer\ncontinuation needle",12,14]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 1);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 1, "chunks_saved": 1})
+    );
     let results = search(&conn, "continuation", &SearchOptions::default()).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(
@@ -3395,7 +3404,10 @@ fn touching_a_log_without_changing_it_reuses_every_vector_and_infers_nothing() {
             r#"["tail question\ntail answer",12,13]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 0);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 0, "chunks_saved": 0})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3423,7 +3435,10 @@ fn truncating_a_log_keeps_the_vector_of_the_remaining_chunk_and_infers_nothing()
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 0);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 0, "chunks_saved": 0})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3456,7 +3471,10 @@ fn truncating_to_a_duplicated_turn_keeps_the_copy_that_has_a_vector() {
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 0);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 0, "chunks_saved": 0})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3495,7 +3513,10 @@ fn replacing_the_opening_turns_keeps_the_vector_of_the_surviving_turn_and_infers
             r#"["replacement needle",10,10]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 1);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 1, "chunks_saved": 1})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3528,7 +3549,10 @@ fn a_session_chunked_under_other_rules_reuses_no_vector_and_infers_every_chunk()
             r#"["tail question\ntail answer",12,13]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 3);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 3, "chunks_saved": 3})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3602,7 +3626,10 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
             r#"["tail question\ntail answer",12,13]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 3);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 3, "chunks_saved": 3})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3679,7 +3706,10 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
             r#"["tail question\ntail answer",12,13]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 0);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 0, "chunks_saved": 0})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
@@ -3710,7 +3740,10 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
             r#"["tail question\ntail answer",12,13]"#,
         ]
     );
-    assert_eq!(inference_chunks_of_an_embed(&mut conn), 3);
+    assert_eq!(
+        inference_counts_of_an_embed(&mut conn),
+        serde_json::json!({"inference_chunks": 3, "chunks_saved": 3})
+    );
     assert_vectors_match_a_rebuild(&mut conn, &log);
 }
 
