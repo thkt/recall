@@ -804,75 +804,72 @@ fn test_unreadable_child_subdir_preserves_source() {
 fn deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_embeddings_and_touched_files()
  {
     let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let claude_sid: String = conn
-        .query_row(
-            "SELECT session_id FROM sessions WHERE source = 'claude'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let msgs_before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            [&claude_sid],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(
-        msgs_before > 0,
-        "seed should leave messages for the session"
-    );
-
-    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    fs::create_dir_all(&claude_dir).unwrap();
+    let claude_log = claude_dir.join("c.jsonl");
+    fs::write(
+        &claude_log,
+        concat!(
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"claude turn"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":[{"type":"text","text":"editing"},{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/c.rs","old_string":"x","new_string":"y"}}]},"timestamp":"2026-03-01T00:00:01Z"}"#,
+        ),
     )
     .unwrap();
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    fs::write(
+        day_dir.join("s1.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"codex-s1","cwd":"/proj"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-04-27T00:00:01Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"codex turn"}]}}"#,
+        ),
+    )
+    .unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        2
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT path FROM session_files"),
+        ["/proj/c.rs"]
+    );
 
-    assert_eq!(
-        stats.total_sessions, 1,
-        "the deleted file's session must be cleaned when its root was scanned"
-    );
-    let surviving_source: String = conn
-        .query_row("SELECT source FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(surviving_source, "codex", "only the codex session survives");
+    fs::remove_file(&claude_log).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
 
-    let msgs_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-            [&claude_sid],
-            |r| r.get(0),
-        )
-        .unwrap();
+    assert_eq!(stats.total_sessions, 1);
+    assert!(stats.skipped_roots.is_empty());
     assert_eq!(
-        msgs_after, 0,
-        "cleanup must cascade to the session's messages"
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["s1"]
     );
-    let chunks_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = ?",
-            [&claude_sid],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        chunks_after, 0,
-        "cleanup must cascade to the session's qa_chunks"
+        collect_strings(&conn, "SELECT DISTINCT session_id FROM messages"),
+        ["s1"]
     );
-    assert!(
-        stats.skipped_roots.is_empty(),
-        "no root was skipped, so nothing should be reported as preserved"
+    assert_eq!(
+        collect_strings(&conn, "SELECT DISTINCT session_id FROM qa_chunks"),
+        ["s1"]
     );
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vectors, 1, "the deleted session's embedding is removed");
+    assert!(collect_strings(&conn, "SELECT path FROM session_files").is_empty());
 }
 
 #[test]
