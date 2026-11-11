@@ -3032,10 +3032,29 @@ fn write_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
     fs::write(path, text).unwrap();
 }
 
+/// Each embedded chunk's content, sub-index and vector bytes, without ids, so two stores
+/// that gave the same chunks different ids, such as before and after a rebuild, compare equal.
 fn chunk_vectors(conn: &Connection) -> Vec<String> {
     collect_strings(
         conn,
         "SELECT json_array(c.content, v.sub_idx, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.content, v.sub_idx, hex(v.embedding)",
+    )
+}
+
+/// Each embedded chunk with its id, generation, vector rowid and vector bytes, in id order.
+/// A kept vector compares equal only if neither its chunk nor its vector row was written again.
+fn vector_rows(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT json_array(c.id, c.generation, c.content, v.rowid, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id",
+    )
+}
+
+/// The content of each embedded chunk, in id order.
+fn embedded_contents(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT c.content FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id",
     )
 }
 
@@ -3218,14 +3237,6 @@ fn reuse_counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_
         "chunks_reconciled_created_committed": counts["chunks_reconciled_created_committed"],
         "chunks_removed_committed": counts["chunks_removed_committed"],
     })
-}
-
-/// Each embedded chunk with its id, generation, vector rowid and vector bytes.
-fn vector_rows(conn: &Connection) -> Vec<String> {
-    collect_strings(
-        conn,
-        "SELECT json_array(c.id, c.generation, c.content, v.rowid, hex(v.embedding)) FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id",
-    )
 }
 
 /// Each stored chunk with the rowid range of the messages it covers, in conversation order.
@@ -3598,10 +3609,7 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
         "moving the root back leaves the log's mtime unchanged"
     );
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT c.content FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id"
-        ),
+        embedded_contents(&conn),
         ["obsolete parser output\nobsolete parser output"; 3]
     );
 
@@ -3893,10 +3901,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         1
     );
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT c.content FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id"
-        ),
+        embedded_contents(&conn),
         ["stable\nanswer", "tail\nnew tail"]
     );
 }
@@ -3923,13 +3928,6 @@ fn session_row(conn: &Connection) -> Vec<String> {
     collect_strings(
         conn,
         "SELECT json_array(session_id, file_path, slug, project, timestamp) FROM sessions",
-    )
-}
-
-fn stored_vectors(conn: &Connection) -> Vec<String> {
-    collect_strings(
-        conn,
-        "SELECT json_array(c.content, hex(v.embedding)) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id ORDER BY c.content, v.sub_idx",
     )
 }
 
@@ -3970,7 +3968,7 @@ fn assert_compressing_keeps_the_session_and_its_embeddings(body: &str) {
         1
     );
     let identity_before = session_identity(&conn);
-    let vectors_before = stored_vectors(&conn);
+    let vectors_before = chunk_vectors(&conn);
 
     let compressed = compress_log(&plain);
     fs::remove_file(&plain).unwrap();
@@ -3982,7 +3980,7 @@ fn assert_compressing_keeps_the_session_and_its_embeddings(body: &str) {
         [compressed.to_str().unwrap()]
     );
     assert_eq!(session_identity(&conn), identity_before);
-    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert_eq!(chunk_vectors(&conn), vectors_before);
     assert!(stats.parse_diagnostics.is_empty());
 }
 
@@ -4053,14 +4051,14 @@ fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_
     index_chunks(&mut conn).unwrap();
     embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
     let row_before = session_row(&conn);
-    let vectors_before = stored_vectors(&conn);
+    let vectors_before = chunk_vectors(&conn);
     assert!(!vectors_before.is_empty());
 
     fs::write(&plain, "").unwrap();
     index_from_dirs(&mut conn, &opts, true).unwrap();
 
     assert_eq!(session_row(&conn), row_before);
-    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert_eq!(chunk_vectors(&conn), vectors_before);
 }
 
 #[test]
@@ -4228,7 +4226,7 @@ fn assert_archiving_keeps_the_session_and_its_embeddings(body: &str) {
         1
     );
     let identity_before = session_identity(&conn);
-    let vectors_before = stored_vectors(&conn);
+    let vectors_before = chunk_vectors(&conn);
 
     let compressed = compress_log(&live);
     let archived = roots.archived.join(compressed.file_name().unwrap());
@@ -4246,7 +4244,7 @@ fn assert_archiving_keeps_the_session_and_its_embeddings(body: &str) {
         identity_before,
         "the slug keeps the session's date"
     );
-    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert_eq!(chunk_vectors(&conn), vectors_before);
     assert!(stats.skipped_roots.is_empty());
 }
 
