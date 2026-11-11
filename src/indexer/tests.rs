@@ -63,7 +63,7 @@ fn test_index_from_dirs_indexes_and_skips() {
 }
 
 #[test]
-fn test_index_from_dirs_steady_state_keeps_db_stable() {
+fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -536,7 +536,7 @@ fn index_one_claude_session(content: &str) -> Option<String> {
 }
 
 #[test]
-fn test_ingest_tags_session_type_from_first_user_turn() {
+fn slash_command_first_turn_is_stored_as_automated_and_human_first_turn_as_interactive() {
     assert_eq!(
         index_one_claude_session("<command-message>clear</command-message>").as_deref(),
         Some("automated"),
@@ -809,7 +809,7 @@ fn test_missing_source_roots_preserve_existing_index() {
 }
 
 #[test]
-fn test_partial_missing_root_preserves_unscanned_source_only() {
+fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_kept_and_reported() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -908,7 +908,8 @@ fn test_unreadable_child_subdir_preserves_source() {
 }
 
 #[test]
-fn test_deleted_file_under_scanned_root_cascades_cleanup() {
+fn deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_embeddings_and_touched_files()
+ {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1019,7 +1020,7 @@ fn test_skipped_root_reports_preserved_count() {
 
 #[cfg(unix)]
 #[test]
-fn test_skipped_root_counts_only_file_absent_rows() {
+fn unreadable_codex_subdirectory_keeps_every_session_and_reports_only_unseen_ones_as_preserved() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_dir, mut conn) = setup_test_db();
@@ -1080,7 +1081,7 @@ fn test_skipped_root_counts_only_file_absent_rows() {
 
 #[cfg(unix)]
 #[test]
-fn test_incomplete_enumeration_surfaces_with_empty_db() {
+fn codex_root_that_cannot_be_fully_read_is_reported_even_with_no_stored_sessions() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_dir, mut conn) = setup_test_db();
@@ -1127,7 +1128,7 @@ fn test_incomplete_enumeration_surfaces_with_empty_db() {
 }
 
 #[test]
-fn test_missing_root_with_no_preserved_rows_is_silent() {
+fn missing_roots_without_stored_sessions_are_not_reported() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let gone_claude = tmp.path().join("missing_claude");
@@ -1187,7 +1188,7 @@ fn test_skipped_reason_note_and_tag_differ_per_variant() {
 }
 
 #[test]
-fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
+fn incomplete_root_note_without_preserved_sessions_warns_that_sessions_may_be_missing() {
     let note = SkippedReason::IncompleteEnumeration.note("claude", 0);
     assert!(
         note.contains("some sessions may be missing"),
@@ -1208,7 +1209,7 @@ fn test_incomplete_note_at_zero_preserved_omits_reconcile() {
 }
 
 #[test]
-fn test_incomplete_note_at_nonzero_preserved_frames_reconcile_as_future() {
+fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_fix_access() {
     let note = SkippedReason::IncompleteEnumeration.note("claude", 2);
     assert!(
         note.contains("none deleted this run"),
@@ -1417,7 +1418,7 @@ fn complete_scan_preserves_sessions_with_unknown_source() {
 }
 
 #[test]
-fn test_force_rebuild_preserves_missing_source_root() {
+fn rebuild_with_a_missing_codex_root_keeps_its_session_and_embeddings_and_reports_it() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1486,7 +1487,7 @@ fn test_force_rebuild_preserves_missing_source_root() {
 }
 
 #[test]
-fn test_force_rebuild_all_roots_missing_preserves_index() {
+fn rebuild_with_every_root_missing_keeps_all_sessions_and_embeddings() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, _claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1531,7 +1532,7 @@ fn test_force_rebuild_all_roots_missing_preserves_index() {
 }
 
 #[test]
-fn test_force_rebuild_deleted_file_under_scanned_root_cascades_cleanup() {
+fn rebuild_removes_the_session_of_a_log_deleted_under_a_fully_read_root() {
     let (_dir, mut conn) = setup_test_db();
     let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
 
@@ -1772,7 +1773,8 @@ fn model_absent_session_id_collision_preserves_data_until_embedding_is_available
 }
 
 #[test]
-fn test_collect_depth_limit() {
+fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_reported_as_incompletely_read()
+ {
     let tmp = TempDir::new().unwrap();
 
     let mut deep = tmp.path().to_path_buf();
@@ -1793,7 +1795,7 @@ fn test_collect_depth_limit() {
 
 #[cfg(unix)]
 #[test]
-fn test_collect_skips_symlinks() {
+fn symlinked_session_log_is_not_indexed_as_a_second_session() {
     use std::os::unix::fs::symlink;
 
     let tmp = TempDir::new().unwrap();
@@ -1812,7 +1814,7 @@ fn test_collect_skips_symlinks() {
 }
 
 #[test]
-fn test_collect_from_entries_incomplete_on_entry_error_still_collects() {
+fn unreadable_directory_entry_marks_the_root_incompletely_read_and_keeps_the_readable_logs() {
     use std::{io, iter};
 
     let tmp = TempDir::new().unwrap();
@@ -1955,7 +1957,7 @@ fn test_index_chunks_progress_callback_silent_when_all_chunked() {
 }
 
 #[test]
-fn test_009_recall_claude_dir_overrides_claude_config_dir() {
+fn recall_claude_dir_takes_priority_over_claude_config_dir() {
     let home = Path::new("/fake/home");
     let result = resolve_claude_dir_with(home, |key| match key {
         "RECALL_CLAUDE_DIR" => Some(OsString::from("/custom/recall/dir")),
@@ -1970,7 +1972,7 @@ fn test_009_recall_claude_dir_overrides_claude_config_dir() {
 }
 
 #[test]
-fn test_010_claude_config_dir_used_as_fallback() {
+fn claude_config_dir_projects_is_used_when_recall_claude_dir_is_unset() {
     let home = Path::new("/fake/home");
     let result = resolve_claude_dir_with(home, |key| match key {
         "CLAUDE_CONFIG_DIR" => Some(OsString::from("/custom/config")),
@@ -2021,7 +2023,7 @@ fn session_root_that_is_not_an_absolute_path_is_not_read_and_keeps_its_sessions(
 }
 
 #[test]
-fn test_codex_dir_env_override() {
+fn recall_codex_dir_replaces_the_default_codex_sessions_dir() {
     let home = Path::new("/fake/home");
     let result = resolve_codex_dir_with(home, |key| match key {
         "RECALL_CODEX_DIR" => Some(OsString::from("/custom/codex/sessions")),
@@ -2031,7 +2033,7 @@ fn test_codex_dir_env_override() {
 }
 
 #[test]
-fn test_codex_dir_default() {
+fn codex_sessions_dir_defaults_to_dot_codex_sessions_under_home() {
     let home = Path::new("/fake/home");
     let result = resolve_codex_dir_with(home, |_| None);
     assert_eq!(result, PathBuf::from("/fake/home/.codex/sessions"));
@@ -3722,7 +3724,7 @@ fn compressed_codex_log_keeps_its_session_while_an_empty_plain_copy_sits_beside_
 }
 
 #[test]
-fn compressed_logs_are_collected_from_the_codex_root_only() {
+fn compressed_logs_are_indexed_only_from_codex_roots() {
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
     let codex_dir = tmp.path().join("codex_sessions");
