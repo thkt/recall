@@ -3858,7 +3858,11 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         index_from_dirs(&mut writer, &opts, true).unwrap().indexed,
         1
     );
-    index_chunks(&mut writer).unwrap();
+    assert_eq!(
+        index_chunks(&mut writer).unwrap().chunks_created,
+        0,
+        "the reconciliation already chunked the rewritten log"
+    );
     assert_eq!(chunk_vectors(&conn), before);
     let stale = embed_chunks(
         &mut conn,
@@ -3881,7 +3885,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     drop(writer);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-    index_chunks(&mut conn).unwrap();
+    assert_eq!(index_chunks(&mut conn).unwrap().chunks_created, 0);
     assert_eq!(
         embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
