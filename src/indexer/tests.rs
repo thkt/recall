@@ -377,30 +377,71 @@ fn ids_types_and_messages(conn: &Connection) -> [Vec<String>; 3] {
     ]
 }
 
+/// Indexes SESSION_A_LOG written at T0 under a Codex root, labels the session `label`, and
+/// rewrites the log with `replacement` at T0 plus 10 seconds, so the next run reads it
+/// whatever the two bodies' sizes are.
+fn session_a_labelled_then_rewritten(
+    conn: &mut Connection,
+    label: &str,
+    replacement: &str,
+) -> OneLog {
+    let log = OneLog::new("codex", "rollout-test.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, SESSION_A_LOG, t0);
+    index_from_dirs(conn, &log.opts(), true).unwrap();
+    index_chunks(conn, None).unwrap();
+    conn.execute("UPDATE sessions SET session_type = ?", [label])
+        .unwrap();
+    rewrite_with_mtime(&log.file, replacement, t0 + Duration::from_secs(10));
+    log
+}
+
+/// Runs the index and chunk passes, then reclassifies every session. Returns how many logs
+/// the index re-parsed, the stored ids, types and messages after it, and the session types
+/// after the reclassification.
+fn reindex_then_reclassify(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+) -> (usize, [Vec<String>; 3], Vec<String>) {
+    let indexed = index_from_dirs(conn, opts, true).unwrap().indexed;
+    index_chunks(conn, None).unwrap();
+    let stored = ids_types_and_messages(conn);
+    reclassify_sessions(conn, true, false).unwrap();
+    let reclassified = collect_strings(conn, "SELECT session_type FROM sessions");
+    (indexed, stored, reclassified)
+}
+
 #[test]
 fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
+    // The same session's metadata replaces an interactive session's body.
     let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let log = root.path().join("rollout-test.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &absent,
-        codex_dir: root.path(),
-        codex_archived_dir: None,
-    };
-    fs::write(&log, SESSION_A_LOG).unwrap();
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    conn.execute("UPDATE sessions SET session_type = 'interactive'", [])
-        .unwrap();
-    fs::write(&log, SESSION_B_SUBAGENT_METADATA).unwrap();
-
-    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(first.indexed, 0);
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "interactive", SESSION_A_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 1);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
     assert_eq!(
-        ids_types_and_messages(&conn),
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+
+    // Another session's metadata replaces an interactive session's body.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "interactive", SESSION_B_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
         [
             vec!["session-a"],
             vec!["interactive"],
@@ -408,116 +449,82 @@ fn metadata_only_reindex_applies_provenance_only_to_the_matching_session() {
         ],
         "another session's metadata cannot establish that this body is empty"
     );
-    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(second.indexed, 0);
     assert_eq!(
-        ids_types_and_messages(&conn),
+        reclassified,
+        ["interactive"],
+        "explicit reclassification must agree with indexing"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
         [
             vec!["session-a"],
             vec!["interactive"],
             vec!["original question"]
         ]
     );
-
-    reclassify_sessions(&mut conn, true, false).unwrap();
     assert_eq!(
-        collect_strings(&conn, "SELECT session_type FROM sessions"),
+        reclassified,
         ["interactive"],
         "explicit reclassification must agree with indexing"
     );
-}
 
-#[test]
-fn metadata_only_rewrite_naming_another_session_keeps_an_automated_label_through_reclassification()
-{
+    // The same session's metadata replaces an automated session's body.
     let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let log = root.path().join("rollout-test.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &absent,
-        codex_dir: root.path(),
-        codex_archived_dir: None,
-    };
-    fs::write(&log, SESSION_A_LOG).unwrap();
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    conn.execute("UPDATE sessions SET session_type = 'automated'", [])
-        .unwrap();
-    fs::write(&log, SESSION_B_SUBAGENT_METADATA).unwrap();
-
-    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(first.indexed, 0);
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "automated", SESSION_A_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 1);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
     assert_eq!(
-        ids_types_and_messages(&conn),
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(stored, [vec!["session-a"], vec!["automated"], vec![]]);
+    assert_eq!(
+        reclassified,
+        ["automated"],
+        "explicit reclassification must agree with indexing"
+    );
+
+    // Another session's metadata replaces an automated session's body.
+    let (_db_dir, mut conn) = setup_test_db();
+    let log =
+        session_a_labelled_then_rewritten(&mut conn, "automated", SESSION_B_SUBAGENT_METADATA);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
+    assert_eq!(
+        stored,
         [
             vec!["session-a"],
             vec!["automated"],
             vec!["original question"]
-        ]
+        ],
+        "another session's metadata cannot establish that this body is empty"
     );
-    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(second.indexed, 0);
     assert_eq!(
-        ids_types_and_messages(&conn),
-        [
-            vec!["session-a"],
-            vec!["automated"],
-            vec!["original question"]
-        ]
-    );
-
-    reclassify_sessions(&mut conn, true, false).unwrap();
-    assert_eq!(
-        collect_strings(&conn, "SELECT session_type FROM sessions"),
+        reclassified,
         ["automated"],
         "a log naming another session cannot reset the stored label"
     );
-}
-
-#[test]
-fn metadata_only_rewrite_of_the_same_session_marks_it_automated_and_clears_its_messages() {
-    let (_db_dir, mut conn) = setup_test_db();
-    let root = TempDir::new().unwrap();
-    let log = root.path().join("rollout-test.jsonl");
-    let absent = root.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: &absent,
-        codex_dir: root.path(),
-        codex_archived_dir: None,
-    };
-    fs::write(&log, SESSION_A_LOG).unwrap();
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    conn.execute("UPDATE sessions SET session_type = 'interactive'", [])
-        .unwrap();
-    fs::write(&log, SESSION_A_SUBAGENT_METADATA).unwrap();
-
-    let first = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(first.indexed, 1);
+    let (indexed, stored, reclassified) = reindex_then_reclassify(&mut conn, &log.opts());
+    assert_eq!(indexed, 0);
     assert_eq!(
-        ids_types_and_messages(&conn),
-        [vec!["session-a"], vec!["automated"], vec![]]
+        stored,
+        [
+            vec!["session-a"],
+            vec!["automated"],
+            vec!["original question"]
+        ]
     );
-    let second = index_from_dirs(&mut conn, &opts, true).unwrap();
-    index_chunks(&mut conn, None).unwrap();
-    assert_eq!(second.indexed, 0);
     assert_eq!(
-        ids_types_and_messages(&conn),
-        [vec!["session-a"], vec!["automated"], vec![]]
-    );
-
-    reclassify_sessions(&mut conn, true, false).unwrap();
-    assert_eq!(
-        collect_strings(&conn, "SELECT session_type FROM sessions"),
+        reclassified,
         ["automated"],
-        "explicit reclassification must agree with indexing"
+        "a log naming another session cannot reset the stored label"
     );
 }
 
