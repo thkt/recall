@@ -2677,78 +2677,87 @@ fn chunk_batches_limit_session_count_and_source_bytes() {
     );
 }
 
+/// Returns the detail column of `EXPLAIN QUERY PLAN` for `sql` bound to `params`.
+fn query_plan(conn: &Connection, sql: &str, params: &[&str]) -> Vec<String> {
+    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .unwrap()
+        .query_map(rusqlite::params_from_iter(params), |r| r.get(3))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 #[test]
 fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     let (_dir, mut conn) = setup_test_db();
-    for i in 0..65 {
-        seed_session(&conn, &format!("s{i:03}"));
-    }
-    for (turn, role) in [
-        (0, "user"),
-        (1, "system"),
-        (2, "assistant"),
-        (3, "assistant"),
-    ] {
-        for i in (0..65).rev() {
-            conn.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
-                rusqlite::params![format!("s{i:03}"), role, format!("session {i} turn {turn}")],
-            )
-            .unwrap();
-        }
-    }
-    let stats = index_chunks(&mut conn, None).unwrap();
+    // 65 sessions, s000 to s064, cross the 64-session batch limit. Their messages are
+    // inserted turn by turn, s064 first, so the rowids of every session interleave.
+    conn.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
+         INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+         SELECT printf('s%03d', i), 'claude', '/f', '/p', 'slug', 0, 0.0 FROM n;
+         WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 64),
+         turns(turn, role) AS
+           (VALUES (0, 'user'), (1, 'system'), (2, 'assistant'), (3, 'assistant'))
+         INSERT INTO messages (session_id, role, text)
+         SELECT printf('s%03d', i), role, printf('session %d turn %d', i, turn)
+         FROM turns, n ORDER BY turn, i DESC;",
+    )
+    .unwrap();
+    let observer = Observer::default();
+
+    let stats = index_chunks_observed(&mut conn, None, &observer).unwrap();
+
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 65,
+            "sessions_chunk_pending": 65,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 65,
+            "sessions_chunked_empty": 0,
+        })
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, content, src_rowid_lo, src_rowid_hi) FROM qa_chunks WHERE session_id IN ('s000', 's063', 's064') ORDER BY session_id"
+        ),
+        [
+            r#"["s000","session 0 turn 0\nsession 0 turn 2\nsession 0 turn 3",65,260]"#,
+            r#"["s063","session 63 turn 0\nsession 63 turn 2\nsession 63 turn 3",2,197]"#,
+            r#"["s064","session 64 turn 0\nsession 64 turn 2\nsession 64 turn 3",1,196]"#,
+        ],
+        "the first and last session of the first batch and the session of the second batch \
+         each keep only their own turns, the two answers merged, and their own rowid range"
+    );
+    // Performance guard (docs/audit/2026-09-20-chunk-index.md): one FTS scan stages every
+    // pending message, the 65 sessions are read in two body batches, and each of the 260
+    // messages is fetched once.
     assert_eq!(
         (
-            stats.chunks_created,
-            stats.sessions_chunked,
+            stats.message_scans,
             stats.message_batches,
-            stats.messages_read,
-            stats.message_scans
+            stats.messages_read
         ),
-        (65, 65, 2, 260, 1)
+        (1, 2, 260)
     );
-    let mut stmt = conn.prepare("SELECT session_id, content, src_rowid_lo, src_rowid_hi FROM qa_chunks ORDER BY session_id").unwrap();
-    let actual: Vec<(String, String, i64, i64)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    for (i, (sid, content, lo, hi)) in (0_i64..65).zip(actual) {
-        assert_eq!(sid, format!("s{i:03}"));
-        assert_eq!(
-            content,
-            format!("session {i} turn 0\nsession {i} turn 2\nsession {i} turn 3")
-        );
-        assert_eq!((lo, hi), (65 - i, 260 - i));
-    }
+    // Performance guard (same audit): staging keeps FTS as the single outer scan and probes
+    // sessions by primary key, and each batch reads message bodies by rowid equality.
     conn.execute_batch("CREATE TEMP TABLE chunk_message_rows (session_id TEXT, message_rowid INTEGER, text_bytes INTEGER, PRIMARY KEY(session_id, message_rowid)) WITHOUT ROWID;").unwrap();
-    let stage_plan: Vec<String> = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {STAGE_CHUNK_MESSAGES}"))
-        .unwrap()
-        .query_map([], |r| r.get(3))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert!(
-        stage_plan[0].contains("SCAN m VIRTUAL TABLE"),
-        "FTS must be the single outer scan: {stage_plan:?}"
+    assert_eq!(
+        query_plan(&conn, STAGE_CHUNK_MESSAGES, &[]),
+        [
+            "SCAN m VIRTUAL TABLE INDEX 0:",
+            "SEARCH s USING INDEX sqlite_autoindex_sessions_1 (session_id=?)"
+        ]
     );
-    assert!(
-        stage_plan[1].contains("SEARCH s USING INDEX"),
-        "each message probes the session primary key: {stage_plan:?}"
-    );
-    let plan: Vec<String> = conn
-        .prepare(&format!("EXPLAIN QUERY PLAN {READ_CHUNK_BATCH}"))
-        .unwrap()
-        .query_map(["s000", "s064"], |r| r.get(3))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
-    assert!(
-        plan.iter()
-            .any(|line| line.contains("VIRTUAL TABLE INDEX") && line.contains('=')),
-        "expected FTS rowid equality lookup: {plan:?}"
+    assert_eq!(
+        query_plan(&conn, READ_CHUNK_BATCH, &["s000", "s064"]),
+        [
+            "SEARCH r USING PRIMARY KEY (session_id>? AND session_id<?)",
+            "SCAN m VIRTUAL TABLE INDEX 0:="
+        ]
     );
 }
 
