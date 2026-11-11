@@ -1904,9 +1904,11 @@ fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_report
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
+    let edge_dir = claude_dir.join("d0/d1/d2/d3/d4/d5/d6/d7/d8");
     let deep_dir = claude_dir.join("d0/d1/d2/d3/d4/d5/d6/d7/d8/d9");
     fs::create_dir_all(&deep_dir).unwrap();
     fs::write(claude_dir.join("shallow.jsonl"), FRESHNESS_QUESTION).unwrap();
+    fs::write(edge_dir.join("edge.jsonl"), FRESHNESS_QUESTION).unwrap();
     fs::write(deep_dir.join("deep.jsonl"), FRESHNESS_QUESTION).unwrap();
     let absent_codex = tmp.path().join("codex_sessions");
 
@@ -1923,8 +1925,9 @@ fn session_log_nested_ten_directories_deep_is_not_indexed_and_its_root_is_report
     .unwrap();
 
     assert_eq!(
-        collect_strings(&conn, "SELECT session_id FROM sessions"),
-        ["shallow"]
+        collect_strings(&conn, "SELECT session_id FROM sessions ORDER BY session_id"),
+        ["edge", "shallow"],
+        "a log nested nine directories deep is still indexed"
     );
     assert_eq!(
         stats
