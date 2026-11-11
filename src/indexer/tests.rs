@@ -3215,6 +3215,14 @@ fn reuse_counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_
 }
 
 /// Each stored chunk with the rowid range of the messages it covers, in conversation order.
+/// `chunk_ranges` of the reuse log before any change: the duplicated turn
+/// twice, then the tail.
+const UNCHANGED_REUSE_CHUNK_RANGES: [&str; 3] = [
+    r#"["duplicate\nsame answer",8,9]"#,
+    r#"["duplicate\nsame answer",10,11]"#,
+    r#"["tail question\ntail answer",12,13]"#,
+];
+
 fn chunk_ranges(conn: &Connection) -> Vec<String> {
     collect_strings(
         conn,
@@ -3382,14 +3390,7 @@ fn touching_a_log_without_changing_it_reuses_every_vector_and_infers_nothing() {
     index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
-    assert_eq!(
-        chunk_ranges(&conn),
-        [
-            r#"["duplicate\nsame answer",8,9]"#,
-            r#"["duplicate\nsame answer",10,11]"#,
-            r#"["tail question\ntail answer",12,13]"#,
-        ]
-    );
+    assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
     assert_eq!(
         inference_counts_of_an_embed(&mut conn),
         serde_json::json!({"inference_chunks": 0, "chunks_saved": 0})
@@ -3527,14 +3528,7 @@ fn a_session_chunked_under_other_rules_reuses_no_vector_and_infers_every_chunk()
     index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
-    assert_eq!(
-        chunk_ranges(&conn),
-        [
-            r#"["duplicate\nsame answer",8,9]"#,
-            r#"["duplicate\nsame answer",10,11]"#,
-            r#"["tail question\ntail answer",12,13]"#,
-        ]
-    );
+    assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
     assert_eq!(
         inference_counts_of_an_embed(&mut conn),
         serde_json::json!({"inference_chunks": 3, "chunks_saved": 3})
@@ -3601,14 +3595,7 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
     index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
-    assert_eq!(
-        chunk_ranges(&conn),
-        [
-            r#"["duplicate\nsame answer",8,9]"#,
-            r#"["duplicate\nsame answer",10,11]"#,
-            r#"["tail question\ntail answer",12,13]"#,
-        ]
-    );
+    assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
     assert_eq!(
         inference_counts_of_an_embed(&mut conn),
         serde_json::json!({"inference_chunks": 3, "chunks_saved": 3})
@@ -3681,14 +3668,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
     index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
-    assert_eq!(
-        chunk_ranges(&conn),
-        [
-            r#"["duplicate\nsame answer",8,9]"#,
-            r#"["duplicate\nsame answer",10,11]"#,
-            r#"["tail question\ntail answer",12,13]"#,
-        ]
-    );
+    assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
     assert_eq!(
         inference_counts_of_an_embed(&mut conn),
         serde_json::json!({"inference_chunks": 0, "chunks_saved": 0})
@@ -3715,14 +3695,7 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
     index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
-    assert_eq!(
-        chunk_ranges(&conn),
-        [
-            r#"["duplicate\nsame answer",8,9]"#,
-            r#"["duplicate\nsame answer",10,11]"#,
-            r#"["tail question\ntail answer",12,13]"#,
-        ]
-    );
+    assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
     assert_eq!(
         inference_counts_of_an_embed(&mut conn),
         serde_json::json!({"inference_chunks": 3, "chunks_saved": 3})
