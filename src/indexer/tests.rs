@@ -2290,6 +2290,14 @@ fn touched_file_paths_that_are_empty_too_long_or_contain_a_newline_are_dropped()
     );
 }
 
+/// A Claude log whose answer edits `/proj/edited.rs`.
+const LOG_THAT_EDITS_A_FILE: &str = concat!(
+    r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"edit it"}}"#,
+    "\n",
+    r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/edited.rs","old_string":"x","new_string":"y"}}]}}"#,
+    "\n",
+);
+
 #[test]
 fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_its_touched_files_once_the_log_is_readable()
  {
@@ -2318,16 +2326,7 @@ fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_i
         )]
     );
 
-    fs::write(
-        &log,
-        concat!(
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"edit it"}}"#,
-            "\n",
-            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/edited.rs","old_string":"x","new_string":"y"}}]}}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
+    fs::write(&log, LOG_THAT_EDITS_A_FILE).unwrap();
     assert_eq!(
         backfill_session_files(&mut conn, None).unwrap(),
         1,
@@ -2343,41 +2342,36 @@ fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_i
 fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_and_does_not_read_them_again()
  {
     let (_dir, mut conn) = setup_test_db();
-    conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('mystery', 'perplexity', '/f', '/p', 'slug', 0, 0.0, NULL)",
-        [],
-    )
-    .unwrap();
     let tmp = TempDir::new().unwrap();
-    let empty = tmp.path().join("empty-session.jsonl");
+    let unknown = tmp.path().join("unknown.jsonl");
+    let empty = tmp.path().join("empty.jsonl");
     fs::write(&empty, "").unwrap();
     conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('mystery', 'perplexity', ?1, '/p', 'slug', 0, 0.0, NULL)",
+        [unknown.to_str().unwrap()],
+    )
+    .unwrap();
+    conn.execute(
         "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('zero', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL)",
-        [empty.to_string_lossy().to_string()],
+        [empty.to_str().unwrap()],
     )
     .unwrap();
 
-    let marked = backfill_session_files(&mut conn, None).unwrap();
+    assert_eq!(
+        backfill_session_files(&mut conn, None).unwrap(),
+        2,
+        "both sessions are marked done"
+    );
+    assert!(collect_strings(&conn, "SELECT path FROM session_files").is_empty());
 
-    assert_eq!(marked, 2, "both terminal cases must be counted as marked");
-    let unmarked: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    fs::write(&unknown, LOG_THAT_EDITS_A_FILE).unwrap();
+    fs::write(&empty, LOG_THAT_EDITS_A_FILE).unwrap();
     assert_eq!(
-        unmarked, 0,
-        "terminal cases must not stay eligible for re-read"
+        backfill_session_files(&mut conn, None).unwrap(),
+        0,
+        "a marked session is not read again"
     );
-    let file_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        file_rows, 0,
-        "neither terminal case yields session_files rows"
-    );
+    assert!(collect_strings(&conn, "SELECT path FROM session_files").is_empty());
 }
 
 #[test]
