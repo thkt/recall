@@ -155,102 +155,207 @@ fn rewrite_with_mtime(path: &Path, body: &str, mtime: SystemTime) {
         .unwrap();
 }
 
+const CLAUDE_METADATA_ONLY: &str = r#"{"type":"system","cwd":"/proj"}"#;
+const CODEX_QUESTION: &str = concat!(
+    r#"{"type":"response_item","payload":{"role":"user","content":"original question"}}"#,
+    "\n",
+);
+const CODEX_ANSWER: &str = concat!(
+    r#"{"type":"response_item","payload":{"role":"assistant","content":"appended answer"}}"#,
+    "\n",
+);
+const CODEX_METADATA_ONLY: &str = r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#;
+
+/// Runs one more index and returns the observed counts that `--json` reports.
+fn counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::Value {
+    let observer = Observer::default();
+    index_from_dirs_observed(conn, opts, true, &observer).unwrap();
+    observer.snapshot()["counts"].clone()
+}
+
 #[test]
 fn size_changes_reindex_with_equal_or_submillisecond_mtime() {
-    for (source, question, answer, metadata) in [
-        (
-            Source::Claude,
-            FRESHNESS_QUESTION,
-            FRESHNESS_ANSWER,
-            r#"{"type":"system","cwd":"/proj"}"#,
-        ),
-        (
-            Source::Codex,
-            "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":\"original question\"}}\n",
-            "{\"type\":\"response_item\",\"payload\":{\"role\":\"assistant\",\"content\":\"appended answer\"}}\n",
-            r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#,
-        ),
-    ] {
-        for offset in [Duration::ZERO, Duration::from_micros(500)] {
-            let (_db_dir, mut conn) = setup_test_db();
-            let root = TempDir::new().unwrap();
-            let file = root.path().join("s.jsonl");
-            let absent = root.path().join("absent");
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: if source == Source::Claude {
-                    root.path()
-                } else {
-                    &absent
-                },
-                codex_dir: if source == Source::Codex {
-                    root.path()
-                } else {
-                    &absent
-                },
-                codex_archived_dir: None,
-            };
-            let initial = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-            rewrite_with_mtime(&file, question, initial);
-            index_from_dirs(&mut conn, &opts, true).unwrap();
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: root.path(),
+        codex_dir: &absent,
+        codex_archived_dir: None,
+    };
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
 
-            rewrite_with_mtime(
-                &file,
-                &question.replace("original", "modified"),
-                initial + Duration::from_secs(2),
-            );
-            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-            assert_eq!(
-                collect_strings(&conn, "SELECT text FROM messages"),
-                ["modified question"]
-            );
-            rewrite_with_mtime(&file, "{", initial + Duration::from_secs(2));
-            assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-            assert_eq!(
-                collect_strings(&conn, "SELECT text FROM messages"),
-                ["modified question"]
-            );
-            let appended = format!("{question}{answer}");
-            for (body, expected) in [
-                (
-                    appended.as_str(),
-                    vec!["original question", "appended answer"],
-                ),
-                (question, vec!["original question"]),
-                (metadata, vec![]),
-                ("", vec![]),
-            ] {
-                let old = fs::metadata(&file).unwrap().modified().unwrap();
-                rewrite_with_mtime(&file, body, old + offset);
-                let observed = fs::metadata(&file).unwrap().modified().unwrap();
-                assert_eq!(observed.duration_since(old).unwrap(), offset);
-                assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-                index_chunks(&mut conn, None).unwrap();
-                assert_eq!(
-                    collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-                    expected
-                );
-                assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-            }
-            let existing = load_existing_sessions(&conn).unwrap();
-            let tx = conn.transaction().unwrap();
-            let ctx = IndexContext {
-                tx: &tx,
-                existing: &existing,
-                force: false,
-                embedded_sessions: None,
-            };
-            assert!(matches!(
-                index_file_with_parser(&ctx, &file, &source, |_, _| panic!(
-                    "unchanged empty body must not be parsed"
-                ))
-                .unwrap(),
-                IndexOutcome::Unchanged
-            ));
-            drop(tx);
-            assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
-        }
-    }
+    rewrite_with_mtime(&file, "{", t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "an unfinished line keeps the stored messages"
+    );
+
+    rewrite_with_mtime(
+        &file,
+        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+        t0,
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+
+    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0 + Duration::from_micros(500));
+    assert_eq!(
+        fs::metadata(&file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"]
+    );
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn codex_log_whose_size_changes_with_an_equal_or_submillisecond_mtime_is_reindexed() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &absent,
+        codex_dir: root.path(),
+        codex_archived_dir: None,
+    };
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&file, CODEX_QUESTION, t0);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+
+    rewrite_with_mtime(&file, "{", t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "an unfinished line keeps the stored messages"
+    );
+
+    rewrite_with_mtime(&file, &format!("{CODEX_QUESTION}{CODEX_ANSWER}"), t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question", "appended answer"]
+    );
+
+    rewrite_with_mtime(&file, CODEX_QUESTION, t0 + Duration::from_micros(500));
+    assert_eq!(
+        fs::metadata(&file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["original question"]
+    );
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn claude_log_emptied_or_reduced_to_metadata_with_an_unchanged_mtime_loses_its_stored_messages() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: root.path(),
+        codex_dir: &absent,
+        codex_archived_dir: None,
+    };
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+
+    rewrite_with_mtime(&file, CLAUDE_METADATA_ONLY, t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+
+    rewrite_with_mtime(&file, "", t0 + Duration::from_micros(500));
+    assert_eq!(
+        fs::metadata(&file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
+#[test]
+fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_its_stored_messages()
+{
+    let (_db_dir, mut conn) = setup_test_db();
+    let root = TempDir::new().unwrap();
+    let file = root.path().join("s.jsonl");
+    let absent = root.path().join("absent");
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &absent,
+        codex_dir: root.path(),
+        codex_archived_dir: None,
+    };
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&file, CODEX_QUESTION, t0);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+
+    rewrite_with_mtime(&file, CODEX_METADATA_ONLY, t0);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+
+    rewrite_with_mtime(&file, "", t0 + Duration::from_micros(500));
+    assert_eq!(
+        fs::metadata(&file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
+
+    let counts = counts_of_a_rerun(&mut conn, &opts);
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
 }
 
 #[test]
