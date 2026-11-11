@@ -2652,8 +2652,7 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     // messages or sessions. Index names and the FTS5 index string change with the SQLite
     // version and the schema, so the asserts read only the access and the table. A virtual
     // table row always reads SCAN, and FTS5 marks a rowid equality with `=` in its index string.
-    conn.execute_batch(chunks::CREATE_CHUNK_MESSAGE_ROWS)
-        .unwrap();
+    conn.execute_batch(CREATE_CHUNK_MESSAGE_ROWS).unwrap();
     let stage = query_plan(&conn, STAGE_CHUNK_MESSAGES, &[]);
     assert_eq!(stage.len(), 2, "{stage:?}");
     assert!(
