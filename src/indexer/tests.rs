@@ -3684,6 +3684,49 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
 }
 
 #[test]
+fn a_second_chunk_pass_on_the_same_connection_chunks_a_rebuilt_session_whose_messages_keep_their_rowids()
+ {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = ReuseLog::new();
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    assert_eq!(index_chunks(&mut conn).unwrap().chunks_created, 3);
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.rebuild_opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    let observer = Observer::default();
+
+    index_chunks_observed(&mut conn, &observer).unwrap();
+
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 3,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 1,
+            "sessions_chunked_empty": 0,
+        })
+    );
+    assert_eq!(
+        chunk_ranges(&conn),
+        [
+            r#"["duplicate\nsame answer",1,2]"#,
+            r#"["duplicate\nsame answer",3,4]"#,
+            r#"["tail question\ntail answer",5,6]"#,
+        ],
+        "the rebuild stores the messages under rowids 1 to 6 again, the rows the first pass staged"
+    );
+}
+
+#[test]
 fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resume() {
     // embed_chunks and pending_chunks are test-only embedder wrappers. No entry point lets a
     // test keep a pending list read before a reindex and save its results after it.
