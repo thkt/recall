@@ -294,6 +294,7 @@ fn claude_log_emptied_or_reduced_to_metadata_with_an_unchanged_mtime_loses_its_s
         codex_archived_dir: None,
     };
     let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let t1 = t0 + Duration::from_secs(10);
     rewrite_with_mtime(&file, FRESHNESS_QUESTION, t0);
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
@@ -303,10 +304,19 @@ fn claude_log_emptied_or_reduced_to_metadata_with_an_unchanged_mtime_loses_its_s
     index_chunks(&mut conn, None).unwrap();
     assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
 
-    rewrite_with_mtime(&file, "", t0 + Duration::from_micros(500));
+    rewrite_with_mtime(&file, FRESHNESS_QUESTION, t1);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "precondition: the log holds a message again"
+    );
+
+    rewrite_with_mtime(&file, "", t1 + Duration::from_micros(500));
     assert_eq!(
         fs::metadata(&file).unwrap().modified().unwrap(),
-        t0 + Duration::from_micros(500),
+        t1 + Duration::from_micros(500),
         "precondition: the file system keeps a submillisecond mtime"
     );
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
@@ -333,6 +343,7 @@ fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_it
         codex_archived_dir: None,
     };
     let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let t1 = t0 + Duration::from_secs(10);
     rewrite_with_mtime(&file, CODEX_QUESTION, t0);
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
@@ -342,10 +353,19 @@ fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_it
     index_chunks(&mut conn, None).unwrap();
     assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
 
-    rewrite_with_mtime(&file, "", t0 + Duration::from_micros(500));
+    rewrite_with_mtime(&file, CODEX_QUESTION, t1);
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "precondition: the log holds a message again"
+    );
+
+    rewrite_with_mtime(&file, "", t1 + Duration::from_micros(500));
     assert_eq!(
         fs::metadata(&file).unwrap().modified().unwrap(),
-        t0 + Duration::from_micros(500),
+        t1 + Duration::from_micros(500),
         "precondition: the file system keeps a submillisecond mtime"
     );
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
