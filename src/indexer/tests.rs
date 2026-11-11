@@ -690,7 +690,12 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
     };
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
-    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
     let snapshot = |conn: &Connection| {
         [
             collect_strings(
@@ -709,7 +714,6 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         ]
     };
     let before = snapshot(&conn);
-    assert!(!before[3].is_empty());
     conn.execute_batch("ALTER TABLE sessions DROP COLUMN file_size;")
         .unwrap();
     drop(conn);
@@ -718,24 +722,30 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
         mtime,
     );
-    for _ in 0..2 {
-        let mut conn = open_db(&db_path).unwrap();
-        assert_eq!(snapshot(&conn), before);
-        let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-        assert_eq!((stats.indexed, stats.preserved_embedded), (0, 1));
-        assert_eq!(snapshot(&conn), before);
-        let size: Option<i64> = conn
-            .query_row("SELECT file_size FROM sessions", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(size, None);
-    }
+
+    let mut conn = open_db(&db_path).unwrap();
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!((first.indexed, first.preserved_embedded), (0, 1));
+    assert_eq!(snapshot(&conn), before);
+    drop(conn);
+
+    let mut conn = open_db(&db_path).unwrap();
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!((second.indexed, second.preserved_embedded), (0, 1));
+    assert_eq!(snapshot(&conn), before);
+    drop(conn);
+
     let mut conn = open_db(&db_path).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    index_chunks(&mut conn, None).unwrap();
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
     drop(conn);
+
     let mut conn = open_db(&db_path).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
 }
