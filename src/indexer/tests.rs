@@ -2699,6 +2699,11 @@ const ONE_INVALID_JSON_LINE: LineDiagnostics = LineDiagnostics {
     ..NO_LINE_ERRORS
 };
 
+const ONE_INCOMPLETE_TAIL_LINE: LineDiagnostics = LineDiagnostics {
+    incomplete_tail_lines: 1,
+    ..NO_LINE_ERRORS
+};
+
 #[test]
 fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repaired() {
     let (db_dir, mut conn) = setup_test_db();
@@ -2715,10 +2720,11 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
+    let partial = [(path.clone(), Source::Claude, ONE_INVALID_JSON_LINE, false)];
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
     index_chunks(&mut conn).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_eq!(diagnosed_files(&stats.parse_diagnostics), partial);
     embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
     let chunks = collect_strings(
         &conn,
@@ -2728,8 +2734,9 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(stats.indexed, 0);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    assert_eq!(diagnosed_files(&stats.parse_diagnostics), partial);
     assert_eq!(
         collect_strings(
             &conn,
@@ -2740,8 +2747,9 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
 
     fs::write(&path, valid).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(stats.preserved_embedded, 1);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    assert_eq!(diagnosed_files(&stats.parse_diagnostics), partial);
     assert_eq!(
         collect_strings(&conn, "SELECT hex(embedding) FROM vec_chunks"),
         vectors
@@ -2750,10 +2758,15 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     let hidden = tmp.path().join("hidden");
     fs::rename(&claude_dir, &hidden).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.skipped_roots.len(), 1);
-    assert_eq!(stats.parse_diagnostics.len(), 1);
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        skipped_roots(&stats),
+        [(Source::Claude, SkippedReason::MissingRoot, 1)]
+    );
+    assert_eq!(diagnosed_files(&stats.parse_diagnostics), partial);
     fs::rename(&hidden, &claude_dir).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(stats.indexed, 1);
     assert!(stats.parse_diagnostics.is_empty());
     assert_eq!(
@@ -2768,7 +2781,16 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     )
     .unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.parse_diagnostics[0].lines.incomplete_tail_lines, 1);
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        diagnosed_files(&stats.parse_diagnostics),
+        [(
+            tail.clone(),
+            Source::Claude,
+            ONE_INCOMPLETE_TAIL_LINE,
+            false
+        )]
+    );
     assert_eq!(stats.total_sessions, 1);
     {
         use std::io::Write;
@@ -2776,26 +2798,28 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         file.write_all(b"\"}\n").unwrap();
     }
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert!(stats.parse_diagnostics.is_empty());
     assert_eq!(stats.total_sessions, 2);
-    assert!(
-        collect_strings(&conn, "SELECT text FROM messages")
-            .contains(&"completed by append".to_owned())
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["retained question", "completed by append"]
     );
     fs::remove_file(tail).unwrap();
 
     let empty = claude_dir.join("no-messages.jsonl");
     fs::write(&empty, "invalid\n").unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.parse_diagnostics.len(), 1);
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        diagnosed_files(&stats.parse_diagnostics),
+        [(empty.clone(), Source::Claude, ONE_INVALID_JSON_LINE, false)]
+    );
     assert_eq!(stats.total_sessions, 1);
     fs::remove_file(empty).unwrap();
-    assert!(
-        index_from_dirs(&mut conn, &opts, true)
-            .unwrap()
-            .parse_diagnostics
-            .is_empty()
-    );
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert!(stats.parse_diagnostics.is_empty());
 }
 
 #[cfg(unix)]
