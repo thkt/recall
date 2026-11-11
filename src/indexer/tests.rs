@@ -3738,7 +3738,9 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
 
 #[test]
 fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resume() {
-    use crate::embedder::{EmbedOptions, embed_chunks, pending_chunks};
+    // embed_chunks and pending_chunks are test-only embedder wrappers. No entry point lets a
+    // test keep a pending list read before a reindex and save its results after it.
+    use crate::embedder::{embed_chunks, pending_chunks};
     let (db_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("reuse.jsonl");
@@ -3749,12 +3751,14 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         codex_dir: &absent,
         codex_archived_dir: None,
     };
-    let mut messages = vec![
-        ("user", "stable"),
-        ("assistant", "answer"),
-        ("user", "tail"),
-    ];
-    write_reuse_conversation(&path, &messages);
+    write_reuse_conversation(
+        &path,
+        &[
+            ("user", "stable"),
+            ("assistant", "answer"),
+            ("user", "tail"),
+        ],
+    );
     index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn, None).unwrap();
     let old_pending = pending_chunks(&conn, 100).unwrap();
@@ -3772,10 +3776,23 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     )
     .unwrap();
     let before = chunk_vectors(&conn);
-    messages.push(("assistant", "new tail"));
-    write_reuse_conversation(&path, &messages);
+    write_reuse_conversation(
+        &path,
+        &[
+            ("user", "stable"),
+            ("assistant", "answer"),
+            ("user", "tail"),
+            ("assistant", "new tail"),
+        ],
+    );
     conn.execute_batch("CREATE TEMP TRIGGER fail_reconcile BEFORE UPDATE OF chunks_indexed ON sessions BEGIN SELECT RAISE(ABORT, 'reconciliation failed'); END;").unwrap();
-    assert!(index_from_dirs(&mut conn, &opts, true).is_err());
+    assert_eq!(
+        index_from_dirs(&mut conn, &opts, true)
+            .err()
+            .unwrap()
+            .to_string(),
+        "reconciliation failed"
+    );
     assert_eq!(chunk_vectors(&conn), before);
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
@@ -3783,7 +3800,11 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     );
     conn.execute_batch("DROP TRIGGER fail_reconcile;").unwrap();
     let mut writer = open_db(&db_dir.path().join("test.db")).unwrap();
-    index_from_dirs(&mut writer, &opts, true).unwrap();
+    assert_eq!(
+        index_from_dirs(&mut writer, &opts, true).unwrap().indexed,
+        1
+    );
+    index_chunks(&mut writer, None).unwrap();
     assert_eq!(chunk_vectors(&conn), before);
     let stale = embed_chunks(
         &mut conn,
@@ -3806,15 +3827,20 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
     drop(writer);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-    let model = MockEmbedder::new();
+    index_chunks(&mut conn, None).unwrap();
     assert_eq!(
-        embed_recent_chunks(&mut conn, &model, 100, None)
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
             .unwrap()
             .embedded,
         1
     );
-    assert_eq!(model.calls(), 1);
-    assert_eq!(chunk_vectors(&conn).len(), 2);
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT c.content FROM qa_chunks c JOIN vec_chunks v ON c.id = v.chunk_id ORDER BY c.id"
+        ),
+        ["stable\nanswer", "tail\nnew tail"]
+    );
 }
 
 const ROLLOUT_NAME: &str = "rollout-2026-04-27T00-00-00-01900000-0000-7000-8000-000000000001.jsonl";
