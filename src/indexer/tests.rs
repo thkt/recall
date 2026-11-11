@@ -1212,111 +1212,205 @@ fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_
     );
 }
 
+/// Runs seed_claude_and_codex, chunks and embeds the Claude session `c` and the Codex
+/// session `s1`, and records one touched file for each.
+fn embedded_claude_and_codex_sessions(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
+    let seeded = seed_claude_and_codex(conn);
+    index_chunks(conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        2
+    );
+    seed_session_file(conn, "c", "/proj/c.rs");
+    seed_session_file(conn, "s1", "/proj/s1.rs");
+    seeded
+}
+
+/// Every stored row of the Codex session `s1`: session, messages, chunks, vectors and
+/// touched files.
+fn codex_session_rows(conn: &Connection) -> [Vec<String>; 5] {
+    [
+        "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions WHERE session_id = 's1'",
+        "SELECT json_array(rowid, role, text) FROM messages WHERE session_id = 's1' ORDER BY rowid",
+        "SELECT json_array(id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks WHERE session_id = 's1' ORDER BY id",
+        "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = 's1') ORDER BY rowid",
+        "SELECT path FROM session_files WHERE session_id = 's1' ORDER BY path",
+    ]
+    .map(|sql| collect_strings(conn, sql))
+}
+
+fn assert_only_the_unchanged_codex_session_remains(conn: &Connection, before: &[Vec<String>; 5]) {
+    assert_eq!(codex_session_rows(conn), *before);
+    assert_eq!(
+        collect_strings(conn, "SELECT DISTINCT session_id FROM messages"),
+        ["s1"]
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT DISTINCT session_id FROM qa_chunks"),
+        ["s1"]
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT DISTINCT session_id FROM session_files"),
+        ["s1"]
+    );
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vectors, 1);
+}
+
+#[test]
+fn deleted_claude_log_replaced_by_an_empty_log_is_removed_without_touching_the_codex_session() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    fs::write(claude_dir.join("fresh.jsonl"), "").unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(first.skipped_roots.is_empty());
+    assert!(first.parse_diagnostics.is_empty());
+
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(second.skipped_roots.is_empty());
+    assert!(second.parse_diagnostics.is_empty());
+}
+
+#[test]
+fn deleted_claude_log_replaced_by_an_invalid_log_is_removed_without_touching_the_codex_session() {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    let fresh = claude_dir.join("fresh.jsonl");
+    fs::write(&fresh, "invalid JSON\n").unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(first.skipped_roots.is_empty());
+    assert_eq!(invalid_json_lines_by_file(&first), [(fresh.clone(), 1)]);
+
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(second.skipped_roots.is_empty());
+    assert_eq!(invalid_json_lines_by_file(&second), [(fresh, 1)]);
+}
+
 #[cfg(unix)]
 #[test]
-fn equal_count_replacement_without_indexing_removes_only_confirmed_orphans() {
+fn deleted_claude_log_replaced_by_an_unreadable_log_is_removed_and_the_read_failure_is_reported() {
     use std::os::unix::fs::PermissionsExt;
 
-    for (replacement, unreadable) in [("", false), ("invalid JSON\n", false), ("", true)] {
-        for incomplete_codex in [false, true] {
-            let (_dir, mut conn) = setup_test_db();
-            let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-            index_chunks(&mut conn, None).unwrap();
-            let embedder = MockEmbedder::new();
-            assert_eq!(
-                embed_recent_chunks(&mut conn, &embedder, 100, None)
-                    .unwrap()
-                    .embedded,
-                2
-            );
-            for sid in ["c", "s1"] {
-                seed_session_file(&conn, sid, &format!("/proj/{sid}.rs"));
-            }
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    let fresh = claude_dir.join("fresh.jsonl");
+    fs::write(&fresh, "").unwrap();
+    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
 
-            let snapshot = |conn: &Connection, sid: &str| {
-                [
-                    "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions WHERE session_id = ? ORDER BY session_id",
-                    "SELECT json_array(rowid, role, text) FROM messages WHERE session_id = ? ORDER BY rowid",
-                    "SELECT json_array(id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks WHERE session_id = ? ORDER BY id",
-                    "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?) ORDER BY rowid",
-                    "SELECT path FROM session_files WHERE session_id = ? ORDER BY path",
-                ]
-                .map(|sql| {
-                    conn.prepare(sql)
-                        .unwrap()
-                        .query_map([sid], |row| row.get::<_, String>(0))
-                        .unwrap()
-                        .map(Result::unwrap)
-                        .collect::<Vec<_>>()
-                })
-            };
-            let survivor = snapshot(&conn, "s1");
-            assert!(
-                survivor.iter().all(|rows| rows.len() == 1),
-                "survivor row counts: {:?}",
-                survivor.each_ref().map(Vec::len)
-            );
-            assert!(snapshot(&conn, "c").iter().all(|rows| rows.len() == 1));
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(first.skipped_roots.is_empty());
+    assert_eq!(
+        first
+            .parse_diagnostics
+            .iter()
+            .map(|d| (d.file_path.as_path(), d.read_error))
+            .collect::<Vec<_>>(),
+        [(fresh.as_path(), true)]
+    );
 
-            if incomplete_codex {
-                let mut deep = codex_dir.clone();
-                for _ in 0..MAX_DIR_DEPTH {
-                    deep = deep.join("nested");
-                }
-                fs::create_dir_all(&deep).unwrap();
-                fs::rename(codex_dir.join("2026/04/27/s1.jsonl"), deep.join("s1.jsonl")).unwrap();
-                fs::write(codex_dir.join("empty.jsonl"), "").unwrap();
-            }
-            fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
-            let fresh = claude_dir.join("fresh.jsonl");
-            fs::write(&fresh, replacement).unwrap();
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: &claude_dir,
-                codex_dir: &codex_dir,
-                codex_archived_dir: None,
-            };
-            assert_eq!(collect_sources(&opts).sources.len(), 2);
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert!(second.skipped_roots.is_empty());
+    assert_eq!(
+        second
+            .parse_diagnostics
+            .iter()
+            .map(|d| (d.file_path.as_path(), d.read_error))
+            .collect::<Vec<_>>(),
+        [(fresh.as_path(), true)]
+    );
+}
 
-            for _ in 0..2 {
-                let permissions = fs::metadata(&fresh).unwrap().permissions();
-                if unreadable {
-                    fs::set_permissions(&fresh, fs::Permissions::from_mode(0o000)).unwrap();
-                }
-                let stats = index_from_dirs(&mut conn, &opts, false);
-                fs::set_permissions(&fresh, permissions).unwrap();
-                let stats = stats.unwrap();
-                assert_eq!(stats.indexed, 0);
-                assert_eq!(
-                    stats
-                        .parse_diagnostics
-                        .iter()
-                        .filter(|d| d.read_error)
-                        .count(),
-                    usize::from(unreadable)
-                );
-                assert_eq!(
-                    stats.total_sessions, 1,
-                    "exactly the Claude orphan is deleted"
-                );
-                assert_eq!(snapshot(&conn, "s1"), survivor);
-                assert!(snapshot(&conn, "c").iter().all(Vec::is_empty));
-                for table in ["messages", "qa_chunks", "vec_chunks", "session_files"] {
-                    let count: i64 = conn
-                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                        .unwrap();
-                    assert_eq!(count, 1, "only the survivor's data remains in {table}");
-                }
-                assert_eq!(stats.skipped_roots.len(), usize::from(incomplete_codex));
-                if incomplete_codex {
-                    let skipped = &stats.skipped_roots[0];
-                    assert_eq!(skipped.source, Source::Codex);
-                    assert_eq!(skipped.reason, SkippedReason::IncompleteEnumeration);
-                    assert_eq!(skipped.preserved_sessions, 1);
-                }
-            }
-        }
-    }
+#[test]
+fn codex_session_nested_past_the_depth_limit_is_kept_and_reported_while_a_deleted_claude_log_is_removed()
+ {
+    let (_dir, mut conn) = setup_test_db();
+    let (_tmp, claude_dir, codex_dir) = embedded_claude_and_codex_sessions(&mut conn);
+    let before = codex_session_rows(&conn);
+    let too_deep =
+        codex_dir.join("nested/nested/nested/nested/nested/nested/nested/nested/nested/nested");
+    fs::create_dir_all(&too_deep).unwrap();
+    fs::rename(
+        codex_dir.join("2026/04/27/s1.jsonl"),
+        too_deep.join("s1.jsonl"),
+    )
+    .unwrap();
+    fs::write(codex_dir.join("empty.jsonl"), "").unwrap();
+    fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
+    fs::write(claude_dir.join("fresh.jsonl"), "").unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+
+    let first = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((first.indexed, first.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert_eq!(
+        first
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
+    );
+    assert!(first.parse_diagnostics.is_empty());
+
+    let second = index_from_dirs(&mut conn, &opts, false).unwrap();
+    assert_eq!((second.indexed, second.total_sessions), (0, 1));
+    assert_only_the_unchanged_codex_session_remains(&conn, &before);
+    assert_eq!(
+        second
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
+    );
+    assert!(second.parse_diagnostics.is_empty());
 }
 
 #[test]
