@@ -1206,16 +1206,15 @@ fn codex_root_that_cannot_be_fully_read_is_reported_even_with_no_stored_sessions
     fs::set_permissions(&locked_subdir, orig).unwrap();
     let stats = stats.unwrap();
 
-    let codex = stats
-        .skipped_roots
-        .iter()
-        .find(|s| s.source == Source::Codex)
-        .expect("an incompletely enumerated root must surface even with nothing preserved");
     assert_eq!(
-        codex.preserved_sessions, 0,
-        "an empty DB has no rows to preserve"
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::IncompleteEnumeration, 0)],
+        "an incompletely enumerated root must surface even with nothing preserved"
     );
-    assert_eq!(codex.reason, SkippedReason::IncompleteEnumeration);
 }
 
 #[test]
@@ -1585,11 +1584,14 @@ fn rebuild_with_a_missing_codex_root_keeps_its_session_and_embeddings_and_report
         "the present root is rebuilt: its chunks are cleared for re-embed"
     );
     assert_eq!(
-        stats.skipped_roots.len(),
-        1,
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::MissingRoot, 1)],
         "the missing codex root must be reported as preserved"
     );
-    assert_eq!(stats.skipped_roots[0].source, Source::Codex);
 }
 
 #[test]
@@ -1631,8 +1633,15 @@ fn rebuild_with_every_root_missing_keeps_all_sessions_and_embeddings() {
         "every embedding must survive a force rebuild with both roots missing"
     );
     assert_eq!(
-        stats.skipped_roots.len(),
-        2,
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [
+            (Source::Claude, SkippedReason::MissingRoot, 1),
+            (Source::Codex, SkippedReason::MissingRoot, 1)
+        ],
         "both missing roots must be reported as preserved"
     );
 }
