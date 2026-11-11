@@ -1267,68 +1267,6 @@ fn rebuild_removes_the_session_of_a_log_deleted_under_a_fully_read_root() {
     );
 }
 
-#[test]
-fn test_session_id_collision_cleans_old_messages() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-
-    let dir_a = tmp.path().join("claude_a");
-    let dir_b = tmp.path().join("claude_b");
-    fs::create_dir_all(&dir_a).unwrap();
-    fs::create_dir_all(&dir_b).unwrap();
-    fs::write(
-            dir_a.join("collision.jsonl"),
-            r#"{"type":"user","message":{"role":"user","content":"from dir a"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-        ).unwrap();
-    fs::write(
-            dir_b.join("collision.jsonl"),
-            r#"{"type":"user","message":{"role":"user","content":"from dir b"},"timestamp":"2026-03-02T00:00:00Z"}"#,
-        ).unwrap();
-
-    let empty_dir = tmp.path().join("empty");
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &dir_a,
-            codex_dir: &empty_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
-
-    let stats2 = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &dir_b,
-            codex_dir: &empty_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats2.indexed, 1);
-
-    let msg_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages WHERE session_id = 'collision'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(msg_count, 1);
-    assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
-    assert_eq!(
-        collect_strings(&conn, "SELECT content FROM qa_chunks"),
-        ["from dir b"]
-    );
-}
-
 struct CollidingLogs {
     _tmp: TempDir,
     claude_dir: PathBuf,
