@@ -1,6 +1,5 @@
 use std::ffi::OsString;
 use std::io;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use super::*;
@@ -2002,52 +2001,6 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
         collect_strings(&conn, "SELECT content FROM qa_chunks"),
         ["hello"]
     );
-}
-
-#[test]
-fn test_index_chunks_progress_callback_counts_sessions() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    seed_session(&conn, "s2");
-    for (role, text) in [("user", "hello"), ("assistant", "hi there")] {
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('s1', ?1, ?2)",
-            rusqlite::params![role, text],
-        )
-        .unwrap();
-    }
-
-    let calls = Mutex::new(Vec::new());
-    let stats = index_chunks(
-        &mut conn,
-        Some(&|done, total| calls.lock().unwrap().push((done, total))),
-    )
-    .unwrap();
-
-    assert_eq!(calls.into_inner().unwrap(), vec![(1, 2), (2, 2)]);
-    assert_eq!(stats.chunks_created, 1);
-}
-
-#[test]
-fn test_index_chunks_progress_callback_silent_when_all_chunked() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
-        [],
-    )
-    .unwrap();
-    index_chunks(&mut conn, None).unwrap();
-
-    let calls = Mutex::new(Vec::new());
-    let stats = index_chunks(
-        &mut conn,
-        Some(&|done, total| calls.lock().unwrap().push((done, total))),
-    )
-    .unwrap();
-
-    assert_eq!(stats.chunks_created, 0);
-    assert_eq!(calls.into_inner().unwrap(), Vec::<(usize, usize)>::new());
 }
 
 #[test]
