@@ -1476,3 +1476,137 @@ fn recall_search_with_a_not_query_returns_only_the_sessions_without_the_excluded
         "sessions with the excluded word or without the first word must be absent: {stdout}"
     );
 }
+
+fn user_line(text: &str, timestamp: &str) -> String {
+    format!(
+        r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"{text}"}},"timestamp":"{timestamp}"}}"#
+    )
+}
+
+fn search_envelope(dir: &Path, args: &[&str]) -> serde_json::Value {
+    let stdout = search_stdout(dir, args);
+    serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"))
+}
+
+fn first_session_id(envelope: &serde_json::Value) -> String {
+    envelope["data"]["results"][0]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no first result in: {envelope}"))
+        .to_owned()
+}
+
+fn mark_source_unknown(dir: &Path, session_id: &str) {
+    let changed = rusqlite::Connection::open(dir.join("recall.db"))
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET source = 'gemini' WHERE session_id = ?1",
+            [session_id],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "session {session_id} should exist in the index");
+}
+
+fn incomplete_note(envelope: &serde_json::Value) -> Option<String> {
+    envelope["notes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("notes should be an array, got: {envelope}"))
+        .iter()
+        .filter_map(|n| n.as_str())
+        .find(|n| n.contains("incomplete"))
+        .map(str::to_owned)
+}
+
+#[test]
+fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
+    let dir = TempDir::new().unwrap();
+    // Equal text gives equal raw ranks, so only the recency blend separates the
+    // sessions. "z-newest" sorts last by id, so a cut before the blend drops it.
+    let sessions: Vec<(String, Vec<String>)> = [
+        ("a1", "2026-01-01T00:00:00Z"),
+        ("a2", "2026-01-02T00:00:00Z"),
+        ("a3", "2026-01-03T00:00:00Z"),
+        ("a4", "2026-01-04T00:00:00Z"),
+        ("a5", "2026-01-05T00:00:00Z"),
+        ("z-newest", "2026-10-01T00:00:00Z"),
+    ]
+    .iter()
+    .map(|(name, ts)| {
+        (
+            (*name).to_owned(),
+            vec![user_line("authentication notes", ts)],
+        )
+    })
+    .collect();
+    let refs: Vec<(&str, Vec<&str>)> = sessions
+        .iter()
+        .map(|(n, l)| (n.as_str(), l.iter().map(String::as_str).collect()))
+        .collect();
+    let borrowed: Vec<(&str, &[&str])> = refs.iter().map(|(n, l)| (*n, l.as_slice())).collect();
+    index_claude_sessions(dir.path(), &borrowed);
+
+    let default_limit = search_envelope(dir.path(), &["authentication"]);
+    let limit_one = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+
+    assert_eq!(
+        first_session_id(&default_limit),
+        "z-newest",
+        "the recency blend should put the newest session first: {default_limit}"
+    );
+    assert_eq!(
+        limit_one["data"]["results"].as_array().map(Vec::len),
+        Some(1),
+        "{limit_one}"
+    );
+    assert_eq!(
+        first_session_id(&limit_one),
+        first_session_id(&default_limit),
+        "--limit 1 must print the head of the default limit: {limit_one}"
+    );
+}
+
+#[test]
+fn search_that_skips_only_an_unknown_source_session_outside_the_results_is_not_degraded() {
+    let dir = TempDir::new().unwrap();
+    let valid = user_line("authentication", "2026-03-01T00:00:00Z");
+    let weird = user_line(
+        "authentication retry logic for the session refresh path in the gateway service",
+        "2026-03-01T00:00:00Z",
+    );
+    index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
+    mark_source_unknown(dir.path(), "weird");
+
+    let envelope = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+
+    assert_eq!(first_session_id(&envelope), "valid", "{envelope}");
+    assert_eq!(
+        incomplete_note(&envelope),
+        None,
+        "a skipped session that cannot reach the results must not raise the note: {envelope}"
+    );
+    assert_eq!(
+        envelope["degraded"].as_bool(),
+        envelope["notes"].as_array().map(|n| !n.is_empty()),
+        "degraded must come only from the remaining notes: {envelope}"
+    );
+}
+
+#[test]
+fn search_that_skips_an_unknown_source_session_that_could_rank_says_so_in_the_note() {
+    let dir = TempDir::new().unwrap();
+    let valid = user_line("authentication notes", "2026-03-01T00:00:00Z");
+    let weird = user_line("authentication notes", "2026-03-01T00:00:00Z");
+    index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
+    mark_source_unknown(dir.path(), "weird");
+
+    let envelope = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+
+    let note = incomplete_note(&envelope).unwrap_or_else(|| {
+        panic!("a skipped session that could rank must raise the note: {envelope}")
+    });
+    assert_eq!(envelope["degraded"], true, "{envelope}");
+    assert!(
+        note.contains("could have ranked"),
+        "the note must say a skipped session could have ranked in the results: {note}"
+    );
+}
