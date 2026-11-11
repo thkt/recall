@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::io;
 use std::time::{Duration, SystemTime};
 
 use super::*;
@@ -9,6 +8,7 @@ use crate::embedder::{
     EmbedOptions, MockEmbedder, embed_pending_observed, embed_recent_chunks, f32_as_bytes,
 };
 use crate::index_observer::{recording, stable_lines};
+use crate::parser::LineDiagnostics;
 use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
 
@@ -2677,6 +2677,23 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     );
 }
 
+/// Each diagnosed file as an index run reports it: the stored path, its source, its line
+/// counts and whether the file could not be read.
+fn diagnosed_files(
+    diagnostics: &[FileParseDiagnostics],
+) -> Vec<(PathBuf, Source, LineDiagnostics, bool)> {
+    diagnostics
+        .iter()
+        .map(|d| (d.file_path.clone(), d.source, d.lines, d.read_error))
+        .collect()
+}
+
+const ONE_INVALID_JSON_LINE: LineDiagnostics = LineDiagnostics {
+    invalid_json_lines: 1,
+    invalid_utf8_lines: 0,
+    incomplete_tail_lines: 0,
+};
+
 #[test]
 fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repaired() {
     let (db_dir, mut conn) = setup_test_db();
@@ -2776,48 +2793,65 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+
     let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("s.jsonl");
-    fs::write(&path, "{\"type\":\"user\",\"message\":\"kept\"}\ninvalid\n").unwrap();
-    let missing = tmp.path().join("no-codex");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: tmp.path(),
-        codex_dir: &missing,
-        codex_archived_dir: None,
-    };
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    let existing = load_existing_sessions(&conn).unwrap();
-    let tx = conn.transaction().unwrap();
-    let ctx = IndexContext {
-        tx: &tx,
-        existing: &existing,
-        force: true,
-        embedded_sessions: None,
-    };
-    index_file_with_parser(&ctx, &path, &Source::Claude, |_, _| {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "private content must not escape",
-        )
-        .into())
-    })
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(
+        &log.file,
+        "{\"type\":\"user\",\"message\":\"kept\"}\ninvalid\n",
+    )
     .unwrap();
-    tx.commit().unwrap();
-    let d = load_parse_diagnostics(&conn).unwrap();
-    assert!(d[0].read_error);
-    assert_eq!(d[0].lines.invalid_json_lines, 1);
+    let first = index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        diagnosed_files(&first.parse_diagnostics),
+        [(
+            log.file.clone(),
+            Source::Claude,
+            ONE_INVALID_JSON_LINE,
+            false
+        )]
+    );
+
+    fs::set_permissions(&log.file, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = index_from_dirs(&mut conn, &log.rebuild_opts(), true).unwrap();
+    fs::set_permissions(&log.file, fs::Permissions::from_mode(0o644)).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_eq!((unreadable.indexed, unreadable.total_sessions), (0, 1));
+    assert_eq!(
+        diagnosed_files(&unreadable.parse_diagnostics),
+        [(
+            log.file.clone(),
+            Source::Claude,
+            ONE_INVALID_JSON_LINE,
+            true
+        )],
+        "the read error joins the line diagnostics of the last successful read"
+    );
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["kept"]
     );
-    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert!(!stats.parse_diagnostics[0].read_error);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+
+    let retry = index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        retry.indexed, 1,
+        "a recorded read error makes an unchanged size and mtime read again"
+    );
+    assert_eq!(
+        diagnosed_files(&retry.parse_diagnostics),
+        [(
+            log.file.clone(),
+            Source::Claude,
+            ONE_INVALID_JSON_LINE,
+            false
+        )]
+    );
 }
 
 #[cfg(unix)]
