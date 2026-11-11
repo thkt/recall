@@ -186,13 +186,9 @@ fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
     }
 }
 
-pub(super) const MAX_DIR_DEPTH: usize = 10;
+const MAX_DIR_DEPTH: usize = 10;
 
-pub(super) fn collect_jsonl_files(
-    dir: &Path,
-    out: &mut Vec<(PathBuf, Source)>,
-    source: Source,
-) -> bool {
+fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source) -> bool {
     collect_jsonl_files_inner(dir, out, source, 0)
 }
 
