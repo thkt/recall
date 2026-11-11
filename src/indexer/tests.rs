@@ -2294,49 +2294,48 @@ fn touched_file_paths_that_are_empty_too_long_or_contain_a_newline_are_dropped()
 fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_its_touched_files_once_the_log_is_readable()
  {
     let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "gone-session");
-    let unmarked_before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(unmarked_before, 1, "precondition: one unmarked session");
-
-    let marked = backfill_session_files(&mut conn, None).unwrap();
+    let tmp = TempDir::new().unwrap();
+    let log = tmp.path().join("legacy.jsonl");
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('legacy', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL)",
+        [log.to_str().unwrap()],
+    )
+    .unwrap();
 
     assert_eq!(
-        marked, 0,
-        "an unreadable session must not be counted as marked"
+        backfill_session_files(&mut conn, None).unwrap(),
+        0,
+        "a log that cannot be read marks no session"
     );
-    let unmarked_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        unmarked_after, 1,
-        "an unreadable JSONL must leave files_scanned NULL so the next index retries"
-    );
-    let file_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM session_files", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        file_rows, 0,
-        "an unreadable JSONL yields no session_files rows"
-    );
-
+    assert!(collect_strings(&conn, "SELECT path FROM session_files").is_empty());
     let diagnostics = load_parse_diagnostics(&conn).unwrap();
     assert_eq!(diagnostics.len(), 1);
-    assert!(diagnostics[0].read_error);
-
-    let retried = backfill_session_files(&mut conn, None).unwrap();
     assert_eq!(
-        retried, 0,
-        "the retry still fails on the vanished file but keeps the session eligible"
+        diagnostics[0].notes(),
+        [format!(
+            "{}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained",
+            log.display()
+        )]
+    );
+
+    fs::write(
+        &log,
+        concat!(
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"edit it"}}"#,
+            "\n",
+            r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"/proj/edited.rs","old_string":"x","new_string":"y"}}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        backfill_session_files(&mut conn, None).unwrap(),
+        1,
+        "the next backfill reads the session again"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id || ' ' || path FROM session_files"),
+        ["legacy /proj/edited.rs"]
     );
 }
 
