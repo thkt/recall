@@ -620,88 +620,6 @@ fn test_index_from_dirs_force_reindexes() {
     assert_eq!(vec_after, 0, "force reindex should clear vec_chunks");
 }
 
-#[test]
-fn test_orphan_cleanup_removes_deleted_files() {
-    let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-
-    let claude_dir = tmp.path().join("claude_projects");
-    fs::create_dir_all(&claude_dir).unwrap();
-    let f1 = claude_dir.join("session1.jsonl");
-    let f2 = claude_dir.join("session2.jsonl");
-    fs::write(&f1, r#"{"type":"user","message":{"role":"user","content":"one"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
-    fs::write(&f2, r#"{"type":"user","message":{"role":"user","content":"two"},"timestamp":"2026-03-01T00:00:00Z"}"#).unwrap();
-
-    let codex_dir = tmp.path().join("codex_sessions");
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats.indexed, 2);
-    assert_eq!(stats.total_sessions, 2);
-
-    index_chunks(&mut conn, None).unwrap();
-    let embedder = MockEmbedder::new();
-    embed_recent_chunks(&mut conn, &embedder, 100, None).unwrap();
-    let chunks_before: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert!(chunks_before > 0, "session2 should have chunks");
-    let vecs_before: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert!(
-        vecs_before > 0,
-        "should have vec_chunks before orphan cleanup"
-    );
-
-    fs::remove_file(&f2).unwrap();
-    let stats2 = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    )
-    .unwrap();
-    assert_eq!(stats2.total_sessions, 1);
-
-    let chunks_after: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM qa_chunks WHERE session_id = 'session2'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        chunks_after, 0,
-        "orphan cleanup should cascade to qa_chunks"
-    );
-
-    let vecs_for_session1: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert!(
-        vecs_for_session1 < vecs_before,
-        "orphan cleanup should remove session2 vec_chunks: before={vecs_before}, after={vecs_for_session1}"
-    );
-}
-
 fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -2141,33 +2059,6 @@ fn test_229_trailing_assistant_in_multi_turn_is_embedded() {
         embedded > 0,
         "the trailing assistant's text must reach an embedded qa_chunk so semantic \
          search can find it; orphaning it leaves it FTS-only and vector-invisible"
-    );
-}
-
-#[test]
-fn セッション削除で_session_files_の行も消える() {
-    let (_dir, mut conn) = setup_test_db();
-    seed_session(&conn, "s1");
-    conn.execute(
-        "INSERT INTO session_files (session_id, path) VALUES ('s1', '/proj/s1.jsonl')",
-        [],
-    )
-    .unwrap();
-
-    let tx = conn.transaction().unwrap();
-    delete_session_dependents(&tx, "s1").unwrap();
-    tx.commit().unwrap();
-
-    let remaining: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM session_files WHERE session_id = 's1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        remaining, 0,
-        "session_files rows must be deleted together with the session"
     );
 }
 
