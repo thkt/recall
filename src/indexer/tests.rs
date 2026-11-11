@@ -3996,34 +3996,76 @@ fn session_ids(conn: &Connection) -> Vec<String> {
 
 #[test]
 fn archiving_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
-    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
-    for body in [format!("{meta}\n{ROLLOUT_TURNS}"), ROLLOUT_TURNS.to_owned()] {
-        let (_db, mut conn) = setup_test_db();
-        let roots = CodexRoots::new();
-        let live = roots.day.join(ROLLOUT_NAME);
-        fs::write(&live, &body).unwrap();
-        index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-        index_chunks(&mut conn, None).unwrap();
-        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
-        let row_before = session_row(&conn);
-        let vectors_before = stored_vectors(&conn);
-        assert!(!vectors_before.is_empty());
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let live = roots.day.join(ROLLOUT_NAME);
+    fs::write(&live, format!("{ROLLOUT_META}\n{ROLLOUT_TURNS}")).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    let identity_before = session_identity(&conn);
+    let vectors_before = stored_vectors(&conn);
 
-        let compressed = compress_log(&live);
-        let archived = roots.archived.join(compressed.file_name().unwrap());
-        fs::rename(&compressed, &archived).unwrap();
-        fs::remove_file(&live).unwrap();
-        let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    let compressed = compress_log(&live);
+    let archived = roots.archived.join(compressed.file_name().unwrap());
+    fs::rename(&compressed, &archived).unwrap();
+    fs::remove_file(&live).unwrap();
+    let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
 
-        assert_eq!(stats.total_sessions, 1, "{body}");
-        assert_eq!(
-            session_row(&conn),
-            [row_before[0].replace(live.to_str().unwrap(), archived.to_str().unwrap())],
-            "only the file path changes; the slug keeps the session's date"
-        );
-        assert_eq!(stored_vectors(&conn), vectors_before);
-        assert!(stats.skipped_roots.is_empty());
-    }
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [archived.to_str().unwrap()]
+    );
+    assert_eq!(
+        session_identity(&conn),
+        identity_before,
+        "the slug keeps the session's date"
+    );
+    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert!(stats.skipped_roots.is_empty());
+}
+
+#[test]
+fn archiving_a_codex_log_that_has_no_session_meta_keeps_the_indexed_session_and_its_embeddings() {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let live = roots.day.join(ROLLOUT_NAME);
+    fs::write(&live, ROLLOUT_TURNS).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    let identity_before = session_identity(&conn);
+    let vectors_before = stored_vectors(&conn);
+
+    let compressed = compress_log(&live);
+    let archived = roots.archived.join(compressed.file_name().unwrap());
+    fs::rename(&compressed, &archived).unwrap();
+    fs::remove_file(&live).unwrap();
+    let stats = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [archived.to_str().unwrap()]
+    );
+    assert_eq!(
+        session_identity(&conn),
+        identity_before,
+        "the slug keeps the session's date"
+    );
+    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert!(stats.skipped_roots.is_empty());
 }
 
 #[test]
