@@ -158,7 +158,7 @@ fn rewrite_with_mtime(path: &Path, body: &str, mtime: SystemTime) {
 /// A Claude root and a Codex root under one temp dir. Only the root named `root` exists,
 /// and it holds the log `name`.
 struct OneLog {
-    _tmp: TempDir,
+    tmp: TempDir,
     claude: PathBuf,
     codex: PathBuf,
     file: PathBuf,
@@ -172,7 +172,7 @@ impl OneLog {
             claude: tmp.path().join("claude"),
             codex: tmp.path().join("codex"),
             file: tmp.path().join(root).join(name),
-            _tmp: tmp,
+            tmp,
         }
     }
 
@@ -182,6 +182,13 @@ impl OneLog {
             claude_dir: &self.claude,
             codex_dir: &self.codex,
             codex_archived_dir: None,
+        }
+    }
+
+    fn rebuild_opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
+            force: true,
+            ..self.opts()
         }
     }
 }
@@ -3020,16 +3027,20 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     );
 }
 
-fn write_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
-    let text = messages
+/// One Claude log line per `(role, text)` message.
+fn reuse_conversation(messages: &[(&str, &str)]) -> String {
+    messages
         .iter()
         .map(|(role, text)| {
             serde_json::json!({"type": role, "message": {"role": role, "content": text}})
                 .to_string()
                 + "\n"
         })
-        .collect::<String>();
-    fs::write(path, text).unwrap();
+        .collect()
+}
+
+fn write_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
+    fs::write(path, reuse_conversation(messages)).unwrap();
 }
 
 /// Each embedded chunk's content, sub-index and vector bytes, without ids, so two stores
@@ -3150,52 +3161,17 @@ const REUSE_CONVERSATION: [(&str, &str); 6] = [
 ];
 
 /// A Claude root holding `reuse.jsonl` with `REUSE_CONVERSATION`, and an absent Codex root.
-struct ReuseLog {
-    tmp: TempDir,
-    root: PathBuf,
-    absent: PathBuf,
-    path: PathBuf,
-}
-
-impl ReuseLog {
-    fn new() -> Self {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("claude");
-        fs::create_dir(&root).unwrap();
-        let log = Self {
-            absent: tmp.path().join("absent"),
-            path: root.join("reuse.jsonl"),
-            root,
-            tmp,
-        };
-        write_reuse_conversation(&log.path, &REUSE_CONVERSATION);
-        log
-    }
-
-    fn opts(&self) -> IndexOptions<'_> {
-        IndexOptions {
-            force: false,
-            claude_dir: &self.root,
-            codex_dir: &self.absent,
-            codex_archived_dir: None,
-        }
-    }
-
-    fn rebuild_opts(&self) -> IndexOptions<'_> {
-        IndexOptions {
-            force: true,
-            claude_dir: &self.root,
-            codex_dir: &self.absent,
-            codex_archived_dir: None,
-        }
-    }
+fn reuse_log() -> OneLog {
+    let log = OneLog::new("claude", "reuse.jsonl");
+    write_reuse_conversation(&log.file, &REUSE_CONVERSATION);
+    log
 }
 
 /// Indexes, chunks and embeds `REUSE_CONVERSATION`: three chunks, two of them with the same
 /// text. Then stores a message of another session, so a re-read log gets rowids its old
 /// messages never had.
-fn embedded_reuse_conversation(conn: &mut Connection) -> ReuseLog {
-    let log = ReuseLog::new();
+fn embedded_reuse_conversation(conn: &mut Connection) -> OneLog {
+    let log = reuse_log();
     assert_eq!(index_from_dirs(conn, &log.opts(), true).unwrap().indexed, 1);
     assert_eq!(index_chunks(conn).unwrap().chunks_created, 3);
     assert_eq!(
@@ -3218,13 +3194,11 @@ fn store_an_unrelated_message(conn: &Connection) {
 
 /// Rewrites the log with `messages` and an mtime 10 seconds later, so the next index reads it.
 fn rewrite_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
-    write_reuse_conversation(path, messages);
-    fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_modified(SystemTime::now() + Duration::from_secs(10))
-        .unwrap();
+    rewrite_with_mtime(
+        path,
+        &reuse_conversation(messages),
+        SystemTime::now() + Duration::from_secs(10),
+    );
 }
 
 /// Reindexes and returns the --json counts that report chunk reuse.
@@ -3267,7 +3241,7 @@ fn inference_counts_of_an_embed(conn: &mut Connection) -> serde_json::Value {
 }
 
 /// Rebuilds the index from the log and asserts it stores the same chunks and vectors.
-fn assert_vectors_match_a_rebuild(conn: &mut Connection, log: &ReuseLog) {
+fn assert_vectors_match_a_rebuild(conn: &mut Connection, log: &OneLog) {
     let kept = chunk_vectors(conn);
     index_from_dirs(conn, &log.rebuild_opts(), true).unwrap();
     index_chunks(conn).unwrap();
@@ -3285,7 +3259,7 @@ fn appending_a_turn_reuses_every_stored_vector_and_infers_only_the_new_chunk() {
     let log = embedded_reuse_conversation(&mut conn);
     let before = vector_rows(&conn);
     rewrite_reuse_conversation(
-        &log.path,
+        &log.file,
         &[
             ("user", "duplicate"),
             ("assistant", "same answer"),
@@ -3333,7 +3307,7 @@ fn continuing_the_last_answer_reuses_the_unchanged_chunks_and_infers_only_the_ex
     let log = embedded_reuse_conversation(&mut conn);
     let before = vector_rows(&conn);
     rewrite_reuse_conversation(
-        &log.path,
+        &log.file,
         &[
             ("user", "duplicate"),
             ("assistant", "same answer"),
@@ -3392,7 +3366,7 @@ fn touching_a_log_without_changing_it_reuses_every_vector_and_infers_nothing() {
     let (_db_dir, mut conn) = setup_test_db();
     let log = embedded_reuse_conversation(&mut conn);
     let before = vector_rows(&conn);
-    rewrite_reuse_conversation(&log.path, &REUSE_CONVERSATION);
+    rewrite_reuse_conversation(&log.file, &REUSE_CONVERSATION);
 
     assert_eq!(
         reuse_counts_of_a_rerun(&mut conn, &log.opts()),
@@ -3428,7 +3402,7 @@ fn truncating_a_log_keeps_the_vector_of_the_remaining_chunk_and_infers_nothing()
     let log = embedded_reuse_conversation(&mut conn);
     let before = vector_rows(&conn);
     rewrite_reuse_conversation(
-        &log.path,
+        &log.file,
         &[("user", "duplicate"), ("assistant", "same answer")],
     );
 
@@ -3464,7 +3438,7 @@ fn truncating_to_a_duplicated_turn_keeps_the_copy_that_has_a_vector() {
     .unwrap();
     let before = vector_rows(&conn);
     rewrite_reuse_conversation(
-        &log.path,
+        &log.file,
         &[("user", "duplicate"), ("assistant", "same answer")],
     );
 
@@ -3496,7 +3470,7 @@ fn replacing_the_opening_turns_keeps_the_vector_of_the_surviving_turn_and_infers
     let log = embedded_reuse_conversation(&mut conn);
     let before = vector_rows(&conn);
     rewrite_reuse_conversation(
-        &log.path,
+        &log.file,
         &[
             ("user", "tail question"),
             ("assistant", "tail answer"),
@@ -3581,9 +3555,9 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
     .unwrap();
     conn.execute("UPDATE sessions SET chunks_indexed = ?1", [marker])
         .unwrap();
-    let mtime = fs::metadata(&log.path).unwrap().modified().unwrap();
+    let mtime = fs::metadata(&log.file).unwrap().modified().unwrap();
     let offline = log.tmp.path().join("offline");
-    fs::rename(&log.root, &offline).unwrap();
+    fs::rename(&log.claude, &offline).unwrap();
     let missing = index_from_dirs(&mut conn, &log.opts(), true).unwrap();
     assert_eq!((missing.indexed, missing.total_sessions), (0, 1));
     assert_eq!(
@@ -3602,9 +3576,9 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
             .embedded,
         3
     );
-    fs::rename(&offline, &log.root).unwrap();
+    fs::rename(&offline, &log.claude).unwrap();
     assert_eq!(
-        fs::metadata(&log.path).unwrap().modified().unwrap(),
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
         mtime,
         "moving the root back leaves the log's mtime unchanged"
     );
@@ -3657,7 +3631,7 @@ fn a_session_parsed_under_old_rules_and_chunked_while_its_root_was_missing_is_re
 fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_reuses_every_vector()
 {
     let (db_dir, mut conn) = setup_test_db();
-    let log = ReuseLog::new();
+    let log = reuse_log();
     assert_eq!(
         index_from_dirs(&mut conn, &log.opts(), true)
             .unwrap()
@@ -3665,7 +3639,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
         1
     );
     let offline = log.tmp.path().join("offline");
-    fs::rename(&log.root, &offline).unwrap();
+    fs::rename(&log.claude, &offline).unwrap();
     let mut resumed = open_db(&db_dir.path().join("test.db")).unwrap();
     assert_eq!(
         index_from_dirs(&mut resumed, &log.opts(), true)
@@ -3674,7 +3648,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
         0
     );
     assert_eq!(index_chunks(&mut resumed).unwrap().chunks_created, 3);
-    fs::rename(&offline, &log.root).unwrap();
+    fs::rename(&offline, &log.claude).unwrap();
     assert_eq!(
         index_from_dirs(&mut conn, &log.opts(), true)
             .unwrap()
@@ -3691,7 +3665,7 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
     );
     store_an_unrelated_message(&conn);
     let before = vector_rows(&conn);
-    rewrite_reuse_conversation(&log.path, &REUSE_CONVERSATION);
+    rewrite_reuse_conversation(&log.file, &REUSE_CONVERSATION);
 
     assert_eq!(
         reuse_counts_of_a_rerun(&mut conn, &log.opts()),
@@ -3759,7 +3733,7 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
 fn a_second_chunk_pass_on_the_same_connection_chunks_a_rebuilt_session_whose_messages_keep_their_rowids()
  {
     let (_db_dir, mut conn) = setup_test_db();
-    let log = ReuseLog::new();
+    let log = reuse_log();
     assert_eq!(
         index_from_dirs(&mut conn, &log.opts(), true)
             .unwrap()
