@@ -605,6 +605,120 @@ fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
     assert_eq!(ids(&results), ["new"]);
 }
 
+/// Four year-old sessions match "authentication" equally well, and one new
+/// session matches slightly worse. The new session ranks fifth by text alone,
+/// and the 20% that recency adds to a same-day session lifts it to the front.
+fn seed_new_session_ranked_fifth_by_text(conn: &Connection) {
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    for sid in ["old-a", "old-b", "old-c", "old-d"] {
+        insert_session(conn, sid, "claude", "/proj", year_ago);
+        insert_message(conn, sid, "user", "authentication notes");
+    }
+    insert_session(conn, "new", "claude", "/proj", NOW_MS);
+    insert_message(conn, "new", "user", "authentication notes kept");
+}
+
+#[test]
+fn a_limit_of_one_returns_a_new_session_that_matches_slightly_worse_than_older_ones() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fifth_by_text(&conn);
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(ids(&results), ["new"]);
+}
+
+#[test]
+fn a_limit_of_one_returns_the_newest_of_sessions_whose_text_matches_equally() {
+    let (_dir, conn) = setup_test_db();
+    // "e" is the newest and sorts last by id. Equal text makes the candidate
+    // query order the five sessions by id, so "e" falls outside the first three.
+    for (days_ago, sid) in [(4, "a"), (3, "b"), (2, "c"), (1, "d"), (0, "e")] {
+        insert_session(
+            &conn,
+            sid,
+            "claude",
+            "/proj",
+            NOW_MS - days_ago * MS_PER_DAY,
+        );
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+
+    let results = search(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(ids(&results), ["e"]);
+}
+
+#[test]
+fn results_for_a_smaller_limit_are_the_first_results_of_a_larger_limit() {
+    let (_dir, conn) = setup_test_db();
+    seed_new_session_ranked_fifth_by_text(&conn);
+    insert_session(&conn, "mid", "claude", "/proj", NOW_MS - 60 * MS_PER_DAY);
+    insert_message(&conn, "mid", "user", "authentication notes kept here");
+    let at_limit = |limit| {
+        let results = search(
+            &conn,
+            "authentication",
+            &SearchOptions { limit, ..at_now() },
+        )
+        .unwrap();
+        ids(&results)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    let full = at_limit(10);
+
+    assert_eq!(full.len(), 6);
+    for limit in 1..full.len() {
+        assert_eq!(at_limit(limit), full[..limit], "limit {limit}");
+    }
+}
+
+#[test]
+fn an_unknown_source_session_ranked_first_does_not_leave_a_limit_of_one_empty() {
+    let (_dir, conn) = setup_test_db();
+    // Three unknown-source sessions match better than the valid one, so they
+    // fill the whole candidate window of a limit of one.
+    for sid in ["u1", "u2", "u3"] {
+        insert_session(&conn, sid, "mystery_source_v99", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication");
+    }
+    insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "valid", "user", "authentication flow discussion");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &SearchOptions {
+            limit: 1,
+            ..at_now()
+        },
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["valid"]);
+    assert!(outcome.results_incomplete);
+}
+
 #[test]
 fn a_session_without_a_timestamp_ranks_below_an_equally_matching_dated_one() {
     let (_dir, conn) = setup_test_db();

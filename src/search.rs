@@ -189,18 +189,22 @@ fn find_candidate_sessions(
     }
     if let Some(err) = first_error {
         if ranked.is_empty() {
-            return Err(if is_fts5_query_syntax_error(&err) {
-                RecallError::QuerySyntax(format!(
-                    "Invalid search query: {err}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
-                ))
-            } else {
-                RecallError::DataError(format!("Search failed: {err}"))
-            }
-            .into());
+            return Err(candidate_query_error(&err));
         }
         warn!(skipped, %err, "rows skipped during search");
     }
     Ok((ranked, skipped))
+}
+
+fn candidate_query_error(err: &rusqlite::Error) -> anyhow::Error {
+    if is_fts5_query_syntax_error(err) {
+        RecallError::QuerySyntax(format!(
+            "Invalid search query: {err}. Use words, \"quoted phrases\", or AND/OR/NOT operators."
+        ))
+    } else {
+        RecallError::DataError(format!("Search failed: {err}"))
+    }
+    .into()
 }
 
 /// The MATCH strings search renders quote every term, so the FTS5 parse errors
@@ -217,8 +221,13 @@ fn is_fts5_query_syntax_error(err: &rusqlite::Error) -> bool {
 }
 
 fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> {
-    let session_id: String = row.get(0)?;
-    let source_str: String = row.get(1)?;
+    decode_session_at(row, 0)
+}
+
+/// Reads the six `sessions` columns that start at column `first`.
+fn decode_session_at(row: &rusqlite::Row, first: usize) -> rusqlite::Result<Option<SessionData>> {
+    let session_id: String = row.get(first)?;
+    let source_str: String = row.get(first + 1)?;
     let Some(source) = Source::from_db(&source_str) else {
         warn!(source = %source_str, session_id, "unknown source");
         return Ok(None);
@@ -226,11 +235,106 @@ fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> 
     Ok(Some(SessionData {
         session_id,
         source,
-        file_path: row.get(2)?,
-        project: row.get(3)?,
-        slug: row.get(4)?,
-        timestamp: row.get(5)?,
+        file_path: row.get(first + 2)?,
+        project: row.get(first + 3)?,
+        slug: row.get(first + 4)?,
+        timestamp: row.get(first + 5)?,
     }))
+}
+
+/// Keyword-only search reads every matching session, with its `sessions` row
+/// joined in, because the recency blend can move any of them to the front. The
+/// cut to `limit` comes after the blend, in `rank_sessions`.
+fn build_keyword_session_query(
+    fts_query: &str,
+    opts: &SearchOptions,
+    now_ms: i64,
+) -> (String, Vec<Box<dyn ToSql>>) {
+    let mut sql = "SELECT messages.session_id, MIN(messages.rank) AS best_rank, \
+                   s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
+                   FROM messages LEFT JOIN sessions s ON s.session_id = messages.session_id \
+                   WHERE messages MATCH ?"
+        .to_owned();
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
+    append_search_filters(&mut sql, &mut params, "messages.session_id", opts, now_ms);
+    sql.push_str(" GROUP BY messages.session_id ORDER BY best_rank, messages.session_id");
+    (sql, params)
+}
+
+struct KeywordSessions {
+    ranked: Vec<(f64, SessionData)>,
+    incomplete: bool,
+}
+
+/// A session with no `sessions` row or an unknown source is skipped and flags
+/// the results incomplete, so it never takes one of the `limit` slots.
+fn find_keyword_sessions(
+    conn: &Connection,
+    opts: &SearchOptions,
+    fts_query: &str,
+    now_ms: i64,
+) -> Result<KeywordSessions> {
+    let (sql, params) = build_keyword_session_query(fts_query, opts, now_ms);
+    debug_assert_eq!(
+        params.len(),
+        sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("Failed to prepare search query")?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let session_id: String = row.get(0)?;
+            let best_rank: f64 = row.get(1)?;
+            let session = match row.get::<_, Option<String>>(2)? {
+                Some(_) => decode_session_at(row, 2),
+                None => Ok(None),
+            };
+            Ok((session_id, best_rank, session))
+        })
+        .context("Search query failed")?;
+
+    let mut ranked = Vec::new();
+    let mut first_error = None;
+    let mut row_errors = 0;
+    let mut skipped = 0;
+    let mut rows_read = 0;
+    for r in rows {
+        match r {
+            Ok((session_id, best_rank, session)) => {
+                rows_read += 1;
+                match session {
+                    Ok(Some(session)) => ranked.push((best_rank, session)),
+                    Ok(None) => {
+                        warn!(
+                            session_id,
+                            "session skipped: no sessions row or unknown source"
+                        );
+                        skipped += 1;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, session_id, "session metadata unreadable");
+                        skipped += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                first_error.get_or_insert(e);
+                row_errors += 1;
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        if rows_read == 0 {
+            return Err(candidate_query_error(&err));
+        }
+        warn!(row_errors, %err, "rows skipped during search");
+    }
+    Ok(KeywordSessions {
+        ranked,
+        incomplete: skipped + row_errors > 0,
+    })
 }
 
 fn fetch_session_metadata(
@@ -290,29 +394,38 @@ fn build_candidates(
         .collect()
 }
 
-fn score_and_sort(
-    candidates: Vec<(f64, SearchResult)>,
+/// Applies the recency blend to every session, sorts, and only then cuts to
+/// `limit`, so a session the blend lifts to the front is not cut beforehand.
+fn rank_sessions(
+    sessions: Vec<(f64, SessionData)>,
     now_ms: i64,
     limit: usize,
-) -> Vec<SearchResult> {
-    let mut results: Vec<(SearchResult, f64)> = candidates
+) -> (Vec<(String, f64)>, HashMap<String, SessionData>) {
+    let mut scored: Vec<(f64, SessionData)> = sessions
         .into_iter()
-        .map(|(rank, result)| {
+        .map(|(rank, session)| {
             debug_assert!(
                 rank < 0.0,
                 "FTS bm25 rank must be negative; rank={rank} would nullify the recency blend or invert ordering"
             );
-            let recency_boost = hybrid::recency_decay(now_ms, result.session.timestamp);
-            let blended_rank = rank * (1.0 + RECENCY_BOOST_WEIGHT * recency_boost);
-            (result, blended_rank)
+            let recency_boost = hybrid::recency_decay(now_ms, session.timestamp);
+            (rank * (1.0 + RECENCY_BOOST_WEIGHT * recency_boost), session)
         })
         .collect();
-    results.sort_by(|a, b| {
-        a.1.total_cmp(&b.1)
-            .then_with(|| a.0.session.session_id.cmp(&b.0.session.session_id))
+    scored.sort_by(|a, b| {
+        a.0.total_cmp(&b.0)
+            .then_with(|| a.1.session_id.cmp(&b.1.session_id))
     });
-    results.truncate(limit);
-    results.into_iter().map(|(r, _)| r).collect()
+    scored.truncate(limit);
+    let ranked = scored
+        .iter()
+        .map(|(rank, session)| (session.session_id.clone(), *rank))
+        .collect();
+    let meta_map = scored
+        .into_iter()
+        .map(|(_, session)| (session.session_id.clone(), session))
+        .collect();
+    (ranked, meta_map)
 }
 
 fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T> {
@@ -746,28 +859,27 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
-    let (fts_ranked, fts_skipped) = match fts_query {
-        Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
-        None => (Vec::new(), 0),
-    };
-    let incomplete = fts_skipped > 0;
 
     let run_hybrid = match embedder {
         Some(_) => match has_vec_data(conn) {
             Ok(has_data) => has_data,
             Err(e) => {
                 warn!(error = %e, "vec_chunks probe failed, using text search only");
-                return fts_only_outcome(
-                    conn, fts_query, fts_ranked, opts, now_ms, true, incomplete,
-                );
+                return keyword_only_outcome(conn, fts_query, opts, now_ms, true);
             }
         },
         None => false,
     };
 
     let Some(embedder) = embedder.filter(|_| run_hybrid) else {
-        return fts_only_outcome(conn, fts_query, fts_ranked, opts, now_ms, false, incomplete);
+        return keyword_only_outcome(conn, fts_query, opts, now_ms, false);
     };
+
+    let (fts_ranked, fts_skipped) = match fts_query {
+        Some(q) => find_candidate_sessions(conn, opts, q, now_ms)?,
+        None => (Vec::new(), 0),
+    };
+    let incomplete = fts_skipped > 0;
 
     let candidate_limit = opts.limit * CANDIDATE_LIMIT_MULTIPLIER;
 
@@ -833,30 +945,27 @@ pub fn search_with_embedder<'q>(
     })
 }
 
-fn fts_only_outcome(
+fn keyword_only_outcome(
     conn: &Connection,
     fts_query: Option<&str>,
-    fts_ranked: Vec<(String, f64)>,
     opts: &SearchOptions,
     now_ms: i64,
     vec_degraded: bool,
-    incomplete: bool,
 ) -> Result<SearchOutcome> {
-    if fts_ranked.is_empty() {
+    let Some(q) = fts_query else {
         return Ok(SearchOutcome {
             results: Vec::new(),
             vec_degraded,
-            results_incomplete: incomplete,
+            results_incomplete: false,
         });
-    }
-    let requested = fts_ranked.len();
-    let mut meta_map = fetch_session_metadata(conn, &fts_ranked)?;
-    let incomplete = incomplete || meta_map.len() < requested;
-    let candidates = fetch_chunks(conn, fts_query, fts_ranked, &mut meta_map, &HashMap::new())?;
+    };
+    let found = find_keyword_sessions(conn, opts, q, now_ms)?;
+    let (ranked, mut meta_map) = rank_sessions(found.ranked, now_ms, opts.limit);
+    let candidates = fetch_chunks(conn, fts_query, ranked, &mut meta_map, &HashMap::new())?;
     Ok(SearchOutcome {
-        results: score_and_sort(candidates, now_ms, opts.limit),
+        results: candidates.into_iter().map(|(_, r)| r).collect(),
         vec_degraded,
-        results_incomplete: incomplete,
+        results_incomplete: found.incomplete,
     })
 }
 
