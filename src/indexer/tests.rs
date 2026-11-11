@@ -1329,109 +1329,211 @@ fn test_session_id_collision_cleans_old_messages() {
     );
 }
 
-#[test]
-fn model_absent_session_id_collision_preserves_data_until_embedding_is_available() {
-    for remove_original in [false, true] {
-        let (_dir, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let claude_dir = tmp.path().join("claude");
-        let dir_a = claude_dir.join("a");
-        let dir_b = claude_dir.join("b");
-        fs::create_dir_all(&dir_a).unwrap();
-        fs::create_dir_all(&dir_b).unwrap();
-        let original = dir_a.join("collision.jsonl");
-        fs::write(
-            &original,
-            concat!(
-                r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-                "\ninvalid JSON\n",
-            ),
-        )
-        .unwrap();
-        let codex_dir = tmp.path().join("codex");
-        let opts = IndexOptions {
+struct CollidingLogs {
+    _tmp: TempDir,
+    claude_dir: PathBuf,
+    codex_dir: PathBuf,
+    original: PathBuf,
+    replacement: PathBuf,
+}
+
+impl CollidingLogs {
+    fn opts(&self) -> IndexOptions<'_> {
+        IndexOptions {
             force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
+            claude_dir: &self.claude_dir,
+            codex_dir: &self.codex_dir,
             codex_archived_dir: None,
-        };
-        assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 1);
-        let embedder = MockEmbedder::new();
-        assert_eq!(
-            embed_recent_chunks(&mut conn, &embedder, 8192, None)
-                .unwrap()
-                .embedded,
-            1
-        );
-
-        let snapshot = |conn: &Connection| {
-            [
-                "SELECT json_array(session_id, file_path, mtime, file_size, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
-                "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
-                "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
-                "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
-                "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
-            ]
-            .map(|sql| collect_strings(conn, sql))
-        };
-        seed_session_file(&conn, "collision", "/proj/original.rs");
-        let before = snapshot(&conn);
-        let replacement = dir_b.join("collision.jsonl");
-        fs::write(
-            &replacement,
-            r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
-        )
-        .unwrap();
-
-        assert!(original.is_file());
-        if remove_original {
-            fs::remove_file(&original).unwrap();
         }
-        for _ in 0..2 {
-            let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-            assert_eq!(stats.indexed, 0);
-            assert_eq!(stats.preserved_embedded, 1);
-            assert_eq!(stats.total_sessions, 1);
-            assert_eq!(stats.parse_diagnostics.len(), 1);
-            assert_eq!(stats.parse_diagnostics[0].file_path, original);
-            assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
-            assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
-            assert_eq!(snapshot(&conn), before);
-        }
-
-        let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-        assert_eq!(stats.indexed, 1);
-        assert_eq!(stats.preserved_embedded, 0);
-        assert_eq!(stats.parse_diagnostics.len(), usize::from(!remove_original));
-        assert_eq!(stats.total_sessions, 1);
-        assert_eq!(
-            collect_strings(&conn, "SELECT file_path FROM sessions"),
-            [replacement.to_str().unwrap()]
-        );
-        assert_eq!(
-            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-            ["replacement question"]
-        );
-        for table in ["vec_chunks", "session_files"] {
-            let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(count, 0, "old {table} must be removed on replacement");
-        }
-        assert_eq!(index_chunks(&mut conn, None).unwrap().chunks_created, 0);
-        assert_eq!(
-            collect_strings(&conn, "SELECT content FROM qa_chunks"),
-            ["replacement question"]
-        );
-        fs::remove_file(&replacement).unwrap();
-        if !remove_original {
-            fs::remove_file(&original).unwrap();
-        }
-        let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
-        assert_eq!(stats.total_sessions, 0);
-        assert!(stats.parse_diagnostics.is_empty());
     }
+}
+
+/// Indexes and embeds `a/collision.jsonl` (one question plus one invalid line), records a
+/// touched file for it, then writes `b/collision.jsonl`, which carries the same session id.
+fn embedded_session_and_a_log_reusing_its_id(conn: &mut Connection) -> CollidingLogs {
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude");
+    fs::create_dir_all(claude_dir.join("a")).unwrap();
+    fs::create_dir_all(claude_dir.join("b")).unwrap();
+    let logs = CollidingLogs {
+        claude_dir: claude_dir.clone(),
+        codex_dir: tmp.path().join("codex"),
+        original: claude_dir.join("a/collision.jsonl"),
+        replacement: claude_dir.join("b/collision.jsonl"),
+        _tmp: tmp,
+    };
+    fs::write(
+        &logs.original,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"original question"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+            "\ninvalid JSON\n",
+        ),
+    )
+    .unwrap();
+    index_from_dirs(conn, &logs.opts(), true).unwrap();
+    index_chunks(conn, None).unwrap();
+    embed_recent_chunks(conn, &MockEmbedder::new(), 100, None).unwrap();
+    seed_session_file(conn, "collision", "/proj/original.rs");
+    fs::write(
+        &logs.replacement,
+        r#"{"type":"user","message":{"role":"user","content":"replacement question"},"timestamp":"2026-03-02T00:00:00Z"}"#,
+    )
+    .unwrap();
+    logs
+}
+
+fn collision_snapshot(conn: &Connection) -> [Vec<String>; 5] {
+    [
+        "SELECT json_array(session_id, file_path, mtime, file_size, chunks_indexed, files_scanned) FROM sessions ORDER BY session_id",
+        "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
+        "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) FROM qa_chunks ORDER BY id",
+        "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
+        "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
+    ]
+    .map(|sql| collect_strings(conn, sql))
+}
+
+fn invalid_json_lines_by_file(stats: &IndexStats) -> Vec<(PathBuf, i64)> {
+    stats
+        .parse_diagnostics
+        .iter()
+        .map(|d| (d.file_path.clone(), d.lines.invalid_json_lines))
+        .collect()
+}
+
+fn assert_the_session_holds_only_the_replacement(conn: &mut Connection, replacement: &Path) {
+    assert_eq!(
+        collect_strings(conn, "SELECT file_path FROM sessions"),
+        [replacement.to_str().unwrap()]
+    );
+    assert_eq!(
+        collect_strings(conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["replacement question"]
+    );
+    let vectors: i64 = conn
+        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(vectors, 0, "the old embedding is removed");
+    assert!(
+        collect_strings(conn, "SELECT path FROM session_files").is_empty(),
+        "the old touched file is removed"
+    );
+    index_chunks(conn, None).unwrap();
+    assert_eq!(
+        collect_strings(conn, "SELECT content FROM qa_chunks"),
+        ["replacement question"]
+    );
+}
+
+#[test]
+fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_session() {
+    let (_dir, mut conn) = setup_test_db();
+    let logs = embedded_session_and_a_log_reusing_its_id(&mut conn);
+    let before = collision_snapshot(&conn);
+
+    let first = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            first.indexed,
+            first.preserved_embedded,
+            first.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&first),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+    let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            second.indexed,
+            second.preserved_embedded,
+            second.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&second),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+
+    let with_model = index_from_dirs(&mut conn, &logs.opts(), true).unwrap();
+    assert_eq!(
+        (
+            with_model.indexed,
+            with_model.preserved_embedded,
+            with_model.total_sessions
+        ),
+        (1, 0, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&with_model),
+        [(logs.original.clone(), 1)]
+    );
+    assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
+
+    fs::remove_file(&logs.original).unwrap();
+    fs::remove_file(&logs.replacement).unwrap();
+    let emptied = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(emptied.total_sessions, 0);
+    assert!(emptied.parse_diagnostics.is_empty());
+}
+
+#[test]
+fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then_replaces_it() {
+    let (_dir, mut conn) = setup_test_db();
+    let logs = embedded_session_and_a_log_reusing_its_id(&mut conn);
+    let before = collision_snapshot(&conn);
+    fs::remove_file(&logs.original).unwrap();
+
+    let first = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            first.indexed,
+            first.preserved_embedded,
+            first.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&first),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+    let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(
+        (
+            second.indexed,
+            second.preserved_embedded,
+            second.total_sessions
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        invalid_json_lines_by_file(&second),
+        [(logs.original.clone(), 1)]
+    );
+    assert_eq!(collision_snapshot(&conn), before);
+
+    let with_model = index_from_dirs(&mut conn, &logs.opts(), true).unwrap();
+    assert_eq!(
+        (
+            with_model.indexed,
+            with_model.preserved_embedded,
+            with_model.total_sessions
+        ),
+        (1, 0, 1)
+    );
+    assert!(with_model.parse_diagnostics.is_empty());
+    assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
+
+    fs::remove_file(&logs.replacement).unwrap();
+    let emptied = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
+    assert_eq!(emptied.total_sessions, 0);
+    assert!(emptied.parse_diagnostics.is_empty());
 }
 
 #[test]
