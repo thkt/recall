@@ -656,31 +656,33 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
 fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_kept_and_reported() {
     let (_dir, mut conn) = setup_test_db();
     let (tmp, claude_dir, _codex_dir) = seed_claude_and_codex(&mut conn);
-
     fs::remove_file(claude_dir.join("c.jsonl")).unwrap();
-    let gone_codex = tmp.path().join("missing_codex");
+    let missing_codex = tmp.path().join("missing_codex");
+
     let stats = index_from_dirs(
         &mut conn,
         &IndexOptions {
             force: false,
             claude_dir: &claude_dir,
-            codex_dir: &gone_codex,
+            codex_dir: &missing_codex,
             codex_archived_dir: None,
         },
         true,
     )
     .unwrap();
 
+    assert_eq!(stats.total_sessions, 1);
     assert_eq!(
-        stats.total_sessions, 1,
-        "the deleted claude file is cleaned, the unscanned codex session is kept"
+        collect_strings(&conn, "SELECT source FROM sessions"),
+        ["codex"]
     );
-    let surviving_source: String = conn
-        .query_row("SELECT source FROM sessions", [], |r| r.get(0))
-        .unwrap();
     assert_eq!(
-        surviving_source, "codex",
-        "the surviving session must be the one whose root was not scanned"
+        stats
+            .skipped_roots
+            .iter()
+            .map(|s| (s.source, s.reason, s.preserved_sessions))
+            .collect::<Vec<_>>(),
+        [(Source::Codex, SkippedReason::MissingRoot, 1)]
     );
 }
 
