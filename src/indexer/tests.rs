@@ -3690,46 +3690,96 @@ fn stored_vectors(conn: &Connection) -> Vec<String> {
     )
 }
 
+const ROLLOUT_META: &str = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
+
+/// The stored session's id, slug, project and start time: every column but the file path.
+fn session_identity(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT json_array(session_id, slug, project, timestamp) FROM sessions",
+    )
+}
+
 #[test]
 fn compressing_a_codex_log_keeps_the_indexed_session_and_its_embeddings() {
-    let meta = r#"{"timestamp":"2026-04-27T00:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","cwd":"/proj"}}"#;
-    for body in [format!("{meta}\n{ROLLOUT_TURNS}"), ROLLOUT_TURNS.to_owned()] {
-        let (_db, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let claude_dir = tmp.path().join("claude_projects");
-        let codex_dir = tmp.path().join("codex_sessions");
-        let day_dir = codex_dir.join("2026/04/27");
-        fs::create_dir_all(&day_dir).unwrap();
-        let plain = day_dir.join(ROLLOUT_NAME);
-        fs::write(&plain, &body).unwrap();
-        let opts = IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        };
-        index_from_dirs(&mut conn, &opts, true).unwrap();
-        index_chunks(&mut conn, None).unwrap();
-        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
-        let row_before = session_row(&conn);
-        let vectors_before = stored_vectors(&conn);
-        assert_eq!(row_before.len(), 1);
-        assert!(!vectors_before.is_empty());
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    let plain = day_dir.join(ROLLOUT_NAME);
+    fs::write(&plain, format!("{ROLLOUT_META}\n{ROLLOUT_TURNS}")).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    let identity_before = session_identity(&conn);
+    let vectors_before = stored_vectors(&conn);
 
-        let compressed = compress_log(&plain);
-        fs::remove_file(&plain).unwrap();
-        let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    let compressed = compress_log(&plain);
+    fs::remove_file(&plain).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
 
-        assert_eq!(stats.total_sessions, 1, "{body}");
-        let row_after = session_row(&conn);
-        assert_eq!(
-            row_after,
-            [row_before[0].replace(plain.to_str().unwrap(), compressed.to_str().unwrap())],
-            "only the file path changes"
-        );
-        assert_eq!(stored_vectors(&conn), vectors_before);
-        assert!(stats.parse_diagnostics.is_empty());
-    }
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [compressed.to_str().unwrap()]
+    );
+    assert_eq!(session_identity(&conn), identity_before);
+    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert!(stats.parse_diagnostics.is_empty());
+}
+
+#[test]
+fn compressing_a_codex_log_that_has_no_session_meta_keeps_the_indexed_session_and_its_embeddings() {
+    let (_db, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let claude_dir = tmp.path().join("claude_projects");
+    let codex_dir = tmp.path().join("codex_sessions");
+    let day_dir = codex_dir.join("2026/04/27");
+    fs::create_dir_all(&day_dir).unwrap();
+    let plain = day_dir.join(ROLLOUT_NAME);
+    fs::write(&plain, ROLLOUT_TURNS).unwrap();
+    let opts = IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None)
+            .unwrap()
+            .embedded,
+        1
+    );
+    let identity_before = session_identity(&conn);
+    let vectors_before = stored_vectors(&conn);
+
+    let compressed = compress_log(&plain);
+    fs::remove_file(&plain).unwrap();
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+
+    assert_eq!(stats.total_sessions, 1);
+    assert_eq!(
+        collect_strings(&conn, "SELECT file_path FROM sessions"),
+        [compressed.to_str().unwrap()]
+    );
+    assert_eq!(session_identity(&conn), identity_before);
+    assert_eq!(stored_vectors(&conn), vectors_before);
+    assert!(stats.parse_diagnostics.is_empty());
 }
 
 #[test]
