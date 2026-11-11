@@ -22,6 +22,12 @@ pub(crate) struct ChunkStats {
 pub(super) const CHUNK_BATCH_SESSIONS: usize = 64;
 pub(super) const CHUNK_BATCH_BYTES: i64 = 8 * 1024 * 1024;
 
+pub(super) const CREATE_CHUNK_MESSAGE_ROWS: &str = "CREATE TEMP TABLE chunk_message_rows (
+         session_id TEXT NOT NULL,
+         message_rowid INTEGER NOT NULL,
+         text_bytes INTEGER NOT NULL,
+         PRIMARY KEY (session_id, message_rowid)
+     ) WITHOUT ROWID;";
 pub(super) const STAGE_CHUNK_MESSAGES: &str =
     "INSERT INTO chunk_message_rows (session_id, message_rowid, text_bytes)
      SELECT m.session_id, m.rowid, length(CAST(m.text AS BLOB))
@@ -119,14 +125,7 @@ pub(crate) fn index_chunks_observed(
 }
 
 fn stage_pending_sessions(tx: &Transaction) -> Result<Vec<PendingChunkSession>> {
-    tx.execute_batch(
-        "CREATE TEMP TABLE chunk_message_rows (
-            session_id TEXT NOT NULL,
-            message_rowid INTEGER NOT NULL,
-            text_bytes INTEGER NOT NULL,
-            PRIMARY KEY (session_id, message_rowid)
-        ) WITHOUT ROWID;",
-    )?;
+    tx.execute_batch(CREATE_CHUNK_MESSAGE_ROWS)?;
     tx.execute(STAGE_CHUNK_MESSAGES, [])?;
     let sessions: Vec<PendingChunkSession> = {
         let mut stmt = tx.prepare(
