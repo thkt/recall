@@ -3224,86 +3224,88 @@ fn embedded_contents(conn: &Connection) -> Vec<String> {
     )
 }
 
-#[test]
-fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
+/// Writes a log the moment an index run reports its enumeration complete, and has a second
+/// connection index, chunk and embed it right away. That writer gets a busy error while the
+/// run holds the writer lock, and indexes the log after the run instead. The session must
+/// then hold the log's messages and the vectors the writer saved.
+///
+/// Both connections run on one thread and the writer does not wait for the lock, so the test
+/// fixes one order. It does not reproduce a second `recall index`, which would wait instead.
+fn assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(embed_capable: bool) {
     use rusqlite::{Error as SqliteError, ErrorCode};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    for embed_capable in [true, false] {
-        let (db_dir, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        let absent = root.join("absent");
-        let opts = IndexOptions {
-            force: false,
-            claude_dir: &root,
-            codex_dir: &absent,
-            codex_archived_dir: None,
-        };
-        let writer = open_db(&db_dir.path().join("test.db")).unwrap();
-        writer.busy_timeout(Duration::ZERO).unwrap();
-        let writer = RefCell::new(writer);
-        let writer_root = root.clone();
-        let saved = Rc::new(RefCell::new(None));
-        let writer_saved = Rc::clone(&saved);
-        let index_new = Rc::new(move || -> Result<()> {
-            let mut writer = writer.borrow_mut();
-            let absent = writer_root.join("absent");
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: &writer_root,
-                codex_dir: &absent,
-                codex_archived_dir: None,
-            };
-            index_from_dirs(&mut writer, &opts, true)?;
-            index_chunks(&mut writer)?;
-            assert_eq!(
-                embed_recent_chunks(&mut writer, &MockEmbedder::new(), 100, None)?.embedded,
-                1
+    let (db_dir, mut conn) = setup_test_db();
+    let log = Rc::new(OneLog::new("claude", "new.jsonl"));
+    let writer = open_db(&db_dir.path().join("test.db")).unwrap();
+    writer.busy_timeout(Duration::ZERO).unwrap();
+    let writer = RefCell::new(writer);
+    let writer_log = Rc::clone(&log);
+    let saved = Rc::new(RefCell::new(None));
+    let writer_saved = Rc::clone(&saved);
+    let index_new = Rc::new(move || -> Result<()> {
+        let mut writer = writer.borrow_mut();
+        index_from_dirs(&mut writer, &writer_log.opts(), true)?;
+        index_chunks(&mut writer)?;
+        assert_eq!(
+            embed_recent_chunks(&mut writer, &MockEmbedder::new(), 100, None)?.embedded,
+            1
+        );
+        *writer_saved.borrow_mut() = Some(chunk_vectors(&writer));
+        Ok(())
+    });
+    let attempted = Rc::new(Cell::new(false));
+    let observer_attempted = Rc::clone(&attempted);
+    let observer_index = Rc::clone(&index_new);
+    let path = log.file.clone();
+    let observer = Observer::with_reporter(move |line| {
+        if line.starts_with("index: enumeration: complete") {
+            assert!(!observer_attempted.replace(true));
+            write_reuse_conversation(
+                &path,
+                &[("user", "new question"), ("assistant", "new answer")],
             );
-            *writer_saved.borrow_mut() = Some(chunk_vectors(&writer));
-            Ok(())
-        });
-        let attempted = Rc::new(Cell::new(false));
-        let observer_attempted = Rc::clone(&attempted);
-        let observer_index = Rc::clone(&index_new);
-        let path = root.join("new.jsonl");
-        let observer = Observer::with_reporter(move |line| {
-            if line.starts_with("index: enumeration: complete") {
-                assert!(!observer_attempted.replace(true));
-                write_reuse_conversation(
-                    &path,
-                    &[("user", "new question"), ("assistant", "new answer")],
+            // Not unwrap_err: if the run let the writer in, the outcome asserts must report it.
+            if let Err(error) = observer_index() {
+                assert_eq!(
+                    error
+                        .downcast_ref::<SqliteError>()
+                        .and_then(SqliteError::sqlite_error_code),
+                    Some(ErrorCode::DatabaseBusy),
+                    "only writer contention permits a retry: {error:#}"
                 );
-                if let Err(error) = observer_index() {
-                    assert_eq!(
-                        error
-                            .downcast_ref::<SqliteError>()
-                            .and_then(SqliteError::sqlite_error_code),
-                        Some(ErrorCode::DatabaseBusy),
-                        "only writer contention permits a retry: {error:#}"
-                    );
-                }
             }
-        });
-
-        index_from_dirs_observed(&mut conn, &opts, embed_capable, &observer).unwrap();
-        assert!(attempted.get());
-        if saved.borrow().is_none() {
-            index_new().unwrap();
         }
-        assert_eq!(
-            collect_strings(&conn, "SELECT session_id FROM sessions"),
-            ["new"]
-        );
-        assert_eq!(
-            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-            ["new question", "new answer"]
-        );
-        assert_eq!(chunk_vectors(&conn).len(), 1);
-        assert_eq!(chunk_vectors(&conn), *saved.borrow().as_ref().unwrap());
+    });
+
+    index_from_dirs_observed(&mut conn, &log.opts(), embed_capable, &observer).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert!(attempted.get());
+    // Not unconditional: indexing again would restore a session the run's cleanup deleted.
+    if saved.borrow().is_none() {
+        index_new().unwrap();
     }
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["new"]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["new question", "new answer"]
+    );
+    assert_eq!(embedded_contents(&conn), ["new question\nnew answer"]);
+    assert_eq!(chunk_vectors(&conn), *saved.borrow().as_ref().unwrap());
+}
+
+#[test]
+fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
+    assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(true);
+}
+
+#[test]
+fn a_session_indexed_after_enumeration_survives_orphan_cleanup_by_a_model_absent_run() {
+    assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(false);
 }
 
 const REUSE_CONVERSATION: [(&str, &str); 6] = [
