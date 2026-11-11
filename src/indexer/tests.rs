@@ -4237,10 +4237,10 @@ fn missing_archived_root_keeps_its_sessions_and_still_removes_sessions_deleted_e
             .collect::<Vec<_>>(),
         [(Source::Codex, SkippedReason::MissingRoot, 1)]
     );
-    let note = stats.skipped_roots[0].note();
-    assert!(
-        note.contains("reconciled the rest") && !note.contains("none deleted this run"),
-        "the other Codex root was cleaned, so the note must not claim nothing was deleted: {note}"
+    assert_eq!(
+        stats.skipped_roots[0].note(),
+        "a codex root is unavailable — preserved 1 existing session(s) under it and reconciled the rest; re-run `recall index` once the root is back so a full scan can reconcile them",
+        "the other Codex root was cleaned, so the note must not claim nothing was deleted"
     );
 }
 
