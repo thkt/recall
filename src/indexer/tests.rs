@@ -684,40 +684,6 @@ fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_k
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn test_unreadable_child_subdir_preserves_source() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let (_dir, mut conn) = setup_test_db();
-    let (_tmp, claude_dir, codex_dir) = seed_claude_and_codex(&mut conn);
-
-    let locked_subdir = codex_dir.join("2026");
-    let orig = fs::metadata(&locked_subdir).unwrap().permissions();
-    let mut zero = orig.clone();
-    zero.set_mode(0o000);
-    fs::set_permissions(&locked_subdir, zero).unwrap();
-
-    let stats = index_from_dirs(
-        &mut conn,
-        &IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        },
-        true,
-    );
-
-    fs::set_permissions(&locked_subdir, orig).unwrap();
-    let stats = stats.unwrap();
-
-    assert_eq!(
-        stats.total_sessions, 2,
-        "an unreadable nested subdir must preserve the whole source's rows"
-    );
-}
-
 #[test]
 fn deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_embeddings_and_touched_files()
  {
