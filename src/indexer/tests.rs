@@ -2661,8 +2661,10 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
         "FTS is the single outer scan: {stage:?}"
     );
     assert!(
-        stage[1].starts_with("SEARCH s ") && stage[1].ends_with("(session_id=?)"),
-        "each staged message probes sessions by key: {stage:?}"
+        stage[1].starts_with("SEARCH s ")
+            && stage[1].ends_with("(session_id=?)")
+            && !stage[1].contains("AUTOMATIC"),
+        "each staged message probes sessions by their key index, not an automatic one: {stage:?}"
     );
     let read = query_plan(&conn, READ_CHUNK_BATCH, &["s000", "s064"]);
     assert_eq!(read.len(), 2, "{read:?}");
