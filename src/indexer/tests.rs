@@ -1927,8 +1927,9 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
     let claude_dir = tmp.path().join("claude_projects");
     fs::create_dir_all(&claude_dir).unwrap();
     let path = claude_dir.join("s1.jsonl");
-    let assistant = r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":"hi there"},"timestamp":"2026-03-01T00:00:00Z"}"#;
-    fs::write(&path, assistant).unwrap();
+    let answer = r#"{"type":"assistant","cwd":"/proj","message":{"role":"assistant","content":"hi there"},"timestamp":"2026-03-01T00:00:00Z"}"#;
+    let question = r#"{"type":"user","message":{"role":"user","content":"hello"}}"#;
+    fs::write(&path, answer).unwrap();
     let codex_dir = tmp.path().join("codex_sessions");
     let opts = IndexOptions {
         force: false,
@@ -1936,60 +1937,72 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    let first = index_chunks(&mut conn, None).unwrap();
+    assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+    let first = Observer::default();
+    index_chunks_observed(&mut conn, None, &first).unwrap();
     assert_eq!(
-        (
-            first.chunks_created,
-            first.sessions_chunked,
-            first.messages_read
-        ),
-        (0, 1, 1)
+        first.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 1,
+            "sessions_chunked_empty": 1,
+        })
     );
+    assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
 
     drop(conn);
     let mut conn = open_db(&dir.path().join("test.db")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
-    let unchanged = index_chunks(
-        &mut conn,
-        Some(&|_, _| panic!("unchanged session processed")),
-    )
-    .unwrap();
+    let (unchanged, lines) = recording();
+    let stats = index_chunks_observed(&mut conn, None, &unchanged).unwrap();
+    // Performance guard (docs/audit/2026-09-20-chunk-index.md): a session already chunked to
+    // nothing costs no FTS scan, no body batch and no message read.
     assert_eq!(
         (
-            unchanged.chunks_created,
-            unchanged.sessions_chunked,
-            unchanged.messages_read,
-            unchanged.message_scans,
-            unchanged.message_batches
+            stats.message_scans,
+            stats.message_batches,
+            stats.messages_read
         ),
-        (0, 0, 0, 0, 0)
+        (0, 0, 0)
+    );
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: chunking: started (not yet complete)",
+            "index: chunking: no pending sessions"
+        ]
+    );
+    assert_eq!(
+        unchanged.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 0,
+            "sessions_chunked_empty": 0,
+        })
     );
 
-    fs::write(
-        &path,
-        format!(
-            "{assistant}\n{}",
-            r#"{"type":"user","message":{"role":"user","content":"hello"}}"#
-        ),
-    )
-    .unwrap();
-    conn.execute("UPDATE sessions SET mtime = 0", []).unwrap();
+    fs::write(&path, format!("{answer}\n{question}")).unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    let appended = index_chunks(&mut conn, None).unwrap();
+    let appended = Observer::default();
+    index_chunks_observed(&mut conn, None, &appended).unwrap();
     assert_eq!(
-        (
-            appended.chunks_created,
-            appended.sessions_chunked,
-            appended.messages_read
-        ),
-        (1, 1, 2)
+        appended.snapshot()["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 1,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 1,
+            "sessions_chunked_empty": 0,
+        })
     );
     assert_eq!(
         collect_strings(&conn, "SELECT content FROM qa_chunks"),
         ["hello"]
     );
-    assert_eq!(index_chunks(&mut conn, None).unwrap().sessions_chunked, 0);
 }
 
 #[test]
