@@ -677,6 +677,66 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
     assert_eq!(counts["files_unchanged"], 1);
 }
 
+/// FRESHNESS_QUESTION with another word of the same byte length.
+const FRESHNESS_SAME_SIZE_QUESTION: &str = concat!(
+    r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"modified question"}}"#,
+    "\n",
+);
+
+#[test]
+fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
+    assert_eq!(
+        FRESHNESS_SAME_SIZE_QUESTION.len(),
+        FRESHNESS_QUESTION.len(),
+        "precondition: the rewrite keeps the byte length"
+    );
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, FRESHNESS_QUESTION, t0);
+    index_claude_log_with_parser(&mut conn, &log.file, |path, source| {
+        let parsed = parse_session_including_empty(path, source);
+        rewrite_with_mtime(
+            path,
+            FRESHNESS_SAME_SIZE_QUESTION,
+            t0 + Duration::from_micros(500),
+        );
+        parsed
+    })
+    .commit()
+    .unwrap();
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        fs::metadata(&log.file).unwrap().modified().unwrap(),
+        t0 + Duration::from_micros(500),
+        "precondition: the file system keeps a submillisecond mtime"
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["original question"],
+        "precondition: the read finished before the rewrite"
+    );
+
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+    index_chunks(&mut conn, None).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages"),
+        ["modified question"]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT content FROM qa_chunks"),
+        ["modified question"]
+    );
+    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    assert_eq!(counts["files_updated"], 0);
+    assert_eq!(counts["files_unchanged"], 1);
+}
+
 #[test]
 fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
     let db_dir = TempDir::new().unwrap();
