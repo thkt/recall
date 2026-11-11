@@ -2582,38 +2582,35 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
 
 #[test]
 fn chunk_batches_limit_session_count_and_source_bytes() {
-    let small = vec![("s".to_owned(), None, 1); CHUNK_BATCH_SESSIONS + 1];
-    assert_eq!(chunk_batch_len(&small), 64);
-    let sizes = [
-        CHUNK_BATCH_BYTES / 2,
-        CHUNK_BATCH_BYTES / 2,
-        1,
-        CHUNK_BATCH_BYTES + 1,
-        0,
-    ];
-    let sessions: Vec<_> = sizes
-        .iter()
-        .map(|size| ("s".to_owned(), None, *size))
-        .collect();
+    // Performance guard (docs/audit/2026-09-20-chunk-index.md): a body batch holds at most 64
+    // sessions and 8 MiB of message text, and a session over 8 MiB is read alone. The guard
+    // calls the private chunk_batch_len with session sizes, because reaching 8 MiB through
+    // index_chunks would need megabytes of message text.
+    let one_byte = ("s".to_owned(), None, 1);
+    let four_mib = ("s".to_owned(), None, 4_194_304);
+    let over_eight_mib = ("s".to_owned(), None, 8_388_609);
+    let no_bytes = ("s".to_owned(), None, 0);
+
+    assert_eq!(chunk_batch_len(&vec![one_byte.clone(); 65]), 64);
     assert_eq!(
-        chunk_batch_len(&sessions),
+        chunk_batch_len(&[four_mib.clone(), four_mib, one_byte.clone()]),
         2,
-        "exact byte budget is allowed"
+        "exactly 8 MiB fits in one batch"
     );
     assert_eq!(
-        chunk_batch_len(&sessions[2..]),
+        chunk_batch_len(&[one_byte, over_eight_mib.clone()]),
         1,
-        "do not add an oversized session"
+        "an oversized session is not added to a batch"
     );
     assert_eq!(
-        chunk_batch_len(&sessions[3..]),
+        chunk_batch_len(&[over_eight_mib, no_bytes.clone()]),
         1,
-        "oversized conversation runs alone"
+        "an oversized session is read alone"
     );
     assert_eq!(
-        chunk_batch_len(&sessions[4..]),
+        chunk_batch_len(&[no_bytes]),
         1,
-        "empty conversation still finishes"
+        "a session without text still forms a batch"
     );
 }
 

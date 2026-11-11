@@ -8,10 +8,7 @@ pub(crate) use backfill::{backfill_rowid_ranges, backfill_session_files};
 pub(crate) use chunks::index_chunks;
 pub(crate) use chunks::index_chunks_observed;
 #[cfg(test)]
-use chunks::{
-    CHUNK_BATCH_BYTES, CHUNK_BATCH_SESSIONS, READ_CHUNK_BATCH, STAGE_CHUNK_MESSAGES,
-    chunk_batch_len,
-};
+use chunks::{READ_CHUNK_BATCH, STAGE_CHUNK_MESSAGES, chunk_batch_len};
 pub use diagnostics::FileParseDiagnostics;
 pub(crate) use diagnostics::load_parse_diagnostics;
 use diagnostics::{cleanup_parse_diagnostics, save_parse_diagnostics, save_read_error};
