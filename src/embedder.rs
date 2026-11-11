@@ -38,7 +38,7 @@ impl EmbedResult {
     }
 }
 
-pub(crate) const EMBED_BATCH_SIZE: usize = 128;
+const EMBED_BATCH_SIZE: usize = 128;
 const PENDING_PAGE_CHUNKS: usize = 1024;
 const PENDING_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
