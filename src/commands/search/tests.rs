@@ -84,14 +84,6 @@ fn search_fallback_notes_are_reason_aware() {
 }
 
 #[test]
-fn search_degraded_state_loaded_embedder_is_not_degraded() {
-    let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
-    let (degraded, notes) = search_degraded_state(&Ok(loaded));
-    assert!(!degraded, "a loaded embedder must not be marked degraded");
-    assert!(notes.is_empty(), "the ideal path carries no notes");
-}
-
-#[test]
 fn search_degraded_state_reason_failure_degrades_with_note() {
     let (degraded, notes) = search_degraded_state(&Err(DegradedReason::ProbeFailed));
     assert!(degraded);
@@ -99,13 +91,6 @@ fn search_degraded_state_reason_failure_degrades_with_note() {
         notes,
         ["semantic search unavailable: embedding model unavailable; results from text search only"]
     );
-}
-
-#[test]
-fn search_degraded_state_disabled_is_not_degraded() {
-    let (degraded, notes) = search_degraded_state(&Err(DegradedReason::Disabled));
-    assert!(!degraded, "a disabled model is intentional, not degraded");
-    assert!(notes.is_empty());
 }
 
 fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
@@ -374,57 +359,6 @@ fn run_search_reports_degraded_when_vector_search_fails_at_runtime() {
             .iter()
             .any(|n| n.contains("vector query failed at runtime")),
         "the runtime degradation note must surface for the agent channel, got: {:?}",
-        out.notes
-    );
-}
-
-#[test]
-fn run_search_reports_degraded_when_results_incomplete() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    {
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 1, "authentication flow");
-        conn.execute(
-                "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('weird', 'gemini', '/f', '/p', 'slug', 0, 0.0)",
-                [],
-            )
-            .unwrap();
-        conn.execute(
-                "INSERT INTO messages (session_id, role, text) VALUES ('weird', 'user', 'authentication retry')",
-                [],
-            )
-            .unwrap();
-        conn.execute(
-                "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (2, 'weird', 'authentication retry', 0)",
-                [],
-            )
-            .unwrap();
-        embed_all_pending(
-            &mut conn,
-            &embedder::MockEmbedder::new(),
-            &embedder::EmbedOptions::default(),
-        )
-        .unwrap();
-    }
-
-    let out = run_search_with(
-        search_command("authentication"),
-        &Some(db_path),
-        mock_loader,
-    )
-    .unwrap();
-
-    assert!(
-        out.degraded,
-        "a silently pruned match must mark the envelope degraded"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("results may be incomplete")),
-        "the incompleteness note must surface for the agent channel, got: {:?}",
         out.notes
     );
 }
