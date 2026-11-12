@@ -2908,6 +2908,15 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
 }
 
 #[cfg(unix)]
+#[path = "../../tests/support/root_skip.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "src/db/tests.rs loads the same support file"
+)]
+#[allow(dead_code, reason = "this file calls only skip_if_root")]
+mod root_skip;
+
+#[cfg(unix)]
 #[test]
 fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadata() {
     use std::os::unix::fs::PermissionsExt;
@@ -2932,9 +2941,16 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
         )],
     );
 
+    let probe = TempDir::new().unwrap();
+    fs::set_permissions(probe.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    if root_skip::skip_if_root(probe.path()) {
+        return;
+    }
+    let permissions = fs::metadata(&log.file).unwrap().permissions();
     fs::set_permissions(&log.file, fs::Permissions::from_mode(0o000)).unwrap();
-    let unreadable = index_from_dirs(&mut conn, &log.rebuild_opts(), true).unwrap();
-    fs::set_permissions(&log.file, fs::Permissions::from_mode(0o644)).unwrap();
+    let unreadable = index_from_dirs(&mut conn, &log.rebuild_opts(), true);
+    fs::set_permissions(&log.file, permissions).unwrap();
+    let unreadable = unreadable.unwrap();
     index_chunks(&mut conn).unwrap();
     assert_eq!((unreadable.indexed, unreadable.total_sessions), (0, 1));
     assert_reported_diagnostics(
