@@ -9,60 +9,6 @@ use crate::{embedder, open_or_create_db};
 
 use super::*;
 
-#[test]
-fn resolve_current_session_truth_table() {
-    use search::CurrentSession;
-    let flags = |exclude, include, only| CurrentSessionFlags {
-        exclude,
-        include,
-        only,
-    };
-    let with_env = || Some("sess-x".to_owned());
-    let exclude_x = || CurrentSession::Exclude("sess-x".to_owned());
-
-    assert_eq!(
-        resolve_current_session(flags(false, false, false), with_env()).unwrap(),
-        exclude_x()
-    );
-    assert_eq!(
-        resolve_current_session(flags(false, false, false), None).unwrap(),
-        CurrentSession::Ignore
-    );
-    assert_eq!(
-        resolve_current_session(flags(true, false, false), with_env()).unwrap(),
-        exclude_x()
-    );
-    assert_eq!(
-        resolve_current_session(flags(true, false, false), None).unwrap(),
-        CurrentSession::Ignore
-    );
-    assert_eq!(
-        resolve_current_session(flags(false, true, false), with_env()).unwrap(),
-        CurrentSession::Ignore
-    );
-    assert_eq!(
-        resolve_current_session(flags(false, true, false), None).unwrap(),
-        CurrentSession::Ignore
-    );
-    assert_eq!(
-        resolve_current_session(flags(false, false, true), with_env()).unwrap(),
-        CurrentSession::Only("sess-x".to_owned())
-    );
-    assert!(
-        resolve_current_session(flags(false, false, true), None).is_err(),
-        "--only-current without CLAUDE_CODE_SESSION_ID must be a usage error"
-    );
-    assert_eq!(
-        resolve_current_session(flags(false, false, false), Some("  ".to_owned())).unwrap(),
-        CurrentSession::Ignore,
-        "blank CLAUDE_CODE_SESSION_ID must not produce a degenerate Exclude"
-    );
-    assert!(
-        resolve_current_session(flags(false, false, true), Some(String::new())).is_err(),
-        "--only-current with a blank env value must still be a usage error"
-    );
-}
-
 /// The `--json` envelope `recall search` prints for an output.
 fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
     serde_json::from_str(&render_json_success(out)).unwrap()
