@@ -851,8 +851,21 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
     .unwrap();
 
     assert_eq!(
-        outcome.preserved_embedded, 0,
-        "a cached session without embeddings must not be preserved"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+            ],
+        }),
+        "a cached session without embeddings is not preserved"
     );
     let conn = open_or_create_db(&db_path).unwrap();
     let search_opts = search::SearchOptions::default();
