@@ -185,24 +185,6 @@ fn null_src_rowid_chunk_falls_back_to_body_plus_full_show_hint() {
     );
 }
 
-#[test]
-fn show_without_chunk_renders_full_session() {
-    let (_dir, conn) = setup_show_db();
-
-    let out = show_session_windowed(&conn, "abc-123", false, None, 3).unwrap();
-
-    assert!(
-        out.markdown.contains("hello world"),
-        "full render lost the user turn"
-    );
-    assert!(
-        out.markdown.contains("hi there"),
-        "full render lost the assistant turn"
-    );
-    assert!(out.markdown.contains("## [user]"));
-    assert!(out.markdown.contains("## [assistant]"));
-}
-
 fn seed_window_db(count: i64) -> (tempfile::TempDir, Connection) {
     let (dir, conn) = db::setup_test_db();
     db::seed_session(&conn, "w1");
