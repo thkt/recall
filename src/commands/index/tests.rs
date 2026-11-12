@@ -1580,7 +1580,11 @@ fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characte
         degraded_note: None,
         embedded: 0,
         failed_count: 2,
-        first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
+        first_error: Some(format!(
+            "batch: \x1b[31mboom\x1b[0m {}{}",
+            "e".repeat(100),
+            "界".repeat(200)
+        )),
         skipped_roots: Vec::new(),
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1600,8 +1604,9 @@ fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characte
             },
             "degraded": true,
             "notes": [format!(
-                "2 chunk(s) failed to embed (batch: boom {}); rerun `recall index` to retry",
-                "e".repeat(108)
+                "2 chunk(s) failed to embed (batch: boom {}{}); rerun `recall index` to retry",
+                "e".repeat(100),
+                "界".repeat(8)
             )],
         })
     );
