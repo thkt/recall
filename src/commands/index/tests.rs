@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
 use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
 use crate::{parser, search};
@@ -30,6 +31,18 @@ fn seed_claude_source(claude_dir: &Path) {
         .unwrap();
 }
 
+/// The `--json` envelope `recall index` prints for a run, without `data.observations`, whose
+/// stage seconds change from run to run.
+fn printed_json(outcome: &IndexOutcome) -> serde_json::Value {
+    let printed = render_json_success(&index_command_output(outcome));
+    let mut envelope: serde_json::Value = serde_json::from_str(&printed).unwrap();
+    envelope["data"]
+        .as_object_mut()
+        .unwrap()
+        .remove("observations");
+    envelope
+}
+
 #[test]
 fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
     let db_dir = tempfile::TempDir::new().unwrap();
@@ -46,26 +59,37 @@ fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
     };
 
     let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
-    let options = embedder::EmbedOptions {
-        token_budget: Some(2048),
-        forward_pause: Some(Duration::from_millis(700)),
-    };
 
-    let result = index_and_report_observed(
+    let outcome = index_and_report_observed(
         &Some(db_path),
         &opts,
         || Ok(embedder.clone()),
-        options,
+        embed_options_from_flags(Some(2048), Some(700)),
         &index_observer::Observer::stderr(),
     )
     .unwrap();
 
-    assert_eq!(result.embedded, 1);
     assert_eq!(
         embedder.captured_options(),
-        Some(options),
-        "--token-budget 2048 --forward-pause-ms 700 must forward as \
-             EmbedOptions{{token_budget:Some(2048), forward_pause:Some(700ms)}}"
+        Some(embedder::EmbedOptions {
+            token_budget: Some(2048),
+            forward_pause: Some(Duration::from_millis(700)),
+        }),
+        "--token-budget 2048 --forward-pause-ms 700 reach the embedder as 2048 tokens and a 700 ms pause"
+    );
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 1,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
