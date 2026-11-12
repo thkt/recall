@@ -817,59 +817,67 @@ fn u002_fts_hit_json_carries_chunk_id_and_inspect_guidance() {
 }
 
 #[test]
-fn u002_vector_hit_json_carries_chunk_id_and_inspect_guidance() {
-    let (_dir, conn) = db::setup_test_db();
-    let now_ms = 1_750_000_000_000_i64;
-    let sid = "0f9e8d7c-6b5a-4321-fedc-ba9876543210";
-    conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
-             VALUES (?1, 'claude', '', '/proj', ?1, ?2, 0.0)",
-        rusqlite::params![sid, now_ms],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) \
-             VALUES (?1, 'user', 'gardening and weather notes')",
-        [sid],
-    )
-    .unwrap();
-    let embedding = embedder::MockEmbedder::deterministic_vector("authentication");
-    let embedding_bytes: &[u8] = embedder::f32_as_bytes(&embedding);
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
-             VALUES (7, ?1, 'authentication', ?2)",
-        rusqlite::params![sid, now_ms],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (7, ?1)",
-        rusqlite::params![embedding_bytes],
+fn search_shows_a_vector_only_match_with_its_closest_chunk_and_a_chunk_inspect_line() {
+    // No message holds the query word, so only the vector search finds the session.
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    {
+        let conn = open_or_create_db(&db_path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('0f9e8d7c-6b5a-4321-fedc-ba9876543210', 'claude', '/f', '/proj', 'garden-notes', 1709251200000, 0.0);
+             INSERT INTO messages (session_id, role, text)
+                 VALUES ('0f9e8d7c-6b5a-4321-fedc-ba9876543210', 'user', 'gardening and weather notes');
+             INSERT INTO qa_chunks (id, session_id, content, timestamp)
+                 VALUES (7, '0f9e8d7c-6b5a-4321-fedc-ba9876543210', 'authentication', 1709251200000);",
+        )
+        .unwrap();
+        let embedding = embedder::MockEmbedder::deterministic_vector("authentication");
+        conn.execute(
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 7, 0)",
+            [embedder::f32_as_bytes(&embedding)],
+        )
+        .unwrap();
+    }
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        mock_loader,
     )
     .unwrap();
 
-    let mock = embedder::MockEmbedder::new();
-    let opts = search::SearchOptions {
-        now_ms: Some(now_ms),
-        ..Default::default()
-    };
-    let outcome =
-        search::search_with_embedder(&conn, "authentication", &opts, Some(&mock)).unwrap();
-    let hit = outcome
-        .results
-        .iter()
-        .find(|r| r.session.session_id == sid)
-        .expect("setup guard: the vector leg must surface the session");
-
-    let json = result_to_json(hit);
     assert_eq!(
-        json["chunk"],
-        serde_json::json!(7),
-        "a vector-tier hit must expose its closest chunk id as the drill-down anchor, got: {json}"
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | garden-notes | proj [claude]\n",
+            "    /proj\n",
+            "    ID: 0f9e8d7c-6b5a-4321-fedc-ba9876543210\n",
+            "    > authentication\n",
+            "    inspect: recall show 0f9e8d7c-6b5a-4321-fedc-ba9876543210 --chunk 7 --window 3\n",
+            "\n",
+        )
     );
-    let payload = json.to_string();
-    assert!(
-        payload.contains(&format!("recall show {sid} --chunk 7 --window 3")),
-        "the vector hit must carry the inspect guidance line with the full (un-shortened) session_id, got: {payload}"
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": 7,
+                    "excerpt": "authentication",
+                    "inspect": "recall show 0f9e8d7c-6b5a-4321-fedc-ba9876543210 --chunk 7 --window 3",
+                    "project": "/proj",
+                    "session_id": "0f9e8d7c-6b5a-4321-fedc-ba9876543210",
+                    "slug": "garden-notes",
+                    "source": "claude",
+                    "timestamp": 1709251200000_i64,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
