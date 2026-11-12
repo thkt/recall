@@ -178,6 +178,14 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    {
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the first index embeds the session's one chunk"
+        );
+    }
 
     let rebuild_opts = indexer::IndexOptions {
         force: true,
