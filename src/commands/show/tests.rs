@@ -568,25 +568,51 @@ fn windowed_show_cuts_a_message_at_4000_characters_and_marks_the_cut() {
 
 #[test]
 fn windowed_show_renders_metadata_only_when_range_matches_no_message() {
-    let (_dir, conn) = seed_window_db(2);
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (70, 'w1', 'orphan-range', 0, 100000, 100001)",
-        [],
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    db::seed_session(&conn, "w1");
+    conn.execute_batch(
+        "INSERT INTO messages (rowid, session_id, role, text) VALUES
+             (1, 'w1', 'user', 'M0'),
+             (2, 'w1', 'user', 'M1');
+         INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (70, 'w1', 'orphan-range', 0, 100000, 100001);",
     )
     .unwrap();
+    drop(conn);
 
-    let out = show_session_windowed(&conn, "w1", false, Some(70), 2).unwrap();
+    let out = run_show("w1", false, Some(70), 2, &Some(db_path)).unwrap();
 
-    assert!(
-        out.markdown.contains("- chunk: 70"),
-        "metadata header must still render, got: {}",
-        out.markdown
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# slug\n",
+            "- session_id: w1\n",
+            "- date: 1970-01-01\n",
+            "- project: /p\n",
+            "- source: claude\n",
+            "- chunk: 70\n",
+            "- window: 2\n",
+            "\n",
+        )
     );
-    assert!(
-        !out.markdown.contains("## ["),
-        "no message body should render for an out-of-range chunk, got: {}",
-        out.markdown
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 70,
+                "messages": [],
+                "project": "/p",
+                "session_id": "w1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+                "window": 2,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
