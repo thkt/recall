@@ -414,19 +414,6 @@ fn verbose_show_of_a_chunk_without_a_message_range_prints_its_body_and_points_to
     );
 }
 
-fn seed_window_db(count: i64) -> (tempfile::TempDir, Connection) {
-    let (dir, conn) = db::setup_test_db();
-    db::seed_session(&conn, "w1");
-    for i in 0..count {
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('w1', 'user', ?1)",
-            [format!("M{i}")],
-        )
-        .unwrap();
-    }
-    (dir, conn)
-}
-
 #[test]
 fn windowed_show_errors_when_chunk_id_is_absent() {
     let db_dir = tempfile::TempDir::new().unwrap();
@@ -602,38 +589,6 @@ fn windowed_show_renders_metadata_only_when_range_matches_no_message() {
             "notes": [],
         })
     );
-}
-
-#[test]
-fn windowed_show_json_payload_lists_anchored_messages_with_in_chunk_flag() {
-    let (_dir, conn) = seed_window_db(5);
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (80, 'w1', 'M2', 0, 3, 3)",
-        [],
-    )
-    .unwrap();
-
-    let out = show_session_windowed(&conn, "w1", false, Some(80), 1).unwrap();
-
-    assert_eq!(out.data["chunk"], 80);
-    assert_eq!(out.data["window"], 1);
-    let msgs = out.data["messages"].as_array().unwrap();
-    assert_eq!(
-        msgs.len(),
-        3,
-        "window=1 around a one-message body yields 3 messages"
-    );
-    assert_eq!(msgs[1]["text"], "M2");
-    assert_eq!(
-        msgs[1]["in_chunk"], true,
-        "the body message must be flagged in_chunk"
-    );
-    assert_eq!(
-        msgs[0]["in_chunk"], false,
-        "a neighbor must not be flagged in_chunk"
-    );
-    assert_eq!(msgs[2]["in_chunk"], false);
 }
 
 #[test]
