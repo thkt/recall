@@ -384,25 +384,57 @@ fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_ch
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
         Err(DegradedReason::NotInstalled)
-    });
-    assert!(
-        outcome.is_ok(),
-        "a model-less index must complete FTS and exit 0, not abort"
-    );
-    let outcome = outcome.unwrap();
-    let counts = &outcome.observations["counts"];
-    assert_eq!(counts["chunks_pending_snapshot"], 1);
-    assert_eq!(counts["chunks_unattempted"], 1);
-    assert_eq!(counts["chunks_remaining_snapshot"], 1);
-    for key in [
-        "chunks_saved",
-        "chunks_failed",
-        "chunks_stale",
-        "chunks_save_failed",
-    ] {
-        assert_eq!(counts[key], 0);
-    }
+    })
+    .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+            ],
+        })
+    );
+    assert_eq!(
+        index_command_output(&outcome).data["observations"]["counts"],
+        serde_json::json!({
+            "chunks_created_committed": 1,
+            "chunks_failed": 0,
+            "chunks_matched_committed": 0,
+            "chunks_pending_snapshot": 1,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_remaining_snapshot": 1,
+            "chunks_removed_committed": 0,
+            "chunks_save_failed": 0,
+            "chunks_saved": 0,
+            "chunks_stale": 0,
+            "chunks_unattempted": 1,
+            "embeddings_reused_committed": 0,
+            "files_deferred": 0,
+            "files_discovered": 1,
+            "files_empty": 0,
+            "files_failed": 0,
+            "files_remaining": 0,
+            "files_unchanged": 0,
+            "files_updated": 1,
+            "files_updated_committed": 1,
+            "inference_batches": 0,
+            "inference_chunks": 0,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_committed": 1,
+            "sessions_chunked_empty": 0,
+            "sessions_stored": 1,
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     let search_opts = search::SearchOptions::default();
     let hits = search::search(&conn, "quokka", &search_opts).unwrap();
