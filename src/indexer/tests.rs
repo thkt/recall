@@ -3106,7 +3106,14 @@ fn failed_fts_transaction_never_reports_saved_files() {
     let error = index_from_dirs_observed(&mut conn, &opts, true, &observer)
         .err()
         .unwrap();
-    assert_eq!(error.to_string(), "injected FTS failure");
+    assert_eq!(
+        error
+            .downcast_ref::<rusqlite::Error>()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("injected FTS failure"),
+        "the SQLite error that aborted the save, under any context the run adds"
+    );
     assert_eq!(
         observer.snapshot()["counts"],
         serde_json::json!({
