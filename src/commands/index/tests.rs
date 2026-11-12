@@ -8,16 +8,6 @@ use crate::{parser, search};
 
 use super::*;
 
-fn pending_embed_count(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM qa_chunks c \
-             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
-        [],
-        |r| r.get(0),
-    )
-    .unwrap()
-}
-
 fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
     (root.join("no_claude"), root.join("no_codex"))
 }
@@ -140,14 +130,6 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    {
-        let conn = open_or_create_db(&db_path).unwrap();
-        assert_eq!(
-            pending_embed_count(&conn),
-            0,
-            "precondition: initial index must leave nothing pending"
-        );
-    }
 
     let rebuild_opts = indexer::IndexOptions {
         force: true,
@@ -155,17 +137,26 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
+    let rebuilt =
+        index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
 
-    let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
-        pending_embed_count(&conn),
-        0,
-        "rebuild must re-embed every chunk (pending=0 after full reset)"
+        printed_json(&rebuilt),
+        serde_json::json!({
+            "data": {
+                "embedded": 1,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
-
-    let opts = search::SearchOptions::default();
-    let hits = search::search(&conn, "quokka", &opts).unwrap();
+    let conn = open_or_create_db(&db_path).unwrap();
+    assert_eq!(vec_chunk_count(&conn), 1, "the session keeps one vector");
+    let hits = search::search(&conn, "quokka", &search::SearchOptions::default()).unwrap();
     assert_eq!(
         hits.len(),
         1,
