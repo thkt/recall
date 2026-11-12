@@ -1338,12 +1338,14 @@ fn index_still_starts_the_probe_in_an_environment_search_has_recorded() {
     let dir = tempfile::TempDir::new().unwrap();
     let records_dir = dir.path().join("probe");
     let host = FakeHost::healthy();
-    for _ in 0..2 {
-        let searched = host.serve(dir.path(), &records_dir, |model_host| {
-            model_host.load_for_search()
-        });
-        assert!(searched.is_ok());
-    }
+    let first_search = host.serve(dir.path(), &records_dir, |model_host| {
+        model_host.load_for_search()
+    });
+    let second_search = host.serve(dir.path(), &records_dir, |model_host| {
+        model_host.load_for_search()
+    });
+    assert!(first_search.is_ok());
+    assert!(second_search.is_ok());
     assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
 
     let loaded = host.serve(dir.path(), &records_dir, index_embedder);
