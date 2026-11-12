@@ -1,7 +1,14 @@
+use crate::envelope::render_json_success;
+use crate::model::tests::FakeHost;
 use crate::tests::{bare_empty_db, payload_keys};
 use crate::{embedder, open_or_create_db};
 
 use super::*;
+
+/// The `--json` envelope `recall status` prints for an output.
+fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
+    serde_json::from_str(&render_json_success(out)).unwrap()
+}
 
 #[test]
 fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
@@ -10,27 +17,31 @@ fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
     let conn = open_or_create_db(&db_path).unwrap();
     db::seed_session(&conn, "s1");
     db::seed_chunk(&conn, 1, "one chunk, two sub-embeddings");
-    let emb = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
-    for sub_idx in 0..2 {
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, ?2)",
-            rusqlite::params![embedder::f32_as_bytes(&emb), sub_idx],
-        )
-        .unwrap();
-    }
+    let embedding = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0), (?1, 1, 1)",
+        [embedder::f32_as_bytes(&embedding)],
+    )
+    .unwrap();
     drop(conn);
 
-    let out = run_status(false, &Some(db_path)).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_status_in(false, &Some(db_path), host)
+        })
+        .unwrap();
 
     assert_eq!(
-        out.data["embedded"], 1,
-        "one qa_chunk with two sub-embedding rows is one embedded chunk, not two"
+        out.markdown,
+        "Sessions: 1\nQA chunks: 1\nEmbedded: 1/1\nModel: ready\n"
     );
-    assert_eq!(out.data["qa_chunks"], 1);
-    assert!(
-        out.markdown.contains("Embedded: 1/1"),
-        "human output must not overstate coverage past the qa_chunks total, got: {}",
-        out.markdown
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "embedded": 1, "model_ready": true, "qa_chunks": 1, "sessions": 1 },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
