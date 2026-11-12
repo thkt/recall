@@ -204,10 +204,18 @@ const CODEX_ANSWER: &str = concat!(
 );
 const CODEX_METADATA_ONLY: &str = r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#;
 
-/// Runs one more index and returns the observed counts that `--json` reports.
-fn counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::Value {
+/// Runs one index and then the chunk pass with one observer, as `recall index` does, and
+/// returns that observer's counts: every `--json` count the index and the chunk pass set.
+/// The backfill and the embedding do not run, so the embedding counts are absent.
+/// `sessions_stored` is absent too, because the command sets it, not the index.
+fn counts_of_an_index(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+    embed_capable: bool,
+) -> serde_json::Value {
     let observer = Observer::default();
-    index_from_dirs_observed(conn, opts, true, &observer).unwrap();
+    index_from_dirs_observed(conn, opts, embed_capable, &observer).unwrap();
+    index_chunks_observed(conn, &observer).unwrap();
     observer.snapshot()["counts"].clone()
 }
 
@@ -253,7 +261,7 @@ fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
         ["original question"]
     );
 
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_an_index(&mut conn, &opts, true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -307,7 +315,7 @@ fn assert_emptied_log_loses_its_stored_messages(root: &str, question: &str, meta
     assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
     assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
 
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_an_index(&mut conn, &opts, true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -548,7 +556,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 
@@ -581,7 +589,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 
@@ -610,7 +618,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -670,7 +678,7 @@ fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
         collect_strings(&conn, "SELECT content FROM qa_chunks"),
         ["modified question"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -3143,19 +3151,6 @@ fn failed_fts_transaction_never_reports_saved_files() {
     index_chunks(&mut conn).unwrap();
 }
 
-/// Runs one index and the chunk pass after it, as `recall index` does, and returns the counts
-/// the index reports in `--json`.
-fn counts_of_an_index(
-    conn: &mut Connection,
-    opts: &IndexOptions,
-    embed_capable: bool,
-) -> serde_json::Value {
-    let observer = Observer::default();
-    index_from_dirs_observed(conn, opts, embed_capable, &observer).unwrap();
-    index_chunks(conn).unwrap();
-    observer.snapshot()["counts"].clone()
-}
-
 #[test]
 fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     let (_dir, mut conn) = setup_test_db();
@@ -3177,6 +3172,11 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
             "embeddings_reused_committed": 0,
             "chunks_reconciled_created_committed": 0,
             "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
         }),
         "a root with no logs reports every file outcome as zero"
     );
@@ -3199,6 +3199,11 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
             "embeddings_reused_committed": 0,
             "chunks_reconciled_created_committed": 0,
             "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 1,
+            "chunks_created_committed": 1,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
         })
     );
     assert_eq!(
@@ -3216,6 +3221,11 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
             "embeddings_reused_committed": 0,
             "chunks_reconciled_created_committed": 0,
             "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
         }),
         "the empty and broken logs are read again because no session holds them"
     );
@@ -3237,6 +3247,11 @@ fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
             "embeddings_reused_committed": 0,
             "chunks_reconciled_created_committed": 0,
             "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
         }),
         "a run without the model defers the changed log of an embedded session"
     );
@@ -3278,14 +3293,8 @@ fn a_model_absent_run_reconciles_an_unembedded_log_that_grew_and_defers_the_embe
         &unembedded,
         &[("user", "pending question"), ("user", "appended question")],
     );
-    let observer = Observer::default();
-    let stats = index_from_dirs_observed(&mut conn, &opts, false, &observer).unwrap();
-    let chunk_pass = Observer::default();
-    index_chunks_observed(&mut conn, &chunk_pass).unwrap();
-
-    assert_eq!((stats.indexed, stats.preserved_embedded), (1, 1));
     assert_eq!(
-        observer.snapshot()["counts"],
+        counts_of_an_index(&mut conn, &opts, false),
         serde_json::json!({
             "files_discovered": 2,
             "files_updated": 1,
@@ -3299,18 +3308,13 @@ fn a_model_absent_run_reconciles_an_unembedded_log_that_grew_and_defers_the_embe
             "embeddings_reused_committed": 0,
             "chunks_reconciled_created_committed": 1,
             "chunks_removed_committed": 0,
-        })
-    );
-    assert_eq!(
-        chunk_pass.snapshot()["counts"],
-        serde_json::json!({
+            "sessions_chunked_committed": 0,
             "chunks_created_committed": 0,
             "sessions_chunk_pending": 0,
             "sessions_chunk_remaining": 0,
-            "sessions_chunked_committed": 0,
             "sessions_chunked_empty": 0,
         }),
-        "the index already reconciled the chunks of the grown log"
+        "the index already reconciled the chunks of the grown log, so the chunk pass creates none"
     );
     assert_eq!(
         collect_strings(&conn, pending_chunk_identity),
@@ -3515,9 +3519,10 @@ fn rewrite_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
     );
 }
 
-/// Reindexes and returns the --json counts that report chunk reuse.
+/// Runs `counts_of_an_index` with the model available and returns its counts that report
+/// chunk reuse.
 fn reuse_counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::Value {
-    let counts = counts_of_a_rerun(conn, opts);
+    let counts = counts_of_an_index(conn, opts, true);
     serde_json::json!({
         "files_updated_committed": counts["files_updated_committed"],
         "chunks_matched_committed": counts["chunks_matched_committed"],
