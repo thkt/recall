@@ -569,21 +569,35 @@ fn search_by_file_without_a_query_lists_its_session_without_loading_the_model() 
     .unwrap();
 
     assert_eq!(
-        out.data["results"].as_array().unwrap().len(),
-        1,
-        "the file list itself must succeed, got: {}",
-        out.data
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 1970-01-01 | slug | p [claude]\n",
+            "    /p\n",
+            "    ID: s1\n",
+            "    inspect: recall show s1\n",
+            "\n",
+        )
     );
-    assert!(
-        !out.degraded,
-        "a complete query-less file list must not be marked degraded"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .all(|n| !n.contains("semantic search unavailable")),
-        "no semantic-search note may appear on the MATCH-free path, got: {:?}",
-        out.notes
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "",
+                    "inspect": "recall show s1",
+                    "project": "/p",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 0,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
