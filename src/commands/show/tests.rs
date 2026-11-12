@@ -172,9 +172,25 @@ fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
 
 #[test]
 fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
-    let (_dir, conn) = setup_show_db();
-    let err = show_session(&conn, "zzz", false).unwrap_err();
-    assert!(err.to_string().contains("No session found matching"));
+    let (dir, conn) = setup_show_db();
+    drop(conn);
+
+    let err = run_show(
+        "zzz",
+        false,
+        None,
+        DEFAULT_WINDOW,
+        &Some(dir.path().join("test.db")),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"No session found matching 'zzz'","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
+    );
 }
 
 #[test]
