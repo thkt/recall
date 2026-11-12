@@ -615,14 +615,14 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(
-        before > 0,
-        "precondition: the initial index embedded chunks"
-    );
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the initial index embeds the session's one chunk"
+        );
+    }
 
     const ORPHAN_ID: i64 = 9_999_999;
     {
@@ -660,7 +660,7 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
     );
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
+        1,
         "preserved embeddings (stable qa ids) survive; only the orphan is removed"
     );
 }
