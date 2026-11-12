@@ -416,23 +416,58 @@ fn test_format_result_empty_excerpt() {
 }
 
 #[test]
-fn test_subagent_file_path_shows_parent_session() {
-    let r = search::SearchResult {
-        session: parser::SessionData {
-            session_id: "agent-a58c408".to_owned(),
-            source: parser::Source::Claude,
-            file_path: "/home/.claude/projects/proj/abc-def-123/subagents/agent-a58c408.jsonl"
-                .to_owned(),
-            project: "/proj".to_owned(),
-            slug: "agent-slug".to_owned(),
-            timestamp: Some(1709251200000),
-        },
-        excerpt: "some text".to_owned(),
-        chunk_id: None,
-    };
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(output.contains("abc-def-123"));
+fn search_names_the_parent_session_of_a_subagent_log() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('agent-a58c408', 'claude', '/home/me/.claude/projects/proj/abc-def-123/subagents/agent-a58c408.jsonl', '/home/me/proj', 'agent-slug', 1709251200000, 0.0);
+             INSERT INTO messages (session_id, role, text) VALUES ('agent-a58c408', 'user', 'authentication flow');",
+        )
+        .unwrap();
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        mock_loader,
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | agent-slug | proj [claude]\n",
+            "    /home/me/proj\n",
+            "    ID: agent-a58c408\n",
+            "    Parent: abc-def-123\n",
+            "    > **authentication** flow\n",
+            "    inspect: recall show agent-a58c408\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication** flow",
+                    "inspect": "recall show agent-a58c408",
+                    "project": "/home/me/proj",
+                    "session_id": "agent-a58c408",
+                    "slug": "agent-slug",
+                    "source": "claude",
+                    "timestamp": 1709251200000_i64,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
