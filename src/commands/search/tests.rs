@@ -691,11 +691,37 @@ fn run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results
     )
     .unwrap();
 
-    assert_eq!(out.data["results"][0]["session_id"], "s1", "{}", out.data);
     assert_eq!(
-        (out.degraded, out.notes),
-        (false, Vec::<String>::new()),
-        "a skipped session below the results must not mark the envelope degraded"
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 1970-01-01 | slug | p [claude]\n",
+            "    /p\n",
+            "    ID: s1\n",
+            "    > **authentication**\n",
+            "    inspect: recall show s1\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication**",
+                    "inspect": "recall show s1",
+                    "project": "/p",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 0,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
