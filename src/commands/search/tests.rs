@@ -882,48 +882,57 @@ fn search_shows_a_vector_only_match_with_its_closest_chunk_and_a_chunk_inspect_l
 }
 
 #[test]
-fn u002_snippet_hit_json_guides_full_show_without_inspect_line() {
-    let (_dir, conn) = db::setup_test_db();
-    let sid = "deadbeef-0000-1111-2222-333344445555";
-    conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
-             VALUES (?1, 'claude', '', '/proj', ?1, 1709251200000, 0.0)",
-        [sid],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) \
-             VALUES (?1, 'user', 'authentication flow discussion')",
-        [sid],
+fn search_shows_a_match_outside_any_chunk_as_a_snippet_with_a_full_show_inspect_line() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('deadbeef-0000-1111-2222-333344445555', 'claude', '/f', '/proj', 'auth-talk', 1709251200000, 0.0);
+             INSERT INTO messages (session_id, role, text)
+                 VALUES ('deadbeef-0000-1111-2222-333344445555', 'user', 'authentication flow discussion');",
+        )
+        .unwrap();
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        mock_loader,
     )
     .unwrap();
 
-    let results =
-        search::search(&conn, "authentication", &search::SearchOptions::default()).unwrap();
     assert_eq!(
-        results.len(),
-        1,
-        "setup guard: the FTS query must return the one session"
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | auth-talk | proj [claude]\n",
+            "    /proj\n",
+            "    ID: deadbeef-0000-1111-2222-333344445555\n",
+            "    > **authentication** flow di...\n",
+            "    inspect: recall show deadbeef-0000-1111-2222-333344445555\n",
+            "\n",
+        )
     );
-    assert!(
-        results[0].excerpt.contains("**"),
-        "setup guard: the hit must be snippet-tier (** highlight markers), got: {:?}",
-        results[0].excerpt
-    );
-
-    let json = result_to_json(&results[0]);
-    let payload = json.to_string();
-    assert!(
-        payload.contains(&format!("recall show {sid}")),
-        "a snippet-tier hit must guide to the full-conversation show, got: {payload}"
-    );
-    assert!(
-        json["chunk"].is_null(),
-        "a snippet-tier hit has no chunk anchor, got: {json}"
-    );
-    assert!(
-        !payload.contains("--chunk"),
-        "a snippet-tier hit must not emit a --chunk inspect line, got: {payload}"
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication** flow di...",
+                    "inspect": "recall show deadbeef-0000-1111-2222-333344445555",
+                    "project": "/proj",
+                    "session_id": "deadbeef-0000-1111-2222-333344445555",
+                    "slug": "auth-talk",
+                    "source": "claude",
+                    "timestamp": 1709251200000_i64,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
