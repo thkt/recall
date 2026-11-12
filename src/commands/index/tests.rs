@@ -334,17 +334,35 @@ fn index_with_its_claude_root_missing_keeps_the_session_and_reports_it_skipped_i
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    let outcome = index_and_report_with(&Some(db_path), &missing_opts, mock_loader).unwrap();
+    let outcome =
+        index_and_report_with(&Some(db_path.clone()), &missing_opts, mock_loader).unwrap();
 
     assert_eq!(
-        outcome.skipped_roots.len(),
-        1,
-        "the missing claude root must be threaded into the outcome"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [{
+                    "preserved_sessions": 1,
+                    "reason": "missing_root",
+                    "source": "claude",
+                }],
+            },
+            "degraded": true,
+            "notes": [
+                "claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions",
+            ],
+        })
     );
-    assert_eq!(outcome.skipped_roots[0].source, parser::Source::Claude);
+    let conn = open_or_create_db(&db_path).unwrap();
+    let hits = search::search(&conn, "quokka", &search::SearchOptions::default()).unwrap();
     assert_eq!(
-        outcome.skipped_roots[0].preserved_sessions, 1,
-        "the one preserved claude session must be counted"
+        hits.len(),
+        1,
+        "the session under the missing root stays searchable"
     );
 }
 
