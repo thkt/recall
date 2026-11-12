@@ -483,38 +483,86 @@ fn windowed_show_errors_when_chunk_belongs_to_another_session() {
 }
 
 #[test]
-fn windowed_show_truncates_a_message_longer_than_the_cap() {
-    let (_dir, conn) = db::setup_test_db();
+fn windowed_show_cuts_a_message_at_4000_characters_and_marks_the_cut() {
+    // 界 takes three bytes, so both messages exceed 4000 bytes.
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
     db::seed_session(&conn, "w1");
-    let long = "X".repeat(MAX_MSG_CHARS + 1);
     conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('w1', 'user', ?1)",
-        [&long],
+        "INSERT INTO messages (rowid, session_id, role, text) VALUES
+             (1, 'w1', 'user', ?1),
+             (2, 'w1', 'user', ?2)",
+        [
+            format!("{}{}", "a".repeat(3990), "界".repeat(10)),
+            format!("{}{}", "a".repeat(3990), "界".repeat(11)),
+        ],
     )
     .unwrap();
-    let rowid: i64 = conn
-        .query_row(
-            "SELECT rowid FROM messages WHERE session_id='w1'",
-            [],
-            |r| r.get(0),
+    conn.execute(
+        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (60, 'w1', 'body', 0, 2, 2)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = run_show("w1", false, Some(60), 1, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        format!(
+            concat!(
+                "# slug\n",
+                "- session_id: w1\n",
+                "- date: 1970-01-01\n",
+                "- project: /p\n",
+                "- source: claude\n",
+                "- chunk: 60\n",
+                "- window: 1\n",
+                "\n",
+                "## [user]\n",
+                "{}{}\n",
+                "\n",
+                "## [user] (chunk)\n",
+                "{}{}…\n",
+                "\n",
+            ),
+            "a".repeat(3990),
+            "界".repeat(10),
+            "a".repeat(3990),
+            "界".repeat(10),
         )
-        .unwrap();
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (60, 'w1', 'body', 0, ?1, ?1)",
-        [rowid],
-    )
-    .unwrap();
-
-    let out = show_session_windowed(&conn, "w1", false, Some(60), 0).unwrap();
-
-    assert!(
-        out.markdown.contains('…'),
-        "an over-cap message must be marked truncated"
     );
-    assert!(
-        !out.markdown.contains(&long),
-        "the full over-cap message must not be rendered verbatim"
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 60,
+                "messages": [
+                    {
+                        "in_chunk": false,
+                        "role": "user",
+                        "rowid": 1,
+                        "text": format!("{}{}", "a".repeat(3990), "界".repeat(10)),
+                    },
+                    {
+                        "in_chunk": true,
+                        "role": "user",
+                        "rowid": 2,
+                        "text": format!("{}{}…", "a".repeat(3990), "界".repeat(10)),
+                    },
+                ],
+                "project": "/p",
+                "session_id": "w1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+                "window": 1,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
