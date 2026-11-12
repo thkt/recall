@@ -29,7 +29,7 @@ fn setup_show_db() -> (tempfile::TempDir, Connection) {
 }
 
 #[test]
-fn test_show_session_exact_match() {
+fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata() {
     let (_dir, conn) = setup_show_db();
     let out = show_session(&conn, "abc-123", false).unwrap();
     assert!(out.markdown.contains("# my-slug"));
@@ -43,28 +43,28 @@ fn test_show_session_exact_match() {
 }
 
 #[test]
-fn test_show_session_prefix_match() {
+fn show_of_a_unique_id_prefix_prints_that_session() {
     let (_dir, conn) = setup_show_db();
     let out = show_session(&conn, "abc-1", false).unwrap();
     assert!(out.markdown.contains("- session_id: abc-123"));
 }
 
 #[test]
-fn test_show_session_ambiguous_prefix() {
+fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
     let (_dir, conn) = setup_show_db();
     let err = show_session(&conn, "abc", false).unwrap_err();
     assert!(err.to_string().contains("Multiple sessions match"));
 }
 
 #[test]
-fn test_show_session_not_found() {
+fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
     let (_dir, conn) = setup_show_db();
     let err = show_session(&conn, "zzz", false).unwrap_err();
     assert!(err.to_string().contains("No session found matching"));
 }
 
 #[test]
-fn test_show_session_verbose_includes_file() {
+fn verbose_show_adds_the_session_file_to_the_header() {
     let (_dir, conn) = setup_show_db();
     let out = show_session(&conn, "abc-123", true).unwrap();
     assert!(out.markdown.contains("- file: /path/f.jsonl"));
@@ -83,7 +83,7 @@ fn test_show_session_message_order() {
 }
 
 #[test]
-fn show_session_unknown_source_falls_back_to_claude() {
+fn show_prints_an_unknown_stored_source_as_claude() {
     let (_dir, conn) = db::setup_test_db();
     conn.execute(
             "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0)",
@@ -99,7 +99,7 @@ fn show_session_unknown_source_falls_back_to_claude() {
 }
 
 #[test]
-fn window_returns_only_same_session_neighbors_within_n() {
+fn windowed_show_prints_only_same_session_messages_within_the_window() {
     let (_dir, conn) = db::setup_test_db();
     db::seed_session(&conn, "sessA");
     db::seed_session(&conn, "sessB");
@@ -374,7 +374,7 @@ fn windowed_show_fallback_includes_file_when_verbose() {
 }
 
 #[test]
-fn run_show_on_existing_empty_db_is_not_found_usage_error() {
+fn show_on_a_database_file_without_tables_is_a_usage_error_asking_to_run_index() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 

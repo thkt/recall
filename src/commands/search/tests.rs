@@ -214,7 +214,7 @@ fn test_normal_session_path_shows_no_parent() {
 }
 
 #[test]
-fn run_search_on_existing_empty_db_returns_idle() {
+fn search_on_a_database_file_without_tables_returns_no_results() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
@@ -229,7 +229,7 @@ fn run_search_on_existing_empty_db_returns_idle() {
 }
 
 #[test]
-fn search_on_indexed_db_without_sessions_returns_idle_without_loading_model() {
+fn search_on_an_index_without_sessions_returns_no_results_without_loading_the_model() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     drop(open_or_create_db(&db_path).unwrap());
@@ -248,7 +248,7 @@ fn search_on_indexed_db_without_sessions_returns_idle_without_loading_model() {
 }
 
 #[test]
-fn run_search_with_embedder_present_embeds_nothing() {
+fn search_with_a_loaded_model_leaves_a_pending_chunk_unembedded() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
@@ -281,7 +281,7 @@ fn no_load() -> Result<Arc<dyn Embed>, DegradedReason> {
 }
 
 #[test]
-fn run_search_query_less_file_list_skips_embedder_and_stays_nominal() {
+fn search_by_file_without_a_query_lists_its_session_without_loading_the_model() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
@@ -408,7 +408,7 @@ fn run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results
 }
 
 #[test]
-fn freeze_search_payload_key_set_both_branches() {
+fn freeze_search_payload_key_set() {
     let empty_dir = tempfile::TempDir::new().unwrap();
     let empty_path = empty_dir.path().join("empty.db");
     open_or_create_db(&empty_path).unwrap();

@@ -4,7 +4,7 @@ use crate::{embedder, open_or_create_db};
 use super::*;
 
 #[test]
-fn run_status_counts_distinct_embedded_chunks_not_subembedding_rows() {
+fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -35,7 +35,7 @@ fn run_status_counts_distinct_embedded_chunks_not_subembedding_rows() {
 }
 
 #[test]
-fn run_status_does_not_create_db_when_absent() {
+fn status_without_a_database_reports_zero_counts_and_does_not_create_it() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("missing.db");
 
@@ -51,7 +51,7 @@ fn run_status_does_not_create_db_when_absent() {
 }
 
 #[test]
-fn run_status_on_existing_empty_db_reports_zero_counts() {
+fn status_on_a_database_file_without_tables_reports_zero_counts() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
@@ -63,7 +63,7 @@ fn run_status_on_existing_empty_db_reports_zero_counts() {
 }
 
 #[test]
-fn freeze_status_payload_key_set_both_branches() {
+fn freeze_status_payload_key_set() {
     let frozen = ["embedded", "model_ready", "qa_chunks", "sessions"];
 
     let missing = tempfile::TempDir::new().unwrap();

@@ -35,7 +35,7 @@ fn session_type_of(conn: &Connection, sid: &str) -> Option<String> {
 }
 
 #[test]
-fn test_010_reclassify_all_tags_sessions() {
+fn classify_all_labels_every_session_from_its_first_turn() {
     let (_dir, mut conn) = seed_classify_db();
     let outcomes = reclassify_sessions(&mut conn, true, false).unwrap();
     assert_eq!(session_type_of(&conn, "auto").as_deref(), Some("automated"));
@@ -51,7 +51,7 @@ fn test_010_reclassify_all_tags_sessions() {
 }
 
 #[test]
-fn reclassify_incremental_skips_already_tagged() {
+fn classify_without_all_labels_only_unlabeled_sessions() {
     let (_dir, mut conn) = db::setup_test_db();
     conn.execute(
             "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type) VALUES ('fresh', 'claude', '/f', '/p', 'f', 0, 0.0, NULL)",
