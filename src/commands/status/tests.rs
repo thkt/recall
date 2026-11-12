@@ -50,11 +50,21 @@ fn status_without_a_database_reports_zero_counts_and_does_not_create_it() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("missing.db");
 
-    let out = run_status(false, &Some(db_path.clone())).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_status_in(false, &Some(db_path.clone()), host)
+        })
+        .unwrap();
 
-    assert_eq!(out.data["sessions"], 0);
-    assert_eq!(out.data["qa_chunks"], 0);
-    assert_eq!(out.data["embedded"], 0);
+    assert_eq!(out.markdown, "");
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "embedded": 0, "model_ready": true, "qa_chunks": 0, "sessions": 0 },
+            "degraded": false,
+            "notes": [],
+        })
+    );
     assert!(
         !db_path.exists(),
         "status must not create the database while reporting"
