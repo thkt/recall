@@ -441,11 +441,18 @@ fn seed_window_db(count: i64) -> (tempfile::TempDir, Connection) {
 
 #[test]
 fn windowed_show_errors_when_chunk_id_is_absent() {
-    let (_dir, conn) = seed_window_db(3);
-    let err = show_session_windowed(&conn, "w1", false, Some(999), 2).unwrap_err();
-    assert!(
-        err.to_string().contains("No chunk found with id 999"),
-        "got: {err}"
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    db::seed_session(&open_or_create_db(&db_path).unwrap(), "w1");
+
+    let err = run_show("w1", false, Some(999), 2, &Some(db_path)).unwrap_err();
+
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"No chunk found with id 999","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
     );
 }
 
