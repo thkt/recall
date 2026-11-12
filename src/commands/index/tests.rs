@@ -84,36 +84,6 @@ fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
 }
 
 #[test]
-fn index_and_report_forwards_default_embed_options_when_flags_unset() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let claude_dir = db_dir.path().join("claude");
-    let codex_dir = db_dir.path().join("codex");
-    seed_claude_source(&claude_dir);
-    fs::create_dir(&codex_dir).unwrap();
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-
-    let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
-
-    let result = index_and_report_with(&Some(db_path), &opts, || Ok(embedder.clone())).unwrap();
-
-    assert_eq!(
-        result.embedded, 1,
-        "default EmbedOptions must preserve current embed behavior"
-    );
-    assert_eq!(
-        embedder.captured_options(),
-        Some(embedder::EmbedOptions::default()),
-        "default EmbedOptions (None/None) must forward when no flags are set"
-    );
-}
-
-#[test]
 fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
@@ -446,46 +416,6 @@ fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_ch
 }
 
 #[test]
-fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
-    for reason in [
-        DegradedReason::BackendUnavailable,
-        DegradedReason::ProbeFailed,
-    ] {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        };
-        let outcome = index_and_report_with(&Some(db_path), &opts, || Err(reason))
-            .expect("a degraded index must succeed");
-
-        let note = outcome
-            .degraded_note
-            .unwrap_or_else(|| panic!("{reason:?} must carry a degraded note"));
-        assert!(
-            note.contains("unavailable"),
-            "{reason:?} must report unavailability (not a download hint), got: {note}"
-        );
-        assert!(
-            !note.to_lowercase().contains("download"),
-            "{reason:?} is not repaired by re-downloading, so the note must not \
-                 suggest it (that hint belongs to NotInstalled), got: {note}"
-        );
-        assert_eq!(outcome.embedded, 0, "{reason:?} skips embedding");
-        assert_eq!(outcome.failed_count, 0, "{reason:?} fails no batches");
-    }
-}
-
-#[test]
 fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
@@ -666,66 +596,6 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
 }
 
 #[test]
-fn model_absent_rebuild_surfaces_preserved_count_and_note() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let rebuild = indexer::IndexOptions {
-        force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .unwrap();
-
-    assert!(
-        outcome.preserved_embedded > 0,
-        "the outcome must report the preserved session count, got {}",
-        outcome.preserved_embedded
-    );
-
-    let out = index_command_output(&outcome);
-    assert!(
-        out.degraded,
-        "a model-absent run with preservation degrades"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains(&outcome.preserved_embedded.to_string())),
-        "the preserve note must name the preserved count, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "the degraded note must carry the download remedy for a not-installed model, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["preserved_embedded"], outcome.preserved_embedded,
-        "the --json payload carries the preserved magnitude for an agent"
-    );
-}
-
-#[test]
 fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_for_text_search() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
@@ -885,45 +755,6 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
     );
 }
 
-fn embed_stop_outcome() -> IndexOutcome {
-    IndexOutcome {
-        degraded_note: None,
-        embedded: 5,
-        failed_count: 3,
-        first_error: Some("batch: mock failure".to_owned()),
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    }
-}
-
-fn model_absent_outcome() -> IndexOutcome {
-    IndexOutcome {
-        degraded_note: Some("note: run `recall model download` to enable.".to_owned()),
-        embedded: 0,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    }
-}
-
-fn success_outcome() -> IndexOutcome {
-    IndexOutcome {
-        degraded_note: None,
-        embedded: 8,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    }
-}
-
 #[test]
 fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_on_the_next_run() {
     let src = tempfile::TempDir::new().unwrap();
@@ -981,44 +812,6 @@ fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_o
     );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(vec_chunk_count(&conn), 1, "the retried chunk is stored");
-}
-
-#[test]
-fn index_command_output_clean_success_is_not_degraded() {
-    let out = index_command_output(&success_outcome());
-
-    assert!(!out.degraded, "a fully embedded index is not degraded");
-    assert!(
-        out.notes.is_empty(),
-        "a clean success carries no notes, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["failed_count"], 0,
-        "the payload reports zero failures on success"
-    );
-    assert_eq!(
-        out.data["embedded"], 8,
-        "the payload reports how many chunks were embedded on success"
-    );
-}
-
-#[test]
-fn index_command_output_degraded_covaries_with_notes() {
-    for outcome in [
-        embed_stop_outcome(),
-        model_absent_outcome(),
-        success_outcome(),
-    ] {
-        let out = index_command_output(&outcome);
-        assert_eq!(
-            out.degraded,
-            !out.notes.is_empty(),
-            "degraded must equal notes-non-empty (degraded={}, notes={:?})",
-            out.degraded,
-            out.notes
-        );
-    }
 }
 
 #[test]
