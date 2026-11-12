@@ -458,20 +458,27 @@ fn windowed_show_errors_when_chunk_id_is_absent() {
 
 #[test]
 fn windowed_show_errors_when_chunk_belongs_to_another_session() {
-    let (_dir, conn) = seed_window_db(3);
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    db::seed_session(&conn, "w1");
     db::seed_session(&conn, "w2");
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (50, 'w2', 'body', 0, 1, 1)",
-        [],
+    conn.execute_batch(
+        "INSERT INTO messages (rowid, session_id, role, text) VALUES (1, 'w2', 'user', 'body');
+         INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (50, 'w2', 'body', 0, 1, 1);",
     )
     .unwrap();
+    drop(conn);
 
-    let err = show_session_windowed(&conn, "w1", false, Some(50), 2).unwrap_err();
+    let err = run_show("w1", false, Some(50), 2, &Some(db_path)).unwrap_err();
 
-    assert!(
-        err.to_string().contains("belongs to session 'w2'"),
-        "cross-session --chunk must name the mismatched session, got: {err}"
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"chunk 50 belongs to session 'w2', not 'w1'","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
     );
 }
 
