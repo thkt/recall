@@ -164,12 +164,8 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
     );
 }
 
-fn write_backfill_session(
-    dir: &Path,
-    file: &str,
-    user_text: &str,
-    edit_path: Option<&str>,
-) -> PathBuf {
+/// Writes a session log whose user turn is followed by an assistant `Edit` of `edit_path`.
+fn write_backfill_session(dir: &Path, file: &str, user_text: &str, edit_path: &str) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let user = serde_json::json!({
         "type": "user",
@@ -177,23 +173,26 @@ fn write_backfill_session(
         "message": {"role": "user", "content": user_text},
         "timestamp": "2026-03-01T00:00:00Z"
     });
-    let mut content = serde_json::to_string(&user).unwrap();
-    if let Some(path) = edit_path {
-        let assistant = serde_json::json!({
-            "type": "assistant",
-            "cwd": "/proj",
-            "message": {"role": "assistant", "content": [
-                {"type": "text", "text": "editing"},
-                {"type": "tool_use", "id": "t1", "name": "Edit",
-                 "input": {"file_path": path, "old_string": "x", "new_string": "y"}}
-            ]},
-            "timestamp": "2026-03-01T00:00:01Z"
-        });
-        content.push('\n');
-        content.push_str(&serde_json::to_string(&assistant).unwrap());
-    }
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "cwd": "/proj",
+        "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "editing"},
+            {"type": "tool_use", "id": "t1", "name": "Edit",
+             "input": {"file_path": edit_path, "old_string": "x", "new_string": "y"}}
+        ]},
+        "timestamp": "2026-03-01T00:00:01Z"
+    });
     let full = dir.join(file);
-    fs::write(&full, content).unwrap();
+    fs::write(
+        &full,
+        format!(
+            "{}\n{}",
+            serde_json::to_string(&user).unwrap(),
+            serde_json::to_string(&assistant).unwrap()
+        ),
+    )
+    .unwrap();
     full
 }
 
@@ -235,13 +234,13 @@ fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_me
         &claude_dir,
         "a.jsonl",
         "session a probe",
-        Some("/proj/marker_a.rs"),
+        "/proj/marker_a.rs",
     );
     write_backfill_session(
         &claude_dir,
         "b.jsonl",
         "session b probe",
-        Some("/proj/marker_b.rs"),
+        "/proj/marker_b.rs",
     );
 
     let body = fs::read_to_string(&partial).unwrap();
@@ -256,32 +255,48 @@ fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_me
         codex_archived_dir: None,
     };
 
-    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    assert_eq!(
-        index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
-        1
-    );
-    let before = {
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    {
         let conn = open_or_create_db(&db_path).unwrap();
         reset_to_legacy_state(&conn);
         conn.execute("DELETE FROM parse_diagnostics", []).unwrap();
-        assert!(
-            !collect_i64(&conn, "SELECT chunk_id FROM vec_chunks").is_empty(),
-            "precondition: the legacy DB must hold embeddings, or the invariant is vacuous"
+        assert_eq!(
+            body_snapshot(&conn),
+            (vec![1, 2, 3, 4], vec![1, 2], vec![1, 2]),
+            "precondition: the legacy DB holds two messages, one chunk and one vector per session"
         );
-        body_snapshot(&conn)
-    };
+    }
 
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    assert_eq!(
-        index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
-        1
-    );
 
+    let partial = partial.to_str().unwrap();
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [{
+                    "file_path": partial,
+                    "incomplete_tail_lines": 0,
+                    "invalid_json_lines": 1,
+                    "invalid_utf8_lines": 0,
+                    "read_error": false,
+                    "source": "claude",
+                }],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [format!(
+                "{partial}: skipped 1 invalid JSON line(s) and 0 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)"
+            )],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         body_snapshot(&conn),
-        before,
+        (vec![1, 2, 3, 4], vec![1, 2], vec![1, 2]),
         "backfill must not change messages / qa_chunks / vec_chunks row counts or id sets"
     );
     assert_eq!(
