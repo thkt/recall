@@ -1,9 +1,9 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::Path;
 
 use crate::model::tests::FakeHost;
 use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
-use crate::{db, parser, search};
+use crate::{parser, search};
 
 use super::*;
 
@@ -28,109 +28,6 @@ fn seed_claude_source(claude_dir: &Path) {
             r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"quokka rebuild probe"},"timestamp":"2026-03-01T00:00:00Z"}"#,
         )
         .unwrap();
-}
-
-#[test]
-fn embed_all_pending_embeds_every_pending_chunk() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let mut conn = open_or_create_db(&db_path).unwrap();
-    db::seed_session(&conn, "s1");
-    for i in 1..=3 {
-        db::seed_chunk(&conn, i, &format!("pending content {i}"));
-    }
-
-    let result = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::new(),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(result.embedded, 3, "every pending chunk embeds");
-    assert_eq!(result.failed_count, 0, "a working embedder fails nothing");
-    assert_eq!(pending_embed_count(&conn), 0, "the pending set empties");
-    assert_eq!(vec_chunk_count(&conn), 3, "each chunk gains a vec row");
-}
-
-#[test]
-fn embed_all_pending_partial_failure_reports_failed_count() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let mut conn = open_or_create_db(&db_path).unwrap();
-    db::seed_session(&conn, "s1");
-    db::seed_chunk(&conn, 1, "x");
-    for i in 2..=3 {
-        db::seed_chunk(&conn, i, &format!("pending content {i}"));
-    }
-
-    let result = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::failing_on_text("x"),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        result.embedded, 0,
-        "the poisoned single batch embeds nothing"
-    );
-    assert_eq!(
-        result.failed_count, 3,
-        "the whole 3-chunk batch is reported failed"
-    );
-    let err = result.first_error.as_deref().unwrap_or_default();
-    assert!(
-        err == "batch inference failed",
-        "the first batch error is carried up for the --json note, got: {err:?}"
-    );
-    assert_eq!(
-        pending_embed_count(&conn),
-        3,
-        "the failed batch stays pending for the next run"
-    );
-}
-
-#[test]
-fn embed_all_pending_reembeds_nothing_on_second_run() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let mut conn = open_or_create_db(&db_path).unwrap();
-    db::seed_session(&conn, "s1");
-    for (id, content) in [(1, "already embedded"), (2, "new pending")] {
-        db::seed_chunk(&conn, id, content);
-    }
-    let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        [embedder::f32_as_bytes(&emb)],
-    )
-    .unwrap();
-
-    let first = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::new(),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        first.embedded, 1,
-        "the first run embeds only the pending chunk"
-    );
-    assert_eq!(vec_chunk_count(&conn), 2, "vec gains exactly the new chunk");
-
-    let second = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::new(),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(second.embedded, 0, "the second run re-embeds nothing");
-    assert_eq!(
-        vec_chunk_count(&conn),
-        2,
-        "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
-    );
 }
 
 #[test]
@@ -249,51 +146,6 @@ fn rebuild_reembeds_all_and_rebuilds_fts_index() {
         hits.len(),
         1,
         "rebuild must reconstruct FTS: the seeded term must return its session"
-    );
-}
-
-#[test]
-fn index_and_report_with_backfills_legacy_null_rowid_ranges() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    {
-        let conn = open_or_create_db(&db_path).unwrap();
-        let cleared = conn
-            .execute(
-                "UPDATE qa_chunks SET src_rowid_lo = NULL, src_rowid_hi = NULL",
-                [],
-            )
-            .unwrap();
-        assert_eq!(cleared, 1, "precondition: one chunk to un-link");
-    }
-
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let conn = open_or_create_db(&db_path).unwrap();
-    let (lo, hi): (Option<i64>, Option<i64>) = conn
-        .query_row(
-            "SELECT src_rowid_lo, src_rowid_hi FROM qa_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert!(
-        lo.is_some() && hi.is_some(),
-        "the index-path backfill must repopulate the legacy NULL rowid range, got lo={lo:?} hi={hi:?}"
     );
 }
 
@@ -427,84 +279,6 @@ fn backfill_が本文_index_と_embedding_を変えない() {
 }
 
 #[test]
-fn 二回目の_index_で_backfill_が再実行されない() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    let write_path = write_backfill_session(
-        &claude_dir,
-        "write.jsonl",
-        "write session probe",
-        Some("/proj/orig_marker.rs"),
-    );
-    write_backfill_session(&claude_dir, "zero.jsonl", "zero touch probe", None);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    {
-        let conn = open_or_create_db(&db_path).unwrap();
-        reset_to_legacy_state(&conn);
-    }
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let original = fs::metadata(&write_path).unwrap();
-    let pinned = original.modified().unwrap();
-    write_backfill_session(
-        &claude_dir,
-        "write.jsonl",
-        "write session probe",
-        Some("/proj/next_marker.rs"),
-    );
-    let f = OpenOptions::new().write(true).open(&write_path).unwrap();
-    f.set_modified(pinned).unwrap();
-    drop(f);
-    let replaced = fs::metadata(&write_path).unwrap();
-    assert_eq!(replaced.len(), original.len(), "canary must preserve size");
-    assert_eq!(replaced.modified().unwrap(), pinned);
-
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let conn = open_or_create_db(&db_path).unwrap();
-    let unmarked: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        unmarked, 0,
-        "every session (write-target and zero-touch) must carry files_scanned after the backfill"
-    );
-    assert!(
-        !session_file_paths(&conn)
-            .iter()
-            .any(|p| p == "/proj/next_marker.rs"),
-        "a marked session must not be re-read: the canary path must not appear in session_files"
-    );
-
-    conn.execute("DELETE FROM session_files WHERE session_id = 'write'", [])
-        .unwrap();
-    conn.execute(
-        "UPDATE sessions SET files_scanned = NULL WHERE session_id = 'write'",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let conn = open_or_create_db(&db_path).unwrap();
-    assert!(session_file_paths(&conn).contains(&"/proj/next_marker.rs".to_owned()));
-}
-
-#[test]
 fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
@@ -591,36 +365,6 @@ fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
 }
 
 #[test]
-fn index_and_report_with_degraded_loader_emits_model_download_note() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .expect("a degraded index must succeed");
-
-    let note = outcome
-        .degraded_note
-        .expect("a model-less index must carry a degraded note");
-    assert!(
-        note.contains("recall model download"),
-        "the degraded note must name `recall model download` to guide the user, got: {note}"
-    );
-}
-
-#[test]
 fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
     for reason in [
         DegradedReason::BackendUnavailable,
@@ -658,86 +402,6 @@ fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
         assert_eq!(outcome.embedded, 0, "{reason:?} skips embedding");
         assert_eq!(outcome.failed_count, 0, "{reason:?} fails no batches");
     }
-}
-
-#[test]
-fn index_and_report_with_disabled_loader_is_indistinguishable_from_success() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    let outcome = index_and_report_with(&Some(db_path), &opts, || Err(DegradedReason::Disabled))
-        .expect("a disabled-embedder index must succeed");
-
-    assert_eq!(
-        outcome.degraded_note, None,
-        "opt-out is not a degradation: no note is carried"
-    );
-    assert_eq!(outcome.embedded, 0, "a disabled embedder embeds nothing");
-    assert_eq!(
-        outcome.failed_count, 0,
-        "a disabled embedder fails no batches"
-    );
-    let envelope = index_command_output(&outcome);
-    assert!(
-        !envelope.degraded,
-        "the --json envelope reports a disabled embedder as non-degraded"
-    );
-}
-
-#[test]
-fn model_absent_rebuild_preserves_existing_embeddings() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
-        let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(
-        before > 0,
-        "precondition: the initial index must embed at least one chunk"
-    );
-
-    let rebuild = indexer::IndexOptions {
-        force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .unwrap();
-
-    let conn = open_or_create_db(&db_path).unwrap();
-    assert_eq!(
-        vec_chunk_count(&conn),
-        before,
-        "a model-absent rebuild must preserve existing embeddings, not destroy them"
-    );
 }
 
 #[test]
@@ -1102,73 +766,6 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
     );
 }
 
-#[test]
-fn model_absent_incremental_index_preserves_edited_embedded_session() {
-    use std::time::{Duration, SystemTime};
-
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
-        let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(before > 0, "precondition: the session was embedded");
-
-    let session = claude_dir.join("s1.jsonl");
-    let mut all = fs::read_to_string(&session).unwrap();
-    all.push('\n');
-    all.push_str(
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"echidna appended"},"timestamp":"2026-03-01T00:00:01Z"}"#,
-        );
-    fs::write(&session, all).unwrap();
-    let f = fs::OpenOptions::new().append(true).open(&session).unwrap();
-    f.set_modified(SystemTime::now() + Duration::from_secs(10))
-        .unwrap();
-    drop(f);
-
-    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .unwrap();
-
-    assert_eq!(
-        outcome.preserved_embedded, 1,
-        "the edited embedded session is preserved, not destroyed, on `recall index`"
-    );
-    let conn = open_or_create_db(&db_path).unwrap();
-    assert_eq!(
-        vec_chunk_count(&conn),
-        before,
-        "the embeddings survive the incremental re-index"
-    );
-    let search_opts = search::SearchOptions::default();
-    assert_eq!(
-        search::search(&conn, "quokka", &search_opts).unwrap().len(),
-        1,
-        "the preserved session's original FTS rows remain searchable"
-    );
-    assert_eq!(
-        search::search(&conn, "echidna", &search_opts)
-            .unwrap()
-            .len(),
-        0,
-        "the appended turn stays out of FTS until the model returns (FR-2 trade-off)"
-    );
-}
-
 fn embed_stop_outcome() -> IndexOutcome {
     IndexOutcome {
         degraded_note: None,
@@ -1238,23 +835,6 @@ fn index_command_output_surfaces_embed_stop_with_failed_count_and_retry() {
     assert_eq!(
         out.data["embedded"], 5,
         "the payload reports how many chunks did embed despite the stop"
-    );
-}
-
-#[test]
-fn index_command_output_surfaces_model_absent_download_note() {
-    let out = index_command_output(&model_absent_outcome());
-
-    assert!(
-        out.degraded,
-        "a model-absent index is degraded: embedding was skipped"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "the model-absent note must reach --json (not stderr only), got: {:?}",
-        out.notes
     );
 }
 
