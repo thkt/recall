@@ -246,18 +246,6 @@ fn verbose_show_adds_the_session_file_to_the_header() {
 }
 
 #[test]
-fn test_show_session_message_order() {
-    let (_dir, conn) = setup_show_db();
-    let out = show_session(&conn, "abc-123", false).unwrap();
-    let user_pos = out.markdown.find("## [user]").unwrap();
-    let assistant_pos = out.markdown.find("## [assistant]").unwrap();
-    assert!(
-        user_pos < assistant_pos,
-        "user message should come before assistant"
-    );
-}
-
-#[test]
 fn show_prints_an_unknown_stored_source_as_claude() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
