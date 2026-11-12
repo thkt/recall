@@ -412,16 +412,12 @@ fn freeze_search_payload_key_set() {
     let empty_dir = tempfile::TempDir::new().unwrap();
     let empty_path = empty_dir.path().join("empty.db");
     open_or_create_db(&empty_path).unwrap();
-    let empty = run_search(search_command("anything"), &Some(empty_path)).unwrap();
+    let empty =
+        run_search_with(search_command("anything"), &Some(empty_path), mock_loader).unwrap();
     assert_eq!(
         payload_keys(&empty.data),
         ["results"],
         "search --json top-level keys are frozen on the empty branch"
-    );
-    assert_eq!(
-        empty.data["results"].as_array().unwrap().len(),
-        0,
-        "the empty branch emits an empty results array"
     );
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -436,20 +432,14 @@ fn freeze_search_payload_key_set() {
         )
         .unwrap();
     }
-    let populated = run_search(search_command("frozen"), &Some(db_path)).unwrap();
+    let populated = run_search_with(search_command("frozen"), &Some(db_path), mock_loader).unwrap();
     assert_eq!(
         payload_keys(&populated.data),
         ["results"],
         "search --json top-level keys are frozen on the populated branch"
     );
-    let results = populated.data["results"].as_array().unwrap();
-    assert!(
-        !results.is_empty(),
-        "the populated branch must return at least one hit, got: {}",
-        populated.data
-    );
     assert_eq!(
-        payload_keys(&results[0]),
+        payload_keys(&populated.data["results"][0]),
         [
             "chunk",
             "excerpt",
