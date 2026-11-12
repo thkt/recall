@@ -250,8 +250,17 @@ fn search_lists_each_match_with_its_date_slug_project_id_excerpt_and_inspect_lin
 }
 
 #[test]
-fn test_render_results_empty_reports_no_match() {
-    assert_eq!(render_results(&[]), "No matching sessions found.");
+fn search_that_matches_no_session_prints_no_matching_sessions_found() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = index_with_one_message(db_dir.path(), "authentication flow");
+
+    let out = run_search_with(search_command("kubernetes"), &Some(db_path), mock_loader).unwrap();
+
+    assert_eq!(out.markdown, "No matching sessions found.");
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({ "data": { "results": [] }, "degraded": false, "notes": [] })
+    );
 }
 
 #[test]
