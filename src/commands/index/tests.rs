@@ -925,36 +925,62 @@ fn success_outcome() -> IndexOutcome {
 }
 
 #[test]
-fn index_command_output_surfaces_embed_stop_with_failed_count_and_retry() {
-    let out = index_command_output(&embed_stop_outcome());
+fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_on_the_next_run() {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    seed_claude_source(&claude_dir);
 
-    assert!(
-        out.degraded,
-        "an embed-stop index is degraded: --json must not report it as a clean success"
-    );
-    assert!(
-        out.notes[0].contains("3 chunk"),
-        "the note must name how many chunks failed, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes[0].contains("recall index"),
-        "the note must guide the agent to retry via `recall index`, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes[0].contains("mock failure"),
-        "the note carries the first batch error, not the unknown-error fallback, got: {:?}",
-        out.notes
-    );
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    // The load probe is the embedder's first call, so the first batch is the call that fails.
+    let failed = index_and_report_with(&Some(db_path.clone()), &opts, || {
+        Ok(Arc::new(embedder::MockEmbedder::failing_after(1)) as Arc<dyn Embed>)
+    })
+    .unwrap();
+
     assert_eq!(
-        out.data["failed_count"], 3,
-        "the payload carries the failure magnitude, not just a bool"
+        printed_json(&failed),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 1,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "1 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
+            ],
+        })
     );
+
+    let retried = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
     assert_eq!(
-        out.data["embedded"], 5,
-        "the payload reports how many chunks did embed despite the stop"
+        printed_json(&retried),
+        serde_json::json!({
+            "data": {
+                "embedded": 1,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
+    let conn = open_or_create_db(&db_path).unwrap();
+    assert_eq!(vec_chunk_count(&conn), 1, "the retried chunk is stored");
 }
 
 #[test]
