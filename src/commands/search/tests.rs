@@ -483,13 +483,12 @@ fn search_on_a_database_file_without_tables_returns_no_results() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
-    let out = run_search_with(search_command("anything"), &Some(db_path), mock_loader).unwrap();
+    let out = run_search_with(search_command("anything"), &Some(db_path), no_load).unwrap();
 
+    assert_eq!(out.markdown, "");
     assert_eq!(
-        out.data["results"].as_array().unwrap().len(),
-        0,
-        "an empty DB search must return zero results, got: {}",
-        out.data
+        printed_envelope(&out),
+        serde_json::json!({ "data": { "results": [] }, "degraded": false, "notes": [] })
     );
 }
 
@@ -499,17 +498,13 @@ fn search_on_an_index_without_sessions_returns_no_results_without_loading_the_mo
     let db_path = db_dir.path().join("recall.db");
     drop(open_or_create_db(&db_path).unwrap());
 
-    let out = run_search_with(
-        search_command("anything"),
-        &Some(db_path),
-        || -> Result<Arc<dyn Embed>, DegradedReason> {
-            panic!("a DB with no sessions must short-circuit before loading the model")
-        },
-    )
-    .unwrap();
+    let out = run_search_with(search_command("anything"), &Some(db_path), no_load).unwrap();
 
-    assert_eq!(out.data, serde_json::json!({ "results": [] }));
-    assert!(!out.degraded, "an idle search is not degraded");
+    assert_eq!(out.markdown, "");
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({ "data": { "results": [] }, "degraded": false, "notes": [] })
+    );
 }
 
 #[test]
@@ -542,7 +537,7 @@ fn runtime_failing_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
 }
 
 fn no_load() -> Result<Arc<dyn Embed>, DegradedReason> {
-    panic!("query-less --file must not load the embedder")
+    panic!("this search must not load the embedder")
 }
 
 #[test]
