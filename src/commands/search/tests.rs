@@ -345,17 +345,65 @@ fn test_format_result_excerpt_not_truncated() {
 }
 
 #[test]
-fn test_format_result_excerpt_strips_control_chars() {
-    let r = make_search_result("s1", "/proj", "clean\x1b[31mANSI\x1b[0mhere\x07bell");
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(
-        !output.contains('\x1b') && !output.contains('\x07'),
-        "control characters must be stripped from the excerpt, got: {output:?}"
+fn search_strips_control_characters_from_the_printed_excerpt() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('s1', 'claude', '/f', '/p', 'slug', 1709251200000, 0.0);
+             INSERT INTO messages (rowid, session_id, role, text)
+                 VALUES (1, 's1', 'user', 'authentication failed at login');
+             INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+                 VALUES (1, 's1', 'authentication ' || char(27) || '[31mfailed' || char(27) || '[0m at login' || char(7), 1709251200000, 1, 1);",
+        )
+        .unwrap();
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        mock_loader,
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | slug | p [claude]\n",
+            "    /p\n",
+            "    ID: s1\n",
+            "    > authentication failed at login\n",
+            "    inspect: recall show s1 --chunk 1 --window 3\n",
+            "\n",
+        )
     );
-    assert!(
-        output.contains("> cleanANSIherebell"),
-        "the cleaned excerpt text must render, got: {output:?}"
+    // The --json excerpt still carries the raw control characters; that gap
+    // is tracked apart from this test, so the comparison leaves it out.
+    let mut envelope = printed_envelope(&out);
+    envelope["data"]["results"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("excerpt");
+    assert_eq!(
+        envelope,
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": 1,
+                    "inspect": "recall show s1 --chunk 1 --window 3",
+                    "project": "/p",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 1709251200000_i64,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
