@@ -124,6 +124,44 @@ fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
 }
 
 #[test]
+fn index_without_the_token_budget_and_forward_pause_flags_hands_the_embedder_the_default_options() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let claude_dir = db_dir.path().join("claude");
+    let codex_dir = db_dir.path().join("codex");
+    seed_claude_source(&claude_dir);
+    fs::create_dir(&codex_dir).unwrap();
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
+    let no_flags = embed_options_from_flags(None, None);
+
+    index_and_report_observed(
+        &Some(db_path),
+        &opts,
+        || Ok(embedder.clone()),
+        no_flags,
+        &index_observer::Observer::stderr(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        no_flags,
+        embedder::EmbedOptions::default(),
+        "no --token-budget and no --forward-pause-ms mean no token budget and no pause"
+    );
+    assert_eq!(
+        embedder.captured_options(),
+        Some(embedder::EmbedOptions::default()),
+        "a run without the flags hands the embedder the default options"
+    );
+}
+
+#[test]
 fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
