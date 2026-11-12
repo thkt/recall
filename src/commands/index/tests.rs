@@ -1022,54 +1022,147 @@ fn index_command_output_degraded_covaries_with_notes() {
 }
 
 #[test]
-fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons() {
-    for mut outcome in [
-        success_outcome(),
-        model_absent_outcome(),
-        embed_stop_outcome(),
-    ] {
-        let existing_notes = index_command_output(&outcome).notes;
-        outcome
-            .parse_diagnostics
-            .push(indexer::FileParseDiagnostics {
-                file_path: format!("/logs/\x1b[31mfile\n\t{}", "界".repeat(300)).into(),
-                source: parser::Source::Claude,
-                lines: parser::LineDiagnostics {
-                    invalid_json_lines: 2,
-                    invalid_utf8_lines: 1,
-                    incomplete_tail_lines: 1,
-                },
-                read_error: true,
-            });
-        let without_root = index_command_output(&outcome);
-        assert!(without_root.degraded);
-        assert_eq!(without_root.notes.len(), existing_notes.len() + 3);
-        outcome.skipped_roots.push(indexer::SkippedRoot {
-            source: parser::Source::Codex,
-            preserved_sessions: 1,
-            reason: indexer::SkippedReason::MissingRoot,
-            other_roots_reconciled: false,
-        });
-        let out = index_command_output(&outcome);
-        assert!(out.degraded);
-        for note in existing_notes {
-            assert!(out.notes.contains(&note));
-        }
-        assert!(out.notes.iter().any(|n| n.contains("root unavailable")));
-        let d = &out.data["parse_diagnostics"][0];
-        let path = d["file_path"].as_str().unwrap();
-        assert_eq!(path.chars().count(), 240);
-        assert!(path.starts_with("/logs/file"));
-        assert!(!path.chars().any(char::is_control));
-        assert_eq!(d["invalid_json_lines"], 2);
-        assert_eq!(d["invalid_utf8_lines"], 1);
-        assert_eq!(d["incomplete_tail_lines"], 1);
-        assert_eq!(d["read_error"], true);
-        for note in &out.notes {
-            assert!(!note.chars().any(char::is_control));
-            assert!(note.chars().count() < 500);
-        }
-    }
+fn lone_parse_diagnostic_degrades_and_prints_a_240_character_path_without_control_characters() {
+    let outcome = IndexOutcome {
+        parse_diagnostics: vec![indexer::FileParseDiagnostics {
+            file_path: format!("/logs/\x1b[31mfile\n\t{}", "界".repeat(300)).into(),
+            source: parser::Source::Claude,
+            lines: parser::LineDiagnostics {
+                invalid_json_lines: 2,
+                invalid_utf8_lines: 1,
+                incomplete_tail_lines: 1,
+            },
+            read_error: true,
+        }],
+        ..IndexOutcome::default()
+    };
+
+    // The color escape and the newline are dropped and the tab becomes a space.
+    let path = format!("/logs/file {}", "界".repeat(229));
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [{
+                    "file_path": path,
+                    "incomplete_tail_lines": 1,
+                    "invalid_json_lines": 2,
+                    "invalid_utf8_lines": 1,
+                    "read_error": true,
+                    "source": "claude",
+                }],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                format!("{path}: skipped 2 invalid JSON line(s) and 1 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)"),
+                format!("{path}: 1 incomplete final line(s), possibly still being written; wait for the next append, then rerun `recall index`; if the writer has stopped, repair the source file"),
+                format!("{path}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained"),
+            ],
+        })
+    );
+}
+
+#[test]
+fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_same_run() {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    seed_claude_source(&claude_dir);
+    let broken = claude_dir.join("broken.jsonl");
+    fs::write(
+        &broken,
+        "{\"type\":\"user\",\"cwd\":\"/proj\",\"message\":{\"role\":\"user\",\"content\":\"wombat broken\"},\"timestamp\":\"2026-03-01T00:00:00Z\"}\ninvalid JSON\n",
+    )
+    .unwrap();
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    // An empty root is not an absolute path, so index does not read it and reports it as
+    // incompletely enumerated.
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: Path::new(""),
+        codex_archived_dir: None,
+    };
+    let rebuild_opts = indexer::IndexOptions {
+        force: true,
+        claude_dir: &claude_dir,
+        codex_dir: Path::new(""),
+        codex_archived_dir: None,
+    };
+    let broken = broken.to_str().unwrap();
+    let parse_diagnostic = serde_json::json!({
+        "file_path": broken,
+        "incomplete_tail_lines": 0,
+        "invalid_json_lines": 1,
+        "invalid_utf8_lines": 0,
+        "read_error": false,
+        "source": "claude",
+    });
+    let unread_codex_root = serde_json::json!({
+        "preserved_sessions": 0,
+        "reason": "incomplete_enumeration",
+        "source": "codex",
+    });
+    let unread_codex_root_note = "codex root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`";
+    let parse_loss_note = format!(
+        "{broken}: skipped 1 invalid JSON line(s) and 0 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)"
+    );
+
+    let failed = index_and_report_with(&Some(db_path.clone()), &opts, || {
+        Ok(Arc::new(embedder::MockEmbedder::failing_after(1)) as Arc<dyn Embed>)
+    })
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&failed),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 2,
+                "parse_diagnostics": [parse_diagnostic],
+                "preserved_embedded": 0,
+                "skipped_roots": [unread_codex_root],
+            },
+            "degraded": true,
+            "notes": [
+                "2 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
+                unread_codex_root_note,
+                parse_loss_note,
+            ],
+        })
+    );
+
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    let rebuilt = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
+        Err(DegradedReason::NotInstalled)
+    })
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&rebuilt),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [parse_diagnostic],
+                "preserved_embedded": 2,
+                "skipped_roots": [unread_codex_root],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+                unread_codex_root_note,
+                "preserved embeddings for 2 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+                parse_loss_note,
+            ],
+        })
+    );
 }
 
 #[test]
