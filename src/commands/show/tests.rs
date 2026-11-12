@@ -302,68 +302,80 @@ fn show_prints_an_unknown_stored_source_as_claude() {
 
 #[test]
 fn windowed_show_prints_only_same_session_messages_within_the_window() {
-    let (_dir, conn) = db::setup_test_db();
+    // The two sessions' messages interleave, so a rowid window that ignored the
+    // session would pull in sessB's messages.
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
     db::seed_session(&conn, "sessA");
     db::seed_session(&conn, "sessB");
-    for (sess, text) in [
-        ("sessA", "AMSG0"),
-        ("sessB", "BMSG0"),
-        ("sessA", "AMSG1"),
-        ("sessB", "BMSG1"),
-        ("sessA", "AMSG2"),
-        ("sessB", "BMSG2"),
-        ("sessA", "AMSG3_BODY"),
-        ("sessB", "BMSG3"),
-        ("sessA", "AMSG4"),
-        ("sessB", "BMSG4"),
-        ("sessA", "AMSG5"),
-        ("sessB", "BMSG5"),
-        ("sessA", "AMSG6"),
-        ("sessB", "BMSG6"),
-    ] {
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES (?1, 'user', ?2)",
-            rusqlite::params![sess, text],
-        )
-        .unwrap();
-    }
-    let body: i64 = conn
-        .query_row(
-            "SELECT rowid FROM messages WHERE session_id='sessA' AND text='AMSG3_BODY'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (100, 'sessA', 'AMSG3_BODY', 0, ?1, ?1)",
-        [body],
+    conn.execute_batch(
+        "INSERT INTO messages (rowid, session_id, role, text) VALUES
+             (1, 'sessA', 'user', 'AMSG0'), (2, 'sessB', 'user', 'BMSG0'),
+             (3, 'sessA', 'user', 'AMSG1'), (4, 'sessB', 'user', 'BMSG1'),
+             (5, 'sessA', 'user', 'AMSG2'), (6, 'sessB', 'user', 'BMSG2'),
+             (7, 'sessA', 'user', 'AMSG3_BODY'), (8, 'sessB', 'user', 'BMSG3'),
+             (9, 'sessA', 'user', 'AMSG4'), (10, 'sessB', 'user', 'BMSG4'),
+             (11, 'sessA', 'user', 'AMSG5'), (12, 'sessB', 'user', 'BMSG5'),
+             (13, 'sessA', 'user', 'AMSG6'), (14, 'sessB', 'user', 'BMSG6');
+         INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (100, 'sessA', 'AMSG3_BODY', 0, 7, 7);",
     )
     .unwrap();
+    drop(conn);
 
-    let out = show_session_windowed(&conn, "sessA", false, Some(100), 2).unwrap();
+    let out = run_show("sessA", false, Some(100), 2, &Some(db_path)).unwrap();
 
-    for included in ["AMSG1", "AMSG2", "AMSG3_BODY", "AMSG4", "AMSG5"] {
-        assert!(
-            out.markdown.contains(included),
-            "window=2 must include same-session {included}, got: {}",
-            out.markdown
-        );
-    }
-    assert!(
-        !out.markdown.contains("AMSG0"),
-        "before-cap: the 3rd-earlier same-session message must be excluded, got: {}",
-        out.markdown
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# slug\n",
+            "- session_id: sessA\n",
+            "- date: 1970-01-01\n",
+            "- project: /p\n",
+            "- source: claude\n",
+            "- chunk: 100\n",
+            "- window: 2\n",
+            "\n",
+            "## [user]\n",
+            "AMSG1\n",
+            "\n",
+            "## [user]\n",
+            "AMSG2\n",
+            "\n",
+            "## [user] (chunk)\n",
+            "AMSG3_BODY\n",
+            "\n",
+            "## [user]\n",
+            "AMSG4\n",
+            "\n",
+            "## [user]\n",
+            "AMSG5\n",
+            "\n",
+        )
     );
-    assert!(
-        !out.markdown.contains("AMSG6"),
-        "after-cap: the 3rd-later same-session message must be excluded, got: {}",
-        out.markdown
-    );
-    assert!(
-        !out.markdown.contains("BMSG"),
-        "must not cross into the adjacent session sharing interleaved rowids, got: {}",
-        out.markdown
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 100,
+                "messages": [
+                    { "in_chunk": false, "role": "user", "rowid": 3, "text": "AMSG1" },
+                    { "in_chunk": false, "role": "user", "rowid": 5, "text": "AMSG2" },
+                    { "in_chunk": true, "role": "user", "rowid": 7, "text": "AMSG3_BODY" },
+                    { "in_chunk": false, "role": "user", "rowid": 9, "text": "AMSG4" },
+                    { "in_chunk": false, "role": "user", "rowid": 11, "text": "AMSG5" },
+                ],
+                "project": "/p",
+                "session_id": "sessA",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+                "window": 2,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
