@@ -1,21 +1,16 @@
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::Path;
 
+use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
 use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
-use crate::{db, parser, search};
+use crate::{parser, search};
 
 use super::*;
 
-fn pending_embed_count(conn: &Connection) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM qa_chunks c \
-             WHERE NOT EXISTS (SELECT 1 FROM vec_chunks v WHERE v.chunk_id = c.id)",
-        [],
-        |r| r.get(0),
-    )
-    .unwrap()
-}
+const MODEL_NOT_INSTALLED_NOTE: &str =
+    "note: embedding model not installed; run `recall model download` to enable semantic search.";
+const ONE_SESSION_PRESERVED_NOTE: &str = "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed";
 
 fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
     (root.join("no_claude"), root.join("no_codex"))
@@ -30,111 +25,25 @@ fn seed_claude_source(claude_dir: &Path) {
         .unwrap();
 }
 
-#[test]
-fn embed_all_pending_embeds_every_pending_chunk() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let mut conn = open_or_create_db(&db_path).unwrap();
-    db::seed_session(&conn, "s1");
-    for i in 1..=3 {
-        db::seed_chunk(&conn, i, &format!("pending content {i}"));
-    }
+/// The `--json` envelope `recall index` prints for an outcome.
+fn printed_envelope(outcome: &IndexOutcome) -> serde_json::Value {
+    serde_json::from_str(&render_json_success(&index_command_output(outcome))).unwrap()
+}
 
-    let result = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::new(),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(result.embedded, 3, "every pending chunk embeds");
-    assert_eq!(result.failed_count, 0, "a working embedder fails nothing");
-    assert_eq!(pending_embed_count(&conn), 0, "the pending set empties");
-    assert_eq!(vec_chunk_count(&conn), 3, "each chunk gains a vec row");
+/// The `--json` envelope `recall index` prints for a run, without `data.observations.seconds`,
+/// whose stage timings change from run to run.
+fn printed_json(outcome: &IndexOutcome) -> serde_json::Value {
+    let mut envelope = printed_envelope(outcome);
+    envelope["data"]["observations"]
+        .as_object_mut()
+        .expect("a run prints data.observations as an object")
+        .remove("seconds")
+        .expect("a run prints data.observations.seconds");
+    envelope
 }
 
 #[test]
-fn embed_all_pending_partial_failure_reports_failed_count() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let mut conn = open_or_create_db(&db_path).unwrap();
-    db::seed_session(&conn, "s1");
-    db::seed_chunk(&conn, 1, "x");
-    for i in 2..=3 {
-        db::seed_chunk(&conn, i, &format!("pending content {i}"));
-    }
-
-    let result = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::failing_on_text("x"),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-
-    assert_eq!(
-        result.embedded, 0,
-        "the poisoned single batch embeds nothing"
-    );
-    assert_eq!(
-        result.failed_count, 3,
-        "the whole 3-chunk batch is reported failed"
-    );
-    let err = result.first_error.as_deref().unwrap_or_default();
-    assert!(
-        err == "batch inference failed",
-        "the first batch error is carried up for the --json note, got: {err:?}"
-    );
-    assert_eq!(
-        pending_embed_count(&conn),
-        3,
-        "the failed batch stays pending for the next run"
-    );
-}
-
-#[test]
-fn embed_all_pending_reembeds_nothing_on_second_run() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let mut conn = open_or_create_db(&db_path).unwrap();
-    db::seed_session(&conn, "s1");
-    for (id, content) in [(1, "already embedded"), (2, "new pending")] {
-        db::seed_chunk(&conn, id, content);
-    }
-    let emb = embedder::MockEmbedder::deterministic_vector("already embedded");
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        [embedder::f32_as_bytes(&emb)],
-    )
-    .unwrap();
-
-    let first = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::new(),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(
-        first.embedded, 1,
-        "the first run embeds only the pending chunk"
-    );
-    assert_eq!(vec_chunk_count(&conn), 2, "vec gains exactly the new chunk");
-
-    let second = embed_all_pending(
-        &mut conn,
-        &embedder::MockEmbedder::new(),
-        &embedder::EmbedOptions::default(),
-    )
-    .unwrap();
-    assert_eq!(second.embedded, 0, "the second run re-embeds nothing");
-    assert_eq!(
-        vec_chunk_count(&conn),
-        2,
-        "a second run must re-embed nothing (NOT EXISTS vec_chunks gate)"
-    );
-}
-
-#[test]
-fn index_and_report_forwards_index_flags_as_embed_options() {
+fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let claude_dir = db_dir.path().join("claude");
@@ -149,31 +58,77 @@ fn index_and_report_forwards_index_flags_as_embed_options() {
     };
 
     let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
-    let options = embedder::EmbedOptions {
-        token_budget: Some(2048),
-        forward_pause: Some(Duration::from_millis(700)),
-    };
 
-    let result = index_and_report_observed(
+    let outcome = index_and_report_observed(
         &Some(db_path),
         &opts,
         || Ok(embedder.clone()),
-        options,
+        embed_options_from_flags(Some(2048), Some(700)),
         &index_observer::Observer::stderr(),
     )
     .unwrap();
 
-    assert_eq!(result.embedded, 1);
     assert_eq!(
         embedder.captured_options(),
-        Some(options),
-        "--token-budget 2048 --forward-pause-ms 700 must forward as \
-             EmbedOptions{{token_budget:Some(2048), forward_pause:Some(700ms)}}"
+        Some(embedder::EmbedOptions {
+            token_budget: Some(2048),
+            forward_pause: Some(Duration::from_millis(700)),
+        }),
+        "--token-budget 2048 --forward-pause-ms 700 reach the embedder as 2048 tokens and a 700 ms pause"
+    );
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 1,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 1,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 1,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 1,
+                        "inference_chunks": 1,
+                        "pending_body_bytes_peak": 20,
+                        "pending_metadata_bytes": 96,
+                        "pending_page_chunks_peak": 1,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
 #[test]
-fn index_and_report_forwards_default_embed_options_when_flags_unset() {
+fn index_without_the_token_budget_and_forward_pause_flags_hands_the_embedder_the_default_options() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let claude_dir = db_dir.path().join("claude");
@@ -186,24 +141,32 @@ fn index_and_report_forwards_default_embed_options_when_flags_unset() {
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-
     let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
+    let no_flags = embed_options_from_flags(None, None);
 
-    let result = index_and_report_with(&Some(db_path), &opts, || Ok(embedder.clone())).unwrap();
+    index_and_report_observed(
+        &Some(db_path),
+        &opts,
+        || Ok(embedder.clone()),
+        no_flags,
+        &index_observer::Observer::stderr(),
+    )
+    .unwrap();
 
     assert_eq!(
-        result.embedded, 1,
-        "default EmbedOptions must preserve current embed behavior"
+        no_flags,
+        embedder::EmbedOptions::default(),
+        "no --token-budget and no --forward-pause-ms mean no token budget and no pause"
     );
     assert_eq!(
         embedder.captured_options(),
         Some(embedder::EmbedOptions::default()),
-        "default EmbedOptions (None/None) must forward when no flags are set"
+        "a run without the flags hands the embedder the default options"
     );
 }
 
 #[test]
-fn rebuild_reembeds_all_and_rebuilds_fts_index() {
+fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -222,29 +185,71 @@ fn rebuild_reembeds_all_and_rebuilds_fts_index() {
     {
         let conn = open_or_create_db(&db_path).unwrap();
         assert_eq!(
-            pending_embed_count(&conn),
-            0,
-            "precondition: initial index must leave nothing pending"
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the first index embeds the session's one chunk"
         );
     }
 
     let rebuild_opts = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
-    index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
+    let rebuilt =
+        index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
 
-    let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
-        pending_embed_count(&conn),
-        0,
-        "rebuild must re-embed every chunk (pending=0 after full reset)"
+        printed_json(&rebuilt),
+        serde_json::json!({
+            "data": {
+                "embedded": 1,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 1,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 1,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 1,
+                        "inference_chunks": 1,
+                        "pending_body_bytes_peak": 20,
+                        "pending_metadata_bytes": 96,
+                        "pending_page_chunks_peak": 1,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
-
-    let opts = search::SearchOptions::default();
-    let hits = search::search(&conn, "quokka", &opts).unwrap();
+    let conn = open_or_create_db(&db_path).unwrap();
+    assert_eq!(vec_chunk_count(&conn), 1, "the session keeps one vector");
+    let hits = search::search(&conn, "quokka", &search::SearchOptions::default()).unwrap();
     assert_eq!(
         hits.len(),
         1,
@@ -252,57 +257,8 @@ fn rebuild_reembeds_all_and_rebuilds_fts_index() {
     );
 }
 
-#[test]
-fn index_and_report_with_backfills_legacy_null_rowid_ranges() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    {
-        let conn = open_or_create_db(&db_path).unwrap();
-        let cleared = conn
-            .execute(
-                "UPDATE qa_chunks SET src_rowid_lo = NULL, src_rowid_hi = NULL",
-                [],
-            )
-            .unwrap();
-        assert_eq!(cleared, 1, "precondition: one chunk to un-link");
-    }
-
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let conn = open_or_create_db(&db_path).unwrap();
-    let (lo, hi): (Option<i64>, Option<i64>) = conn
-        .query_row(
-            "SELECT src_rowid_lo, src_rowid_hi FROM qa_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert!(
-        lo.is_some() && hi.is_some(),
-        "the index-path backfill must repopulate the legacy NULL rowid range, got lo={lo:?} hi={hi:?}"
-    );
-}
-
-fn write_backfill_session(
-    dir: &Path,
-    file: &str,
-    user_text: &str,
-    edit_path: Option<&str>,
-) -> PathBuf {
+/// Writes a session log whose user turn is followed by an assistant `Edit` of `edit_path`.
+fn write_backfill_session(dir: &Path, file: &str, user_text: &str, edit_path: &str) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let user = serde_json::json!({
         "type": "user",
@@ -310,23 +266,26 @@ fn write_backfill_session(
         "message": {"role": "user", "content": user_text},
         "timestamp": "2026-03-01T00:00:00Z"
     });
-    let mut content = serde_json::to_string(&user).unwrap();
-    if let Some(path) = edit_path {
-        let assistant = serde_json::json!({
-            "type": "assistant",
-            "cwd": "/proj",
-            "message": {"role": "assistant", "content": [
-                {"type": "text", "text": "editing"},
-                {"type": "tool_use", "id": "t1", "name": "Edit",
-                 "input": {"file_path": path, "old_string": "x", "new_string": "y"}}
-            ]},
-            "timestamp": "2026-03-01T00:00:01Z"
-        });
-        content.push('\n');
-        content.push_str(&serde_json::to_string(&assistant).unwrap());
-    }
+    let assistant = serde_json::json!({
+        "type": "assistant",
+        "cwd": "/proj",
+        "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "editing"},
+            {"type": "tool_use", "id": "t1", "name": "Edit",
+             "input": {"file_path": edit_path, "old_string": "x", "new_string": "y"}}
+        ]},
+        "timestamp": "2026-03-01T00:00:01Z"
+    });
     let full = dir.join(file);
-    fs::write(&full, content).unwrap();
+    fs::write(
+        &full,
+        format!(
+            "{}\n{}",
+            serde_json::to_string(&user).unwrap(),
+            serde_json::to_string(&assistant).unwrap()
+        ),
+    )
+    .unwrap();
     full
 }
 
@@ -359,7 +318,8 @@ fn reset_to_legacy_state(conn: &Connection) {
 }
 
 #[test]
-fn backfill_が本文_index_と_embedding_を変えない() {
+fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_messages_chunks_or_embeddings()
+ {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -367,13 +327,13 @@ fn backfill_が本文_index_と_embedding_を変えない() {
         &claude_dir,
         "a.jsonl",
         "session a probe",
-        Some("/proj/marker_a.rs"),
+        "/proj/marker_a.rs",
     );
     write_backfill_session(
         &claude_dir,
         "b.jsonl",
         "session b probe",
-        Some("/proj/marker_b.rs"),
+        "/proj/marker_b.rs",
     );
 
     let body = fs::read_to_string(&partial).unwrap();
@@ -388,32 +348,83 @@ fn backfill_が本文_index_と_embedding_を変えない() {
         codex_archived_dir: None,
     };
 
-    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    assert_eq!(
-        index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
-        1
-    );
-    let before = {
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    {
         let conn = open_or_create_db(&db_path).unwrap();
         reset_to_legacy_state(&conn);
         conn.execute("DELETE FROM parse_diagnostics", []).unwrap();
-        assert!(
-            !collect_i64(&conn, "SELECT chunk_id FROM vec_chunks").is_empty(),
-            "precondition: the legacy DB must hold embeddings, or the invariant is vacuous"
+        assert_eq!(
+            body_snapshot(&conn),
+            (vec![1, 2, 3, 4], vec![1, 2], vec![1, 2]),
+            "precondition: the legacy DB holds two messages, one chunk and one vector per session"
         );
-        body_snapshot(&conn)
-    };
+    }
 
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    assert_eq!(
-        index_command_output(&outcome).data["parse_diagnostics"][0]["invalid_json_lines"],
-        1
-    );
 
+    let partial = partial.to_str().unwrap();
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 2,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 2,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "pending_body_bytes_peak": 0,
+                        "pending_metadata_bytes": 0,
+                        "pending_page_chunks_peak": 0,
+                        "pending_pages": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 2,
+                    },
+                },
+                "parse_diagnostics": [{
+                    "file_path": partial,
+                    "incomplete_tail_lines": 0,
+                    "invalid_json_lines": 1,
+                    "invalid_utf8_lines": 0,
+                    "read_error": false,
+                    "source": "claude",
+                }],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [format!(
+                "{partial}: skipped 1 invalid JSON line(s) and 0 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)"
+            )],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         body_snapshot(&conn),
-        before,
+        (vec![1, 2, 3, 4], vec![1, 2], vec![1, 2]),
         "backfill must not change messages / qa_chunks / vec_chunks row counts or id sets"
     );
     assert_eq!(
@@ -427,85 +438,7 @@ fn backfill_が本文_index_と_embedding_を変えない() {
 }
 
 #[test]
-fn 二回目の_index_で_backfill_が再実行されない() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    let write_path = write_backfill_session(
-        &claude_dir,
-        "write.jsonl",
-        "write session probe",
-        Some("/proj/orig_marker.rs"),
-    );
-    write_backfill_session(&claude_dir, "zero.jsonl", "zero touch probe", None);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    {
-        let conn = open_or_create_db(&db_path).unwrap();
-        reset_to_legacy_state(&conn);
-    }
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let original = fs::metadata(&write_path).unwrap();
-    let pinned = original.modified().unwrap();
-    write_backfill_session(
-        &claude_dir,
-        "write.jsonl",
-        "write session probe",
-        Some("/proj/next_marker.rs"),
-    );
-    let f = OpenOptions::new().write(true).open(&write_path).unwrap();
-    f.set_modified(pinned).unwrap();
-    drop(f);
-    let replaced = fs::metadata(&write_path).unwrap();
-    assert_eq!(replaced.len(), original.len(), "canary must preserve size");
-    assert_eq!(replaced.modified().unwrap(), pinned);
-
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let conn = open_or_create_db(&db_path).unwrap();
-    let unmarked: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sessions WHERE files_scanned IS NULL",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        unmarked, 0,
-        "every session (write-target and zero-touch) must carry files_scanned after the backfill"
-    );
-    assert!(
-        !session_file_paths(&conn)
-            .iter()
-            .any(|p| p == "/proj/next_marker.rs"),
-        "a marked session must not be re-read: the canary path must not appear in session_files"
-    );
-
-    conn.execute("DELETE FROM session_files WHERE session_id = 'write'", [])
-        .unwrap();
-    conn.execute(
-        "UPDATE sessions SET files_scanned = NULL WHERE session_id = 'write'",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let conn = open_or_create_db(&db_path).unwrap();
-    assert!(session_file_paths(&conn).contains(&"/proj/next_marker.rs".to_owned()));
-}
-
-#[test]
-fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
+fn index_with_its_claude_root_missing_keeps_the_session_and_reports_it_skipped_in_json() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -529,22 +462,75 @@ fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    let outcome = index_and_report_with(&Some(db_path), &missing_opts, mock_loader).unwrap();
+    let outcome =
+        index_and_report_with(&Some(db_path.clone()), &missing_opts, mock_loader).unwrap();
 
     assert_eq!(
-        outcome.skipped_roots.len(),
-        1,
-        "the missing claude root must be threaded into the outcome"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 0,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "pending_body_bytes_peak": 0,
+                        "pending_metadata_bytes": 0,
+                        "pending_page_chunks_peak": 0,
+                        "pending_pages": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [{
+                    "preserved_sessions": 1,
+                    "reason": "missing_root",
+                    "source": "claude",
+                }],
+            },
+            "degraded": true,
+            "notes": [
+                "claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions",
+            ],
+        })
     );
-    assert_eq!(outcome.skipped_roots[0].source, parser::Source::Claude);
+    let conn = open_or_create_db(&db_path).unwrap();
+    let hits = search::search(&conn, "quokka", &search::SearchOptions::default()).unwrap();
     assert_eq!(
-        outcome.skipped_roots[0].preserved_sessions, 1,
-        "the one preserved claude session must be counted"
+        hits.len(),
+        1,
+        "the session under the missing root stays searchable"
     );
 }
 
 #[test]
-fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
+fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_chunk_unattempted() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -561,25 +547,56 @@ fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
         Err(DegradedReason::NotInstalled)
-    });
-    assert!(
-        outcome.is_ok(),
-        "a model-less index must complete FTS and exit 0, not abort"
-    );
-    let outcome = outcome.unwrap();
-    let counts = &outcome.observations["counts"];
-    assert_eq!(counts["chunks_pending_snapshot"], 1);
-    assert_eq!(counts["chunks_unattempted"], 1);
-    assert_eq!(counts["chunks_remaining_snapshot"], 1);
-    for key in [
-        "chunks_saved",
-        "chunks_failed",
-        "chunks_stale",
-        "chunks_save_failed",
-    ] {
-        assert_eq!(counts[key], 0);
-    }
+    })
+    .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 1,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 1,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 1,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                MODEL_NOT_INSTALLED_NOTE,
+            ],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     let search_opts = search::SearchOptions::default();
     let hits = search::search(&conn, "quokka", &search_opts).unwrap();
@@ -591,112 +608,7 @@ fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
 }
 
 #[test]
-fn index_and_report_with_degraded_loader_emits_model_download_note() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .expect("a degraded index must succeed");
-
-    let note = outcome
-        .degraded_note
-        .expect("a model-less index must carry a degraded note");
-    assert!(
-        note.contains("recall model download"),
-        "the degraded note must name `recall model download` to guide the user, got: {note}"
-    );
-}
-
-#[test]
-fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
-    for reason in [
-        DegradedReason::BackendUnavailable,
-        DegradedReason::ProbeFailed,
-    ] {
-        let src = tempfile::TempDir::new().unwrap();
-        let claude_dir = src.path().join("claude");
-        let (_, codex_dir) = absent_source_dirs(src.path());
-        seed_claude_source(&claude_dir);
-
-        let db_dir = tempfile::TempDir::new().unwrap();
-        let db_path = db_dir.path().join("recall.db");
-
-        let opts = indexer::IndexOptions {
-            force: false,
-            claude_dir: &claude_dir,
-            codex_dir: &codex_dir,
-            codex_archived_dir: None,
-        };
-        let outcome = index_and_report_with(&Some(db_path), &opts, || Err(reason))
-            .expect("a degraded index must succeed");
-
-        let note = outcome
-            .degraded_note
-            .unwrap_or_else(|| panic!("{reason:?} must carry a degraded note"));
-        assert!(
-            note.contains("unavailable"),
-            "{reason:?} must report unavailability (not a download hint), got: {note}"
-        );
-        assert!(
-            !note.to_lowercase().contains("download"),
-            "{reason:?} is not repaired by re-downloading, so the note must not \
-                 suggest it (that hint belongs to NotInstalled), got: {note}"
-        );
-        assert_eq!(outcome.embedded, 0, "{reason:?} skips embedding");
-        assert_eq!(outcome.failed_count, 0, "{reason:?} fails no batches");
-    }
-}
-
-#[test]
-fn index_and_report_with_disabled_loader_is_indistinguishable_from_success() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    let outcome = index_and_report_with(&Some(db_path), &opts, || Err(DegradedReason::Disabled))
-        .expect("a disabled-embedder index must succeed");
-
-    assert_eq!(
-        outcome.degraded_note, None,
-        "opt-out is not a degradation: no note is carried"
-    );
-    assert_eq!(outcome.embedded, 0, "a disabled embedder embeds nothing");
-    assert_eq!(
-        outcome.failed_count, 0,
-        "a disabled embedder fails no batches"
-    );
-    let envelope = index_command_output(&outcome);
-    assert!(
-        !envelope.degraded,
-        "the --json envelope reports a disabled embedder as non-degraded"
-    );
-}
-
-#[test]
-fn model_absent_rebuild_preserves_existing_embeddings() {
+fn index_without_the_model_keeps_the_embeddings_of_a_changed_session_and_reports_them_preserved() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -712,36 +624,83 @@ fn model_absent_rebuild_preserves_existing_embeddings() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(
-        before > 0,
-        "precondition: the initial index must embed at least one chunk"
-    );
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the first index embeds the session's one chunk"
+        );
+    }
 
-    let rebuild = indexer::IndexOptions {
-        force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &rebuild, || {
+    fs::write(
+            claude_dir.join("s1.jsonl"),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"quokka rebuild probe, edited after it was embedded"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
         Err(DegradedReason::NotInstalled)
     })
     .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 1,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 1,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                MODEL_NOT_INSTALLED_NOTE,
+                ONE_SESSION_PRESERVED_NOTE,
+            ],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
-        "a model-absent rebuild must preserve existing embeddings, not destroy them"
+        1,
+        "the changed session keeps its stored embedding"
     );
 }
 
 #[test]
-fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
+fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -757,39 +716,77 @@ fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(
-        before > 0,
-        "precondition: the initial index must embed at least one chunk"
-    );
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the initial index embeds the session's one chunk"
+        );
+    }
 
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
     })
     .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 1,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 1,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model unavailable; results from text search only.",
+                ONE_SESSION_PRESERVED_NOTE,
+            ],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
-        "a load-OK-but-inference-fails rebuild must preserve existing embeddings, not destroy them"
-    );
-    assert!(
-        outcome.preserved_embedded > 0,
-        "the preserved-embedding count must ride the degraded arm"
-    );
-    assert!(
-        outcome.degraded_note.is_some(),
-        "an inference-incapable model must report a degraded note"
+        1,
+        "a rebuild whose model fails its probe keeps the stored embedding"
     );
 }
 
@@ -824,9 +821,7 @@ fn model_present_rebuild_heals_orphan_vec_rows() {
 
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, mock_loader).unwrap();
 
@@ -861,14 +856,14 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(
-        before > 0,
-        "precondition: the initial index embedded chunks"
-    );
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the initial index embeds the session's one chunk"
+        );
+    }
 
     const ORPHAN_ID: i64 = 9_999_999;
     {
@@ -883,9 +878,7 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
 
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -906,13 +899,13 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
     );
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
+        1,
         "preserved embeddings (stable qa ids) survive; only the orphan is removed"
     );
 }
 
 #[test]
-fn model_absent_rebuild_surfaces_preserved_count_and_note() {
+fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_for_text_search() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -928,71 +921,14 @@ fn model_absent_rebuild_surfaces_preserved_count_and_note() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-
-    let rebuild = indexer::IndexOptions {
-        force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .unwrap();
-
-    assert!(
-        outcome.preserved_embedded > 0,
-        "the outcome must report the preserved session count, got {}",
-        outcome.preserved_embedded
-    );
-
-    let out = index_command_output(&outcome);
-    assert!(
-        out.degraded,
-        "a model-absent run with preservation degrades"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains(&outcome.preserved_embedded.to_string())),
-        "the preserve note must name the preserved count, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "the degraded note must carry the download remedy for a not-installed model, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["preserved_embedded"], outcome.preserved_embedded,
-        "the --json payload carries the preserved magnitude for an agent"
-    );
-}
-
-#[test]
-fn model_absent_index_adds_new_session_and_preserves_embeddings() {
-    let src = tempfile::TempDir::new().unwrap();
-    let claude_dir = src.path().join("claude");
-    let (_, codex_dir) = absent_source_dirs(src.path());
-    seed_claude_source(&claude_dir);
-
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-
-    let opts = indexer::IndexOptions {
-        force: false,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
-    };
-    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(before > 0, "precondition: the first session was embedded");
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the first session's one chunk is embedded"
+        );
+    }
 
     fs::write(
             claude_dir.join("s2.jsonl"),
@@ -1001,24 +937,66 @@ fn model_absent_index_adds_new_session_and_preserves_embeddings() {
         .unwrap();
     let rebuild_opts = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
         Err(DegradedReason::NotInstalled)
     })
     .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 1,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 1,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 1,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 1,
+                        "files_discovered": 2,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 2,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 1,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                MODEL_NOT_INSTALLED_NOTE,
+                ONE_SESSION_PRESERVED_NOTE,
+            ],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
+        1,
         "the original session's embeddings must be preserved, not destroyed"
-    );
-    assert_eq!(
-        outcome.preserved_embedded, 1,
-        "only the one embedded session is preserved; the new one is indexed"
     );
     let search_opts = search::SearchOptions::default();
     let hits = search::search(&conn, "platypus", &search_opts).unwrap();
@@ -1071,9 +1049,7 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
         .unwrap();
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -1081,8 +1057,52 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
     .unwrap();
 
     assert_eq!(
-        outcome.preserved_embedded, 0,
-        "a cached session without embeddings must not be preserved"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 1,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 1,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 1,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                MODEL_NOT_INSTALLED_NOTE,
+            ],
+        }),
+        "a cached session without embeddings is not preserved"
     );
     let conn = open_or_create_db(&db_path).unwrap();
     let search_opts = search::SearchOptions::default();
@@ -1103,9 +1123,497 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
 }
 
 #[test]
-fn model_absent_incremental_index_preserves_edited_embedded_session() {
-    use std::time::{Duration, SystemTime};
+fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_on_the_next_run() {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    seed_claude_source(&claude_dir);
 
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    // The load probe is the embedder's first call and the only one that succeeds; every batch
+    // after it fails.
+    let failed = index_and_report_with(&Some(db_path.clone()), &opts, || {
+        Ok(Arc::new(embedder::MockEmbedder::failing_after(1)) as Arc<dyn Embed>)
+    })
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&failed),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 1,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 1,
+                        "chunks_failed": 1,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 1,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 1,
+                        "inference_chunks": 1,
+                        "pending_body_bytes_peak": 20,
+                        "pending_metadata_bytes": 96,
+                        "pending_page_chunks_peak": 1,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "1 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
+            ],
+        })
+    );
+
+    let retried = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+
+    assert_eq!(
+        printed_json(&retried),
+        serde_json::json!({
+            "data": {
+                "embedded": 1,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 1,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 1,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 1,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 1,
+                        "inference_chunks": 1,
+                        "pending_body_bytes_peak": 20,
+                        "pending_metadata_bytes": 96,
+                        "pending_page_chunks_peak": 1,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+    let conn = open_or_create_db(&db_path).unwrap();
+    assert_eq!(vec_chunk_count(&conn), 1, "the retried chunk is stored");
+}
+
+/// One session-log line holding a user turn whose text is `text`.
+fn user_turn_line(text: &str) -> String {
+    let turn = serde_json::json!({
+        "type": "user",
+        "cwd": "/proj",
+        "message": {"role": "user", "content": text},
+        "timestamp": "2026-03-01T00:00:00Z"
+    });
+    format!("{turn}\n")
+}
+
+#[test]
+fn index_whose_second_embedding_batch_fails_keeps_the_first_batch_and_hands_the_flags_to_both_batches()
+ {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    fs::create_dir_all(&claude_dir).unwrap();
+    // Pending chunks are embedded shortest first, so the 128 short turns fill the first batch
+    // and the one longer turn is the whole second batch.
+    let long_text = "wombat batch, the longest turn";
+    fs::write(
+        claude_dir.join("s1.jsonl"),
+        format!(
+            "{}{}",
+            user_turn_line("wombat batch").repeat(128),
+            user_turn_line(long_text)
+        ),
+    )
+    .unwrap();
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    let embedder = Arc::new(embedder::MockEmbedder::failing_on_text(long_text));
+
+    let outcome = index_and_report_observed(
+        &Some(db_path),
+        &opts,
+        || Ok(embedder.clone()),
+        embed_options_from_flags(Some(2048), Some(700)),
+        &index_observer::Observer::stderr(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 128,
+                "failed_count": 1,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 129,
+                        "chunks_failed": 1,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 129,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 1,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 128,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 2,
+                        "inference_chunks": 129,
+                        "pending_body_bytes_peak": 1566,
+                        "pending_metadata_bytes": 6144,
+                        "pending_page_chunks_peak": 129,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "1 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
+            ],
+        })
+    );
+    let flags = embedder::EmbedOptions {
+        token_budget: Some(2048),
+        forward_pause: Some(Duration::from_millis(700)),
+    };
+    assert_eq!(
+        embedder.captured_batch_options(),
+        vec![flags, flags],
+        "--token-budget 2048 --forward-pause-ms 700 reach both the saved and the failed batch"
+    );
+}
+
+#[test]
+fn lone_parse_diagnostic_degrades_and_prints_a_240_character_path_without_control_characters() {
+    let outcome = IndexOutcome {
+        parse_diagnostics: vec![indexer::FileParseDiagnostics {
+            file_path: format!("/logs/\x1b[31mfile\n\t{}", "界".repeat(300)).into(),
+            source: parser::Source::Claude,
+            lines: parser::LineDiagnostics {
+                invalid_json_lines: 2,
+                invalid_utf8_lines: 1,
+                incomplete_tail_lines: 1,
+            },
+            read_error: true,
+        }],
+        ..IndexOutcome::default()
+    };
+
+    // The color escape and the newline are dropped and the tab becomes a space.
+    let path = format!("/logs/file {}", "界".repeat(229));
+    assert_eq!(
+        printed_envelope(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": null,
+                "parse_diagnostics": [{
+                    "file_path": path,
+                    "incomplete_tail_lines": 1,
+                    "invalid_json_lines": 2,
+                    "invalid_utf8_lines": 1,
+                    "read_error": true,
+                    "source": "claude",
+                }],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                format!("{path}: skipped 2 invalid JSON line(s) and 1 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)"),
+                format!("{path}: 1 incomplete final line(s), possibly still being written; wait for the next append, then rerun `recall index`; if the writer has stopped, repair the source file"),
+                format!("{path}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained"),
+            ],
+        })
+    );
+}
+
+#[test]
+fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_same_run() {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    seed_claude_source(&claude_dir);
+    let broken = claude_dir.join("broken.jsonl");
+    fs::write(
+        &broken,
+        "{\"type\":\"user\",\"cwd\":\"/proj\",\"message\":{\"role\":\"user\",\"content\":\"wombat broken\"},\"timestamp\":\"2026-03-01T00:00:00Z\"}\ninvalid JSON\n",
+    )
+    .unwrap();
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    // An empty root is not an absolute path, so index does not read it and reports it as
+    // incompletely enumerated.
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: Path::new(""),
+        codex_archived_dir: None,
+    };
+    let rebuild_opts = indexer::IndexOptions {
+        force: true,
+        ..opts
+    };
+    let broken = broken.to_str().unwrap();
+    let parse_diagnostic = serde_json::json!({
+        "file_path": broken,
+        "incomplete_tail_lines": 0,
+        "invalid_json_lines": 1,
+        "invalid_utf8_lines": 0,
+        "read_error": false,
+        "source": "claude",
+    });
+    let unread_codex_root = serde_json::json!({
+        "preserved_sessions": 0,
+        "reason": "incomplete_enumeration",
+        "source": "codex",
+    });
+    let unread_codex_root_note = "codex root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`";
+    let parse_loss_note = format!(
+        "{broken}: skipped 1 invalid JSON line(s) and 0 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)"
+    );
+
+    let failed = index_and_report_with(&Some(db_path.clone()), &opts, || {
+        Ok(Arc::new(embedder::MockEmbedder::failing_after(1)) as Arc<dyn Embed>)
+    })
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&failed),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 2,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 2,
+                        "chunks_failed": 2,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 2,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 2,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 2,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 2,
+                        "files_updated_committed": 2,
+                        "inference_batches": 1,
+                        "inference_chunks": 2,
+                        "pending_body_bytes_peak": 33,
+                        "pending_metadata_bytes": 96,
+                        "pending_page_chunks_peak": 2,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 2,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 2,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 2,
+                    },
+                },
+                "parse_diagnostics": [parse_diagnostic],
+                "preserved_embedded": 0,
+                "skipped_roots": [unread_codex_root],
+            },
+            "degraded": true,
+            "notes": [
+                "2 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
+                unread_codex_root_note,
+                parse_loss_note,
+            ],
+        })
+    );
+
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    let rebuilt = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
+        Err(DegradedReason::NotInstalled)
+    })
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&rebuilt),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 2,
+                        "files_discovered": 2,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 2,
+                    },
+                },
+                "parse_diagnostics": [parse_diagnostic],
+                "preserved_embedded": 2,
+                "skipped_roots": [unread_codex_root],
+            },
+            "degraded": true,
+            "notes": [
+                MODEL_NOT_INSTALLED_NOTE,
+                unread_codex_root_note,
+                "preserved embeddings for 2 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+                parse_loss_note,
+            ],
+        })
+    );
+}
+
+#[test]
+fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characters_of_the_error() {
+    let outcome = IndexOutcome {
+        degraded_note: None,
+        embedded: 0,
+        failed_count: 2,
+        first_error: Some(format!(
+            "batch: \x1b[31mboom\x1b[0m {}{}",
+            "e".repeat(100),
+            "界".repeat(200)
+        )),
+        skipped_roots: Vec::new(),
+        preserved_embedded: 0,
+        parse_diagnostics: Vec::new(),
+        observations: serde_json::Value::Null,
+    };
+
+    assert_eq!(
+        printed_envelope(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 2,
+                "observations": null,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [format!(
+                "2 chunk(s) failed to embed (batch: boom {}{}); rerun `recall index` to retry",
+                "e".repeat(100),
+                "界".repeat(8)
+            )],
+        })
+    );
+}
+
+#[test]
+fn index_with_a_claude_root_that_cannot_be_read_reports_its_preserved_session_as_incomplete_enumeration()
+ {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -1121,353 +1629,152 @@ fn model_absent_incremental_index_preserves_edited_embedded_session() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
-        let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
+
+    // An empty root is not an absolute path, so index does not read it.
+    let unread_opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: Path::new(""),
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
-    assert!(before > 0, "precondition: the session was embedded");
-
-    let session = claude_dir.join("s1.jsonl");
-    let mut all = fs::read_to_string(&session).unwrap();
-    all.push('\n');
-    all.push_str(
-            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"echidna appended"},"timestamp":"2026-03-01T00:00:01Z"}"#,
-        );
-    fs::write(&session, all).unwrap();
-    let f = fs::OpenOptions::new().append(true).open(&session).unwrap();
-    f.set_modified(SystemTime::now() + Duration::from_secs(10))
-        .unwrap();
-    drop(f);
-
-    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
-        Err(DegradedReason::NotInstalled)
-    })
-    .unwrap();
+    let outcome = index_and_report_with(&Some(db_path.clone()), &unread_opts, mock_loader).unwrap();
 
     assert_eq!(
-        outcome.preserved_embedded, 1,
-        "the edited embedded session is preserved, not destroyed, on `recall index`"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 0,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "pending_body_bytes_peak": 0,
+                        "pending_metadata_bytes": 0,
+                        "pending_page_chunks_peak": 0,
+                        "pending_pages": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [{
+                    "preserved_sessions": 1,
+                    "reason": "incomplete_enumeration",
+                    "source": "claude",
+                }],
+            },
+            "degraded": true,
+            "notes": [
+                "claude root could not be fully read — preserved 1 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions",
+            ],
+        })
     );
     let conn = open_or_create_db(&db_path).unwrap();
+    let hits = search::search(&conn, "quokka", &search::SearchOptions::default()).unwrap();
     assert_eq!(
-        vec_chunk_count(&conn),
-        before,
-        "the embeddings survive the incremental re-index"
-    );
-    let search_opts = search::SearchOptions::default();
-    assert_eq!(
-        search::search(&conn, "quokka", &search_opts).unwrap().len(),
+        hits.len(),
         1,
-        "the preserved session's original FTS rows remain searchable"
-    );
-    assert_eq!(
-        search::search(&conn, "echidna", &search_opts)
-            .unwrap()
-            .len(),
-        0,
-        "the appended turn stays out of FTS until the model returns (FR-2 trade-off)"
-    );
-}
-
-fn embed_stop_outcome() -> IndexOutcome {
-    IndexOutcome {
-        degraded_note: None,
-        embedded: 5,
-        failed_count: 3,
-        first_error: Some("batch: mock failure".to_owned()),
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    }
-}
-
-fn model_absent_outcome() -> IndexOutcome {
-    IndexOutcome {
-        degraded_note: Some("note: run `recall model download` to enable.".to_owned()),
-        embedded: 0,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    }
-}
-
-fn success_outcome() -> IndexOutcome {
-    IndexOutcome {
-        degraded_note: None,
-        embedded: 8,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    }
-}
-
-#[test]
-fn index_command_output_surfaces_embed_stop_with_failed_count_and_retry() {
-    let out = index_command_output(&embed_stop_outcome());
-
-    assert!(
-        out.degraded,
-        "an embed-stop index is degraded: --json must not report it as a clean success"
-    );
-    assert!(
-        out.notes[0].contains("3 chunk"),
-        "the note must name how many chunks failed, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes[0].contains("recall index"),
-        "the note must guide the agent to retry via `recall index`, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes[0].contains("mock failure"),
-        "the note carries the first batch error, not the unknown-error fallback, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["failed_count"], 3,
-        "the payload carries the failure magnitude, not just a bool"
-    );
-    assert_eq!(
-        out.data["embedded"], 5,
-        "the payload reports how many chunks did embed despite the stop"
+        "the session under the unread root stays searchable"
     );
 }
 
 #[test]
-fn index_command_output_surfaces_model_absent_download_note() {
-    let out = index_command_output(&model_absent_outcome());
+fn index_with_a_claude_root_that_cannot_be_read_and_no_stored_sessions_warns_that_sessions_may_be_missing()
+ {
+    let src = tempfile::TempDir::new().unwrap();
+    let (_, codex_dir) = absent_source_dirs(src.path());
 
-    assert!(
-        out.degraded,
-        "a model-absent index is degraded: embedding was skipped"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "the model-absent note must reach --json (not stderr only), got: {:?}",
-        out.notes
-    );
-}
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
 
-#[test]
-fn index_command_output_clean_success_is_not_degraded() {
-    let out = index_command_output(&success_outcome());
+    // An empty root is not an absolute path, so index does not read it.
+    let unread_opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: Path::new(""),
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    let outcome = index_and_report_with(&Some(db_path), &unread_opts, mock_loader).unwrap();
 
-    assert!(!out.degraded, "a fully embedded index is not degraded");
-    assert!(
-        out.notes.is_empty(),
-        "a clean success carries no notes, got: {:?}",
-        out.notes
-    );
     assert_eq!(
-        out.data["failed_count"], 0,
-        "the payload reports zero failures on success"
-    );
-    assert_eq!(
-        out.data["embedded"], 8,
-        "the payload reports how many chunks were embedded on success"
-    );
-}
-
-#[test]
-fn index_command_output_degraded_covaries_with_notes() {
-    for outcome in [
-        embed_stop_outcome(),
-        model_absent_outcome(),
-        success_outcome(),
-    ] {
-        let out = index_command_output(&outcome);
-        assert_eq!(
-            out.degraded,
-            !out.notes.is_empty(),
-            "degraded must equal notes-non-empty (degraded={}, notes={:?})",
-            out.degraded,
-            out.notes
-        );
-    }
-}
-
-#[test]
-fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons() {
-    for mut outcome in [
-        success_outcome(),
-        model_absent_outcome(),
-        embed_stop_outcome(),
-    ] {
-        let existing_notes = index_command_output(&outcome).notes;
-        outcome
-            .parse_diagnostics
-            .push(indexer::FileParseDiagnostics {
-                file_path: format!("/logs/\x1b[31mfile\n\t{}", "界".repeat(300)).into(),
-                source: parser::Source::Claude,
-                lines: parser::LineDiagnostics {
-                    invalid_json_lines: 2,
-                    invalid_utf8_lines: 1,
-                    incomplete_tail_lines: 1,
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 0,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "pending_body_bytes_peak": 0,
+                        "pending_metadata_bytes": 0,
+                        "pending_page_chunks_peak": 0,
+                        "pending_pages": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 0,
+                    },
                 },
-                read_error: true,
-            });
-        let without_root = index_command_output(&outcome);
-        assert!(without_root.degraded);
-        assert_eq!(without_root.notes.len(), existing_notes.len() + 3);
-        outcome.skipped_roots.push(indexer::SkippedRoot {
-            source: parser::Source::Codex,
-            preserved_sessions: 1,
-            reason: indexer::SkippedReason::MissingRoot,
-            other_roots_reconciled: false,
-        });
-        let out = index_command_output(&outcome);
-        assert!(out.degraded);
-        for note in existing_notes {
-            assert!(out.notes.contains(&note));
-        }
-        assert!(out.notes.iter().any(|n| n.contains("root unavailable")));
-        let d = &out.data["parse_diagnostics"][0];
-        let path = d["file_path"].as_str().unwrap();
-        assert_eq!(path.chars().count(), 240);
-        assert!(path.starts_with("/logs/file"));
-        assert!(!path.chars().any(char::is_control));
-        assert_eq!(d["invalid_json_lines"], 2);
-        assert_eq!(d["invalid_utf8_lines"], 1);
-        assert_eq!(d["incomplete_tail_lines"], 1);
-        assert_eq!(d["read_error"], true);
-        for note in &out.notes {
-            assert!(!note.chars().any(char::is_control));
-            assert!(note.chars().count() < 500);
-        }
-    }
-}
-
-#[test]
-fn index_command_output_sanitizes_and_bounds_first_error_in_note() {
-    let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 0,
-        failed_count: 2,
-        first_error: Some(format!("batch: \x1b[31mboom\x1b[0m {}", "e".repeat(300))),
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    };
-
-    let out = index_command_output(&outcome);
-
-    assert!(
-        !out.notes[0].contains('\x1b'),
-        "control chars are stripped from the note, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes[0].len() < 200,
-        "a verbose error is capped, got len {}",
-        out.notes[0].len()
-    );
-    assert!(
-        out.notes[0].contains("rerun `recall index`"),
-        "the retry guidance survives the capping, got: {:?}",
-        out.notes
-    );
-}
-
-#[test]
-fn index_command_output_surfaces_skipped_root_in_json() {
-    let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 4,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: vec![indexer::SkippedRoot {
-            source: parser::Source::Codex,
-            preserved_sessions: 2,
-            reason: indexer::SkippedReason::IncompleteEnumeration,
-            other_roots_reconciled: false,
-        }],
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    };
-
-    let out = index_command_output(&outcome);
-
-    assert!(
-        out.degraded,
-        "a skipped root is a degradation: --json must not report it as a clean success"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("codex") && n.contains("2") && n.contains("recall index")),
-        "the note must name the source, the preserved count, and the reconcile command, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("permissions and access")),
-        "an incomplete-enumeration root must surface the access remedy, not the missing-root wording, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["skipped_roots"][0]["source"], "codex",
-        "the payload carries the skipped source, not just prose"
-    );
-    assert_eq!(
-        out.data["skipped_roots"][0]["preserved_sessions"], 2,
-        "the payload carries the preserved magnitude an agent can act on"
-    );
-    assert_eq!(
-        out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
-        "the payload carries the machine-readable skip cause so an agent picks the right remedy"
-    );
-}
-
-#[test]
-fn index_command_note_for_zero_preserved_incomplete_root_omits_reconcile() {
-    let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 0,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: vec![indexer::SkippedRoot {
-            source: parser::Source::Claude,
-            preserved_sessions: 0,
-            reason: indexer::SkippedReason::IncompleteEnumeration,
-            other_roots_reconciled: false,
-        }],
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    };
-
-    let out = index_command_output(&outcome);
-
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("claude") && n.contains("some sessions may be missing")),
-        "a zero-preserved incomplete root must warn that sessions may be missing, got: {:?}",
-        out.notes
-    );
-    assert!(
-        !out.notes
-            .iter()
-            .any(|n| n.contains("reconcile any real deletions")),
-        "with nothing preserved the note must not promise to reconcile deletions, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
-        "the payload still carries the machine-readable cause at zero preserved"
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [{
+                    "preserved_sessions": 0,
+                    "reason": "incomplete_enumeration",
+                    "source": "claude",
+                }],
+            },
+            "degraded": true,
+            "notes": [
+                "claude root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`",
+            ],
+        })
     );
 }
 
@@ -1515,12 +1822,14 @@ fn index_still_starts_the_probe_in_an_environment_search_has_recorded() {
     let dir = tempfile::TempDir::new().unwrap();
     let records_dir = dir.path().join("probe");
     let host = FakeHost::healthy();
-    for _ in 0..2 {
-        let searched = host.serve(dir.path(), &records_dir, |model_host| {
-            model_host.load_for_search()
-        });
-        assert!(searched.is_ok());
-    }
+    let first_search = host.serve(dir.path(), &records_dir, |model_host| {
+        model_host.load_for_search()
+    });
+    let second_search = host.serve(dir.path(), &records_dir, |model_host| {
+        model_host.load_for_search()
+    });
+    assert!(first_search.is_ok());
+    assert!(second_search.is_ok());
     assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
 
     let loaded = host.serve(dir.path(), &records_dir, index_embedder);

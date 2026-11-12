@@ -398,7 +398,7 @@ pub(crate) struct MockEmbedder {
     call_count: AtomicUsize,
     fail_after: Option<usize>,
     fail_on_text: Option<String>,
-    captured_options: Mutex<Option<EmbedOptions>>,
+    captured_options: Mutex<Vec<EmbedOptions>>,
 }
 
 #[cfg(test)]
@@ -408,7 +408,7 @@ impl MockEmbedder {
             call_count: AtomicUsize::new(0),
             fail_after: None,
             fail_on_text: None,
-            captured_options: Mutex::new(None),
+            captured_options: Mutex::new(Vec::new()),
         }
     }
 
@@ -417,7 +417,7 @@ impl MockEmbedder {
             call_count: AtomicUsize::new(0),
             fail_after: Some(n),
             fail_on_text: None,
-            captured_options: Mutex::new(None),
+            captured_options: Mutex::new(Vec::new()),
         }
     }
 
@@ -426,7 +426,7 @@ impl MockEmbedder {
             call_count: AtomicUsize::new(0),
             fail_after: None,
             fail_on_text: Some(text.to_owned()),
-            captured_options: Mutex::new(None),
+            captured_options: Mutex::new(Vec::new()),
         }
     }
 
@@ -439,7 +439,11 @@ impl MockEmbedder {
     }
 
     pub(crate) fn captured_options(&self) -> Option<EmbedOptions> {
-        *self.captured_options.lock().unwrap()
+        self.captured_options.lock().unwrap().last().copied()
+    }
+
+    pub(crate) fn captured_batch_options(&self) -> Vec<EmbedOptions> {
+        self.captured_options.lock().unwrap().clone()
     }
 
     fn inference_error(message: String) -> EmbedError {
@@ -501,7 +505,7 @@ impl Embed for MockEmbedder {
         texts: &[&str],
         options: &EmbedOptions,
     ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        *self.captured_options.lock().unwrap() = Some(*options);
+        self.captured_options.lock().unwrap().push(*options);
         self.embed_documents_batch(texts)
     }
 }
