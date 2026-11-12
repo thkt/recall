@@ -276,12 +276,56 @@ fn test_render_results_lists_header_and_each_result() {
 }
 
 #[test]
-fn test_format_result_empty_project() {
-    let r = make_search_result("s1", "", "excerpt");
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(output.contains("unknown [claude]"));
-    assert!(!output.contains("    /"));
+fn search_prints_unknown_for_a_session_without_a_project_and_omits_the_project_line() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('s1', 'claude', '/f', '', 'slug', 1709251200000, 0.0);
+             INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'authentication flow');",
+        )
+        .unwrap();
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        mock_loader,
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | slug | unknown [claude]\n",
+            "    ID: s1\n",
+            "    > **authentication** flow\n",
+            "    inspect: recall show s1\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication** flow",
+                    "inspect": "recall show s1",
+                    "project": "",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 1709251200000_i64,
+                }],
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
