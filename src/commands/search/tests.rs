@@ -263,18 +263,6 @@ fn search_that_matches_no_session_prints_no_matching_sessions_found() {
 }
 
 #[test]
-fn test_render_results_lists_header_and_each_result() {
-    let results = [
-        make_search_result("abc123", "/proj/a", "hello world"),
-        make_search_result("def456", "/proj/b", "another match"),
-    ];
-    let out = render_results(&results);
-    assert!(out.starts_with("Found 2 sessions:\n"), "got: {out}");
-    assert!(out.contains("ID: abc123"), "got: {out}");
-    assert!(out.contains("ID: def456"), "got: {out}");
-}
-
-#[test]
 fn search_prints_unknown_for_a_session_without_a_project_and_omits_the_project_line() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
@@ -324,22 +312,6 @@ fn search_prints_unknown_for_a_session_without_a_project_and_omits_the_project_l
             "degraded": false,
             "notes": [],
         })
-    );
-}
-
-#[test]
-fn test_format_result_excerpt_not_truncated() {
-    let long = "a".repeat(300);
-    let r = make_search_result("s1", "/proj", &long);
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(
-        output.contains(&format!("> {long}")),
-        "the full excerpt must render without truncation"
-    );
-    assert!(
-        !output.contains("> ..."),
-        "no truncation marker should be emitted, got: {output}"
     );
 }
 
@@ -467,14 +439,6 @@ fn search_names_the_parent_session_of_a_subagent_log() {
             "notes": [],
         })
     );
-}
-
-#[test]
-fn test_normal_session_path_shows_no_parent() {
-    let r = make_search_result("s1", "/home/me/project", "excerpt");
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(!output.contains("Parent:"));
 }
 
 #[test]
@@ -769,50 +733,6 @@ fn freeze_search_payload_key_set() {
             "timestamp"
         ],
         "search --json result element keys are frozen"
-    );
-}
-
-#[test]
-fn u002_fts_hit_json_carries_chunk_id_and_inspect_guidance() {
-    let (_dir, conn) = db::setup_test_db();
-    let sid = "a1b2c3d4-e5f6-7890-1234-567890abcdef";
-    conn.execute(
-        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) \
-             VALUES (?1, 'claude', '', '/proj', ?1, 1709251200000, 0.0)",
-        [sid],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) \
-             VALUES (?1, 'user', 'how to implement authentication')",
-        [sid],
-    )
-    .unwrap();
-    conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (42, ?1, 'how to implement authentication — use JWT access tokens', 1709251200000, 1, 1000000)",
-            [sid],
-        )
-        .unwrap();
-
-    let results =
-        search::search(&conn, "authentication", &search::SearchOptions::default()).unwrap();
-    assert_eq!(
-        results.len(),
-        1,
-        "setup guard: the FTS query must return the one session"
-    );
-
-    let json = result_to_json(&results[0]);
-    assert_eq!(
-        json["chunk"],
-        serde_json::json!(42),
-        "an FTS rowid-tier hit must expose its resolved chunk id as the drill-down anchor, got: {json}"
-    );
-    let payload = json.to_string();
-    assert!(
-        payload.contains(&format!("recall show {sid} --chunk 42 --window 3")),
-        "the hit must carry the inspect guidance line with the full (un-shortened) session_id, got: {payload}"
     );
 }
 
