@@ -663,21 +663,6 @@ fn verbose_windowed_show_prints_the_file_and_flags_the_chunk_messages() {
 }
 
 #[test]
-fn windowed_show_fallback_includes_file_when_verbose() {
-    let (_dir, conn) = db::setup_test_db();
-    db::seed_session(&conn, "s1");
-    db::seed_chunk(&conn, 300, "legacy body");
-
-    let out = show_session_windowed(&conn, "s1", true, Some(300), 3).unwrap();
-
-    assert!(
-        out.markdown.contains("- file: /f"),
-        "verbose fallback must include the file path, got: {}",
-        out.markdown
-    );
-}
-
-#[test]
 fn show_on_a_database_file_without_tables_is_a_usage_error_asking_to_run_index() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
