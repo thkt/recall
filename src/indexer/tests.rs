@@ -3263,11 +3263,16 @@ fn a_model_absent_run_reconciles_an_unembedded_log_that_grew_and_defers_the_embe
     write_reuse_conversation(&unembedded, &[("user", "pending question")]);
     index_from_dirs(&mut conn, &opts, false).unwrap();
     index_chunks(&mut conn).unwrap();
-    let chunks_sql = "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded' ORDER BY id";
     assert_eq!(
-        collect_strings(&conn, chunks_sql),
-        [r#"[2,2,"pending question"]"#]
+        chunk_ranges(&conn),
+        [
+            r#"["embedded question",1,1]"#,
+            r#"["pending question",2,2]"#
+        ]
     );
+    let pending_chunk_identity =
+        "SELECT json_array(id, generation) FROM qa_chunks WHERE content = 'pending question'";
+    let identity_before = collect_strings(&conn, pending_chunk_identity);
 
     write_reuse_conversation(
         &unembedded,
@@ -3308,12 +3313,17 @@ fn a_model_absent_run_reconciles_an_unembedded_log_that_grew_and_defers_the_embe
         "the index already reconciled the chunks of the grown log"
     );
     assert_eq!(
-        collect_strings(&conn, chunks_sql),
-        [
-            r#"[2,2,"pending question"]"#,
-            r#"[3,3,"appended question"]"#
-        ],
+        collect_strings(&conn, pending_chunk_identity),
+        identity_before,
         "the matched chunk keeps its id and generation"
+    );
+    assert_eq!(
+        chunk_ranges(&conn),
+        [
+            r#"["embedded question",1,1]"#,
+            r#"["pending question",2,2]"#,
+            r#"["appended question",3,3]"#,
+        ]
     );
     assert_eq!(
         collect_strings(
