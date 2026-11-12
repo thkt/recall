@@ -8,6 +8,10 @@ use crate::{parser, search};
 
 use super::*;
 
+const MODEL_NOT_INSTALLED_NOTE: &str =
+    "note: embedding model not installed; run `recall model download` to enable semantic search.";
+const ONE_SESSION_PRESERVED_NOTE: &str = "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed";
+
 fn absent_source_dirs(root: &Path) -> (PathBuf, PathBuf) {
     (root.join("no_claude"), root.join("no_codex"))
 }
@@ -189,9 +193,7 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
 
     let rebuild_opts = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let rebuilt =
         index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
@@ -591,7 +593,7 @@ fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_ch
             },
             "degraded": true,
             "notes": [
-                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+                MODEL_NOT_INSTALLED_NOTE,
             ],
         })
     );
@@ -684,8 +686,8 @@ fn index_without_the_model_keeps_the_embeddings_of_a_changed_session_and_reports
             },
             "degraded": true,
             "notes": [
-                "note: embedding model not installed; run `recall model download` to enable semantic search.",
-                "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+                MODEL_NOT_INSTALLED_NOTE,
+                ONE_SESSION_PRESERVED_NOTE,
             ],
         })
     );
@@ -725,9 +727,7 @@ fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
 
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Ok(Arc::new(embedder::MockEmbedder::failing_after(0)) as Arc<dyn Embed>)
@@ -778,7 +778,7 @@ fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
             "degraded": true,
             "notes": [
                 "note: embedding model unavailable; results from text search only.",
-                "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+                ONE_SESSION_PRESERVED_NOTE,
             ],
         })
     );
@@ -821,9 +821,7 @@ fn model_present_rebuild_heals_orphan_vec_rows() {
 
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, mock_loader).unwrap();
 
@@ -880,9 +878,7 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
 
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -941,9 +937,7 @@ fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_fo
         .unwrap();
     let rebuild_opts = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild_opts, || {
         Err(DegradedReason::NotInstalled)
@@ -993,8 +987,8 @@ fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_fo
             },
             "degraded": true,
             "notes": [
-                "note: embedding model not installed; run `recall model download` to enable semantic search.",
-                "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+                MODEL_NOT_INSTALLED_NOTE,
+                ONE_SESSION_PRESERVED_NOTE,
             ],
         })
     );
@@ -1055,9 +1049,7 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
         .unwrap();
     let rebuild = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: &codex_dir,
-        codex_archived_dir: None,
+        ..opts
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &rebuild, || {
         Err(DegradedReason::NotInstalled)
@@ -1107,7 +1099,7 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
             },
             "degraded": true,
             "notes": [
-                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+                MODEL_NOT_INSTALLED_NOTE,
             ],
         }),
         "a cached session without embeddings is not preserved"
@@ -1443,9 +1435,7 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
     };
     let rebuild_opts = indexer::IndexOptions {
         force: true,
-        claude_dir: &claude_dir,
-        codex_dir: Path::new(""),
-        codex_archived_dir: None,
+        ..opts
     };
     let broken = broken.to_str().unwrap();
     let parse_diagnostic = serde_json::json!({
@@ -1574,7 +1564,7 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
             },
             "degraded": true,
             "notes": [
-                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+                MODEL_NOT_INSTALLED_NOTE,
                 unread_codex_root_note,
                 "preserved embeddings for 2 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
                 parse_loss_note,
