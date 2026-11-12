@@ -3198,7 +3198,6 @@ fn failed_fts_transaction_never_reports_saved_files() {
     );
     conn.execute_batch("DROP TRIGGER fail_session;").unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
-    index_chunks(&mut conn).unwrap();
 }
 
 #[test]
@@ -3491,7 +3490,6 @@ fn assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(embed_capa
     });
 
     index_from_dirs_observed(&mut conn, &log.opts(), embed_capable, &observer).unwrap();
-    index_chunks(&mut conn).unwrap();
     assert!(attempted.get());
     // Not unconditional: indexing again would restore a session the run's cleanup deleted.
     if saved.borrow().is_none() {
@@ -3659,7 +3657,6 @@ fn appending_a_turn_reuses_every_stored_vector_and_infers_only_the_new_chunk() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(
@@ -3706,7 +3703,6 @@ fn continuing_the_last_answer_reuses_the_unchanged_chunks_and_infers_only_the_ex
             "chunks_removed_committed": 1,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..2]);
     assert_eq!(
@@ -3755,7 +3751,6 @@ fn touching_a_log_without_changing_it_reuses_every_vector_and_infers_nothing() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3786,7 +3781,6 @@ fn truncating_a_log_keeps_the_vector_of_the_remaining_chunk_and_infers_nothing()
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
@@ -3822,7 +3816,6 @@ fn truncating_to_a_duplicated_turn_keeps_the_copy_that_has_a_vector() {
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
@@ -3858,7 +3851,6 @@ fn replacing_the_opening_turns_keeps_the_vector_of_the_surviving_turn_and_infers
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[2..]);
     assert_eq!(
@@ -3893,7 +3885,6 @@ fn a_session_chunked_under_other_rules_reuses_no_vector_and_infers_every_chunk()
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3960,7 +3951,6 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -4033,7 +4023,6 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -4060,7 +4049,6 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
