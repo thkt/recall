@@ -195,9 +195,54 @@ fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
 
 #[test]
 fn verbose_show_adds_the_session_file_to_the_header() {
-    let (_dir, conn) = setup_show_db();
-    let out = show_session(&conn, "abc-123", true).unwrap();
-    assert!(out.markdown.contains("- file: /path/f.jsonl"));
+    let (dir, conn) = setup_show_db();
+    drop(conn);
+
+    let out = run_show(
+        "abc-123",
+        true,
+        None,
+        DEFAULT_WINDOW,
+        &Some(dir.path().join("test.db")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# my-slug\n",
+            "- session_id: abc-123\n",
+            "- date: 2024-03-01\n",
+            "- project: /proj\n",
+            "- source: claude\n",
+            "- file: /path/f.jsonl\n",
+            "\n",
+            "## [user]\n",
+            "hello world\n",
+            "\n",
+            "## [assistant]\n",
+            "hi there\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "messages": [
+                    { "role": "user", "text": "hello world" },
+                    { "role": "assistant", "text": "hi there" },
+                ],
+                "project": "/proj",
+                "session_id": "abc-123",
+                "slug": "my-slug",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
