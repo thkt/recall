@@ -259,17 +259,44 @@ fn test_show_session_message_order() {
 
 #[test]
 fn show_prints_an_unknown_stored_source_as_claude() {
-    let (_dir, conn) = db::setup_test_db();
-    conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0)",
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('xyz-1', 'bogus', '/f', '/p', 'odd-slug', 1709251200000, 0.0)",
             [],
         )
         .unwrap();
-    let out = show_session(&conn, "xyz-1", false).unwrap();
-    assert!(
-        out.markdown.contains("- source: claude"),
-        "an unknown stored source must fall back to claude, got: {}",
-        out.markdown
+
+    let out = run_show("xyz-1", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# odd-slug\n",
+            "- session_id: xyz-1\n",
+            "- date: 2024-03-01\n",
+            "- project: /p\n",
+            "- source: claude\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "messages": [],
+                "project": "/p",
+                "session_id": "xyz-1",
+                "slug": "odd-slug",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
