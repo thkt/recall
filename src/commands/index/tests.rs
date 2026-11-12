@@ -1198,54 +1198,59 @@ fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characte
 }
 
 #[test]
-fn index_command_output_surfaces_skipped_root_in_json() {
-    let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 4,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: vec![indexer::SkippedRoot {
-            source: parser::Source::Codex,
-            preserved_sessions: 2,
-            reason: indexer::SkippedReason::IncompleteEnumeration,
-            other_roots_reconciled: false,
-        }],
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
+fn index_with_a_claude_root_that_cannot_be_read_reports_its_preserved_session_as_incomplete_enumeration()
+ {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    seed_claude_source(&claude_dir);
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
-    let out = index_command_output(&outcome);
+    // An empty root is not an absolute path, so index does not read it.
+    let unread_opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: Path::new(""),
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    let outcome = index_and_report_with(&Some(db_path.clone()), &unread_opts, mock_loader).unwrap();
 
-    assert!(
-        out.degraded,
-        "a skipped root is a degradation: --json must not report it as a clean success"
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("codex") && n.contains("2") && n.contains("recall index")),
-        "the note must name the source, the preserved count, and the reconcile command, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("permissions and access")),
-        "an incomplete-enumeration root must surface the access remedy, not the missing-root wording, got: {:?}",
-        out.notes
-    );
     assert_eq!(
-        out.data["skipped_roots"][0]["source"], "codex",
-        "the payload carries the skipped source, not just prose"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [{
+                    "preserved_sessions": 1,
+                    "reason": "incomplete_enumeration",
+                    "source": "claude",
+                }],
+            },
+            "degraded": true,
+            "notes": [
+                "claude root could not be fully read — preserved 1 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions",
+            ],
+        })
     );
+    let conn = open_or_create_db(&db_path).unwrap();
+    let hits = search::search(&conn, "quokka", &search::SearchOptions::default()).unwrap();
     assert_eq!(
-        out.data["skipped_roots"][0]["preserved_sessions"], 2,
-        "the payload carries the preserved magnitude an agent can act on"
-    );
-    assert_eq!(
-        out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
-        "the payload carries the machine-readable skip cause so an agent picks the right remedy"
+        hits.len(),
+        1,
+        "the session under the unread root stays searchable"
     );
 }
 
