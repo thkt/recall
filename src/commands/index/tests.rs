@@ -31,7 +31,7 @@ fn seed_claude_source(claude_dir: &Path) {
 }
 
 #[test]
-fn index_and_report_forwards_index_flags_as_embed_options() {
+fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let claude_dir = db_dir.path().join("claude");
@@ -100,7 +100,7 @@ fn index_and_report_forwards_default_embed_options_when_flags_unset() {
 }
 
 #[test]
-fn rebuild_reembeds_all_and_rebuilds_fts_index() {
+fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -211,7 +211,8 @@ fn reset_to_legacy_state(conn: &Connection) {
 }
 
 #[test]
-fn backfill_が本文_index_と_embedding_を変えない() {
+fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_messages_chunks_or_embeddings()
+ {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -279,7 +280,7 @@ fn backfill_が本文_index_と_embedding_を変えない() {
 }
 
 #[test]
-fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
+fn index_with_its_claude_root_missing_keeps_the_session_and_reports_it_skipped_in_json() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -318,7 +319,7 @@ fn index_and_report_with_missing_root_threads_skipped_root_into_outcome() {
 }
 
 #[test]
-fn index_and_report_with_degraded_loader_completes_fts_and_succeeds() {
+fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_chunk_unattempted() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -405,7 +406,7 @@ fn index_and_report_with_unavailable_loader_carries_unavailability_note() {
 }
 
 #[test]
-fn load_ok_inference_fail_rebuild_preserves_existing_embeddings() {
+fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -636,7 +637,7 @@ fn model_absent_rebuild_surfaces_preserved_count_and_note() {
 }
 
 #[test]
-fn model_absent_index_adds_new_session_and_preserves_embeddings() {
+fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_for_text_search() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
@@ -928,7 +929,7 @@ fn parse_diagnostics_degrade_alone_and_coexist_with_embedding_and_root_reasons()
 }
 
 #[test]
-fn index_command_output_sanitizes_and_bounds_first_error_in_note() {
+fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characters_of_the_error() {
     let outcome = IndexOutcome {
         degraded_note: None,
         embedded: 0,
