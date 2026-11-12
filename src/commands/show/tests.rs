@@ -1,7 +1,13 @@
+use crate::envelope::render_json_success;
 use crate::open_or_create_db;
 use crate::tests::bare_empty_db;
 
 use super::*;
+
+/// The `--json` envelope `recall show` prints for an output.
+fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
+    serde_json::from_str(&render_json_success(out)).unwrap()
+}
 
 fn setup_show_db() -> (tempfile::TempDir, Connection) {
     let (dir, conn) = db::setup_test_db();
@@ -30,16 +36,53 @@ fn setup_show_db() -> (tempfile::TempDir, Connection) {
 
 #[test]
 fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata() {
-    let (_dir, conn) = setup_show_db();
-    let out = show_session(&conn, "abc-123", false).unwrap();
-    assert!(out.markdown.contains("# my-slug"));
-    assert!(out.markdown.contains("- session_id: abc-123"));
-    assert!(out.markdown.contains("- date: 2024-03-01"));
-    assert!(out.markdown.contains("## [user]\nhello world"));
-    assert!(out.markdown.contains("## [assistant]\nhi there"));
-    assert_eq!(out.data["session_id"], "abc-123");
-    assert_eq!(out.data["messages"][0]["role"], "user");
-    assert_eq!(out.data["messages"][0]["text"], "hello world");
+    let (dir, conn) = setup_show_db();
+    drop(conn);
+
+    let out = run_show(
+        "abc-123",
+        false,
+        None,
+        DEFAULT_WINDOW,
+        &Some(dir.path().join("test.db")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# my-slug\n",
+            "- session_id: abc-123\n",
+            "- date: 2024-03-01\n",
+            "- project: /proj\n",
+            "- source: claude\n",
+            "\n",
+            "## [user]\n",
+            "hello world\n",
+            "\n",
+            "## [assistant]\n",
+            "hi there\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "messages": [
+                    { "role": "user", "text": "hello world" },
+                    { "role": "assistant", "text": "hi there" },
+                ],
+                "project": "/proj",
+                "session_id": "abc-123",
+                "slug": "my-slug",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
