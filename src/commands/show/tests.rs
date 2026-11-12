@@ -741,8 +741,11 @@ fn show_on_a_database_file_without_tables_is_a_usage_error_asking_to_run_index()
 
     let err = run_show("deadbeef", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
 
-    assert!(
-        err.to_string().contains("Database not found"),
-        "empty DB show must report not-found, got: {err}"
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"Database not found. Run `recall index` first.","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
     );
 }
