@@ -1,4 +1,7 @@
+use std::path::{Path, PathBuf};
+
 use crate::commands::index::embed_all_pending;
+use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
 use crate::tests::{
     bare_empty_db, mock_loader, payload_keys, search_command, seed_healthy_index, vec_chunk_count,
@@ -61,35 +64,91 @@ fn resolve_current_session_truth_table() {
     );
 }
 
+/// The `--json` envelope `recall search` prints for an output.
+fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
+    serde_json::from_str(&render_json_success(out)).unwrap()
+}
+
+/// An index whose only session, `s1`, holds one user message.
+fn index_with_one_message(dir: &Path, text: &str) -> PathBuf {
+    let db_path = dir.join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    db::seed_session(&conn, "s1");
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
+        [text],
+    )
+    .unwrap();
+    db_path
+}
+
 #[test]
-fn search_fallback_notes_are_reason_aware() {
+fn search_without_the_model_installed_returns_text_matches_and_says_how_to_download_it() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = index_with_one_message(db_dir.path(), "authentication flow");
+
+    let out = run_search_with(search_command("authentication"), &Some(db_path), || {
+        Err(DegradedReason::NotInstalled)
+    })
+    .unwrap();
+
     assert_eq!(
-        search_fallback_notes(DegradedReason::NotInstalled),
-        [
-            "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"
-        ]
+        out.markdown,
+        "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n"
     );
     assert_eq!(
-        search_fallback_notes(DegradedReason::ProbeFailed),
-        ["semantic search unavailable: embedding model unavailable; results from text search only"]
-    );
-    assert_eq!(
-        search_fallback_notes(DegradedReason::BackendUnavailable),
-        ["semantic search unavailable: embedding model unavailable; results from text search only"]
-    );
-    assert!(
-        search_fallback_notes(DegradedReason::Disabled).is_empty(),
-        "a disabled model is intentional, not degraded: no note"
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication** flow",
+                    "inspect": "recall show s1",
+                    "project": "/p",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 0,
+                }],
+            },
+            "degraded": true,
+            "notes": ["semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"],
+        })
     );
 }
 
 #[test]
-fn search_degraded_state_reason_failure_degrades_with_note() {
-    let (degraded, notes) = search_degraded_state(&Err(DegradedReason::ProbeFailed));
-    assert!(degraded);
+fn search_whose_model_fails_to_load_returns_text_matches_with_an_unavailable_note() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = index_with_one_message(db_dir.path(), "authentication flow");
+
+    let out = run_search_with(search_command("authentication"), &Some(db_path), || {
+        Err(DegradedReason::ProbeFailed)
+    })
+    .unwrap();
+
     assert_eq!(
-        notes,
-        ["semantic search unavailable: embedding model unavailable; results from text search only"]
+        out.markdown,
+        "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n"
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication** flow",
+                    "inspect": "recall show s1",
+                    "project": "/p",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 0,
+                }],
+            },
+            "degraded": true,
+            "notes": ["semantic search unavailable: embedding model unavailable; results from text search only"],
+        })
     );
 }
 
