@@ -110,7 +110,11 @@ fn freeze_status_payload_key_set() {
     let frozen = ["embedded", "model_ready", "qa_chunks", "sessions"];
 
     let missing = tempfile::TempDir::new().unwrap();
-    let no_db = run_status(false, &Some(missing.path().join("absent.db"))).unwrap();
+    let no_db = FakeHost::healthy()
+        .serve(missing.path(), &missing.path().join("probe"), |host| {
+            run_status_in(false, &Some(missing.path().join("absent.db")), host)
+        })
+        .unwrap();
     assert_eq!(
         payload_keys(&no_db.data),
         frozen,
@@ -123,7 +127,11 @@ fn freeze_status_payload_key_set() {
         let conn = open_or_create_db(&db_path).unwrap();
         db::seed_session(&conn, "s1");
     }
-    let with_db = run_status(false, &Some(db_path)).unwrap();
+    let with_db = FakeHost::healthy()
+        .serve(dir.path(), &dir.path().join("probe"), |host| {
+            run_status_in(false, &Some(db_path), host)
+        })
+        .unwrap();
     assert_eq!(
         payload_keys(&with_db.data),
         frozen,
