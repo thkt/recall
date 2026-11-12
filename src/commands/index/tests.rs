@@ -1178,22 +1178,22 @@ fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characte
         observations: serde_json::Value::Null,
     };
 
-    let out = index_command_output(&outcome);
-
-    assert!(
-        !out.notes[0].contains('\x1b'),
-        "control chars are stripped from the note, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.notes[0].len() < 200,
-        "a verbose error is capped, got len {}",
-        out.notes[0].len()
-    );
-    assert!(
-        out.notes[0].contains("rerun `recall index`"),
-        "the retry guidance survives the capping, got: {:?}",
-        out.notes
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 2,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [format!(
+                "2 chunk(s) failed to embed (batch: boom {}); rerun `recall index` to retry",
+                "e".repeat(108)
+            )],
+        })
     );
 }
 
