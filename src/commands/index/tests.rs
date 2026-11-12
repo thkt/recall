@@ -1251,6 +1251,118 @@ fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_o
     assert_eq!(vec_chunk_count(&conn), 1, "the retried chunk is stored");
 }
 
+/// One session-log line holding a user turn whose text is `text`.
+fn user_turn_line(text: &str) -> String {
+    let turn = serde_json::json!({
+        "type": "user",
+        "cwd": "/proj",
+        "message": {"role": "user", "content": text},
+        "timestamp": "2026-03-01T00:00:00Z"
+    });
+    format!("{turn}\n")
+}
+
+#[test]
+fn index_whose_second_embedding_batch_fails_keeps_the_first_batch_and_hands_the_flags_to_both_batches()
+ {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    fs::create_dir_all(&claude_dir).unwrap();
+    // Pending chunks are embedded shortest first, so the 128 short turns fill the first batch
+    // and the one longer turn is the whole second batch.
+    let long_text = "wombat batch, the longest turn";
+    fs::write(
+        claude_dir.join("s1.jsonl"),
+        format!(
+            "{}{}",
+            user_turn_line("wombat batch").repeat(128),
+            user_turn_line(long_text)
+        ),
+    )
+    .unwrap();
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    let embedder = Arc::new(embedder::MockEmbedder::failing_on_text(long_text));
+
+    let outcome = index_and_report_observed(
+        &Some(db_path),
+        &opts,
+        || Ok(embedder.clone()),
+        embed_options_from_flags(Some(2048), Some(700)),
+        &index_observer::Observer::stderr(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 128,
+                "failed_count": 1,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 129,
+                        "chunks_failed": 1,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 129,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 1,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 128,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 0,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 1,
+                        "files_updated_committed": 1,
+                        "inference_batches": 2,
+                        "inference_chunks": 129,
+                        "pending_body_bytes_peak": 1566,
+                        "pending_metadata_bytes": 6144,
+                        "pending_page_chunks_peak": 129,
+                        "pending_pages": 1,
+                        "sessions_chunk_pending": 1,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 1,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "1 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
+            ],
+        })
+    );
+    let flags = embedder::EmbedOptions {
+        token_budget: Some(2048),
+        forward_pause: Some(Duration::from_millis(700)),
+    };
+    assert_eq!(
+        embedder.captured_batch_options(),
+        vec![flags, flags],
+        "--token-budget 2048 --forward-pause-ms 700 reach both the saved and the failed batch"
+    );
+}
+
 #[test]
 fn lone_parse_diagnostic_degrades_and_prints_a_240_character_path_without_control_characters() {
     let outcome = IndexOutcome {
