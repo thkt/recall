@@ -1255,42 +1255,42 @@ fn index_with_a_claude_root_that_cannot_be_read_reports_its_preserved_session_as
 }
 
 #[test]
-fn index_command_note_for_zero_preserved_incomplete_root_omits_reconcile() {
-    let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 0,
-        failed_count: 0,
-        first_error: None,
-        skipped_roots: vec![indexer::SkippedRoot {
-            source: parser::Source::Claude,
-            preserved_sessions: 0,
-            reason: indexer::SkippedReason::IncompleteEnumeration,
-            other_roots_reconciled: false,
-        }],
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
+fn index_with_a_claude_root_that_cannot_be_read_and_no_stored_sessions_warns_that_sessions_may_be_missing()
+ {
+    let src = tempfile::TempDir::new().unwrap();
+    let (_, codex_dir) = absent_source_dirs(src.path());
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    // An empty root is not an absolute path, so index does not read it.
+    let unread_opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: Path::new(""),
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
     };
+    let outcome = index_and_report_with(&Some(db_path), &unread_opts, mock_loader).unwrap();
 
-    let out = index_command_output(&outcome);
-
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("claude") && n.contains("some sessions may be missing")),
-        "a zero-preserved incomplete root must warn that sessions may be missing, got: {:?}",
-        out.notes
-    );
-    assert!(
-        !out.notes
-            .iter()
-            .any(|n| n.contains("reconcile any real deletions")),
-        "with nothing preserved the note must not promise to reconcile deletions, got: {:?}",
-        out.notes
-    );
     assert_eq!(
-        out.data["skipped_roots"][0]["reason"], "incomplete_enumeration",
-        "the payload still carries the machine-readable cause at zero preserved"
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 0,
+                "skipped_roots": [{
+                    "preserved_sessions": 0,
+                    "reason": "incomplete_enumeration",
+                    "source": "claude",
+                }],
+            },
+            "degraded": true,
+            "notes": [
+                "claude root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`",
+            ],
+        })
     );
 }
 
