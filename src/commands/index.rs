@@ -329,21 +329,4 @@ fn run_legacy_backfill(
 }
 
 #[cfg(test)]
-pub(crate) fn embed_all_pending(
-    conn: &mut Connection,
-    embedder: &dyn Embed,
-    options: &embedder::EmbedOptions,
-) -> Result<embedder::EmbedResult> {
-    let result = embedder::embed_pending_observed(
-        conn,
-        embedder,
-        None,
-        options,
-        &index_observer::Observer::default(),
-    )?;
-    result.warn_if_batches_failed();
-    Ok(result)
-}
-
-#[cfg(test)]
 mod tests;

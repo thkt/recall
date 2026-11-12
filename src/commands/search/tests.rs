@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use crate::commands::index::embed_all_pending;
 use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
 use crate::tests::{
@@ -602,38 +601,57 @@ fn search_by_file_without_a_query_lists_its_session_without_loading_the_model() 
 }
 
 #[test]
-fn run_search_reports_degraded_when_vector_search_fails_at_runtime() {
+fn search_whose_vector_query_fails_returns_the_text_match_with_a_text_only_note() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
-        let mut conn = open_or_create_db(&db_path).unwrap();
-        db::seed_session(&conn, "s1");
-        db::seed_chunk(&conn, 1, "authentication flow");
-        embed_all_pending(
-            &mut conn,
-            &embedder::MockEmbedder::new(),
-            &embedder::EmbedOptions::default(),
+        let conn = open_or_create_db(&db_path).unwrap();
+        seed_healthy_index(&conn);
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'healthy chunk')",
+            [],
         )
         .unwrap();
     }
 
     let out = run_search_with(
-        search_command("authentication"),
+        search_command("healthy"),
         &Some(db_path),
         runtime_failing_loader,
     )
     .unwrap();
 
-    assert!(
-        out.degraded,
-        "a runtime vector-search failure must mark the envelope degraded"
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 1970-01-01 | slug | p [claude]\n",
+            "    /p\n",
+            "    ID: s1\n",
+            "    > healthy chunk\n",
+            "    inspect: recall show s1\n",
+            "\n",
+        )
     );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("vector query failed at runtime")),
-        "the runtime degradation note must surface for the agent channel, got: {:?}",
-        out.notes
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "healthy chunk",
+                    "inspect": "recall show s1",
+                    "project": "/p",
+                    "session_id": "s1",
+                    "slug": "slug",
+                    "source": "claude",
+                    "timestamp": 0,
+                }],
+            },
+            "degraded": true,
+            "notes": ["semantic search unavailable: vector query failed at runtime; results are text-only"],
+        })
     );
 }
 
