@@ -87,9 +87,53 @@ fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata()
 
 #[test]
 fn show_of_a_unique_id_prefix_prints_that_session() {
-    let (_dir, conn) = setup_show_db();
-    let out = show_session(&conn, "abc-1", false).unwrap();
-    assert!(out.markdown.contains("- session_id: abc-123"));
+    let (dir, conn) = setup_show_db();
+    drop(conn);
+
+    let out = run_show(
+        "abc-1",
+        false,
+        None,
+        DEFAULT_WINDOW,
+        &Some(dir.path().join("test.db")),
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# my-slug\n",
+            "- session_id: abc-123\n",
+            "- date: 2024-03-01\n",
+            "- project: /proj\n",
+            "- source: claude\n",
+            "\n",
+            "## [user]\n",
+            "hello world\n",
+            "\n",
+            "## [assistant]\n",
+            "hi there\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "messages": [
+                    { "role": "user", "text": "hello world" },
+                    { "role": "assistant", "text": "hi there" },
+                ],
+                "project": "/proj",
+                "session_id": "abc-123",
+                "slug": "my-slug",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
