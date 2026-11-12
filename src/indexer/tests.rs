@@ -1252,13 +1252,15 @@ fn deleted_claude_log_replaced_by_an_invalid_log_is_removed_without_touching_the
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(first.skipped_roots.is_empty());
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        invalid_json_lines_by_file(&first.parse_diagnostics),
-        [(fresh.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(fresh.clone(), 1)]
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
@@ -1266,13 +1268,15 @@ fn deleted_claude_log_replaced_by_an_invalid_log_is_removed_without_touching_the
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(second.skipped_roots.is_empty());
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        invalid_json_lines_by_file(&second.parse_diagnostics),
-        [(fresh.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(fresh, 1)]
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
 }
 
@@ -1300,13 +1304,15 @@ fn deleted_claude_log_replaced_by_an_unreadable_log_is_removed_and_the_read_fail
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(first.skipped_roots.is_empty());
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        read_errors_by_file(&first.parse_diagnostics),
-        [(fresh.as_path(), true)]
-    );
-    assert_eq!(
-        read_errors_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(fresh.as_path(), true)]
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
     );
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
@@ -1314,13 +1320,15 @@ fn deleted_claude_log_replaced_by_an_unreadable_log_is_removed_and_the_read_fail
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(second.skipped_roots.is_empty());
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        read_errors_by_file(&second.parse_diagnostics),
-        [(fresh.as_path(), true)]
-    );
-    assert_eq!(
-        read_errors_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(fresh.as_path(), true)]
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
     );
 }
 
@@ -1656,20 +1664,6 @@ fn collision_snapshot(conn: &Connection) -> [Vec<String>; 5] {
     .map(|sql| collect_strings(conn, sql))
 }
 
-fn invalid_json_lines_by_file(diagnostics: &[FileParseDiagnostics]) -> Vec<(PathBuf, i64)> {
-    diagnostics
-        .iter()
-        .map(|d| (d.file_path.clone(), d.lines.invalid_json_lines))
-        .collect()
-}
-
-fn read_errors_by_file(diagnostics: &[FileParseDiagnostics]) -> Vec<(&Path, bool)> {
-    diagnostics
-        .iter()
-        .map(|d| (d.file_path.as_path(), d.read_error))
-        .collect()
-}
-
 fn assert_the_session_holds_only_the_replacement(conn: &mut Connection, replacement: &Path) {
     assert_eq!(
         collect_strings(conn, "SELECT file_path FROM sessions"),
@@ -1714,13 +1708,15 @@ fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_
         (0, 1, 1)
     );
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        invalid_json_lines_by_file(&first.parse_diagnostics),
-        [(logs.original.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(logs.original.clone(), 1)]
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
     let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
@@ -1733,13 +1729,15 @@ fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_
         (0, 1, 1)
     );
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        invalid_json_lines_by_file(&second.parse_diagnostics),
-        [(logs.original.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(logs.original.clone(), 1)]
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
 
@@ -1753,13 +1751,15 @@ fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_
         (1, 0, 1)
     );
     assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
-    assert_eq!(
-        invalid_json_lines_by_file(&with_model.parse_diagnostics),
-        [(logs.original.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(logs.original.clone(), 1)]
+    assert_reported_diagnostics(
+        &with_model.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
 
     fs::remove_file(&logs.original).unwrap();
@@ -1787,13 +1787,15 @@ fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then
         (0, 1, 1)
     );
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        invalid_json_lines_by_file(&first.parse_diagnostics),
-        [(logs.original.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(logs.original.clone(), 1)]
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
     let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
@@ -1806,13 +1808,15 @@ fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then
         (0, 1, 1)
     );
     index_chunks(&mut conn).unwrap();
-    assert_eq!(
-        invalid_json_lines_by_file(&second.parse_diagnostics),
-        [(logs.original.clone(), 1)]
-    );
-    assert_eq!(
-        invalid_json_lines_by_file(&load_parse_diagnostics(&conn).unwrap()),
-        [(logs.original.clone(), 1)]
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
 
@@ -2745,14 +2749,25 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     );
 }
 
-/// Each diagnosed file in a diagnostics list: the stored path, its source, its line counts
+/// One diagnosed file in a diagnostics list: the stored path, its source, its line counts
 /// and whether the file could not be read.
-fn diagnosed_files(
-    diagnostics: &[FileParseDiagnostics],
-) -> Vec<(PathBuf, Source, LineDiagnostics, bool)> {
+#[derive(Debug, PartialEq)]
+struct DiagnosedFile {
+    file_path: PathBuf,
+    source: Source,
+    lines: LineDiagnostics,
+    read_error: bool,
+}
+
+fn diagnosed_files(diagnostics: &[FileParseDiagnostics]) -> Vec<DiagnosedFile> {
     diagnostics
         .iter()
-        .map(|d| (d.file_path.clone(), d.source, d.lines, d.read_error))
+        .map(|d| DiagnosedFile {
+            file_path: d.file_path.clone(),
+            source: d.source,
+            lines: d.lines,
+            read_error: d.read_error,
+        })
         .collect()
 }
 
@@ -2765,7 +2780,7 @@ fn diagnosed_files(
 fn assert_reported_diagnostics(
     returned: &[FileParseDiagnostics],
     conn: &Connection,
-    expected: &[(PathBuf, Source, LineDiagnostics, bool)],
+    expected: &[DiagnosedFile],
 ) {
     assert_eq!(
         diagnosed_files(returned),
@@ -2811,7 +2826,12 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    let partial = [(path.clone(), Source::Claude, ONE_INVALID_JSON_LINE, false)];
+    let partial = [DiagnosedFile {
+        file_path: path.clone(),
+        source: Source::Claude,
+        lines: ONE_INVALID_JSON_LINE,
+        read_error: false,
+    }];
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn).unwrap();
     assert_eq!(stats.indexed, 1);
@@ -2876,12 +2896,12 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     assert_reported_diagnostics(
         &stats.parse_diagnostics,
         &conn,
-        &[(
-            tail.clone(),
-            Source::Claude,
-            ONE_INCOMPLETE_TAIL_LINE,
-            false,
-        )],
+        &[DiagnosedFile {
+            file_path: tail.clone(),
+            source: Source::Claude,
+            lines: ONE_INCOMPLETE_TAIL_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(stats.total_sessions, 1);
     {
@@ -2906,7 +2926,12 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     assert_reported_diagnostics(
         &stats.parse_diagnostics,
         &conn,
-        &[(empty.clone(), Source::Claude, ONE_INVALID_JSON_LINE, false)],
+        &[DiagnosedFile {
+            file_path: empty.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(stats.total_sessions, 1);
     fs::remove_file(empty).unwrap();
@@ -2941,12 +2966,12 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
     assert_reported_diagnostics(
         &first.parse_diagnostics,
         &conn,
-        &[(
-            log.file.clone(),
-            Source::Claude,
-            ONE_INVALID_JSON_LINE,
-            false,
-        )],
+        &[DiagnosedFile {
+            file_path: log.file.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
 
     let probe = TempDir::new().unwrap();
@@ -2964,12 +2989,12 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
     assert_reported_diagnostics(
         &unreadable.parse_diagnostics,
         &conn,
-        &[(
-            log.file.clone(),
-            Source::Claude,
-            ONE_INVALID_JSON_LINE,
-            true,
-        )],
+        &[DiagnosedFile {
+            file_path: log.file.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: true,
+        }],
     );
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
@@ -2985,12 +3010,12 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
     assert_reported_diagnostics(
         &retry.parse_diagnostics,
         &conn,
-        &[(
-            log.file.clone(),
-            Source::Claude,
-            ONE_INVALID_JSON_LINE,
-            false,
-        )],
+        &[DiagnosedFile {
+            file_path: log.file.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
 }
 
@@ -3052,14 +3077,24 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         &first,
         &conn,
         &[
-            (
-                paths[2].clone(),
-                Source::Claude,
-                ONE_INVALID_JSON_LINE,
-                false,
-            ),
-            (paths[1].clone(), Source::Claude, NO_LINE_ERRORS, true),
-            (paths[0].clone(), Source::Claude, NO_LINE_ERRORS, true),
+            DiagnosedFile {
+                file_path: paths[2].clone(),
+                source: Source::Claude,
+                lines: ONE_INVALID_JSON_LINE,
+                read_error: false,
+            },
+            DiagnosedFile {
+                file_path: paths[1].clone(),
+                source: Source::Claude,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
+            DiagnosedFile {
+                file_path: paths[0].clone(),
+                source: Source::Claude,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
         ],
     );
     assert_eq!(
@@ -3072,8 +3107,18 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     fs::write(&paths[2], "{\"type\":\"user\",\"message\":\"readable\"}\n").unwrap();
     let unreadable_only = [
-        (paths[1].clone(), Source::Claude, NO_LINE_ERRORS, true),
-        (paths[0].clone(), Source::Claude, NO_LINE_ERRORS, true),
+        DiagnosedFile {
+            file_path: paths[1].clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        },
+        DiagnosedFile {
+            file_path: paths[0].clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        },
     ];
     let repaired = index_paths(&mut conn, &paths);
     assert_reported_diagnostics(&repaired, &conn, &unreadable_only);
@@ -3083,7 +3128,12 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
     assert_reported_diagnostics(
         &first_unreadable_gone,
         &conn,
-        &[(paths[1].clone(), Source::Claude, NO_LINE_ERRORS, true)],
+        &[DiagnosedFile {
+            file_path: paths[1].clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
     );
     let both_unreadable_gone = index_paths(&mut conn, &paths[2..]);
     assert_reported_diagnostics(&both_unreadable_gone, &conn, &[]);
@@ -4420,7 +4470,12 @@ fn undecodable_compressed_codex_log_is_reported_as_a_read_error_and_other_sessio
     assert_reported_diagnostics(
         &stats.parse_diagnostics,
         &conn,
-        &[(corrupt, Source::Codex, NO_LINE_ERRORS, true)],
+        &[DiagnosedFile {
+            file_path: corrupt,
+            source: Source::Codex,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
     );
 }
 
@@ -4601,8 +4656,18 @@ fn missing_archived_root_keeps_its_parse_diagnostics_and_still_clears_those_dele
         &first.parse_diagnostics,
         &conn,
         &[
-            (archived.clone(), Source::Codex, NO_LINE_ERRORS, true),
-            (deleted.clone(), Source::Codex, NO_LINE_ERRORS, true),
+            DiagnosedFile {
+                file_path: archived.clone(),
+                source: Source::Codex,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
+            DiagnosedFile {
+                file_path: deleted.clone(),
+                source: Source::Codex,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
         ],
     );
 
@@ -4613,7 +4678,12 @@ fn missing_archived_root_keeps_its_parse_diagnostics_and_still_clears_those_dele
     assert_reported_diagnostics(
         &second.parse_diagnostics,
         &conn,
-        &[(archived, Source::Codex, NO_LINE_ERRORS, true)],
+        &[DiagnosedFile {
+            file_path: archived,
+            source: Source::Codex,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
     );
 }
 
