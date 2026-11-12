@@ -944,21 +944,55 @@ fn two_searches_in_one_environment_start_the_probe_only_for_the_first() {
     let records_dir = db_dir.path().join("probe");
     let host = FakeHost::healthy();
 
-    for _ in 0..2 {
-        let out = host
-            .serve(db_dir.path(), &records_dir, |model_host| {
-                run_search_in(
-                    search_command("healthy chunk"),
-                    &Some(db_path.clone()),
-                    model_host,
-                )
-            })
-            .unwrap();
-        assert!(!out.degraded, "{:?}", out.notes);
-        assert!(out.notes.is_empty(), "{:?}", out.notes);
-        assert_eq!(out.data["results"].as_array().unwrap().len(), 1);
-    }
+    let first_search = host
+        .serve(db_dir.path(), &records_dir, |model_host| {
+            run_search_in(
+                search_command("healthy chunk"),
+                &Some(db_path.clone()),
+                model_host,
+            )
+        })
+        .unwrap();
+    let second_search = host
+        .serve(db_dir.path(), &records_dir, |model_host| {
+            run_search_in(
+                search_command("healthy chunk"),
+                &Some(db_path.clone()),
+                model_host,
+            )
+        })
+        .unwrap();
 
-    assert_eq!(host.probes.get(), 1);
-    assert_eq!(host.loads.get(), 2);
+    let expected_markdown = concat!(
+        "Found 1 sessions:\n",
+        "\n",
+        "[1] 1970-01-01 | slug | p [claude]\n",
+        "    /p\n",
+        "    ID: s1\n",
+        "    > healthy chunk\n",
+        "    inspect: recall show s1 --chunk 1 --window 3\n",
+        "\n",
+    );
+    let expected_envelope = serde_json::json!({
+        "data": {
+            "results": [{
+                "chunk": 1,
+                "excerpt": "healthy chunk",
+                "inspect": "recall show s1 --chunk 1 --window 3",
+                "project": "/p",
+                "session_id": "s1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+            }],
+        },
+        "degraded": false,
+        "notes": [],
+    });
+    assert_eq!(first_search.markdown, expected_markdown);
+    assert_eq!(printed_envelope(&first_search), expected_envelope);
+    assert_eq!(second_search.markdown, expected_markdown);
+    assert_eq!(printed_envelope(&second_search), expected_envelope);
+    assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
+    assert_eq!(host.loads.get(), 2, "each search loaded the model");
 }
