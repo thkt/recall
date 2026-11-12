@@ -1,4 +1,7 @@
-use crate::envelope::render_json_success;
+use std::process::ExitCode;
+
+use crate::envelope::{render_json_error, render_json_success};
+use crate::error::{classify_exit_code, error_envelope};
 use crate::open_or_create_db;
 use crate::tests::bare_empty_db;
 
@@ -7,6 +10,14 @@ use super::*;
 /// The `--json` envelope `recall show` prints for an output.
 fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
     serde_json::from_str(&render_json_success(out)).unwrap()
+}
+
+/// What a failing `recall show` reports: its exit code and the `--json` error envelope.
+fn reported(err: &anyhow::Error) -> (ExitCode, String) {
+    (
+        classify_exit_code(err),
+        render_json_error(&error_envelope(err)),
+    )
 }
 
 fn setup_show_db() -> (tempfile::TempDir, Connection) {
@@ -138,9 +149,25 @@ fn show_of_a_unique_id_prefix_prints_that_session() {
 
 #[test]
 fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
-    let (_dir, conn) = setup_show_db();
-    let err = show_session(&conn, "abc", false).unwrap_err();
-    assert!(err.to_string().contains("Multiple sessions match"));
+    let (dir, conn) = setup_show_db();
+    drop(conn);
+
+    let err = run_show(
+        "abc",
+        false,
+        None,
+        DEFAULT_WINDOW,
+        &Some(dir.path().join("test.db")),
+    )
+    .unwrap_err();
+
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"Multiple sessions match 'abc':\n  abc-123  my-slug\n  abc-456  other-slug\nNarrow the session ID prefix to match exactly one session","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
+    );
 }
 
 #[test]
