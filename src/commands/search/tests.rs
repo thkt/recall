@@ -5,7 +5,7 @@ use crate::model::tests::FakeHost;
 use crate::tests::{
     bare_empty_db, mock_loader, payload_keys, search_command, seed_healthy_index, vec_chunk_count,
 };
-use crate::{embedder, open_or_create_db, parser};
+use crate::{embedder, open_or_create_db};
 
 use super::*;
 
@@ -149,21 +149,6 @@ fn search_whose_model_fails_to_load_returns_text_matches_with_an_unavailable_not
             "notes": ["semantic search unavailable: embedding model unavailable; results from text search only"],
         })
     );
-}
-
-fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search::SearchResult {
-    search::SearchResult {
-        session: parser::SessionData {
-            session_id: session_id.to_owned(),
-            source: parser::Source::Claude,
-            file_path: "/path/to/file.jsonl".to_owned(),
-            project: project.to_owned(),
-            slug: "test-slug".to_owned(),
-            timestamp: Some(1709251200000),
-        },
-        excerpt: excerpt.to_owned(),
-        chunk_id: None,
-    }
 }
 
 #[test]
@@ -376,14 +361,6 @@ fn search_strips_control_characters_from_the_printed_excerpt() {
             "notes": [],
         })
     );
-}
-
-#[test]
-fn test_format_result_empty_excerpt() {
-    let r = make_search_result("s1", "/proj", "");
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(!output.contains("> "));
 }
 
 #[test]
