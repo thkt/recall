@@ -1,5 +1,4 @@
 use std::ffi::OsString;
-use std::io;
 use std::time::{Duration, SystemTime};
 
 use super::*;
@@ -9,6 +8,7 @@ use crate::embedder::{
     EmbedOptions, MockEmbedder, embed_pending_observed, embed_recent_chunks, f32_as_bytes,
 };
 use crate::index_observer::{recording, stable_lines};
+use crate::parser::LineDiagnostics;
 use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
 
@@ -204,10 +204,18 @@ const CODEX_ANSWER: &str = concat!(
 );
 const CODEX_METADATA_ONLY: &str = r#"{"type":"session_meta","payload":{"cwd":"/proj"}}"#;
 
-/// Runs one more index and returns the observed counts that `--json` reports.
-fn counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::Value {
+/// Runs one index and then the chunk pass with one observer, as `recall index` does, and
+/// returns that observer's counts: every `--json` count the index and the chunk pass set.
+/// The backfill and the embedding do not run, so the embedding counts are absent.
+/// `sessions_stored` is absent too, because the command sets it, not the index.
+fn counts_of_an_index(
+    conn: &mut Connection,
+    opts: &IndexOptions,
+    embed_capable: bool,
+) -> serde_json::Value {
     let observer = Observer::default();
-    index_from_dirs_observed(conn, opts, true, &observer).unwrap();
+    index_from_dirs_observed(conn, opts, embed_capable, &observer).unwrap();
+    index_chunks_observed(conn, &observer).unwrap();
     observer.snapshot()["counts"].clone()
 }
 
@@ -253,7 +261,7 @@ fn assert_size_changes_are_reindexed(root: &str, question: &str, answer: &str) {
         ["original question"]
     );
 
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_an_index(&mut conn, &opts, true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -307,7 +315,7 @@ fn assert_emptied_log_loses_its_stored_messages(root: &str, question: &str, meta
     assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
     assert!(collect_strings(&conn, "SELECT content FROM qa_chunks").is_empty());
 
-    let counts = counts_of_a_rerun(&mut conn, &opts);
+    let counts = counts_of_an_index(&mut conn, &opts, true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -548,7 +556,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 
@@ -581,7 +589,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 
@@ -610,7 +618,7 @@ fn append_around_parsing_is_retried_and_unchanged_body_is_not_parsed() {
         collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
         ["original question", "appended answer"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -670,7 +678,7 @@ fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
         collect_strings(&conn, "SELECT content FROM qa_chunks"),
         ["modified question"]
     );
-    let counts = counts_of_a_rerun(&mut conn, &log.opts());
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
     assert_eq!(counts["files_updated"], 0);
     assert_eq!(counts["files_unchanged"], 1);
 }
@@ -1213,13 +1221,15 @@ fn deleted_claude_log_replaced_by_an_empty_log_is_removed_without_touching_the_c
     assert_eq!((first.indexed, first.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(first.skipped_roots.is_empty());
-    assert!(first.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&first.parse_diagnostics, &conn, &[]);
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
     assert_eq!((second.indexed, second.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(second.skipped_roots.is_empty());
-    assert!(second.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&second.parse_diagnostics, &conn, &[]);
 }
 
 #[test]
@@ -1241,13 +1251,33 @@ fn deleted_claude_log_replaced_by_an_invalid_log_is_removed_without_touching_the
     assert_eq!((first.indexed, first.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(first.skipped_roots.is_empty());
-    assert_eq!(invalid_json_lines_by_file(&first), [(fresh.clone(), 1)]);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
+    );
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
     assert_eq!((second.indexed, second.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(second.skipped_roots.is_empty());
-    assert_eq!(invalid_json_lines_by_file(&second), [(fresh, 1)]);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
+    );
 }
 
 #[cfg(unix)]
@@ -1273,13 +1303,33 @@ fn deleted_claude_log_replaced_by_an_unreadable_log_is_removed_and_the_read_fail
     assert_eq!((first.indexed, first.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(first.skipped_roots.is_empty());
-    assert_eq!(read_errors_by_file(&first), [(fresh.as_path(), true)]);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
+    );
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
     assert_eq!((second.indexed, second.total_sessions), (0, 1));
     assert_only_the_unchanged_codex_session_remains(&conn, &before);
     assert!(second.skipped_roots.is_empty());
-    assert_eq!(read_errors_by_file(&second), [(fresh.as_path(), true)]);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: fresh.clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
+    );
 }
 
 #[test]
@@ -1313,7 +1363,8 @@ fn codex_session_nested_past_the_depth_limit_is_kept_and_reported_while_a_delete
         skipped_roots(&first),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
     );
-    assert!(first.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&first.parse_diagnostics, &conn, &[]);
 
     let second = index_from_dirs(&mut conn, &opts, false).unwrap();
     assert_eq!((second.indexed, second.total_sessions), (0, 1));
@@ -1322,7 +1373,8 @@ fn codex_session_nested_past_the_depth_limit_is_kept_and_reported_while_a_delete
         skipped_roots(&second),
         [(Source::Codex, SkippedReason::IncompleteEnumeration, 1)]
     );
-    assert!(second.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&second.parse_diagnostics, &conn, &[]);
 }
 
 #[test]
@@ -1612,22 +1664,6 @@ fn collision_snapshot(conn: &Connection) -> [Vec<String>; 5] {
     .map(|sql| collect_strings(conn, sql))
 }
 
-fn invalid_json_lines_by_file(stats: &IndexStats) -> Vec<(PathBuf, i64)> {
-    stats
-        .parse_diagnostics
-        .iter()
-        .map(|d| (d.file_path.clone(), d.lines.invalid_json_lines))
-        .collect()
-}
-
-fn read_errors_by_file(stats: &IndexStats) -> Vec<(&Path, bool)> {
-    stats
-        .parse_diagnostics
-        .iter()
-        .map(|d| (d.file_path.as_path(), d.read_error))
-        .collect()
-}
-
 fn assert_the_session_holds_only_the_replacement(conn: &mut Connection, replacement: &Path) {
     assert_eq!(
         collect_strings(conn, "SELECT file_path FROM sessions"),
@@ -1671,9 +1707,16 @@ fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_
         ),
         (0, 1, 1)
     );
-    assert_eq!(
-        invalid_json_lines_by_file(&first),
-        [(logs.original.clone(), 1)]
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
     let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
@@ -1685,9 +1728,16 @@ fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_
         ),
         (0, 1, 1)
     );
-    assert_eq!(
-        invalid_json_lines_by_file(&second),
-        [(logs.original.clone(), 1)]
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
 
@@ -1700,17 +1750,24 @@ fn log_reusing_an_embedded_session_id_waits_for_the_model_and_then_replaces_the_
         ),
         (1, 0, 1)
     );
-    assert_eq!(
-        invalid_json_lines_by_file(&with_model),
-        [(logs.original.clone(), 1)]
-    );
     assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
+    assert_reported_diagnostics(
+        &with_model.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
+    );
 
     fs::remove_file(&logs.original).unwrap();
     fs::remove_file(&logs.replacement).unwrap();
     let emptied = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
     assert_eq!(emptied.total_sessions, 0);
-    assert!(emptied.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&emptied.parse_diagnostics, &conn, &[]);
 }
 
 #[test]
@@ -1729,9 +1786,16 @@ fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then
         ),
         (0, 1, 1)
     );
-    assert_eq!(
-        invalid_json_lines_by_file(&first),
-        [(logs.original.clone(), 1)]
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
     let second = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
@@ -1743,9 +1807,16 @@ fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then
         ),
         (0, 1, 1)
     );
-    assert_eq!(
-        invalid_json_lines_by_file(&second),
-        [(logs.original.clone(), 1)]
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: logs.original.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
     );
     assert_eq!(collision_snapshot(&conn), before);
 
@@ -1758,13 +1829,14 @@ fn log_reusing_the_id_of_a_deleted_embedded_session_waits_for_the_model_and_then
         ),
         (1, 0, 1)
     );
-    assert!(with_model.parse_diagnostics.is_empty());
     assert_the_session_holds_only_the_replacement(&mut conn, &logs.replacement);
+    assert_reported_diagnostics(&with_model.parse_diagnostics, &conn, &[]);
 
     fs::remove_file(&logs.replacement).unwrap();
     let emptied = index_from_dirs(&mut conn, &logs.opts(), false).unwrap();
     assert_eq!(emptied.total_sessions, 0);
-    assert!(emptied.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&emptied.parse_diagnostics, &conn, &[]);
 }
 
 #[test]
@@ -2677,6 +2749,67 @@ fn chunk_batches_preserve_interleaved_sessions_order_and_search_ranges() {
     );
 }
 
+/// One diagnosed file in a diagnostics list: the stored path, its source, its line counts
+/// and whether the file could not be read.
+#[derive(Debug, PartialEq)]
+struct DiagnosedFile {
+    file_path: PathBuf,
+    source: Source,
+    lines: LineDiagnostics,
+    read_error: bool,
+}
+
+fn diagnosed_files(diagnostics: &[FileParseDiagnostics]) -> Vec<DiagnosedFile> {
+    diagnostics
+        .iter()
+        .map(|d| DiagnosedFile {
+            file_path: d.file_path.clone(),
+            source: d.source,
+            lines: d.lines,
+            read_error: d.read_error,
+        })
+        .collect()
+}
+
+/// Asserts that both diagnostics lists `recall index` reports after one run hold `expected`.
+/// `returned` is the list the run returns. Its length is the count of files with unresolved
+/// diagnostics that stderr prints when the run indexed no session. The table read through
+/// `load_parse_diagnostics` after the chunk pass is the list `--json` reports and the notes
+/// name.
+#[track_caller]
+fn assert_reported_diagnostics(
+    returned: &[FileParseDiagnostics],
+    conn: &Connection,
+    expected: &[DiagnosedFile],
+) {
+    assert_eq!(
+        diagnosed_files(returned),
+        expected,
+        "the list the run returns, which the stderr summary counts"
+    );
+    assert_eq!(
+        diagnosed_files(&load_parse_diagnostics(conn).unwrap()),
+        expected,
+        "the table read after the chunk pass, which --json and the notes report"
+    );
+}
+
+const NO_LINE_ERRORS: LineDiagnostics = LineDiagnostics {
+    invalid_json_lines: 0,
+    invalid_utf8_lines: 0,
+    incomplete_tail_lines: 0,
+};
+
+const ONE_INVALID_JSON_LINE: LineDiagnostics = LineDiagnostics {
+    invalid_json_lines: 1,
+    ..NO_LINE_ERRORS
+};
+
+const ONE_INCOMPLETE_TAIL_LINE: LineDiagnostics = LineDiagnostics {
+    incomplete_tail_lines: 1,
+    ..NO_LINE_ERRORS
+};
+
 #[test]
 fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repaired() {
     let (db_dir, mut conn) = setup_test_db();
@@ -2693,10 +2826,16 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
+    let partial = [DiagnosedFile {
+        file_path: path.clone(),
+        source: Source::Claude,
+        lines: ONE_INVALID_JSON_LINE,
+        read_error: false,
+    }];
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
     index_chunks(&mut conn).unwrap();
+    assert_eq!(stats.indexed, 1);
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &partial);
     embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
     let chunks = collect_strings(
         &conn,
@@ -2706,8 +2845,9 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(stats.indexed, 0);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &partial);
     assert_eq!(
         collect_strings(
             &conn,
@@ -2718,8 +2858,9 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
 
     fs::write(&path, valid).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, false).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(stats.preserved_embedded, 1);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &partial);
     assert_eq!(
         collect_strings(&conn, "SELECT hex(embedding) FROM vec_chunks"),
         vectors
@@ -2728,12 +2869,17 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     let hidden = tmp.path().join("hidden");
     fs::rename(&claude_dir, &hidden).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.skipped_roots.len(), 1);
-    assert_eq!(stats.parse_diagnostics.len(), 1);
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        skipped_roots(&stats),
+        [(Source::Claude, SkippedReason::MissingRoot, 1)]
+    );
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &partial);
     fs::rename(&hidden, &claude_dir).unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
     assert_eq!(stats.indexed, 1);
-    assert!(stats.parse_diagnostics.is_empty());
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &[]);
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["retained question"]
@@ -2746,7 +2892,17 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     )
     .unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.parse_diagnostics[0].lines.incomplete_tail_lines, 1);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &stats.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: tail.clone(),
+            source: Source::Claude,
+            lines: ONE_INCOMPLETE_TAIL_LINE,
+            read_error: false,
+        }],
+    );
     assert_eq!(stats.total_sessions, 1);
     {
         use std::io::Write;
@@ -2754,70 +2910,113 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
         file.write_all(b"\"}\n").unwrap();
     }
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert!(stats.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &[]);
     assert_eq!(stats.total_sessions, 2);
-    assert!(
-        collect_strings(&conn, "SELECT text FROM messages")
-            .contains(&"completed by append".to_owned())
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["retained question", "completed by append"]
     );
     fs::remove_file(tail).unwrap();
 
     let empty = claude_dir.join("no-messages.jsonl");
     fs::write(&empty, "invalid\n").unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.parse_diagnostics.len(), 1);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &stats.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: empty.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
+    );
     assert_eq!(stats.total_sessions, 1);
     fs::remove_file(empty).unwrap();
-    assert!(
-        index_from_dirs(&mut conn, &opts, true)
-            .unwrap()
-            .parse_diagnostics
-            .is_empty()
-    );
+    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &[]);
 }
 
+#[cfg(unix)]
+#[path = "../../tests/support/root_skip.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "src/db/tests.rs loads the same support file"
+)]
+#[allow(dead_code, reason = "this file calls only skip_if_root")]
+mod root_skip;
+
+#[cfg(unix)]
 #[test]
 fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadata() {
+    use std::os::unix::fs::PermissionsExt;
+
     let (_dir, mut conn) = setup_test_db();
-    let tmp = TempDir::new().unwrap();
-    let path = tmp.path().join("s.jsonl");
-    fs::write(&path, "{\"type\":\"user\",\"message\":\"kept\"}\ninvalid\n").unwrap();
-    let missing = tmp.path().join("no-codex");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: tmp.path(),
-        codex_dir: &missing,
-        codex_archived_dir: None,
-    };
-    index_from_dirs(&mut conn, &opts, true).unwrap();
-    let existing = load_existing_sessions(&conn).unwrap();
-    let tx = conn.transaction().unwrap();
-    let ctx = IndexContext {
-        tx: &tx,
-        existing: &existing,
-        force: true,
-        embedded_sessions: None,
-    };
-    index_file_with_parser(&ctx, &path, &Source::Claude, |_, _| {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "private content must not escape",
-        )
-        .into())
-    })
+    let log = OneLog::new("claude", "s.jsonl");
+    fs::write(
+        &log.file,
+        "{\"type\":\"user\",\"message\":\"kept\"}\ninvalid\n",
+    )
     .unwrap();
-    tx.commit().unwrap();
-    let d = load_parse_diagnostics(&conn).unwrap();
-    assert!(d[0].read_error);
-    assert_eq!(d[0].lines.invalid_json_lines, 1);
+    let first = index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: log.file.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
+    );
+
+    let probe = TempDir::new().unwrap();
+    fs::set_permissions(probe.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    if root_skip::skip_if_root(probe.path()) {
+        return;
+    }
+    let permissions = fs::metadata(&log.file).unwrap().permissions();
+    fs::set_permissions(&log.file, fs::Permissions::from_mode(0o000)).unwrap();
+    let unreadable = index_from_dirs(&mut conn, &log.rebuild_opts(), true);
+    fs::set_permissions(&log.file, permissions).unwrap();
+    let unreadable = unreadable.unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_eq!((unreadable.indexed, unreadable.total_sessions), (0, 1));
+    assert_reported_diagnostics(
+        &unreadable.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: log.file.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: true,
+        }],
+    );
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["kept"]
     );
-    let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert!(!stats.parse_diagnostics[0].read_error);
-    assert_eq!(stats.parse_diagnostics[0].lines.invalid_json_lines, 1);
+
+    let retry = index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    assert_eq!(
+        retry.indexed, 1,
+        "a recorded read error makes an unchanged size and mtime read again"
+    );
+    assert_reported_diagnostics(
+        &retry.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: log.file.clone(),
+            source: Source::Claude,
+            lines: ONE_INVALID_JSON_LINE,
+            read_error: false,
+        }],
+    );
 }
 
 #[cfg(unix)]
@@ -2825,7 +3024,14 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
 fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resolved() {
     use std::os::unix::ffi::OsStringExt;
 
-    fn observe(conn: &mut Connection, paths: &[PathBuf]) -> Vec<FileParseDiagnostics> {
+    /// Runs part of one index run over `paths` as Claude logs, then the chunk pass, and
+    /// returns the list `cleanup_parse_diagnostics` returns. It loads the stored sessions,
+    /// opens a deferred transaction and runs `index_all` with `force` off and the model
+    /// available. It then runs `cleanup_parse_diagnostics` with `paths` as every log of a
+    /// fully read Claude root, commits and runs `index_chunks`. It skips enumeration, because
+    /// APFS refuses the file names that are not UTF-8 this test needs. It also skips
+    /// `cleanup_orphans`, the FTS automerge settings and `finalize_fts`.
+    fn index_paths(conn: &mut Connection, paths: &[PathBuf]) -> Vec<FileParseDiagnostics> {
         let existing = load_existing_sessions(conn).unwrap();
         let tx = conn.transaction().unwrap();
         let ctx = IndexContext {
@@ -2837,14 +3043,22 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
         let sources: Vec<_> = paths.iter().cloned().map(|p| (p, Source::Claude)).collect();
         index_all(&ctx, &sources, &Observer::default()).unwrap();
         let source_paths = paths.iter().map(PathBuf::as_path).collect();
-        let diagnostics = cleanup_parse_diagnostics(
+        let returned = cleanup_parse_diagnostics(
             &tx,
             &source_paths,
             &RemovalGate::fully_read([Source::Claude]),
         )
         .unwrap();
         tx.commit().unwrap();
+        index_chunks(conn).unwrap();
+        returned
+    }
+
+    fn display_paths(diagnostics: &[FileParseDiagnostics]) -> Vec<String> {
         diagnostics
+            .iter()
+            .map(FileParseDiagnostics::display_path)
+            .collect()
     }
 
     let (db_dir, mut conn) = setup_test_db();
@@ -2856,40 +3070,73 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
             .join(OsString::from_vec(b"bad-\xfe.jsonl".to_vec())),
         tmp.path().join("bad-\u{fffd}.jsonl"),
     ];
+    let shown = paths[2].to_str().unwrap();
     fs::write(&paths[2], "invalid JSON\n").unwrap();
-    let diagnostics = observe(&mut conn, &paths);
-    assert_eq!(diagnostics.len(), 3);
-    assert_eq!(diagnostics.iter().filter(|d| d.read_error).count(), 2);
-    assert!(
-        diagnostics
-            .iter()
-            .all(|d| { d.display_path() == paths[2].to_str().unwrap() })
+    let first = index_paths(&mut conn, &paths);
+    assert_reported_diagnostics(
+        &first,
+        &conn,
+        &[
+            DiagnosedFile {
+                file_path: paths[2].clone(),
+                source: Source::Claude,
+                lines: ONE_INVALID_JSON_LINE,
+                read_error: false,
+            },
+            DiagnosedFile {
+                file_path: paths[1].clone(),
+                source: Source::Claude,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
+            DiagnosedFile {
+                file_path: paths[0].clone(),
+                source: Source::Claude,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
+        ],
     );
     assert_eq!(
-        diagnostics
-            .iter()
-            .map(|d| d.lines.invalid_json_lines)
-            .sum::<i64>(),
-        1
+        display_paths(&load_parse_diagnostics(&conn).unwrap()),
+        [shown, shown, shown],
+        "the three files show the same path in --json and the notes"
     );
 
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
     fs::write(&paths[2], "{\"type\":\"user\",\"message\":\"readable\"}\n").unwrap();
-    for _ in 0..2 {
-        let diagnostics = observe(&mut conn, &paths);
-
-        assert_eq!(diagnostics.len(), 2);
-        assert!(diagnostics.iter().all(|d| d.read_error));
-        let reported: HashSet<_> = diagnostics.iter().map(|d| &d.file_path).collect();
-        assert_eq!(reported, HashSet::from([&paths[0], &paths[1]]));
-    }
-    let diagnostics = observe(&mut conn, &paths[1..]);
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].file_path, paths[1]);
-    assert!(diagnostics[0].read_error);
-    let diagnostics = observe(&mut conn, &paths[2..]);
-    assert!(diagnostics.is_empty());
+    let unreadable_only = [
+        DiagnosedFile {
+            file_path: paths[1].clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        },
+        DiagnosedFile {
+            file_path: paths[0].clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        },
+    ];
+    let repaired = index_paths(&mut conn, &paths);
+    assert_reported_diagnostics(&repaired, &conn, &unreadable_only);
+    let unchanged_rerun = index_paths(&mut conn, &paths);
+    assert_reported_diagnostics(&unchanged_rerun, &conn, &unreadable_only);
+    let first_unreadable_gone = index_paths(&mut conn, &paths[1..]);
+    assert_reported_diagnostics(
+        &first_unreadable_gone,
+        &conn,
+        &[DiagnosedFile {
+            file_path: paths[1].clone(),
+            source: Source::Claude,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
+    );
+    let both_unreadable_gone = index_paths(&mut conn, &paths[2..]);
+    assert_reported_diagnostics(&both_unreadable_gone, &conn, &[]);
     assert_eq!(
         collect_strings(&conn, "SELECT text FROM messages"),
         ["readable"]
@@ -2917,20 +3164,37 @@ fn failed_fts_transaction_never_reports_saved_files() {
     let error = index_from_dirs_observed(&mut conn, &opts, true, &observer)
         .err()
         .unwrap();
-    assert!(error.to_string().contains("injected FTS failure"));
-    assert_eq!(observer.snapshot()["counts"]["files_updated_committed"], 0);
-    assert!(collect_strings(&conn, "SELECT session_id FROM sessions").is_empty());
-    assert!(
-        !lines
-            .borrow()
-            .iter()
-            .any(|line| line.contains("fts_transaction: committed"))
+    assert_eq!(
+        error
+            .downcast_ref::<rusqlite::Error>()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("injected FTS failure"),
+        "the SQLite error that aborted the save, under any context the run adds"
     );
-    assert!(
-        lines
-            .borrow()
-            .iter()
-            .any(|line| line.contains("fts_transaction: unfinished"))
+    assert_eq!(
+        observer.snapshot()["counts"],
+        serde_json::json!({
+            "files_discovered": 1,
+            "files_remaining": 1,
+            "files_updated_committed": 0,
+        }),
+        "the file whose save failed stays remaining and none counts as committed"
+    );
+    assert!(collect_strings(&conn, "SELECT session_id FROM sessions").is_empty());
+    assert_eq!(
+        stable_lines(&lines.borrow()),
+        [
+            "index: fts_transaction: started (not yet complete)",
+            "index: enumeration: started (not yet complete)",
+            "index: enumeration: complete; unavailable roots reported separately",
+            "index: index_prepare: started (not yet complete)",
+            "index: index_prepare: complete",
+            "index: parse_fts: started (not yet complete)",
+            "index: parse_fts: unfinished; only earlier commit notifications confirm saves",
+            "index: fts_transaction: unfinished; only earlier commit notifications confirm saves"
+        ],
+        "the FTS transaction is reported unfinished, never committed"
     );
     conn.execute_batch("DROP TRIGGER fail_session;").unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
@@ -2939,92 +3203,192 @@ fn failed_fts_transaction_never_reports_saved_files() {
 #[test]
 fn file_outcome_counts_partition_empty_failed_and_deferred_work() {
     let (_dir, mut conn) = setup_test_db();
-    let source = TempDir::new().unwrap();
+    let log = OneLog::new("claude", "good.jsonl");
+    let opts = log.opts();
     let body = r#"{"type":"user","message":{"role":"user","content":"question"}}"#;
-    let absent = source.path().join("absent");
-    let opts = IndexOptions {
-        force: false,
-        claude_dir: source.path(),
-        codex_dir: &absent,
-        codex_archived_dir: None,
-    };
-    let observer = Observer::default();
-    index_from_dirs_observed(&mut conn, &opts, true, &observer).unwrap();
-    let counts = observer.snapshot()["counts"].clone();
-    for key in [
-        "files_discovered",
-        "files_updated",
-        "files_unchanged",
-        "files_empty",
-        "files_failed",
-        "files_deferred",
-        "files_remaining",
-        "files_updated_committed",
-    ] {
-        assert_eq!(counts[key], 0, "empty source: {key}");
-    }
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, true),
+        serde_json::json!({
+            "files_discovered": 0,
+            "files_updated": 0,
+            "files_unchanged": 0,
+            "files_empty": 0,
+            "files_failed": 0,
+            "files_deferred": 0,
+            "files_remaining": 0,
+            "files_updated_committed": 0,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
+        }),
+        "a root with no logs reports every file outcome as zero"
+    );
 
-    fs::write(source.path().join("good.jsonl"), body).unwrap();
-    fs::write(source.path().join("empty.jsonl"), "\n").unwrap();
-    fs::write(source.path().join("broken.jsonl"), "{broken}\n").unwrap();
-    for pass in 0..3 {
-        let observer = Observer::default();
-        index_from_dirs_observed(&mut conn, &opts, pass != 2, &observer).unwrap();
-        let counts = observer.snapshot()["counts"].clone();
-        assert_eq!(counts["files_discovered"], 3);
-        assert_eq!(counts["files_empty"], 1);
-        assert_eq!(counts["files_failed"], 1);
-        assert_eq!(counts["files_updated"], usize::from(pass == 0));
-        assert_eq!(counts["files_unchanged"], usize::from(pass == 1));
-        assert_eq!(counts["files_deferred"], usize::from(pass == 2));
-        assert_eq!(counts["files_remaining"], 0);
-        index_chunks(&mut conn).unwrap();
-        if pass == 1 {
-            embed_recent_chunks(&mut conn, &MockEmbedder::new(), usize::MAX, None).unwrap();
-            fs::write(
-                source.path().join("good.jsonl"),
-                format!("{body}\n{body}\n"),
-            )
-            .unwrap();
-        }
-    }
+    fs::write(&log.file, body).unwrap();
+    fs::write(log.claude.join("empty.jsonl"), "\n").unwrap();
+    fs::write(log.claude.join("broken.jsonl"), "{broken}\n").unwrap();
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, true),
+        serde_json::json!({
+            "files_discovered": 3,
+            "files_updated": 1,
+            "files_unchanged": 0,
+            "files_empty": 1,
+            "files_failed": 1,
+            "files_deferred": 0,
+            "files_remaining": 0,
+            "files_updated_committed": 1,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 1,
+            "chunks_created_committed": 1,
+            "sessions_chunk_pending": 1,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
+        })
+    );
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, true),
+        serde_json::json!({
+            "files_discovered": 3,
+            "files_updated": 0,
+            "files_unchanged": 1,
+            "files_empty": 1,
+            "files_failed": 1,
+            "files_deferred": 0,
+            "files_remaining": 0,
+            "files_updated_committed": 0,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
+        }),
+        "the empty and broken logs are read again because no session holds them"
+    );
 
-    let protected = chunk_vectors(&conn);
-    assert_eq!(protected.len(), 1);
-    let unembedded = source.path().join("unembedded.jsonl");
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    fs::write(&log.file, format!("{body}\n{body}\n")).unwrap();
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, false),
+        serde_json::json!({
+            "files_discovered": 3,
+            "files_updated": 0,
+            "files_unchanged": 0,
+            "files_empty": 1,
+            "files_failed": 1,
+            "files_deferred": 1,
+            "files_remaining": 0,
+            "files_updated_committed": 0,
+            "chunks_matched_committed": 0,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 0,
+            "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
+        }),
+        "a run without the model defers the changed log of an embedded session"
+    );
+}
+
+#[test]
+fn a_model_absent_run_reconciles_an_unembedded_log_that_grew_and_defers_the_embedded_one() {
+    let (_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "embedded.jsonl");
+    let opts = log.opts();
+    write_reuse_conversation(&log.file, &[("user", "embedded question")]);
+    index_from_dirs(&mut conn, &opts, true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    embed_recent_chunks(&mut conn, &MockEmbedder::new(), 100, None).unwrap();
+    let embedded = vector_rows(&conn);
+    write_reuse_conversation(
+        &log.file,
+        &[
+            ("user", "embedded question"),
+            ("user", "embedded follow-up"),
+        ],
+    );
+    let unembedded = log.claude.join("unembedded.jsonl");
     write_reuse_conversation(&unembedded, &[("user", "pending question")]);
     index_from_dirs(&mut conn, &opts, false).unwrap();
     index_chunks(&mut conn).unwrap();
-    let before = collect_strings(
-        &conn,
-        "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded'",
+    assert_eq!(
+        chunk_ranges(&conn),
+        [
+            r#"["embedded question",1,1]"#,
+            r#"["pending question",2,2]"#
+        ]
     );
+    let pending_chunk_identity =
+        "SELECT json_array(id, generation) FROM qa_chunks WHERE content = 'pending question'";
+    let identity_before = collect_strings(&conn, pending_chunk_identity);
+
     write_reuse_conversation(
         &unembedded,
         &[("user", "pending question"), ("user", "appended question")],
     );
-    let observer = Observer::default();
-    let stats = index_from_dirs_observed(&mut conn, &opts, false, &observer).unwrap();
-    assert_eq!(stats.indexed, 1);
-    assert_eq!(stats.preserved_embedded, 1);
-    let counts = observer.snapshot()["counts"].clone();
-    assert_eq!(counts["chunks_matched_committed"], 1);
-    assert_eq!(counts["embeddings_reused_committed"], 0);
-    assert_eq!(counts["chunks_reconciled_created_committed"], 1);
-    assert_eq!(index_chunks(&mut conn).unwrap().sessions_chunked, 0);
-    assert_eq!(chunk_vectors(&conn), protected);
-    let after = collect_strings(
-        &conn,
-        "SELECT json_array(id, generation, content) FROM qa_chunks WHERE session_id = 'unembedded' ORDER BY id",
+    assert_eq!(
+        counts_of_an_index(&mut conn, &opts, false),
+        serde_json::json!({
+            "files_discovered": 2,
+            "files_updated": 1,
+            "files_unchanged": 0,
+            "files_empty": 0,
+            "files_failed": 0,
+            "files_deferred": 1,
+            "files_remaining": 0,
+            "files_updated_committed": 1,
+            "chunks_matched_committed": 1,
+            "embeddings_reused_committed": 0,
+            "chunks_reconciled_created_committed": 1,
+            "chunks_removed_committed": 0,
+            "sessions_chunked_committed": 0,
+            "chunks_created_committed": 0,
+            "sessions_chunk_pending": 0,
+            "sessions_chunk_remaining": 0,
+            "sessions_chunked_empty": 0,
+        }),
+        "the index already reconciled the chunks of the grown log, so the chunk pass creates none"
     );
-    assert_eq!(after.len(), 2);
-    assert_eq!(after[..1], before);
+    assert_eq!(
+        collect_strings(&conn, pending_chunk_identity),
+        identity_before,
+        "the matched chunk keeps its id and generation"
+    );
+    assert_eq!(
+        chunk_ranges(&conn),
+        [
+            r#"["embedded question",1,1]"#,
+            r#"["pending question",2,2]"#,
+            r#"["appended question",3,3]"#,
+        ]
+    );
     assert_eq!(
         collect_strings(
             &conn,
             "SELECT text FROM messages WHERE session_id = 'unembedded' ORDER BY rowid"
         ),
         ["pending question", "appended question"]
+    );
+    assert_eq!(
+        vector_rows(&conn),
+        embedded,
+        "the deferred session keeps its chunk and vector rows"
     );
 }
 
@@ -3070,86 +3434,87 @@ fn embedded_contents(conn: &Connection) -> Vec<String> {
     )
 }
 
-#[test]
-fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
+/// Writes a log the moment an index run reports its enumeration complete, and has a second
+/// connection index, chunk and embed it right away. That writer gets a busy error while the
+/// run holds the writer lock, and indexes the log after the run instead. The session must
+/// then hold the log's messages and the vectors the writer saved.
+///
+/// Both connections run on one thread and the writer does not wait for the lock, so the test
+/// fixes one order. It does not reproduce a second `recall index`, which would wait instead.
+fn assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(embed_capable: bool) {
     use rusqlite::{Error as SqliteError, ErrorCode};
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
-    for embed_capable in [true, false] {
-        let (db_dir, mut conn) = setup_test_db();
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
-        let absent = root.join("absent");
-        let opts = IndexOptions {
-            force: false,
-            claude_dir: &root,
-            codex_dir: &absent,
-            codex_archived_dir: None,
-        };
-        let writer = open_db(&db_dir.path().join("test.db")).unwrap();
-        writer.busy_timeout(Duration::ZERO).unwrap();
-        let writer = RefCell::new(writer);
-        let writer_root = root.clone();
-        let saved = Rc::new(RefCell::new(None));
-        let writer_saved = Rc::clone(&saved);
-        let index_new = Rc::new(move || -> Result<()> {
-            let mut writer = writer.borrow_mut();
-            let absent = writer_root.join("absent");
-            let opts = IndexOptions {
-                force: false,
-                claude_dir: &writer_root,
-                codex_dir: &absent,
-                codex_archived_dir: None,
-            };
-            index_from_dirs(&mut writer, &opts, true)?;
-            index_chunks(&mut writer)?;
-            assert_eq!(
-                embed_recent_chunks(&mut writer, &MockEmbedder::new(), 100, None)?.embedded,
-                1
+    let (db_dir, mut conn) = setup_test_db();
+    let log = Rc::new(OneLog::new("claude", "new.jsonl"));
+    let writer = open_db(&db_dir.path().join("test.db")).unwrap();
+    writer.busy_timeout(Duration::ZERO).unwrap();
+    let writer = RefCell::new(writer);
+    let writer_log = Rc::clone(&log);
+    let saved = Rc::new(RefCell::new(None));
+    let writer_saved = Rc::clone(&saved);
+    let index_new = Rc::new(move || -> Result<()> {
+        let mut writer = writer.borrow_mut();
+        index_from_dirs(&mut writer, &writer_log.opts(), true)?;
+        index_chunks(&mut writer)?;
+        assert_eq!(
+            embed_recent_chunks(&mut writer, &MockEmbedder::new(), 100, None)?.embedded,
+            1
+        );
+        *writer_saved.borrow_mut() = Some(chunk_vectors(&writer));
+        Ok(())
+    });
+    let attempted = Rc::new(Cell::new(false));
+    let observer_attempted = Rc::clone(&attempted);
+    let observer_index = Rc::clone(&index_new);
+    let path = log.file.clone();
+    let observer = Observer::with_reporter(move |line| {
+        if line.starts_with("index: enumeration: complete") {
+            assert!(!observer_attempted.replace(true));
+            write_reuse_conversation(
+                &path,
+                &[("user", "new question"), ("assistant", "new answer")],
             );
-            *writer_saved.borrow_mut() = Some(chunk_vectors(&writer));
-            Ok(())
-        });
-        let attempted = Rc::new(Cell::new(false));
-        let observer_attempted = Rc::clone(&attempted);
-        let observer_index = Rc::clone(&index_new);
-        let path = root.join("new.jsonl");
-        let observer = Observer::with_reporter(move |line| {
-            if line.starts_with("index: enumeration: complete") {
-                assert!(!observer_attempted.replace(true));
-                write_reuse_conversation(
-                    &path,
-                    &[("user", "new question"), ("assistant", "new answer")],
+            // Not unwrap_err: if the run let the writer in, the outcome asserts must report it.
+            if let Err(error) = observer_index() {
+                assert_eq!(
+                    error
+                        .downcast_ref::<SqliteError>()
+                        .and_then(SqliteError::sqlite_error_code),
+                    Some(ErrorCode::DatabaseBusy),
+                    "only writer contention permits a retry: {error:#}"
                 );
-                if let Err(error) = observer_index() {
-                    assert_eq!(
-                        error
-                            .downcast_ref::<SqliteError>()
-                            .and_then(SqliteError::sqlite_error_code),
-                        Some(ErrorCode::DatabaseBusy),
-                        "only writer contention permits a retry: {error:#}"
-                    );
-                }
             }
-        });
-
-        index_from_dirs_observed(&mut conn, &opts, embed_capable, &observer).unwrap();
-        assert!(attempted.get());
-        if saved.borrow().is_none() {
-            index_new().unwrap();
         }
-        assert_eq!(
-            collect_strings(&conn, "SELECT session_id FROM sessions"),
-            ["new"]
-        );
-        assert_eq!(
-            collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
-            ["new question", "new answer"]
-        );
-        assert_eq!(chunk_vectors(&conn).len(), 1);
-        assert_eq!(chunk_vectors(&conn), *saved.borrow().as_ref().unwrap());
+    });
+
+    index_from_dirs_observed(&mut conn, &log.opts(), embed_capable, &observer).unwrap();
+    assert!(attempted.get());
+    // Not unconditional: indexing again would restore a session the run's cleanup deleted.
+    if saved.borrow().is_none() {
+        index_new().unwrap();
     }
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["new"]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["new question", "new answer"]
+    );
+    assert_eq!(embedded_contents(&conn), ["new question\nnew answer"]);
+    assert_eq!(chunk_vectors(&conn), *saved.borrow().as_ref().unwrap());
+}
+
+#[test]
+fn a_session_indexed_after_enumeration_survives_orphan_cleanup() {
+    assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(true);
+}
+
+#[test]
+fn a_session_indexed_after_enumeration_survives_orphan_cleanup_by_a_model_absent_run() {
+    assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(false);
 }
 
 const REUSE_CONVERSATION: [(&str, &str); 6] = [
@@ -3202,9 +3567,10 @@ fn rewrite_reuse_conversation(path: &Path, messages: &[(&str, &str)]) {
     );
 }
 
-/// Reindexes and returns the --json counts that report chunk reuse.
+/// Runs `counts_of_an_index` with the model available and returns its counts that report
+/// chunk reuse.
 fn reuse_counts_of_a_rerun(conn: &mut Connection, opts: &IndexOptions) -> serde_json::Value {
-    let counts = counts_of_a_rerun(conn, opts);
+    let counts = counts_of_an_index(conn, opts, true);
     serde_json::json!({
         "files_updated_committed": counts["files_updated_committed"],
         "chunks_matched_committed": counts["chunks_matched_committed"],
@@ -3291,7 +3657,6 @@ fn appending_a_turn_reuses_every_stored_vector_and_infers_only_the_new_chunk() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(
@@ -3338,7 +3703,6 @@ fn continuing_the_last_answer_reuses_the_unchanged_chunks_and_infers_only_the_ex
             "chunks_removed_committed": 1,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..2]);
     assert_eq!(
@@ -3387,7 +3751,6 @@ fn touching_a_log_without_changing_it_reuses_every_vector_and_infers_nothing() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3418,7 +3781,6 @@ fn truncating_a_log_keeps_the_vector_of_the_remaining_chunk_and_infers_nothing()
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
@@ -3454,7 +3816,6 @@ fn truncating_to_a_duplicated_turn_keeps_the_copy_that_has_a_vector() {
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[..1]);
     assert_eq!(chunk_ranges(&conn), [r#"["duplicate\nsame answer",8,9]"#]);
@@ -3490,7 +3851,6 @@ fn replacing_the_opening_turns_keeps_the_vector_of_the_surviving_turn_and_infers
             "chunks_removed_committed": 2,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before[2..]);
     assert_eq!(
@@ -3525,7 +3885,6 @@ fn a_session_chunked_under_other_rules_reuses_no_vector_and_infers_every_chunk()
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3592,7 +3951,6 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3665,7 +4023,6 @@ fn a_session_parsed_under_current_rules_and_chunked_while_its_root_was_missing_r
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert_eq!(vector_rows(&conn), before);
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3692,7 +4049,6 @@ fn rebuilding_reuses_no_vector_and_infers_every_chunk_again() {
             "chunks_removed_committed": 0,
         })
     );
-    index_chunks(&mut conn).unwrap();
 
     assert!(vector_rows(&conn).is_empty());
     assert_eq!(chunk_ranges(&conn), UNCHANGED_REUSE_CHUNK_RANGES);
@@ -3929,7 +4285,8 @@ fn assert_compressing_keeps_the_session_and_its_embeddings(body: &str) {
     );
     assert_eq!(session_identity(&conn), identity_before);
     assert_eq!(chunk_vectors(&conn), vectors_before);
-    assert!(stats.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &[]);
 }
 
 #[test]
@@ -4065,7 +4422,8 @@ fn compressed_logs_are_indexed_only_from_codex_roots() {
         collect_strings(&conn, "SELECT file_path FROM sessions"),
         [codex_log.to_str().unwrap()]
     );
-    assert!(stats.parse_diagnostics.is_empty());
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &[]);
 }
 
 #[test]
@@ -4096,13 +4454,16 @@ fn undecodable_compressed_codex_log_is_reported_as_a_read_error_and_other_sessio
     .unwrap();
 
     assert_eq!((stats.indexed, stats.total_sessions), (1, 1));
-    assert_eq!(
-        stats
-            .parse_diagnostics
-            .iter()
-            .map(|d| (d.file_path.as_path(), d.source, d.read_error))
-            .collect::<Vec<_>>(),
-        [(corrupt.as_path(), Source::Codex, true)]
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &stats.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: corrupt,
+            source: Source::Codex,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
     );
 }
 
@@ -4277,25 +4638,41 @@ fn missing_archived_root_keeps_its_parse_diagnostics_and_still_clears_those_dele
     let deleted = roots.day.join(format!("{}.zst", rollout_name(3)));
     fs::write(&archived, &undecodable).unwrap();
     fs::write(&deleted, &undecodable).unwrap();
-    let diagnosed = |stats: &IndexStats| -> Vec<PathBuf> {
-        let mut paths: Vec<_> = stats
-            .parse_diagnostics
-            .iter()
-            .map(|d| d.file_path.clone())
-            .collect();
-        paths.sort();
-        paths
-    };
     let first = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-    let mut both = vec![archived.clone(), deleted.clone()];
-    both.sort();
-    assert_eq!(diagnosed(&first), both);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &first.parse_diagnostics,
+        &conn,
+        &[
+            DiagnosedFile {
+                file_path: archived.clone(),
+                source: Source::Codex,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
+            DiagnosedFile {
+                file_path: deleted.clone(),
+                source: Source::Codex,
+                lines: NO_LINE_ERRORS,
+                read_error: true,
+            },
+        ],
+    );
 
     fs::remove_dir_all(&roots.archived).unwrap();
     fs::remove_file(&deleted).unwrap();
     let second = index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
-
-    assert_eq!(diagnosed(&second), [archived]);
+    index_chunks(&mut conn).unwrap();
+    assert_reported_diagnostics(
+        &second.parse_diagnostics,
+        &conn,
+        &[DiagnosedFile {
+            file_path: archived,
+            source: Source::Codex,
+            lines: NO_LINE_ERRORS,
+            read_error: true,
+        }],
+    );
 }
 
 #[test]
