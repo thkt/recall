@@ -168,15 +168,85 @@ fn make_search_result(session_id: &str, project: &str, excerpt: &str) -> search:
 }
 
 #[test]
-fn test_format_result_basic() {
-    let r = make_search_result("s1", "/home/me/project", "some excerpt");
-    let mut output = String::new();
-    format_result(&mut output, 0, &r).unwrap();
-    assert!(output.contains("[1] 2024-03-01"));
-    assert!(output.contains("test-slug"));
-    assert!(output.contains("project [claude]"));
-    assert!(output.contains("ID: s1"));
-    assert!(output.contains("> some excerpt"));
+fn search_lists_each_match_with_its_date_slug_project_id_excerpt_and_inspect_line() {
+    // Both sessions hold the same message at the same time, so their scores
+    // tie and the session id orders them; the b2c3d4e5 session is inserted first.
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES
+                 ('b2c3d4e5-f6a7-8901-2345-67890abcdef1', 'claude', '/home/me/.claude/projects/other/b2c3d4e5-f6a7-8901-2345-67890abcdef1.jsonl', '/home/me/other', 'add-login-tests', 1709251200000, 0.0),
+                 ('a1b2c3d4-e5f6-7890-1234-567890abcdef', 'claude', '/home/me/.claude/projects/project/a1b2c3d4-e5f6-7890-1234-567890abcdef.jsonl', '/home/me/project', 'fix-login', 1709251200000, 0.0);
+             INSERT INTO messages (rowid, session_id, role, text) VALUES
+                 (1, 'b2c3d4e5-f6a7-8901-2345-67890abcdef1', 'user', 'how to implement authentication'),
+                 (2, 'a1b2c3d4-e5f6-7890-1234-567890abcdef', 'user', 'how to implement authentication');
+             INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) VALUES
+                 (7, 'b2c3d4e5-f6a7-8901-2345-67890abcdef1', 'Q: how to implement authentication' || char(10) || 'A: start with the login test', 1709251200000, 1, 1),
+                 (42, 'a1b2c3d4-e5f6-7890-1234-567890abcdef', 'Q: how to implement authentication' || char(10) || 'A: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs', 1709251200000, 2, 2);",
+        )
+        .unwrap();
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        mock_loader,
+    )
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Found 2 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | fix-login | project [claude]\n",
+            "    /home/me/project\n",
+            "    ID: a1b2c3d4-e5f6-7890-1234-567890abcdef\n",
+            "    > Q: how to implement authentication\n",
+            "    > A: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs\n",
+            "    inspect: recall show a1b2c3d4-e5f6-7890-1234-567890abcdef --chunk 42 --window 3\n",
+            "\n",
+            "[2] 2024-03-01 | add-login-tests | other [claude]\n",
+            "    /home/me/other\n",
+            "    ID: b2c3d4e5-f6a7-8901-2345-67890abcdef1\n",
+            "    > Q: how to implement authentication\n",
+            "    > A: start with the login test\n",
+            "    inspect: recall show b2c3d4e5-f6a7-8901-2345-67890abcdef1 --chunk 7 --window 3\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [
+                    {
+                        "chunk": 42,
+                        "excerpt": "Q: how to implement authentication\nA: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs",
+                        "inspect": "recall show a1b2c3d4-e5f6-7890-1234-567890abcdef --chunk 42 --window 3",
+                        "project": "/home/me/project",
+                        "session_id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
+                        "slug": "fix-login",
+                        "source": "claude",
+                        "timestamp": 1709251200000_i64,
+                    },
+                    {
+                        "chunk": 7,
+                        "excerpt": "Q: how to implement authentication\nA: start with the login test",
+                        "inspect": "recall show b2c3d4e5-f6a7-8901-2345-67890abcdef1 --chunk 7 --window 3",
+                        "project": "/home/me/other",
+                        "session_id": "b2c3d4e5-f6a7-8901-2345-67890abcdef1",
+                        "slug": "add-login-tests",
+                        "source": "claude",
+                        "timestamp": 1709251200000_i64,
+                    },
+                ],
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
