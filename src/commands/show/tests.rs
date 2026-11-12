@@ -649,42 +649,74 @@ fn windowed_show_json_payload_lists_anchored_messages_with_in_chunk_flag() {
 }
 
 #[test]
-fn run_show_windowed_reads_a_real_db_and_includes_file_when_verbose() {
+fn verbose_windowed_show_prints_the_file_and_flags_the_chunk_messages() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
     db::seed_session(&conn, "s1");
-    for text in ["m0", "m1", "m2"] {
-        conn.execute(
-            "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
-            [text],
-        )
-        .unwrap();
-    }
-    let rowid: i64 = conn
-        .query_row("SELECT rowid FROM messages WHERE text='m1'", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    conn.execute(
-        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
-             VALUES (1, 's1', 'm1', 0, ?1, ?1)",
-        [rowid],
+    conn.execute_batch(
+        "INSERT INTO messages (rowid, session_id, role, text) VALUES
+             (1, 's1', 'user', 'm0'),
+             (2, 's1', 'assistant', 'm1'),
+             (3, 's1', 'user', 'm2'),
+             (4, 's1', 'assistant', 'm3'),
+             (5, 's1', 'user', 'm4');
+         INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (1, 's1', 'm1 m2', 0, 2, 3);",
     )
     .unwrap();
     drop(conn);
 
     let out = run_show("s1", true, Some(1), 1, &Some(db_path)).unwrap();
 
-    assert!(out.markdown.contains("- chunk: 1"));
-    assert!(
-        out.markdown.contains("- file: /f"),
-        "verbose windowed show must include the file path, got: {}",
-        out.markdown
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# slug\n",
+            "- session_id: s1\n",
+            "- date: 1970-01-01\n",
+            "- project: /p\n",
+            "- source: claude\n",
+            "- chunk: 1\n",
+            "- window: 1\n",
+            "- file: /f\n",
+            "\n",
+            "## [user]\n",
+            "m0\n",
+            "\n",
+            "## [assistant] (chunk)\n",
+            "m1\n",
+            "\n",
+            "## [user] (chunk)\n",
+            "m2\n",
+            "\n",
+            "## [assistant]\n",
+            "m3\n",
+            "\n",
+        )
     );
-    for m in ["m0", "m1", "m2"] {
-        assert!(out.markdown.contains(m), "window=1 must include {m}");
-    }
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 1,
+                "messages": [
+                    { "in_chunk": false, "role": "user", "rowid": 1, "text": "m0" },
+                    { "in_chunk": true, "role": "assistant", "rowid": 2, "text": "m1" },
+                    { "in_chunk": true, "role": "user", "rowid": 3, "text": "m2" },
+                    { "in_chunk": false, "role": "assistant", "rowid": 4, "text": "m3" },
+                ],
+                "project": "/p",
+                "session_id": "s1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+                "window": 1,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
