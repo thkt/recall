@@ -125,7 +125,7 @@ PRの測定記録にはハードウェア・モデル・件数・変更量、推
 
 - `pending_body_bytes_peak`：同時保持したページ本文のbyte長の合計の最大値。RSSやheap全体の測定ではない。
 - `pending_page_chunks_peak`：同時保持したページ本文の最大件数。
-- `pending_metadata_bytes`：未処理一覧のcapacity × 要素サイズ。照合用HashSetを含まない。
+- `pending_metadata_bytes`：未処理一覧の件数 × 要素サイズ。一覧は並べ替えの後に件数ちょうどまで縮めるので、確保量（capacity × 要素サイズ）と一致し、Rust の `Vec` の容量の増え方に左右されない。照合用HashSetを含まない。
 - `pending_pages`：取得したページ数。全件が世代不一致で本文0件のページも数える。
 
 取得方式の比較では、毎ページpending照合を繰り返す方式は #138 の利点を失うため採らない。ID keysetだけのページ取得はmetadataを減らせる一方、長さの近い入力を全体からまとめる現在の推論効率を変える。今回のmetadata一覧方式は O(P) の小さい一覧を残してその長さ順を保つ選択である。1,024件・8 MiBは実装上の比較対象値であり、実測済みの最適値や人が合意した性能SLOではない。今回の実測と制約は[本文保持量の比較記録](../research/bounded-pending-measurements.md)に記す。

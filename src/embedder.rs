@@ -233,7 +233,10 @@ fn embed_page(
     }
 }
 
-fn pending_snapshot(conn: &Connection) -> Result<Vec<PendingIdentity>> {
+/// The pending identities, sorted by length. The list is cut to its length so
+/// it holds exactly `len` entries for the whole run, and
+/// `pending_metadata_bytes` does not depend on how `Vec` grows.
+fn pending_snapshot(conn: &Connection) -> Result<Box<[PendingIdentity]>> {
     let tx = conn.unchecked_transaction()?;
     let mut pending = Vec::new();
     visit_pending(&tx, true, |row| {
@@ -246,7 +249,7 @@ fn pending_snapshot(conn: &Connection) -> Result<Vec<PendingIdentity>> {
     })?;
     tx.commit()?;
     pending.sort_unstable_by_key(|chunk| (chunk.bytes, chunk.id));
-    Ok(pending)
+    Ok(pending.into_boxed_slice())
 }
 
 fn load_page(conn: &Connection, identities: &[PendingIdentity]) -> Result<Vec<PendingChunk>> {
@@ -283,7 +286,7 @@ pub(crate) fn embed_pending_observed(
     observer.start_embedding(pending.len());
     observer.count(
         "pending_metadata_bytes",
-        pending.capacity() * size_of::<PendingIdentity>(),
+        pending.len() * size_of::<PendingIdentity>(),
     );
     observer.count("pending_body_bytes_peak", 0);
     observer.count("pending_page_chunks_peak", 0);
