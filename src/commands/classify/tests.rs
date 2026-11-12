@@ -1,13 +1,8 @@
 use std::fs;
 
-use crate::envelope::render_json_success;
+use crate::tests::printed_envelope;
 
 use super::*;
-
-/// The `--json` envelope `recall classify` prints for an output.
-fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
-    serde_json::from_str(&render_json_success(out)).unwrap()
-}
 
 /// Every session's stored label, ordered by session id.
 fn labels(db_path: &Path) -> Vec<(String, Option<String>)> {

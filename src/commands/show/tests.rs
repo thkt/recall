@@ -1,16 +1,11 @@
 use std::process::ExitCode;
 
-use crate::envelope::{render_json_error, render_json_success};
+use crate::envelope::render_json_error;
 use crate::error::{classify_exit_code, error_envelope};
 use crate::open_or_create_db;
-use crate::tests::bare_empty_db;
+use crate::tests::{bare_empty_db, printed_envelope};
 
 use super::*;
-
-/// The `--json` envelope `recall show` prints for an output.
-fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
-    serde_json::from_str(&render_json_success(out)).unwrap()
-}
 
 /// What a failing `recall show` reports: its exit code and the `--json` error envelope.
 fn reported(err: &anyhow::Error) -> (ExitCode, String) {

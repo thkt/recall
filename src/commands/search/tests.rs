@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
 use crate::tests::{
-    bare_empty_db, mock_loader, payload_keys, search_command, seed_healthy_index, vec_chunk_count,
+    bare_empty_db, mock_loader, payload_keys, printed_envelope, search_command, seed_healthy_index,
+    vec_chunk_count,
 };
 use crate::{embedder, open_or_create_db};
 
@@ -11,11 +11,6 @@ use super::*;
 
 /// The markdown of a text-only search for "authentication" in the index of "authentication flow".
 const AUTHENTICATION_FLOW_MATCH_MARKDOWN: &str = "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n";
-
-/// The `--json` envelope `recall search` prints for an output.
-fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
-    serde_json::from_str(&render_json_success(out)).unwrap()
-}
 
 /// An index whose only session, `s1`, holds one user message.
 fn index_with_one_message(dir: &Path, text: &str) -> PathBuf {

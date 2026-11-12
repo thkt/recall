@@ -461,6 +461,11 @@ fn read_commands_use_pre_generation_index_without_migrating_it() {
     assert_eq!(saved, embedder::f32_as_bytes(&vector));
 }
 
+/// The `--json` envelope a command prints for an output.
+pub(crate) fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
+    serde_json::from_str(&render_json_success(out)).unwrap()
+}
+
 pub(crate) fn payload_keys(v: &serde_json::Value) -> Vec<String> {
     let mut keys: Vec<String> = v
         .as_object()

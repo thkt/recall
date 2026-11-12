@@ -1,14 +1,8 @@
-use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
-use crate::tests::{bare_empty_db, payload_keys};
+use crate::tests::{bare_empty_db, payload_keys, printed_envelope};
 use crate::{embedder, open_or_create_db};
 
 use super::*;
-
-/// The `--json` envelope `recall status` prints for an output.
-fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
-    serde_json::from_str(&render_json_success(out)).unwrap()
-}
 
 #[test]
 fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
