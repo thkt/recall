@@ -20,44 +20,29 @@ fn reported(err: &anyhow::Error) -> (ExitCode, String) {
     )
 }
 
-fn setup_show_db() -> (tempfile::TempDir, Connection) {
-    let (dir, conn) = db::setup_test_db();
-    conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0)",
-            [],
+/// An index where abc-123 holds a user and an assistant message and abc-456 shares its prefix.
+fn setup_show_db() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES
+                 ('abc-123', 'claude', '/path/f.jsonl', '/proj', 'my-slug', 1709251200000, 0.0),
+                 ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0);
+             INSERT INTO messages (session_id, role, text) VALUES
+                 ('abc-123', 'user', 'hello world'),
+                 ('abc-123', 'assistant', 'hi there');",
         )
         .unwrap();
-    conn.execute(
-            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime) VALUES ('abc-456', 'claude', '/path/g.jsonl', '/proj', 'other-slug', 1709251200000, 0.0)",
-            [],
-        )
-        .unwrap();
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('abc-123', 'user', 'hello world')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('abc-123', 'assistant', 'hi there')",
-        [],
-    )
-    .unwrap();
-    (dir, conn)
+    (dir, db_path)
 }
 
 #[test]
 fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata() {
-    let (dir, conn) = setup_show_db();
-    drop(conn);
+    let (_dir, db_path) = setup_show_db();
 
-    let out = run_show(
-        "abc-123",
-        false,
-        None,
-        DEFAULT_WINDOW,
-        &Some(dir.path().join("test.db")),
-    )
-    .unwrap();
+    let out = run_show("abc-123", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
 
     assert_eq!(
         out.markdown,
@@ -98,17 +83,9 @@ fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata()
 
 #[test]
 fn show_of_a_unique_id_prefix_prints_that_session() {
-    let (dir, conn) = setup_show_db();
-    drop(conn);
+    let (_dir, db_path) = setup_show_db();
 
-    let out = run_show(
-        "abc-1",
-        false,
-        None,
-        DEFAULT_WINDOW,
-        &Some(dir.path().join("test.db")),
-    )
-    .unwrap();
+    let out = run_show("abc-1", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
 
     assert_eq!(
         out.markdown,
@@ -149,17 +126,9 @@ fn show_of_a_unique_id_prefix_prints_that_session() {
 
 #[test]
 fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
-    let (dir, conn) = setup_show_db();
-    drop(conn);
+    let (_dir, db_path) = setup_show_db();
 
-    let err = run_show(
-        "abc",
-        false,
-        None,
-        DEFAULT_WINDOW,
-        &Some(dir.path().join("test.db")),
-    )
-    .unwrap_err();
+    let err = run_show("abc", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
 
     assert_eq!(
         reported(&err),
@@ -172,17 +141,9 @@ fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
 
 #[test]
 fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
-    let (dir, conn) = setup_show_db();
-    drop(conn);
+    let (_dir, db_path) = setup_show_db();
 
-    let err = run_show(
-        "zzz",
-        false,
-        None,
-        DEFAULT_WINDOW,
-        &Some(dir.path().join("test.db")),
-    )
-    .unwrap_err();
+    let err = run_show("zzz", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
 
     assert_eq!(
         reported(&err),
@@ -195,17 +156,9 @@ fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
 
 #[test]
 fn verbose_show_adds_the_session_file_to_the_header() {
-    let (dir, conn) = setup_show_db();
-    drop(conn);
+    let (_dir, db_path) = setup_show_db();
 
-    let out = run_show(
-        "abc-123",
-        true,
-        None,
-        DEFAULT_WINDOW,
-        &Some(dir.path().join("test.db")),
-    )
-    .unwrap();
+    let out = run_show("abc-123", true, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
 
     assert_eq!(
         out.markdown,
