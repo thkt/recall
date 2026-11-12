@@ -742,11 +742,14 @@ fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_fo
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(before > 0, "precondition: the first session was embedded");
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the first session's one chunk is embedded"
+        );
+    }
 
     fs::write(
             claude_dir.join("s2.jsonl"),
@@ -764,15 +767,28 @@ fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_fo
     })
     .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 1,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+                "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+            ],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
+        1,
         "the original session's embeddings must be preserved, not destroyed"
-    );
-    assert_eq!(
-        outcome.preserved_embedded, 1,
-        "only the one embedded session is preserved; the new one is indexed"
     );
     let search_opts = search::SearchOptions::default();
     let hits = search::search(&conn, "platypus", &search_opts).unwrap();
