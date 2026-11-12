@@ -502,14 +502,14 @@ fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
         codex_archived_dir: None,
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
-    let before = {
+    {
         let conn = open_or_create_db(&db_path).unwrap();
-        vec_chunk_count(&conn)
-    };
-    assert!(
-        before > 0,
-        "precondition: the initial index must embed at least one chunk"
-    );
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the initial index embeds the session's one chunk"
+        );
+    }
 
     let rebuild = indexer::IndexOptions {
         force: true,
@@ -522,19 +522,28 @@ fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
     })
     .unwrap();
 
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "parse_diagnostics": [],
+                "preserved_embedded": 1,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model unavailable; results from text search only.",
+                "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+            ],
+        })
+    );
     let conn = open_or_create_db(&db_path).unwrap();
     assert_eq!(
         vec_chunk_count(&conn),
-        before,
-        "a load-OK-but-inference-fails rebuild must preserve existing embeddings, not destroy them"
-    );
-    assert!(
-        outcome.preserved_embedded > 0,
-        "the preserved-embedding count must ride the degraded arm"
-    );
-    assert!(
-        outcome.degraded_note.is_some(),
-        "an inference-incapable model must report a degraded note"
+        1,
+        "a rebuild whose model fails its probe keeps the stored embedding"
     );
 }
 
