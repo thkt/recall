@@ -9,6 +9,9 @@ use crate::{embedder, open_or_create_db};
 
 use super::*;
 
+/// The markdown of a text-only search for "authentication" in the index of "authentication flow".
+const AUTHENTICATION_FLOW_MATCH_MARKDOWN: &str = "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n";
+
 /// The `--json` envelope `recall search` prints for an output.
 fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
     serde_json::from_str(&render_json_success(out)).unwrap()
@@ -37,10 +40,7 @@ fn search_without_the_model_installed_returns_text_matches_and_says_how_to_downl
     })
     .unwrap();
 
-    assert_eq!(
-        out.markdown,
-        "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n"
-    );
+    assert_eq!(out.markdown, AUTHENTICATION_FLOW_MATCH_MARKDOWN);
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({
@@ -72,10 +72,7 @@ fn search_whose_model_fails_to_load_returns_text_matches_with_an_unavailable_not
     })
     .unwrap();
 
-    assert_eq!(
-        out.markdown,
-        "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n"
-    );
+    assert_eq!(out.markdown, AUTHENTICATION_FLOW_MATCH_MARKDOWN);
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({
