@@ -1146,7 +1146,8 @@ fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_o
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    // The load probe is the embedder's first call, so the first batch is the call that fails.
+    // The load probe is the embedder's first call and the only one that succeeds; every batch
+    // after it fails.
     let failed = index_and_report_with(&Some(db_path.clone()), &opts, || {
         Ok(Arc::new(embedder::MockEmbedder::failing_after(1)) as Arc<dyn Embed>)
     })
