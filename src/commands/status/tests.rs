@@ -72,7 +72,7 @@ fn status_without_a_database_reports_zero_counts_and_does_not_create_it() {
 }
 
 #[test]
-fn status_on_a_database_file_without_tables_reports_zero_counts() {
+fn status_of_a_table_less_file_reports_zero_counts_and_a_missing_model_without_degrading() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
