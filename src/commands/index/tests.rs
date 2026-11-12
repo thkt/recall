@@ -598,6 +598,98 @@ fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_ch
 }
 
 #[test]
+fn index_without_the_model_keeps_the_embeddings_of_a_changed_session_and_reports_them_preserved() {
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    seed_claude_source(&claude_dir);
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    {
+        let conn = open_or_create_db(&db_path).unwrap();
+        assert_eq!(
+            vec_chunk_count(&conn),
+            1,
+            "precondition: the first index embeds the session's one chunk"
+        );
+    }
+
+    fs::write(
+            claude_dir.join("s1.jsonl"),
+            r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"quokka rebuild probe, edited after it was embedded"},"timestamp":"2026-03-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+    let outcome = index_and_report_with(&Some(db_path.clone()), &opts, || {
+        Err(DegradedReason::NotInstalled)
+    })
+    .unwrap();
+
+    assert_eq!(
+        printed_json(&outcome),
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {
+                    "counts": {
+                        "chunks_created_committed": 0,
+                        "chunks_failed": 0,
+                        "chunks_matched_committed": 0,
+                        "chunks_pending_snapshot": 0,
+                        "chunks_reconciled_created_committed": 0,
+                        "chunks_remaining_snapshot": 0,
+                        "chunks_removed_committed": 0,
+                        "chunks_save_failed": 0,
+                        "chunks_saved": 0,
+                        "chunks_stale": 0,
+                        "chunks_unattempted": 0,
+                        "embeddings_reused_committed": 0,
+                        "files_deferred": 1,
+                        "files_discovered": 1,
+                        "files_empty": 0,
+                        "files_failed": 0,
+                        "files_remaining": 0,
+                        "files_unchanged": 0,
+                        "files_updated": 0,
+                        "files_updated_committed": 0,
+                        "inference_batches": 0,
+                        "inference_chunks": 0,
+                        "sessions_chunk_pending": 0,
+                        "sessions_chunk_remaining": 0,
+                        "sessions_chunked_committed": 0,
+                        "sessions_chunked_empty": 0,
+                        "sessions_stored": 1,
+                    },
+                },
+                "parse_diagnostics": [],
+                "preserved_embedded": 1,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [
+                "note: embedding model not installed; run `recall model download` to enable semantic search.",
+                "preserved embeddings for 1 session(s) the model could not rebuild this run — semantic search for them stays intact; re-run `recall index` once the model can embed again to refresh any that changed",
+            ],
+        })
+    );
+    let conn = open_or_create_db(&db_path).unwrap();
+    assert_eq!(
+        vec_chunk_count(&conn),
+        1,
+        "the changed session keeps its stored embedding"
+    );
+}
+
+#[test]
 fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
     let src = tempfile::TempDir::new().unwrap();
     let claude_dir = src.path().join("claude");
