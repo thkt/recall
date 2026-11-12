@@ -380,22 +380,49 @@ fn windowed_show_prints_only_same_session_messages_within_the_window() {
 }
 
 #[test]
-fn null_src_rowid_chunk_falls_back_to_body_plus_full_show_hint() {
-    let (_dir, conn) = db::setup_test_db();
+fn verbose_show_of_a_chunk_without_a_message_range_prints_its_body_and_points_to_the_full_show() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
     db::seed_session(&conn, "s1");
-    db::seed_chunk(&conn, 200, "legacy chunk body TEXTMARK");
+    db::seed_chunk(&conn, 200, "legacy chunk body");
+    drop(conn);
 
-    let out = show_session_windowed(&conn, "s1", false, Some(200), 3).unwrap();
+    let out = run_show("s1", true, Some(200), 3, &Some(db_path)).unwrap();
 
-    assert!(
-        out.markdown.contains("legacy chunk body TEXTMARK"),
-        "the legacy chunk's own body must be shown, got: {}",
-        out.markdown
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# slug\n",
+            "- session_id: s1\n",
+            "- date: 1970-01-01\n",
+            "- project: /p\n",
+            "- source: claude\n",
+            "- chunk: 200\n",
+            "- file: /f\n",
+            "\n",
+            "legacy chunk body\n",
+            "\n",
+            "This chunk predates message-range tracking; run `recall show s1` for the full conversation.\n",
+        )
     );
-    assert!(
-        out.markdown.contains("recall show"),
-        "must steer to the full `recall show` for the whole conversation, got: {}",
-        out.markdown
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 200,
+                "content": "legacy chunk body",
+                "next_step": "This chunk predates message-range tracking; run `recall show s1` for the full conversation.",
+                "project": "/p",
+                "session_id": "s1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+                "windowed": false,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
