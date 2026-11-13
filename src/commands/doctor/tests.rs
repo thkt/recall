@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::commands::search::run_search_in;
 use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError};
-use crate::model::tests::FakeHost;
+use crate::model::tests::{CachedArtifacts, FakeHost};
 use crate::open_or_create_db;
 use crate::tests::{
     bare_empty_db, mock_loader, printed_envelope, search_command, seed_healthy_index,
@@ -499,28 +499,50 @@ fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
+    let host = FakeHost {
+        artifacts: Cell::new(CachedArtifacts::NotInstalled),
+        ..FakeHost::healthy()
+    };
 
-    let not_installed = || Err(DegradedReason::NotInstalled);
-    let out = run_doctor_with(false, false, &Some(db_path), not_installed, no_recover).unwrap();
-
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "model")
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), model_host, no_recover)
+        })
         .unwrap();
+
     assert_eq!(
-        check["ok"], true,
-        "a not-installed model is FTS-only, not a broken index"
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok] model not installed; search runs FTS-only\n",
+        )
     );
-    assert_eq!(check["remedy"], serde_json::Value::Null);
-    assert_eq!(out.data["healthy"], true);
-    assert!(
-        !out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "info-level no-model must not emit the download remedy, got: {:?}",
-        out.notes
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "model not installed; search runs FTS-only",
+                        "name": "model",
+                        "ok": true,
+                        "remedy": null,
+                    },
+                ],
+                "healthy": true,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
@@ -531,43 +553,50 @@ fn doctor_fix_recovers_not_installed_model_to_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-
-    let calls = Cell::new(0u32);
-    let loader = || {
-        let n = calls.get();
-        calls.set(n + 1);
-        if n == 0 {
-            Err(DegradedReason::NotInstalled)
-        } else {
-            Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
-        }
+    let host = FakeHost {
+        artifacts: Cell::new(CachedArtifacts::NotInstalled),
+        ..FakeHost::healthy()
     };
-    let recover = || Ok(());
-    let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
 
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "model")
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                host.install();
+                Ok(())
+            })
+        })
         .unwrap();
-    assert_eq!(check["ok"], true, "post-recovery probe must pass");
+
     assert_eq!(
-        check["detail"],
-        serde_json::Value::Null,
-        "a recovered model is a clean pass, not the not-installed note"
-    );
-    assert_eq!(out.data["model_recovered"], true);
-    assert_eq!(out.data["healthy"], true);
-    assert!(
-        out.markdown.contains("Recovered model"),
-        "human output must report the re-fetch, got: {}",
-        out.markdown
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "Recovered model\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
     );
     assert_eq!(
-        calls.get(),
-        2,
-        "recovery must trigger a second, re-probe load"
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": true,
+                "model_recovery_retryable": null,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
@@ -578,24 +607,50 @@ fn doctor_fix_recovers_unloadable_model_flipping_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-
-    let calls = Cell::new(0u32);
-    let loader = || {
-        let n = calls.get();
-        calls.set(n + 1);
-        if n == 0 {
-            Err(DegradedReason::ProbeFailed)
-        } else {
-            Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
-        }
+    let host = FakeHost {
+        artifacts: Cell::new(CachedArtifacts::Corrupt),
+        ..FakeHost::healthy()
     };
-    let recover = || Ok(());
-    let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
 
-    assert_eq!(out.data["model_recovered"], true);
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                host.install();
+                Ok(())
+            })
+        })
+        .unwrap();
+
     assert_eq!(
-        out.data["healthy"], true,
-        "a recovered fault must clear the degraded flag"
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "Recovered model\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": true,
+                "model_recovery_retryable": null,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
@@ -606,29 +661,54 @@ fn doctor_fix_surfaces_model_recovery_failure() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
+    let host = FakeHost {
+        artifacts: Cell::new(CachedArtifacts::NotInstalled),
+        ..FakeHost::healthy()
+    };
 
-    let not_installed = || Err(DegradedReason::NotInstalled);
-    let recover = || Err(RecallError::Internal("MLX backend unavailable".to_owned()));
-    let out = run_doctor_with(false, true, &Some(db_path), not_installed, recover).unwrap();
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                Err(RecallError::Internal("MLX backend unavailable".to_owned()))
+            })
+        })
+        .unwrap();
 
-    assert_eq!(out.data["model_recovered"], false);
-    assert_eq!(out.data["model_recovery_retryable"], false);
-    assert!(
-        out.markdown
-            .contains("Model recovery failed: MLX backend unavailable"),
-        "human output must name the recovery failure, got: {}",
-        out.markdown
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "Model recovery failed: MLX backend unavailable\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok] model not installed; search runs FTS-only\n",
+        )
     );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("fix: model: recovery failed: MLX backend unavailable")),
-        "recovery failure must reach notes, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.degraded,
-        "a failed --fix recovery must mark the envelope degraded even when every check is ok (#249 RC-004)"
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "model not installed; search runs FTS-only",
+                        "name": "model",
+                        "ok": true,
+                        "remedy": null,
+                    },
+                ],
+                "healthy": true,
+                "model_recovered": false,
+                "model_recovery_retryable": false,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": true,
+            "notes": ["fix: model: recovery failed: MLX backend unavailable"],
+        })
     );
 }
 
