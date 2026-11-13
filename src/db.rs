@@ -5,7 +5,7 @@ use std::process;
 use std::time::Duration;
 
 use crate::embedding::EMBEDDING_DIMS;
-use crate::runtime::notify_schema_change;
+use crate::runtime::{info, notify_schema_change};
 use crate::storage::ensure_sqlite_vec;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -180,6 +180,23 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// The vocabulary view over `messages` that `schema_state` requires.
+const MESSAGES_VOCAB_SQL: &str =
+    "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);";
+
+/// The full-text table of message text under `name`; `create_schema` and the tokenizer migration
+/// both build it from here.
+fn messages_table_sql(name: &str) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5(
+            session_id UNINDEXED,
+            role,
+            text,
+            tokenize='{FTS_TOKENIZER}'
+        );"
+    )
+}
+
 fn create_schema(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS sessions (
@@ -222,14 +239,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         );",
     )?;
 
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
-            session_id UNINDEXED,
-            role,
-            text,
-            tokenize='{FTS_TOKENIZER}'
-        );"
-    ))?;
+    conn.execute_batch(&messages_table_sql("messages"))?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qa_chunks (
@@ -254,9 +264,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         );"
     ))?;
 
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
-    )?;
+    conn.execute_batch(MESSAGES_VOCAB_SQL)?;
 
     migrate_chunks_indexed_if_needed(conn)?;
 
@@ -429,24 +437,30 @@ fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// Moves a `messages` table built with an older tokenizer onto `FTS_TOKENIZER` by copying every
+/// row, rowid included, into a new table. Sessions, chunks and the chunks' message rowid ranges
+/// (DR 0005) stay, so the sessions of a missing or unreadable root are not lost (DR 0017).
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
-    let Some(sql) = table_def(conn, "messages")? else {
-        return Ok(());
-    };
-
-    if !sql.contains(FTS_TOKENIZER) {
-        let session_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-        let count = usize::try_from(session_count).unwrap_or(0);
-        let tx = conn.transaction()?;
-        tx.execute_batch(
-            "DROP TABLE messages; DELETE FROM sessions; \
-             DROP TABLE IF EXISTS qa_chunks; DROP TABLE IF EXISTS vec_chunks;",
-        )?;
-        tx.commit()?;
-        notify_schema_change("recall", "cached sessions", count, "`recall index`");
+    // Checked inside the write lock, so an opener that waited for it sees the table migrated.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_def(&tx, "messages")?.is_some_and(|sql| !sql.contains(FTS_TOKENIZER)) {
+        info(&format!(
+            "recall: rebuilding the full-text index for the {FTS_TOKENIZER} tokenizer; sessions are kept"
+        ));
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS messages_retokenized;
+             {}
+             INSERT INTO messages_retokenized (rowid, session_id, role, text)
+                 SELECT rowid, session_id, role, text FROM messages
+                 WHERE session_id IN (SELECT session_id FROM sessions);
+             DROP TABLE IF EXISTS messages_vocab;
+             DROP TABLE messages;
+             ALTER TABLE messages_retokenized RENAME TO messages;
+             {MESSAGES_VOCAB_SQL}",
+            messages_table_sql("messages_retokenized")
+        ))?;
     }
-
+    tx.commit()?;
     Ok(())
 }
 

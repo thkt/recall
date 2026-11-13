@@ -1131,6 +1131,59 @@ fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log()
     root_skip::assert_copy_based_remedy(message, "show");
 }
 
+/// An index from before the trigram tokenizer and before embeddings: one session whose log
+/// sits under the Claude root, which is missing in `recall()`'s environment.
+fn seed_pre_trigram_index(dir: &Path) {
+    rusqlite::Connection::open(dir.join("recall.db"))
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
+                 project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
+             );
+             CREATE VIRTUAL TABLE messages USING fts5(
+                 session_id UNINDEXED, role, text, tokenize='porter unicode61'
+             );
+             INSERT INTO sessions VALUES ('s1', 'claude', '/gone/s1.jsonl', '/p', 'slug', 0, 0.0);
+             INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello world recall');",
+        )
+        .unwrap();
+}
+
+#[test]
+fn index_upgrading_a_pre_trigram_index_keeps_the_sessions_of_a_missing_root_searchable() {
+    let dir = TempDir::new().unwrap();
+    seed_pre_trigram_index(dir.path());
+
+    let index = recall(dir.path())
+        .arg("index")
+        .output()
+        .expect("spawn recall binary");
+    let status = recall(dir.path())
+        .arg("status")
+        .output()
+        .expect("spawn recall binary");
+    let search = recall(dir.path())
+        .args(["search", "hello"])
+        .output()
+        .expect("spawn recall binary");
+
+    assert_eq!(
+        index.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&status.stdout),
+        "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&search.stdout),
+        "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > hello world recall\n    inspect: recall show s1 --chunk 1 --window 3\n\n"
+    );
+}
+
 #[test]
 fn show_on_an_index_from_an_older_version_asks_for_a_rebuild() {
     let dir = TempDir::new().unwrap();
