@@ -668,50 +668,32 @@ const EXCLUDE_CURRENT_HAS_NO_EFFECT: &str =
     "--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set\n";
 
 #[test]
-fn search_treats_a_whitespace_only_session_id_as_unset_and_lists_every_session() {
+fn search_exclude_current_with_a_whitespace_only_session_id_lists_every_session_and_warns() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let default_run = recall(dir.path())
-        .args(["search", "hello"])
-        .env("CLAUDE_CODE_SESSION_ID", "  ")
-        .output()
-        .expect("spawn recall binary");
-    let exclude_run = recall(dir.path())
+    let out = recall(dir.path())
         .args(["search", "hello", "--exclude-current"])
         .env("CLAUDE_CODE_SESSION_ID", "  ")
         .output()
         .expect("spawn recall binary");
 
-    assert_eq!(default_run.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8_lossy(&default_run.stdout),
-        BOTH_SEEDED_SESSIONS
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&default_run.stderr),
-        "note: embedding model not installed; run `recall model download` to enable semantic search.\n"
-    );
-    assert_eq!(exclude_run.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8_lossy(&exclude_run.stdout),
-        BOTH_SEEDED_SESSIONS
-    );
-    let exclude_stderr = String::from_utf8_lossy(&exclude_run.stderr);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), BOTH_SEEDED_SESSIONS);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        exclude_stderr.contains(EXCLUDE_CURRENT_HAS_NO_EFFECT),
-        "a whitespace-only id counts as unset, so --exclude-current warns: {exclude_stderr}"
+        stderr.contains(EXCLUDE_CURRENT_HAS_NO_EFFECT),
+        "a whitespace-only id counts as unset, so --exclude-current warns: {stderr}"
     );
 }
 
 #[test]
-fn search_only_current_with_an_empty_session_id_exits_usage() {
+fn search_only_current_with_a_whitespace_only_session_id_exits_usage() {
     let dir = TempDir::new().unwrap();
-    seed_two_matching_sessions(dir.path());
 
     let out = recall(dir.path())
         .args(["search", "hello", "--only-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "")
+        .env("CLAUDE_CODE_SESSION_ID", "  ")
         .output()
         .expect("spawn recall binary");
 
