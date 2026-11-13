@@ -425,10 +425,7 @@ fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -479,10 +476,7 @@ fn doctor_fix_recovers_not_installed_model_to_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -587,10 +581,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -1186,7 +1177,7 @@ fn stored_rows<T>(
 }
 
 #[test]
-fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_keeps_its_model_identity()
+fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_changes_neither_its_identity_nor_the_model()
  {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
@@ -1198,10 +1189,11 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
     )
     .unwrap();
     drop(conn);
+    let host = FakeHost::not_installed();
 
-    let out = FakeHost::healthy()
-        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
-            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, no_recover)
         })
         .unwrap();
 
@@ -1370,10 +1362,11 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
     .unwrap();
     conn.execute("DROP TABLE embedding_identity", []).unwrap();
     drop(conn);
+    let host = FakeHost::not_installed();
 
-    let out = FakeHost::healthy()
-        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
-            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, no_recover)
         })
         .unwrap();
 
@@ -1417,6 +1410,55 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
                 "orphan_embeddings: recall doctor --fix",
                 "model: select the matching --model-manifest and index, or build this model in a separate --db-path",
             ],
+        })
+    );
+}
+
+#[test]
+fn doctor_fix_of_a_database_file_it_cannot_open_still_installs_a_missing_model() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    fs::write(&db_path, b"this is not a sqlite database").unwrap();
+    let host = FakeHost::not_installed();
+
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                host.install();
+                Ok(())
+            })
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "Recovered model\n",
+            "  integrity [FAIL] cannot open database: file is not a database -> remove the database file and run `recall index`\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    {
+                        "detail": "cannot open database: file is not a database",
+                        "name": "integrity",
+                        "ok": false,
+                        "remedy": "remove the database file and run `recall index`",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": true,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["integrity: remove the database file and run `recall index`"],
         })
     );
 }

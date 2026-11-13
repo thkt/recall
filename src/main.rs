@@ -113,12 +113,15 @@ enum Command {
     /// Show index and embedding status
     Status,
     /// Diagnose a broken index: corruption, orphaned rows, and a live model
-    /// load probe. Read-only by default; `--fix` repairs orphan embeddings and
-    /// re-runs the checks. Other remedies point at index/rebuild/model download.
+    /// load probe. Read-only by default; `--fix` repairs orphan embeddings,
+    /// recovers the model, and re-runs the checks. Other remedies point at
+    /// index/rebuild/model download.
     Doctor {
         /// Delete dangling `vec_chunks` rows whose `chunk_id` no longer resolves
-        /// to a `qa_chunks` row (the orphan_embeddings fault), then re-run the
-        /// checks so the verdict reflects the repaired state.
+        /// to a `qa_chunks` row (the orphan_embeddings fault), and download and
+        /// verify the selected model (~558 MB for the default) when it is missing
+        /// or fails its check, then re-run the checks so the verdict reflects the
+        /// repaired state. An index whose model identity check fails gets neither.
         #[arg(long)]
         fix: bool,
     },

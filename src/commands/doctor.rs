@@ -176,7 +176,7 @@ enum ModelRecovery {
 }
 
 fn check_model_with_optional_recovery<F, R>(
-    fix: bool,
+    recover: bool,
     load_embedder: F,
     recover_model: R,
 ) -> (DoctorCheck, ModelRecovery)
@@ -185,7 +185,7 @@ where
     R: FnOnce() -> Result<(), RecallError>,
 {
     let initial = check_model(&load_embedder);
-    if !fix || initial.is_fully_usable() {
+    if !recover || initial.is_fully_usable() {
         return (initial, ModelRecovery::Skipped);
     }
     match recover_model() {
@@ -217,7 +217,8 @@ pub(crate) fn run_doctor(
 }
 
 /// Diagnoses the index at `db_path` against `host`, always probing the model (DR 0013). Under
-/// `--fix`, `recover_model` stands for the model download.
+/// `--fix`, `recover_model` stands for the model download; it runs only when the model is missing
+/// or fails its check, and the index's identity check did not fail.
 fn run_doctor_in<R>(
     verbose: bool,
     fix: bool,
@@ -281,8 +282,10 @@ where
         }
         Err(e) => (open_failure_checks(e), None),
     };
+    // Installing the selected model cannot make an index built for another model usable.
+    let recover = fix && identity_error.is_none();
     let (mut model_check, model_recovery) =
-        check_model_with_optional_recovery(fix, load_embedder, recover_model);
+        check_model_with_optional_recovery(recover, load_embedder, recover_model);
     if let Some(error) = identity_error {
         model_check = DoctorCheck::fail("model", error.to_string(), MODEL_INDEX_REMEDY);
     }
