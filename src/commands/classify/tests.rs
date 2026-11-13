@@ -157,3 +157,28 @@ fn classify_dry_run_prints_a_first_turn_with_newlines_on_its_session_line() {
         )
     );
 }
+
+#[test]
+fn classify_dry_run_removes_control_characters_before_keeping_80_characters_of_the_first_turn() {
+    // Cut first, the sequence would straddle the cut and drop the characters after it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    db::seed_session(&conn, "human");
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('human', 'user', ?1)",
+        [format!("{}\x1b[1mbcd", "a".repeat(78))],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = run_classify(false, true, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        format!(
+            "human [interactive] {}bc\ndry-run: 1 session(s) would be classified (0 automated, 1 interactive)",
+            "a".repeat(78)
+        )
+    );
+}
