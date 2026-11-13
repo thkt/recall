@@ -179,27 +179,49 @@ fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
     .unwrap();
     drop(conn);
 
-    let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
-
-    assert_eq!(out.data["healthy"], true, "got: {}", out.data);
-    assert!(!out.degraded, "repaired index must not be degraded");
-    assert_eq!(
-        out.data["repaired"]["orphan_embeddings"], 1,
-        "the name-keyed breakdown must report 1 row repaired, got: {}",
-        out.data
-    );
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "orphan_embeddings")
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
         .unwrap();
-    assert_eq!(check["ok"], true, "orphan check must pass post-repair");
-    assert!(
-        out.markdown
-            .contains("Repaired orphan_embeddings: 1 row(s)"),
-        "got: {}",
-        out.markdown
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "Repaired orphan_embeddings: 1 row(s)\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": { "orphan_embeddings": 1 },
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+    assert_eq!(
+        stored_rows(
+            &db_path,
+            "SELECT chunk_id, sub_idx FROM vec_chunks",
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+        ),
+        vec![(1, 0)]
     );
 }
 
@@ -429,41 +451,53 @@ fn doctor_fix_leaves_unrepairable_orphan_chunk_in_place() {
     .unwrap();
     drop(conn);
 
-    let out =
-        run_doctor_with(false, true, &Some(db_path.clone()), mock_loader, no_recover).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
 
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "orphan_chunks")
-        .unwrap();
     assert_eq!(
-        check["ok"], false,
-        "--fix must not repair orphan_chunks, got: {}",
-        out.data
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [FAIL] 1 chunk(s) reference a missing session -> recall rebuild\n",
+            "  model [ok]\n",
+        )
     );
     assert_eq!(
-        out.data["healthy"], false,
-        "unrepaired fault stays degraded"
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    {
+                        "detail": "1 chunk(s) reference a missing session",
+                        "name": "orphan_chunks",
+                        "ok": false,
+                        "remedy": "recall rebuild",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": true,
+            "notes": ["orphan_chunks: recall rebuild"],
+        })
     );
-    assert!(
-        out.notes.iter().any(|n| n.contains("recall rebuild")),
-        "the orphan_chunks remedy must still surface, got: {:?}",
-        out.notes
-    );
-    assert!(
-        out.data["repaired"].get("orphan_chunks").is_none(),
-        "orphan_chunks is not a repair, so the breakdown must omit it, got: {}",
-        out.data
-    );
-    let conn = open_or_create_db(&db_path).unwrap();
-    let remaining: i64 = conn
-        .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-        .unwrap();
     assert_eq!(
-        remaining, 1,
-        "the orphan chunk must not be deleted by --fix"
+        stored_rows(&db_path, "SELECT id, session_id FROM qa_chunks", |r| Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?
+        ))),
+        vec![(1, "ghost".to_owned())]
     );
 }
 
@@ -475,22 +509,41 @@ fn doctor_fix_breakdown_lists_every_repair_even_when_clean() {
     seed_healthy_index(&conn);
     drop(conn);
 
-    let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
 
-    assert_eq!(out.data["healthy"], true, "got: {}", out.data);
-    let repaired = out.data["repaired"]
-        .as_object()
-        .unwrap_or_else(|| panic!("--fix must report an object breakdown, got: {}", out.data));
     assert_eq!(
-        repaired.keys().collect::<Vec<_>>(),
-        vec!["orphan_embeddings"],
-        "the breakdown includes only the orphan_embeddings repair, got: {}",
-        out.data
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
     );
     assert_eq!(
-        repaired["orphan_embeddings"], 0,
-        "a clean DB repairs zero rows, got: {}",
-        out.data
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
@@ -1172,29 +1225,41 @@ fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
-    let out =
-        run_doctor_with(false, true, &Some(db_path.clone()), mock_loader, no_recover).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
 
-    assert_eq!(out.data["healthy"], false);
-    let index_check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "index")
-        .unwrap_or_else(|| panic!("expected an `index` check, got: {}", out.data));
-    assert_eq!(index_check["ok"], false);
-    assert!(
-        index_check["detail"]
-            .as_str()
-            .unwrap()
-            .contains("cannot confirm"),
-        "got: {index_check}"
+    let detail = format!(
+        "no index: database has never been indexed; recall cannot confirm this file ({}) was created by recall — verify the path if this is unexpected",
+        db_path.display()
     );
-    assert_eq!(out.data["repaired"], serde_json::Value::Null);
-    let (conn, _) = db::open_db_readonly(&db_path).unwrap();
-    assert!(
-        matches!(db::schema_state(&conn), Ok(db::SchemaState::Empty)),
-        "expected the foreign DB to stay Empty (ungrafted)"
+    assert_eq!(
+        out.markdown,
+        format!("Health: degraded\n  index [FAIL] {detail} -> run `recall index`\n  model [ok]\n")
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": detail, "name": "index", "ok": false, "remedy": "run `recall index`" },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["index: run `recall index`"],
+        })
+    );
+    assert_eq!(
+        stored_rows(&db_path, "SELECT name FROM sqlite_master", |r| r
+            .get::<_, String>(0)),
+        Vec::<String>::new()
     );
 }
 
@@ -1258,6 +1323,20 @@ fn stored_session_count(db_path: &Path) -> i64 {
         .unwrap()
 }
 
+/// The rows `sql` reads from the index at `db_path`, each built by `row`.
+fn stored_rows<T>(
+    db_path: &Path,
+    sql: &str,
+    row: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> Vec<T> {
+    let (conn, _) = db::open_db_readonly(db_path).unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.query_map([], row)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 #[test]
 fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_keeps_its_model_identity()
  {
@@ -1311,6 +1390,14 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
             "degraded": true,
             "notes": ["model: select the matching --model-manifest and index, or build this model in a separate --db-path"],
         })
+    );
+    assert_eq!(
+        stored_rows(
+            &db_path,
+            "SELECT fingerprint FROM embedding_identity",
+            |r| r.get::<_, String>(0)
+        ),
+        vec!["other-model".to_owned()]
     );
 }
 
