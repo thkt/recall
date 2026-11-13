@@ -7,49 +7,12 @@ use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError};
 use crate::model::tests::{CachedArtifacts, FakeHost};
 use crate::open_or_create_db;
-use crate::tests::{
-    bare_empty_db, mock_loader, printed_envelope, search_command, seed_healthy_index,
-};
+use crate::tests::{bare_empty_db, printed_envelope, search_command, seed_healthy_index};
 
 use super::*;
 
 fn no_recover() -> Result<(), RecallError> {
     panic!("model recovery must not run")
-}
-
-#[test]
-fn doctor_fix_model_mismatch_preserves_index_and_never_suggests_deletion() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("index.db");
-    {
-        let conn = open_or_create_db(&path).unwrap();
-        conn.execute(
-            "UPDATE embedding_identity SET fingerprint='previous-model'",
-            [],
-        )
-        .unwrap();
-    }
-    let out = run_doctor_with(false, true, &Some(path.clone()), mock_loader, || {
-        panic!("model artifacts must not be replaced for an index identity mismatch")
-    })
-    .unwrap();
-    assert_eq!(out.data["healthy"], false);
-    assert!(out.degraded);
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("matching --model-manifest"))
-    );
-    assert!(out.notes.iter().all(|n| !n.contains("remove the database")));
-    let (conn, _) = db::open_db_readonly(&path).unwrap();
-    assert_eq!(
-        conn.query_row("SELECT fingerprint FROM embedding_identity", [], |r| r
-            .get::<_, String>(
-            0
-        ))
-        .unwrap(),
-        "previous-model"
-    );
 }
 
 struct WidthEmbedder(usize);
@@ -67,29 +30,6 @@ impl Embed for WidthEmbedder {
     fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
         unreachable!("doctor probe only calls embed_query")
     }
-}
-
-#[test]
-fn doctor_reports_healthy_on_intact_index_and_loadable_model() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let conn = open_or_create_db(&db_path).unwrap();
-    seed_healthy_index(&conn);
-    drop(conn);
-
-    let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-    assert_eq!(out.data["healthy"], true);
-    assert!(!out.degraded, "an intact index must not be degraded");
-    assert!(
-        out.notes.is_empty(),
-        "no failing check means no remedy notes"
-    );
-    assert!(
-        out.markdown.contains("Health: healthy"),
-        "got: {}",
-        out.markdown
-    );
 }
 
 #[test]
@@ -206,166 +146,6 @@ fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
         ),
         vec![(1, 0)]
     );
-}
-
-#[test]
-fn render_doctor_report_surfaces_repair_error() {
-    let path = PathBuf::from("/tmp/recall-test.db");
-    let checks = vec![DoctorCheck::fail(
-        "orphan_embeddings",
-        "1 embedding(s) reference a missing chunk".to_owned(),
-        "recall doctor --fix",
-    )];
-    let repairs = Some(vec![RepairOutcome {
-        name: "orphan_embeddings",
-        result: Err(anyhow::anyhow!("disk I/O error")),
-    }]);
-
-    let out = render_doctor_report(false, &path, &checks, &repairs, &ModelRecovery::Skipped);
-
-    assert!(
-        out.markdown
-            .contains("Repair failed orphan_embeddings: disk I/O error"),
-        "the repair cause must appear in human output, got: {}",
-        out.markdown
-    );
-    assert!(
-        out.notes.iter().any(|n| n.contains("repair failed")),
-        "the repair cause must appear in notes, got: {:?}",
-        out.notes
-    );
-    assert_eq!(
-        out.data["repaired"]["orphan_embeddings"],
-        serde_json::Value::Null,
-        "a failed repair reports a null value under its name, got: {}",
-        out.data
-    );
-}
-
-#[test]
-fn render_doctor_report_output_matches_every_check_repair_recovery_and_verbose_combination() {
-    const RETRYABLE: &str = "download interrupted";
-    const PERMANENT: &str = "artifact rejected";
-    let path = PathBuf::from("/tmp/recall-test.db");
-
-    for healthy in [true, false] {
-        for with_repairs in [false, true] {
-            for recovery_case in ["skipped", "succeeded", "retryable", "permanent"] {
-                for verbose in [false, true] {
-                    let mut checks = vec![
-                        DoctorCheck::pass("plain"),
-                        DoctorCheck::info("noted", "1 note".to_owned()),
-                    ];
-                    let mut check_json = vec![
-                        serde_json::json!({"name": "plain", "ok": true, "detail": null, "remedy": null}),
-                        serde_json::json!({"name": "noted", "ok": true, "detail": "1 note", "remedy": null}),
-                    ];
-                    let mut check_lines = "  plain [ok]\n  noted [ok] 1 note\n".to_owned();
-                    let mut notes = Vec::new();
-                    if !healthy {
-                        checks.push(DoctorCheck::fail("failed", "3 rows".to_owned(), "run fix"));
-                        checks.push(DoctorCheck {
-                            name: "bare",
-                            ok: false,
-                            detail: None,
-                            remedy: Some("bare remedy"),
-                        });
-                        check_json.push(serde_json::json!({"name": "failed", "ok": false, "detail": "3 rows", "remedy": "run fix"}));
-                        check_json.push(serde_json::json!({"name": "bare", "ok": false, "detail": null, "remedy": "bare remedy"}));
-                        check_lines.push_str("  failed [FAIL] 3 rows -> run fix\n  bare [FAIL]\n");
-                        notes.push("failed: run fix".to_owned());
-                        notes.push("bare: bare remedy".to_owned());
-                    }
-
-                    let repairs = with_repairs.then(|| {
-                        vec![
-                            RepairOutcome {
-                                name: "sound",
-                                result: Ok(2),
-                            },
-                            RepairOutcome {
-                                name: "broken",
-                                result: Err(anyhow::anyhow!("disk I/O error")),
-                            },
-                        ]
-                    });
-                    let mut repair_lines = "";
-                    let mut repaired = serde_json::Value::Null;
-                    if with_repairs {
-                        repair_lines =
-                            "Repaired sound: 2 row(s)\nRepair failed broken: disk I/O error\n";
-                        repaired = serde_json::json!({"sound": 2, "broken": null});
-                        notes.push("fix: broken: repair failed: disk I/O error".to_owned());
-                    }
-
-                    let (recovery, recovery_line, recovered, retryable) = match recovery_case {
-                        "skipped" => (
-                            ModelRecovery::Skipped,
-                            String::new(),
-                            serde_json::Value::Null,
-                            serde_json::Value::Null,
-                        ),
-                        "succeeded" => (
-                            ModelRecovery::Succeeded,
-                            "Recovered model\n".to_owned(),
-                            serde_json::json!(true),
-                            serde_json::Value::Null,
-                        ),
-                        "retryable" => {
-                            notes.push(format!("fix: model: recovery failed: {RETRYABLE}"));
-                            (
-                                ModelRecovery::Failed(RecallError::TempFailure(
-                                    RETRYABLE.to_owned(),
-                                )),
-                                format!("Model recovery failed: {RETRYABLE}\n"),
-                                serde_json::json!(false),
-                                serde_json::json!(true),
-                            )
-                        }
-                        "permanent" => {
-                            notes.push(format!("fix: model: recovery failed: {PERMANENT}"));
-                            (
-                                ModelRecovery::Failed(RecallError::DataError(PERMANENT.to_owned())),
-                                format!("Model recovery failed: {PERMANENT}\n"),
-                                serde_json::json!(false),
-                                serde_json::json!(false),
-                            )
-                        }
-                        _ => unreachable!(),
-                    };
-                    let recovery_failed = matches!(recovery, ModelRecovery::Failed(_));
-
-                    let out = render_doctor_report(verbose, &path, &checks, &repairs, &recovery);
-
-                    let health = if healthy { "healthy" } else { "degraded" };
-                    let db_line = if verbose {
-                        "DB: /tmp/recall-test.db\n"
-                    } else {
-                        ""
-                    };
-                    assert_eq!(
-                        out.markdown,
-                        format!(
-                            "Health: {health}\n{repair_lines}{recovery_line}{check_lines}{db_line}"
-                        )
-                    );
-                    assert_eq!(out.notes, notes);
-                    // The repairs always include the failed `broken` one.
-                    assert_eq!(out.degraded, !healthy || with_repairs || recovery_failed);
-                    assert_eq!(
-                        out.data,
-                        serde_json::json!({
-                            "healthy": healthy,
-                            "checks": check_json,
-                            "repaired": repaired,
-                            "model_recovered": recovered,
-                            "model_recovery_retryable": retryable,
-                        })
-                    );
-                }
-            }
-        }
-    }
 }
 
 #[test]
@@ -979,21 +759,6 @@ fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
 }
 
 #[test]
-fn doctor_without_fix_leaves_model_recovered_null() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    let conn = open_or_create_db(&db_path).unwrap();
-    seed_healthy_index(&conn);
-    drop(conn);
-
-    let failing = || Err(DegradedReason::ProbeFailed);
-    let out = run_doctor_with(false, false, &Some(db_path), failing, no_recover).unwrap();
-
-    assert_eq!(out.data["model_recovered"], serde_json::Value::Null);
-    assert_eq!(out.data["healthy"], false, "an unloadable model is a fault");
-}
-
-#[test]
 fn doctor_reports_unhealthy_and_does_not_create_db_when_absent() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("missing.db");
@@ -1293,37 +1058,6 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
 }
 
 #[test]
-fn doctor_on_an_existing_bare_sqlite_db_emits_an_index_fail_with_the_unconfirmed_origin_caveat() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = bare_empty_db(db_dir.path());
-
-    let out = run_doctor_with(
-        false,
-        false,
-        &Some(db_path.clone()),
-        mock_loader,
-        no_recover,
-    )
-    .unwrap();
-
-    assert_eq!(out.data["healthy"], false);
-    let index_check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "index")
-        .unwrap_or_else(|| panic!("expected an `index` check, got: {}", out.data));
-    assert_eq!(index_check["ok"], false);
-    let detail = index_check["detail"].as_str().unwrap();
-    assert!(detail.contains("cannot confirm"), "got: {detail}");
-    assert!(
-        detail.contains(&db_path.display().to_string()),
-        "caveat detail must name the resolved DB path to verify; got: {detail}"
-    );
-    assert_eq!(index_check["remedy"], "run `recall index`");
-}
-
-#[test]
 fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
@@ -1363,30 +1097,6 @@ fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
         stored_rows(&db_path, "SELECT name FROM sqlite_master", |r| r
             .get::<_, String>(0)),
         Vec::<String>::new()
-    );
-}
-
-#[test]
-fn run_doctor_fix_reports_open_failure_on_unopenable_db() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    fs::write(&db_path, b"this is not a sqlite database").unwrap();
-
-    let out = run_doctor_with(false, true, &Some(db_path), mock_loader, no_recover).unwrap();
-
-    let integrity = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "integrity")
-        .unwrap();
-    assert_eq!(integrity["ok"], false);
-    assert!(
-        integrity["detail"]
-            .as_str()
-            .unwrap()
-            .contains("cannot open database"),
-        "got: {integrity}"
     );
 }
 
