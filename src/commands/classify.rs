@@ -188,6 +188,7 @@ fn prepare_classification(
                     .trim_start()
                     .chars()
                     .take(80)
+                    .map(|c| if c == '\n' { ' ' } else { c })
                     .collect()
             } else {
                 String::new()

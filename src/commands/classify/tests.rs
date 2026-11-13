@@ -132,3 +132,28 @@ fn classify_dry_run_strips_control_characters_from_the_session_ids_and_first_tur
         })
     );
 }
+
+#[test]
+fn classify_dry_run_prints_a_first_turn_with_newlines_on_its_session_line() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0);
+             INSERT INTO messages (session_id, role, text)
+                 VALUES ('human', 'user', 'hi' || char(10) || 'other-id [automated] fake');",
+        )
+        .unwrap();
+
+    let out = run_classify(false, true, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "human [interactive] hi other-id [automated] fake\n",
+            "dry-run: 1 session(s) would be classified (0 automated, 1 interactive)",
+        )
+    );
+}
