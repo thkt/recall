@@ -1420,3 +1420,62 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
         })
     );
 }
+
+#[test]
+fn doctor_fix_of_an_index_built_for_another_model_leaves_a_missing_model_uninstalled() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    conn.execute(
+        "UPDATE embedding_identity SET fingerprint = 'other-model'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let host = FakeHost {
+        artifacts: Cell::new(CachedArtifacts::NotInstalled),
+        ..FakeHost::healthy()
+    };
+
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "select the matching --model-manifest and index, or build this model in a separate --db-path",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["model: select the matching --model-manifest and index, or build this model in a separate --db-path"],
+        })
+    );
+}

@@ -281,8 +281,10 @@ where
         }
         Err(e) => (open_failure_checks(e), None),
     };
+    // Installing the selected model cannot make an index built for another model usable.
+    let recover = fix && identity_error.is_none();
     let (mut model_check, model_recovery) =
-        check_model_with_optional_recovery(fix, load_embedder, recover_model);
+        check_model_with_optional_recovery(recover, load_embedder, recover_model);
     if let Some(error) = identity_error {
         model_check = DoctorCheck::fail("model", error.to_string(), MODEL_INDEX_REMEDY);
     }
