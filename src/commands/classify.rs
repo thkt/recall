@@ -10,7 +10,7 @@ use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser::Source;
-use crate::{classify, db, open_or_create_db, parser, resolve_db_path};
+use crate::{ansi, classify, db, open_or_create_db, parser, resolve_db_path};
 
 pub(crate) struct ClassifyOutcome {
     session_id: String,
@@ -184,7 +184,11 @@ fn prepare_classification(
             session_id,
             session_type: classify::classify_session(first_turn, origin),
             excerpt: if dry_run {
-                first_turn.trim_start().chars().take(80).collect()
+                ansi::strip_control_chars(first_turn)
+                    .trim_start()
+                    .chars()
+                    .take(80)
+                    .collect()
             } else {
                 String::new()
             },
@@ -311,7 +315,7 @@ pub(crate) fn run_classify(
         for o in &outcomes {
             markdown.push_str(&format!(
                 "{} [{}] {}\n",
-                o.session_id,
+                ansi::strip_control_chars(&o.session_id),
                 o.session_type.as_str(),
                 o.excerpt
             ));
