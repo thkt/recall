@@ -903,7 +903,7 @@ fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_inde
 }
 
 #[test]
-fn run_doctor_reports_schema_out_of_date_on_stale_db() {
+fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
@@ -1053,7 +1053,7 @@ fn stored_session_count(db_path: &Path) -> i64 {
 }
 
 #[test]
-fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_runs_every_index_check()
+fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_keeps_its_model_identity()
  {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
