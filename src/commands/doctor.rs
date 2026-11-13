@@ -324,7 +324,11 @@ fn render_doctor_report(
     let notes = doctor_notes(checks, repairs, model_recovery);
     let markdown = doctor_markdown(verbose, path, healthy, checks, repairs, model_recovery);
     let data = doctor_data(healthy, checks, repairs, model_recovery);
-    let degraded = !healthy || matches!(model_recovery, ModelRecovery::Failed(_));
+    let repair_failed = repairs
+        .iter()
+        .flatten()
+        .any(|outcome| outcome.result.is_err());
+    let degraded = !healthy || repair_failed || matches!(model_recovery, ModelRecovery::Failed(_));
     CommandOutput::with_notes(markdown, data, degraded, notes)
 }
 

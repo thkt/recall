@@ -321,7 +321,8 @@ fn render_doctor_report_output_matches_every_check_repair_recovery_and_verbose_c
                         )
                     );
                     assert_eq!(out.notes, notes);
-                    assert_eq!(out.degraded, !healthy || recovery_failed);
+                    // The repairs always include the failed `broken` one.
+                    assert_eq!(out.degraded, !healthy || with_repairs || recovery_failed);
                     assert_eq!(
                         out.data,
                         serde_json::json!({
@@ -1159,4 +1160,53 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
         })
     );
     assert_eq!(stored_session_count(&db_path), 1);
+}
+
+#[test]
+fn doctor_fix_that_cannot_write_the_index_is_degraded_and_says_why() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    drop(conn);
+    fs::set_permissions(&db_path, fs::Permissions::from_mode(0o444)).unwrap();
+
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "Repair failed orphan_embeddings: attempt to write a readonly database\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": { "orphan_embeddings": null },
+            },
+            "degraded": true,
+            "notes": ["fix: orphan_embeddings: repair failed: attempt to write a readonly database"],
+        })
+    );
 }
