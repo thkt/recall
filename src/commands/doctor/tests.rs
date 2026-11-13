@@ -855,7 +855,11 @@ fn run_doctor_wrapper_reports_on_healthy_db_with_verbose_output() {
     seed_healthy_index(&conn);
     drop(conn);
 
-    let out = run_doctor(true, false, &Some(db_path.clone())).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(true, false, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
 
     assert!(out.data["healthy"].is_boolean(), "got: {}", out.data);
     assert!(
@@ -871,7 +875,11 @@ fn run_doctor_reports_unhealthy_on_never_indexed_db() {
     let db_path = db_dir.path().join("recall.db");
     drop(rusqlite::Connection::open(&db_path).unwrap());
 
-    let out = run_doctor(false, false, &Some(db_path.clone())).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
 
     assert_eq!(
         out.data["healthy"], false,
