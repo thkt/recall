@@ -266,19 +266,13 @@ fn search_strips_control_characters_from_the_printed_excerpt() {
             "\n",
         )
     );
-    // The --json excerpt still carries the raw control characters (#426), so
-    // the comparison leaves it out.
-    let mut envelope = printed_envelope(&out);
-    envelope["data"]["results"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("excerpt");
     assert_eq!(
-        envelope,
+        printed_envelope(&out),
         serde_json::json!({
             "data": {
                 "results": [{
                     "chunk": 1,
+                    "excerpt": "authentication failed at login",
                     "inspect": "recall show s1 --chunk 1 --window 3",
                     "project": "/p",
                     "session_id": "s1",
@@ -289,6 +283,61 @@ fn search_strips_control_characters_from_the_printed_excerpt() {
             },
             "degraded": false,
             "notes": [],
+        })
+    );
+}
+
+#[test]
+fn search_strips_control_characters_from_the_session_id_project_and_slug_it_prints() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('s' || char(7) || '1', 'claude', '/f',
+                         '/work/' || char(27) || ']0;PROJ' || char(7) || 'app',
+                         'fix-' || char(27) || '[1mlogin' || char(27) || '[0m', 1709251200000, 0.0);
+             INSERT INTO messages (session_id, role, text)
+                 VALUES ('s' || char(7) || '1', 'user', 'authentication flow');",
+        )
+        .unwrap();
+
+    let out = run_search_with(search_command("authentication"), &Some(db_path), || {
+        Err(DegradedReason::NotInstalled)
+    })
+    .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Found 1 sessions:\n",
+            "\n",
+            "[1] 2024-03-01 | fix-login | app [claude]\n",
+            "    /work/app\n",
+            "    ID: s1\n",
+            "    > **authentication** flow\n",
+            "    inspect: recall show s1\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "results": [{
+                    "chunk": null,
+                    "excerpt": "**authentication** flow",
+                    "inspect": "recall show s1",
+                    "project": "/work/app",
+                    "session_id": "s1",
+                    "slug": "fix-login",
+                    "source": "claude",
+                    "timestamp": 1709251200000_i64,
+                }],
+            },
+            "degraded": true,
+            "notes": ["semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"],
         })
     );
 }

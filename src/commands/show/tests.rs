@@ -615,3 +615,264 @@ fn show_on_a_database_file_without_tables_is_a_usage_error_asking_to_run_index()
         )
     );
 }
+
+/// An index whose session `abc-123` carries control characters in its id, file, project, slug,
+/// messages and chunks. Chunk 1 covers both messages, and chunk 2 has no message range.
+fn index_with_control_characters() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('abc' || char(7) || '-123', 'claude', '/logs/' || char(27) || '[2Jf.jsonl',
+                         '/work/' || char(27) || ']0;PROJ' || char(7) || 'app',
+                         'fix-' || char(27) || '[1mlogin' || char(27) || '[0m', 1709251200000, 0.0);
+             INSERT INTO messages (rowid, session_id, role, text) VALUES
+                 (1, 'abc' || char(7) || '-123', 'user', 'run ' || char(27) || '[31mmake' || char(27) || '[0m'),
+                 (2, 'abc' || char(7) || '-123', 'assistant', 'done' || char(7));
+             INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) VALUES
+                 (1, 'abc' || char(7) || '-123', 'run make done', 1709251200000, 1, 2),
+                 (2, 'abc' || char(7) || '-123', 'legacy ' || char(27) || '[31mbody' || char(27) || '[0m', 1709251200000, NULL, NULL);",
+        )
+        .unwrap();
+    (dir, db_path)
+}
+
+#[test]
+fn show_strips_control_characters_from_the_session_fields_and_messages_it_prints() {
+    let (_dir, db_path) = index_with_control_characters();
+
+    let out = run_show("abc", true, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# fix-login\n",
+            "- session_id: abc-123\n",
+            "- date: 2024-03-01\n",
+            "- project: /work/app\n",
+            "- source: claude\n",
+            "- file: /logs/f.jsonl\n",
+            "\n",
+            "## [user]\n",
+            "run make\n",
+            "\n",
+            "## [assistant]\n",
+            "done\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "messages": [
+                    { "role": "user", "text": "run make" },
+                    { "role": "assistant", "text": "done" },
+                ],
+                "project": "/work/app",
+                "session_id": "abc-123",
+                "slug": "fix-login",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+}
+
+#[test]
+fn windowed_show_strips_control_characters_from_the_session_fields_and_messages_it_prints() {
+    let (_dir, db_path) = index_with_control_characters();
+
+    let out = run_show("abc", false, Some(1), 3, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# fix-login\n",
+            "- session_id: abc-123\n",
+            "- date: 2024-03-01\n",
+            "- project: /work/app\n",
+            "- source: claude\n",
+            "- chunk: 1\n",
+            "- window: 3\n",
+            "\n",
+            "## [user] (chunk)\n",
+            "run make\n",
+            "\n",
+            "## [assistant] (chunk)\n",
+            "done\n",
+            "\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 1,
+                "messages": [
+                    { "in_chunk": true, "role": "user", "rowid": 1, "text": "run make" },
+                    { "in_chunk": true, "role": "assistant", "rowid": 2, "text": "done" },
+                ],
+                "project": "/work/app",
+                "session_id": "abc-123",
+                "slug": "fix-login",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+                "window": 3,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+}
+
+#[test]
+fn show_of_a_chunk_without_a_message_range_strips_control_characters_from_the_session_fields_and_body()
+ {
+    let (_dir, db_path) = index_with_control_characters();
+
+    let out = run_show("abc", false, Some(2), 3, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "# fix-login\n",
+            "- session_id: abc-123\n",
+            "- date: 2024-03-01\n",
+            "- project: /work/app\n",
+            "- source: claude\n",
+            "- chunk: 2\n",
+            "\n",
+            "legacy body\n",
+            "\n",
+            "This chunk predates message-range tracking; run `recall show abc-123` for the full conversation.\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 2,
+                "content": "legacy body",
+                "next_step": "This chunk predates message-range tracking; run `recall show abc-123` for the full conversation.",
+                "project": "/work/app",
+                "session_id": "abc-123",
+                "slug": "fix-login",
+                "source": "claude",
+                "timestamp": 1709251200000_i64,
+                "windowed": false,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+}
+
+#[test]
+fn show_of_a_prefix_shared_by_two_sessions_strips_control_characters_from_the_listed_candidates() {
+    let (_dir, db_path) = index_with_control_characters();
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('abc' || char(7) || '-456', 'claude', '/f', '/p',
+                         char(27) || ']0;TITLE' || char(7) || 'other', 0, 0.0)",
+            [],
+        )
+        .unwrap();
+
+    let err = run_show("abc", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
+
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"Multiple sessions match 'abc':\n  abc-123  fix-login\n  abc-456  other\nNarrow the session ID prefix to match exactly one session","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
+    );
+}
+
+#[test]
+fn windowed_show_of_another_sessions_chunk_strips_control_characters_from_the_owner_id() {
+    let (_dir, db_path) = index_with_control_characters();
+    db::seed_session(&open_or_create_db(&db_path).unwrap(), "w1");
+
+    let err = run_show("w1", false, Some(1), 2, &Some(db_path)).unwrap_err();
+
+    assert_eq!(
+        reported(&err),
+        (
+            ExitCode::from(64),
+            r#"{"error":{"code":"USAGE_ERROR","message":"chunk 1 belongs to session 'abc-123', not 'w1'","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#.to_owned()
+        )
+    );
+}
+
+#[test]
+fn windowed_show_removes_control_characters_before_cutting_a_message_at_4000_characters() {
+    // Cut first, the sequence would straddle the cut and take the … with it.
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    db::seed_session(&conn, "w1");
+    conn.execute(
+        "INSERT INTO messages (rowid, session_id, role, text) VALUES (1, 'w1', 'user', ?1)",
+        [format!("{}\x1b[31mtail", "a".repeat(3997))],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             VALUES (60, 'w1', 'body', 0, 1, 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = run_show("w1", false, Some(60), 0, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        format!(
+            concat!(
+                "# slug\n",
+                "- session_id: w1\n",
+                "- date: 1970-01-01\n",
+                "- project: /p\n",
+                "- source: claude\n",
+                "- chunk: 60\n",
+                "- window: 0\n",
+                "\n",
+                "## [user] (chunk)\n",
+                "{}tai…\n",
+                "\n",
+            ),
+            "a".repeat(3997),
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "chunk": 60,
+                "messages": [{
+                    "in_chunk": true,
+                    "role": "user",
+                    "rowid": 1,
+                    "text": format!("{}tai…", "a".repeat(3997)),
+                }],
+                "project": "/p",
+                "session_id": "w1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+                "window": 0,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+}

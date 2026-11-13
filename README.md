@@ -314,6 +314,7 @@ Gemma product latency and indexing throughput depend on corpus, hardware, checks
 | Text only           | Images, tool results, and binary content are not indexed                    |
 | Apple Silicon only  | Requires Apple Silicon. The supported model probe requires the GPU backend           |
 | Excerpts in search  | Search results show excerpts. Use `recall show <id>` for full conversations |
+| Control characters  | Session text, such as messages, slugs, project paths and session IDs, is printed without control characters, in human output and in `--json`. Each tab becomes a space, so `recall show` does not keep tab indentation. Newlines stay, except in `classify --dry-run`, which prints each session on one line. An OSC sequence (`ESC ]`) with no terminator also drops the rest of its line |
 
 ## Exit Codes
 

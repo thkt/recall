@@ -5,6 +5,7 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use tracing::warn;
 
+use crate::ansi;
 use crate::commands::build_markdown;
 use crate::compat::filter::escape_like;
 use crate::envelope::CommandOutput;
@@ -19,16 +20,20 @@ fn write_show_header(
     verbose: bool,
     extra: &[String],
 ) -> fmt::Result {
-    writeln!(buf, "# {}", session.slug)?;
-    writeln!(buf, "- session_id: {}", session.session_id)?;
+    let slug = ansi::strip_control_chars(&session.slug);
+    let session_id = ansi::strip_control_chars(&session.session_id);
+    let project = ansi::strip_control_chars(&session.project);
+    writeln!(buf, "# {slug}")?;
+    writeln!(buf, "- session_id: {session_id}")?;
     writeln!(buf, "- date: {}", format_timestamp(session.timestamp))?;
-    writeln!(buf, "- project: {}", session.project)?;
+    writeln!(buf, "- project: {project}")?;
     writeln!(buf, "- source: {}", session.source)?;
     for line in extra {
         writeln!(buf, "{line}")?;
     }
     if verbose {
-        writeln!(buf, "- file: {}", session.file_path)?;
+        let file = ansi::strip_control_chars(&session.file_path);
+        writeln!(buf, "- file: {file}")?;
     }
     writeln!(buf)
 }
@@ -38,7 +43,9 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
 
     let mut msg_stmt =
         conn.prepare("SELECT role, text FROM messages WHERE session_id = ?1 ORDER BY rowid")?;
-    let rows = msg_stmt.query_map([&session.session_id], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    let rows = msg_stmt.query_map([&session.session_id], |row| {
+        Ok((row.get(0)?, shown_text(&row.get::<_, String>(1)?)))
+    })?;
     let messages: Vec<(String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
 
     let markdown = build_markdown(|buf| {
@@ -70,6 +77,12 @@ pub(crate) const DEFAULT_WINDOW: i64 = 5;
 const MAX_WINDOW: i64 = 50;
 const MAX_MSG_CHARS: usize = 4000;
 
+/// A stored message or chunk body as both outputs print it. It is stripped before `cap_message`
+/// cuts it, since an escape sequence cut in half would swallow the `…` that marks the cut.
+fn shown_text(stored: &str) -> String {
+    ansi::strip_control_chars(stored).into_owned()
+}
+
 fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::SessionData> {
     let mut stmt = conn.prepare(
         "SELECT session_id, source, file_path, project, slug, timestamp \
@@ -98,7 +111,11 @@ fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::Sessio
     if matches.len() > 1 {
         let mut msg = format!("Multiple sessions match '{session_id}':\n");
         for s in &matches {
-            msg.push_str(&format!("  {}  {}\n", s.session_id, s.slug));
+            msg.push_str(&format!(
+                "  {}  {}\n",
+                ansi::strip_control_chars(&s.session_id),
+                ansi::strip_control_chars(&s.slug)
+            ));
         }
         msg.push_str("Narrow the session ID prefix to match exactly one session");
         return Err(RecallError::Usage(msg).into());
@@ -147,8 +164,9 @@ fn show_session_windowed(
 
     if chunk_session != session.session_id {
         return Err(RecallError::Usage(format!(
-            "chunk {chunk_id} belongs to session '{chunk_session}', not '{}'",
-            session.session_id
+            "chunk {chunk_id} belongs to session '{}', not '{}'",
+            ansi::strip_control_chars(&chunk_session),
+            ansi::strip_control_chars(&session.session_id)
         ))
         .into());
     }
@@ -176,7 +194,7 @@ fn render_windowed(
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
+            shown_text(&row.get::<_, String>(2)?),
         ))
     })?;
     let msgs: Vec<(i64, String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -242,12 +260,13 @@ fn render_chunk_fallback(
 ) -> CommandOutput {
     let hint = format!(
         "This chunk predates message-range tracking; run `recall show {}` for the full conversation.",
-        session.session_id
+        ansi::strip_control_chars(&session.session_id)
     );
+    let body = cap_message(&shown_text(content));
 
     let markdown = build_markdown(|buf| {
         write_show_header(buf, session, verbose, &[format!("- chunk: {chunk_id}")])?;
-        writeln!(buf, "{}", cap_message(content))?;
+        writeln!(buf, "{body}")?;
         writeln!(buf)?;
         writeln!(buf, "{hint}")
     });
@@ -259,7 +278,7 @@ fn render_chunk_fallback(
         "source": session.source.to_string(),
         "timestamp": session.timestamp,
         "chunk": chunk_id,
-        "content": cap_message(content),
+        "content": body,
         "windowed": false,
         "next_step": hint,
     });

@@ -98,3 +98,87 @@ fn classify_without_all_labels_only_unlabeled_sessions() {
         ]
     );
 }
+
+#[test]
+fn classify_dry_run_strips_control_characters_from_the_session_ids_and_first_turns_it_prints() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('h' || char(7) || 'uman', 'claude', '/f', '/p', 'h', 0, 0.0);
+             INSERT INTO messages (session_id, role, text)
+                 VALUES ('h' || char(7) || 'uman', 'user',
+                         'how do I ' || char(27) || '[1mimplement' || char(27) || '[0m auth');",
+        )
+        .unwrap();
+
+    let out = run_classify(false, true, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "human [interactive] how do I implement auth\n",
+            "dry-run: 1 session(s) would be classified (0 automated, 1 interactive)",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "automated": 0, "classified": 1, "dry_run": true, "interactive": 1 },
+            "degraded": false,
+            "notes": [],
+        })
+    );
+}
+
+#[test]
+fn classify_dry_run_prints_a_first_turn_with_newlines_on_its_session_line() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    open_or_create_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime)
+                 VALUES ('human', 'claude', '/f', '/p', 'h', 0, 0.0);
+             INSERT INTO messages (session_id, role, text)
+                 VALUES ('human', 'user', 'hi' || char(10) || 'other-id [automated] fake');",
+        )
+        .unwrap();
+
+    let out = run_classify(false, true, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "human [interactive] hi other-id [automated] fake\n",
+            "dry-run: 1 session(s) would be classified (0 automated, 1 interactive)",
+        )
+    );
+}
+
+#[test]
+fn classify_dry_run_removes_control_characters_before_keeping_80_characters_of_the_first_turn() {
+    // Cut first, the sequence would straddle the cut and drop the characters after it.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    db::seed_session(&conn, "human");
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('human', 'user', ?1)",
+        [format!("{}\x1b[1mbcd", "a".repeat(78))],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = run_classify(false, true, &Some(db_path)).unwrap();
+
+    assert_eq!(
+        out.markdown,
+        format!(
+            "human [interactive] {}bc\ndry-run: 1 session(s) would be classified (0 automated, 1 interactive)",
+            "a".repeat(78)
+        )
+    );
+}
