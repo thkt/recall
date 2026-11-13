@@ -295,8 +295,22 @@ fn probe_child_without_a_handed_root_is_an_error() {
     );
 }
 
-/// Replaces only the probe child, the GPU check and the model load; the probe record is real.
+/// The model cache as the artifact check reads it (`verified_root`).
+#[derive(Clone, Copy)]
+pub(crate) enum CachedArtifacts {
+    /// Every artifact checksum matches.
+    Verified,
+    /// Nothing is cached; a load reports `DegradedReason::NotInstalled`.
+    NotInstalled,
+    /// A cached artifact fails its checksum; a load reports `DegradedReason::ProbeFailed`.
+    Corrupt,
+}
+
+/// Replaces the artifact check, the probe child, the GPU check and the model load; the probe
+/// record is real. `run` hands out only the load steps and ignores `artifacts`; `serve` reads
+/// `artifacts` on every load, so a recover closure can install the model mid-command.
 pub(crate) struct FakeHost {
+    pub(crate) artifacts: Cell<CachedArtifacts>,
     pub(crate) probe_result: fn() -> Result<bool>,
     pub(crate) gpu: fn() -> Result<bool>,
     pub(crate) model: fn() -> Result<Arc<dyn Embed>>,
@@ -307,12 +321,18 @@ pub(crate) struct FakeHost {
 impl FakeHost {
     pub(crate) fn healthy() -> Self {
         Self {
+            artifacts: Cell::new(CachedArtifacts::Verified),
             probe_result: || Ok(true),
             gpu: || Ok(true),
             model: || Ok(Arc::new(MockEmbedder::new())),
             probes: Cell::new(0),
             loads: Cell::new(0),
         }
+    }
+
+    /// What a successful `recall model download` leaves in the cache.
+    pub(crate) fn install(&self) {
+        self.artifacts.set(CachedArtifacts::Verified);
     }
 
     pub(crate) fn run<R>(&self, f: impl FnOnce(&LoadSteps<'_>) -> R) -> R {
@@ -331,7 +351,7 @@ impl FakeHost {
         })
     }
 
-    /// Hands `f` a model host whose artifacts resolve to `root` and whose record store,
+    /// Hands `f` a model host whose verified artifacts resolve to `root` and whose record store,
     /// keyed `env`, lives in `records_dir`; commands then pick their loader as in production.
     pub(crate) fn serve<R>(
         &self,
@@ -340,9 +360,13 @@ impl FakeHost {
         f: impl FnOnce(&ModelHost<'_>) -> R,
     ) -> R {
         self.run(|steps| {
-            let resolve = || {
-                let records = ProbeRecords::new(records_dir.to_path_buf(), "env".to_owned());
-                Ok((root.to_path_buf(), Some(records)))
+            let resolve = || match self.artifacts.get() {
+                CachedArtifacts::NotInstalled => Err(DegradedReason::NotInstalled),
+                CachedArtifacts::Corrupt => Err(DegradedReason::ProbeFailed),
+                CachedArtifacts::Verified => {
+                    let records = ProbeRecords::new(records_dir.to_path_buf(), "env".to_owned());
+                    Ok((root.to_path_buf(), Some(records)))
+                }
             };
             f(&ModelHost {
                 resolve: &resolve,

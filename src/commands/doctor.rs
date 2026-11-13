@@ -216,7 +216,8 @@ pub(crate) fn run_doctor(
     })
 }
 
-/// Picks the always-probe loader; the model host is the only injected model input.
+/// Diagnoses the index at `db_path` against `host`, always probing the model (DR 0013). Under
+/// `--fix`, `recover_model` stands for the model download.
 fn run_doctor_in<R>(
     verbose: bool,
     fix: bool,
@@ -227,26 +228,7 @@ fn run_doctor_in<R>(
 where
     R: FnOnce() -> Result<(), RecallError>,
 {
-    run_doctor_with(
-        verbose,
-        fix,
-        db_path,
-        || try_load_embedder_cached_with(|| host.load_probing()),
-        recover_model,
-    )
-}
-
-fn run_doctor_with<F, R>(
-    verbose: bool,
-    fix: bool,
-    db_path: &Option<PathBuf>,
-    load_embedder: F,
-    recover_model: R,
-) -> Result<CommandOutput>
-where
-    F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
-    R: FnOnce() -> Result<(), RecallError>,
-{
+    let load_embedder = || try_load_embedder_cached_with(|| host.load_probing());
     let path = resolve_db_path(db_path)?;
 
     if !path.exists() {
