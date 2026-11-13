@@ -511,6 +511,13 @@ pub(crate) fn seed_session_file(conn: &Connection, session_id: &str, path: &str)
 }
 
 #[cfg(test)]
+pub(crate) fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+#[cfg(test)]
 pub(crate) fn seed_chunk(conn: &Connection, id: i64, content: &str) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, 's1', ?2, 0)",

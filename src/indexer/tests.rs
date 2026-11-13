@@ -3,7 +3,7 @@ use std::time::{Duration, SystemTime};
 
 use super::*;
 use crate::commands::classify::reclassify_sessions;
-use crate::db::{open_db, seed_session, seed_session_file, setup_test_db};
+use crate::db::{collect_strings, open_db, seed_session, seed_session_file, setup_test_db};
 use crate::embedder::{
     EmbedOptions, MockEmbedder, embed_pending_observed, embed_recent_chunks, f32_as_bytes,
 };
@@ -11,12 +11,6 @@ use crate::index_observer::{recording, stable_lines};
 use crate::parser::LineDiagnostics;
 use crate::search::{SearchOptions, search};
 use tempfile::TempDir;
-
-fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
-    let mut stmt = conn.prepare(sql).unwrap();
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-    rows.map(Result::unwrap).collect()
-}
 
 #[test]
 fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() {
