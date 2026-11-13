@@ -1004,6 +1004,44 @@ fn read_commands_work_in_readonly_directory() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn status_reads_an_index_given_by_a_relative_path_from_a_read_only_working_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let db = dir.path().join("recall.db");
+    for suffix in ["-wal", "-shm"] {
+        let _ = fs::remove_file(db.with_file_name(format!("recall.db{suffix}")));
+    }
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let out = recall(dir.path())
+        .current_dir(dir.path())
+        .env("RECALL_DB", "recall.db")
+        .arg("status")
+        .output()
+        .expect("spawn recall binary");
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        ),
+        (
+            Some(0),
+            "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n".to_owned()
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Indexes one session, then leaves a nonempty `-wal` beside the DB the way an
 /// interrupted writer does, so a read from a read-only directory sees a stale snapshot.
 fn seed_stale_wal(dir: &Path) {

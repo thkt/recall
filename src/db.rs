@@ -61,8 +61,11 @@ fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
 }
 
 fn dir_is_unwritable(db_path: &Path) -> bool {
-    let Some(dir) = db_path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
-        return false;
+    // A bare file name lives in the working directory.
+    let dir = match db_path.parent() {
+        Some(dir) if dir.as_os_str().is_empty() => Path::new("."),
+        Some(dir) => dir,
+        None => return false,
     };
     let Ok(meta) = fs::metadata(dir) else {
         return false;
