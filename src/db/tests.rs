@@ -813,7 +813,27 @@ fn write_probe_reports_a_writable_directory_as_writable_and_leaves_no_probe_file
 
 #[test]
 fn probe_cleanup_failure_warns_instead_of_failing_the_read() {
-    remove_write_probe(Path::new("/nonexistent-recall-dir/.recall-write-probe-0"));
+    use std::sync::Mutex;
+    use tracing::subscriber::with_default;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(Mutex::new(fs::File::create(&log).unwrap()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    with_default(subscriber, || {
+        remove_write_probe(Path::new("/nonexistent-recall-dir/.recall-write-probe-0"));
+    });
+
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        " WARN recall::db: failed to remove write probe \
+         probe=/nonexistent-recall-dir/.recall-write-probe-0 \
+         error=No such file or directory (os error 2)\n"
+    );
 }
 
 #[cfg(target_os = "macos")]
