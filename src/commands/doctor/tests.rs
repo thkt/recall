@@ -69,23 +69,6 @@ impl Embed for WidthEmbedder {
     }
 }
 
-struct FailingEmbedder;
-
-impl Embed for FailingEmbedder {
-    fn embed_query(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
-        Err(EmbedError::EmptySequence)
-    }
-    fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-        unreachable!("doctor probe only calls embed_query")
-    }
-    fn embed_documents_batch(&self, _texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        unreachable!("doctor probe only calls embed_query")
-    }
-    fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
-        unreachable!("doctor probe only calls embed_query")
-    }
-}
-
 #[test]
 fn doctor_reports_healthy_on_intact_index_and_loadable_model() {
     let db_dir = tempfile::TempDir::new().unwrap();
@@ -554,24 +537,50 @@ fn doctor_flags_model_that_fails_to_load() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
+    let host = FakeHost {
+        probe_result: || anyhow::bail!("isolated model probe failed"),
+        ..FakeHost::healthy()
+    };
 
-    let failing_loader = || Err(DegradedReason::ProbeFailed);
-    let out = run_doctor_with(false, false, &Some(db_path), failing_loader, no_recover).unwrap();
-
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "model")
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), model_host, no_recover)
+        })
         .unwrap();
-    assert_eq!(check["ok"], false);
-    assert_eq!(out.data["healthy"], false);
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "got: {:?}",
-        out.notes
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] model not loadable: model probe failed -> recall model download\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "model not loadable: model probe failed",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "recall model download",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["model: recall model download"],
+        })
     );
 }
 
@@ -582,21 +591,51 @@ fn doctor_flags_model_dimension_mismatch() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
+    let host = FakeHost {
+        model: || Ok(Arc::new(WidthEmbedder(EMBEDDING_DIMS - 1))),
+        ..FakeHost::healthy()
+    };
 
-    let wrong_width = || Ok(Arc::new(WidthEmbedder(EMBEDDING_DIMS - 1)) as Arc<dyn Embed>);
-    let out = run_doctor_with(false, false, &Some(db_path), wrong_width, no_recover).unwrap();
-
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "model")
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), model_host, no_recover)
+        })
         .unwrap();
+
     assert_eq!(
-        check["ok"], false,
-        "wrong embedding width must fail the probe"
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] embedding width 767 != expected 768 -> recall model download\n",
+        )
     );
-    assert_eq!(out.data["healthy"], false);
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "embedding width 767 != expected 768",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "recall model download",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["model: recall model download"],
+        })
+    );
 }
 
 #[test]
@@ -994,31 +1033,50 @@ fn doctor_flags_model_that_fails_to_embed() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
+    let host = FakeHost {
+        model: || Ok(Arc::new(embedder::MockEmbedder::failing_after(0))),
+        ..FakeHost::healthy()
+    };
 
-    let failing_embed = || Ok(Arc::new(FailingEmbedder) as Arc<dyn Embed>);
-    let out = run_doctor_with(false, false, &Some(db_path), failing_embed, no_recover).unwrap();
-
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "model")
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), model_host, no_recover)
+        })
         .unwrap();
-    assert_eq!(check["ok"], false);
-    assert!(
-        check["detail"]
-            .as_str()
-            .unwrap()
-            .contains("model embed failed"),
-        "got: {check}"
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] model embed failed: embedding inference failed: mock failure -> recall model download\n",
+        )
     );
-    assert_eq!(out.data["healthy"], false);
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n.contains("recall model download")),
-        "got: {:?}",
-        out.notes
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "model embed failed: embedding inference failed: mock failure",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "recall model download",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["model: recall model download"],
+        })
     );
 }
 
@@ -1294,25 +1352,63 @@ fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
     seed_healthy_index(&open_or_create_db(&db_path).unwrap());
     let records_dir = db_dir.path().join("probe");
     let host = FakeHost::healthy();
-    for _ in 0..2 {
-        let searched = host.serve(db_dir.path(), &records_dir, |model_host| {
+    let first_search = host
+        .serve(db_dir.path(), &records_dir, |model_host| {
             run_search_in(
                 search_command("healthy chunk"),
                 &Some(db_path.clone()),
                 model_host,
             )
-        });
-        assert!(!searched.unwrap().degraded);
-    }
+        })
+        .unwrap();
+    let second_search = host
+        .serve(db_dir.path(), &records_dir, |model_host| {
+            run_search_in(
+                search_command("healthy chunk"),
+                &Some(db_path.clone()),
+                model_host,
+            )
+        })
+        .unwrap();
+    assert!(!first_search.degraded);
+    assert!(!second_search.degraded);
     assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
 
     let out = host
         .serve(db_dir.path(), &records_dir, |model_host| {
-            run_doctor_in(false, false, &Some(db_path), model_host, no_recover)
+            run_doctor_in(false, false, &Some(db_path.clone()), model_host, no_recover)
         })
         .unwrap();
 
-    assert_eq!(out.data["healthy"], true);
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: healthy\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": false,
+            "notes": [],
+        })
+    );
     assert_eq!(host.probes.get(), 2, "doctor runs the probe every time");
 }
 
