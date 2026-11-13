@@ -13,7 +13,7 @@ use crate::envelope::CommandOutput;
 use crate::error::{RecallError, download_error};
 use crate::model::{self, DegradedReason, download_and_verify_model};
 use crate::runtime::info as cli_info;
-use crate::{open_or_create_db, resolve_db_path, try_load_embedder_cached_with};
+use crate::{resolve_db_path, try_load_embedder_cached_with};
 
 struct DoctorCheck {
     name: &'static str,
@@ -268,58 +268,40 @@ where
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
     let mut wal_note: Option<String> = None;
-    let mut checks = if fix {
-        let empty_foreign_db = matches!(
-            db::open_db_readonly(&path).map(|(conn, _)| db::schema_state(&conn)),
-            Ok(Ok(db::SchemaState::Empty))
-        );
-        if empty_foreign_db {
-            vec![empty_index_check(&path)]
-        } else {
-            match open_or_create_db(&path) {
-                Ok(conn) => {
-                    repairs = Some(vec![RepairOutcome {
-                        name: "orphan_embeddings",
-                        result: fix_orphan_embeddings(&conn),
-                    }]);
+    let (mut checks, identity_error) = match db::open_db_readonly(&path) {
+        Ok((conn, tier)) => {
+            wal_note = db::stale_wal_note(&path, tier);
+            let identity = model::check_index(&conn, model::selected());
+            let checks = match db::schema_state(&conn) {
+                Ok(db::SchemaState::Current) => {
+                    // An index built for another model, or a legacy one kept for rollback, stays
+                    // unwritten.
+                    if fix && identity.is_ok() {
+                        repairs = Some(vec![RepairOutcome {
+                            name: "orphan_embeddings",
+                            result: db::open_existing_db(&path)
+                                .and_then(|writer| fix_orphan_embeddings(&writer)),
+                        }]);
+                    }
+                    // Each check reads in a new transaction and sees the repair. An index opened
+                    // immutable sits in a read-only directory, where the repair fails instead.
                     db_checks(&conn)
                 }
-                Err(e)
-                    if e.downcast_ref::<RecallError>()
-                        .is_some_and(|e| matches!(e, RecallError::DatabaseRead(_))) =>
-                {
-                    vec![DoctorCheck::fail(
-                        "integrity",
-                        e.to_string(),
-                        MODEL_INDEX_REMEDY,
-                    )]
-                }
+                Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
+                    "schema",
+                    "database schema is out of date".to_owned(),
+                    "run `recall rebuild`",
+                )],
+                Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
-            }
+            };
+            (checks, identity.err())
         }
-    } else {
-        match db::open_db_readonly(&path) {
-            Ok((conn, tier)) => {
-                wal_note = db::stale_wal_note(&path, tier);
-                match db::schema_state(&conn) {
-                    Ok(db::SchemaState::Current) => db_checks(&conn),
-                    Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
-                        "schema",
-                        "database schema is out of date".to_owned(),
-                        "run `recall rebuild`",
-                    )],
-                    Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
-                    Err(e) => open_failure_checks(e),
-                }
-            }
-            Err(e) => open_failure_checks(e),
-        }
+        Err(e) => (open_failure_checks(e), None),
     };
     let (mut model_check, model_recovery) =
         check_model_with_optional_recovery(fix, load_embedder, recover_model);
-    if let Ok((conn, _)) = db::open_db_readonly(&path)
-        && let Err(error) = model::check_index(&conn, model::selected())
-    {
+    if let Some(error) = identity_error {
         model_check = DoctorCheck::fail("model", error.to_string(), MODEL_INDEX_REMEDY);
     }
     checks.push(model_check);
@@ -343,7 +325,11 @@ fn render_doctor_report(
     let notes = doctor_notes(checks, repairs, model_recovery);
     let markdown = doctor_markdown(verbose, path, healthy, checks, repairs, model_recovery);
     let data = doctor_data(healthy, checks, repairs, model_recovery);
-    let degraded = !healthy || matches!(model_recovery, ModelRecovery::Failed(_));
+    let repair_failed = repairs
+        .iter()
+        .flatten()
+        .any(|outcome| outcome.result.is_err());
+    let degraded = !healthy || repair_failed || matches!(model_recovery, ModelRecovery::Failed(_));
     CommandOutput::with_notes(markdown, data, degraded, notes)
 }
 
