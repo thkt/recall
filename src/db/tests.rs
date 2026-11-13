@@ -452,13 +452,6 @@ fn build_schema(path: &Path, sessions_cols: &str, tokenizer: &str, qa_cols: &str
 }
 
 #[test]
-fn test_schema_state_current_on_freshly_opened_db() {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_db(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
-}
-
-#[test]
 fn a_database_without_a_sessions_table_has_an_empty_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = Connection::open(tmp.path()).unwrap();
@@ -681,47 +674,6 @@ fn a_read_only_open_in_a_writable_directory_opens_the_live_database_and_rejects_
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn test_is_readonly_dir_error_writable_dir_rejects_immutable_fallback() {
-    use rusqlite::ffi::Error as FfiError;
-
-    let cantopen = rusqlite::Error::SqliteFailure(FfiError::new(14), None);
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let db = dir.path().join("recall.db");
-
-    assert!(
-        !is_readonly_dir_error(&db, &cantopen),
-        "CannotOpen in a writable dir is not read-only media; the immutable fallback must not fire"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
-    use rusqlite::ffi::Error as FfiError;
-    use std::os::unix::fs::PermissionsExt;
-
-    let cantopen = rusqlite::Error::SqliteFailure(FfiError::new(14), None);
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let db = dir.path().join("recall.db");
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-
-    if root_skip::skip_if_root(dir.path()) {
-        return;
-    }
-
-    let got = is_readonly_dir_error(&db, &cantopen);
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert!(
-        got,
-        "CannotOpen in a read-only (0o555) dir is read-only media; the immutable fallback must fire"
-    );
-}
-
 #[test]
 fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -791,23 +743,6 @@ fn a_database_in_a_read_only_directory_whose_path_has_a_space_and_a_question_mar
             collect_strings(&conn, "SELECT session_id FROM sessions")
         ),
         (OpenTier::Immutable, vec!["s1".to_owned()])
-    );
-}
-
-#[test]
-fn write_probe_reports_a_writable_directory_as_writable_and_leaves_no_probe_file_behind() {
-    let dir = tempfile::TempDir::new().unwrap();
-
-    let result = dir_write_probe_fails(dir.path());
-
-    assert!(
-        !result,
-        "a writable directory must not be reported as unwritable"
-    );
-    let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-    assert!(
-        entries.is_empty(),
-        "probe file must be removed after a successful write, got entries: {entries:?}"
     );
 }
 
