@@ -119,9 +119,9 @@ enum Command {
     Doctor {
         /// Delete dangling `vec_chunks` rows whose `chunk_id` no longer resolves
         /// to a `qa_chunks` row (the orphan_embeddings fault), and download and
-        /// verify the selected model (~558 MB) when the model check fails, then
-        /// re-run the checks so the verdict reflects the repaired state. An index
-        /// whose model identity check fails gets neither.
+        /// verify the selected model (~558 MB for the default) when it is missing
+        /// or fails its check, then re-run the checks so the verdict reflects the
+        /// repaired state. An index whose model identity check fails gets neither.
         #[arg(long)]
         fix: bool,
     },

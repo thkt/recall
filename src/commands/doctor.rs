@@ -217,8 +217,8 @@ pub(crate) fn run_doctor(
 }
 
 /// Diagnoses the index at `db_path` against `host`, always probing the model (DR 0013). Under
-/// `--fix`, `recover_model` stands for the model download; it runs only when the model check
-/// fails and the index's identity check did not.
+/// `--fix`, `recover_model` stands for the model download; it runs only when the model is missing
+/// or fails its check, and the index's identity check did not fail.
 fn run_doctor_in<R>(
     verbose: bool,
     fix: bool,
