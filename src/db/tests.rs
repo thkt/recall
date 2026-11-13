@@ -547,14 +547,35 @@ fn an_index_tokenized_without_trigrams_has_a_stale_schema() {
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
 }
 
+const WRITABLE_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
+     write-ahead log; run `recall index` to checkpoint them.";
+const READ_ONLY_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
+     write-ahead log; the directory is read-only, so copy the DB together with its `-wal` \
+     (and `-shm`, if present) sidecar files elsewhere and run `recall index --db-path <copy>` \
+     to checkpoint them there.";
+
+/// The names of the entries in `dir`, sorted.
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn test_stale_wal_note_immutable_nonempty_wal_is_some() {
-    let tmp = NamedTempFile::new().unwrap();
-    let wal = wal_path(tmp.path());
-    fs::write(&wal, b"uncommitted").unwrap();
-    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
-    fs::remove_file(&wal).ok();
-    assert!(note.is_some(), "immutable tier + non-empty -wal must warn");
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
+
+    let note = stale_wal_note(&db, OpenTier::Immutable);
+
+    assert_eq!(
+        (note.as_deref(), file_names(dir.path())),
+        (Some(WRITABLE_DIR_NOTE), vec!["recall.db-wal".to_owned()])
+    );
 }
 
 #[test]
@@ -588,8 +609,7 @@ fn stale_snapshot_note_in_a_read_only_directory_asks_to_index_a_copy_with_its_si
 
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
-    let wal = wal_path(&db);
-    fs::write(&wal, b"uncommitted").unwrap();
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
     if root_skip::skip_if_root(dir.path()) {
@@ -599,27 +619,46 @@ fn stale_snapshot_note_in_a_read_only_directory_asks_to_index_a_copy_with_its_si
     let note = stale_wal_note(&db, OpenTier::Immutable);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
-    let note = note.expect("non-empty -wal on Immutable tier must warn");
-    root_skip::assert_copy_based_remedy(&note, "read-only dir immutable tier");
+    assert_eq!(note.as_deref(), Some(READ_ONLY_DIR_NOTE));
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_snapshot_note_in_a_directory_that_refuses_the_owner_new_files_asks_to_index_a_copy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
+    // The group may write, so the mode does not read as read-only, but the owner may not.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o575)).unwrap();
+
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let note = stale_wal_note(&db, OpenTier::Immutable);
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(note.as_deref(), Some(READ_ONLY_DIR_NOTE));
 }
 
 #[test]
-fn writable_dir_immutable_tier_非空_wal_で_stale_wal_note_は従来文言を含む() {
-    let tmp = NamedTempFile::new().unwrap();
-    let wal = wal_path(tmp.path());
-    fs::write(&wal, b"uncommitted").unwrap();
+fn stale_snapshot_note_in_a_writable_directory_with_a_leftover_write_probe_file_asks_to_run_recall_index()
+ {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
+    let leftover = dir
+        .path()
+        .join(format!(".recall-write-probe-{}", process::id()));
+    fs::write(&leftover, b"stale").unwrap();
 
-    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
-    fs::remove_file(&wal).ok();
+    let note = stale_wal_note(&db, OpenTier::Immutable);
 
-    let note = note.expect("non-empty -wal on Immutable tier must warn");
-    assert!(
-        note.contains("write-ahead log"),
-        "note must carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        note.contains("run `recall index`"),
-        "writable dir must keep the legacy bare `recall index` wording, got: {note}"
+    assert_eq!(
+        (note.as_deref(), fs::read_to_string(&leftover).unwrap()),
+        (Some(WRITABLE_DIR_NOTE), "stale".to_owned())
     );
 }
 
@@ -746,42 +785,6 @@ fn write_probe_reports_a_writable_directory_as_writable_and_leaves_no_probe_file
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn write_probe_reports_a_directory_with_cleared_write_bits_as_unwritable() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-
-    if root_skip::skip_if_root(dir.path()) {
-        return;
-    }
-
-    let result = dir_write_probe_fails(dir.path());
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert!(
-        result,
-        "a directory with cleared write bits (0o555) must be reported as unwritable (EACCES -> PermissionDenied)"
-    );
-}
-
-#[test]
-fn a_leftover_probe_file_reads_as_ambiguous_so_the_directory_stays_classified_writable() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let leftover = dir
-        .path()
-        .join(format!(".recall-write-probe-{}", process::id()));
-    fs::write(&leftover, b"stale").unwrap();
-
-    assert!(
-        !dir_write_probe_fails(dir.path()),
-        "a pre-existing probe file (AlreadyExists) must classify the directory \
-         as writable, not read-only"
-    );
-}
-
 #[test]
 fn probe_cleanup_failure_warns_instead_of_failing_the_read() {
     remove_write_probe(Path::new("/nonexistent-recall-dir/.recall-write-probe-0"));
@@ -897,9 +900,9 @@ fn stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_
  {
     let mount = attach_readonly_wal_only_db();
 
-    let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable)
-        .expect("non-empty -wal on a read-only mount must warn");
-    root_skip::assert_copy_based_remedy(&note, "read-only mount immutable tier");
+    let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable);
+
+    assert_eq!(note.as_deref(), Some(READ_ONLY_DIR_NOTE));
 }
 
 #[test]
