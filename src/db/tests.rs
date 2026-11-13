@@ -7,12 +7,17 @@ fn test_open_db_creates_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
 
-    for table in ["sessions", "messages", "qa_chunks", "messages_vocab"] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "table {table} should be empty");
-    }
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(
+                 (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages),
+                 (SELECT COUNT(*) FROM qa_chunks), (SELECT COUNT(*) FROM vec_chunks),
+                 (SELECT COUNT(*) FROM messages_vocab))"
+        ),
+        ["[0,0,0,0,0]"]
+    );
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
 }
 
 #[test]
@@ -32,8 +37,11 @@ fn an_opened_database_runs_sqlite_vec_v0_1_9() {
 #[test]
 fn test_open_db_idempotent() {
     let tmp = NamedTempFile::new().unwrap();
-    let _conn1 = open_db(tmp.path()).unwrap();
-    let _conn2 = open_db(tmp.path()).unwrap();
+    let first = schema_snapshot(&open_db(tmp.path()).unwrap());
+
+    let second = schema_snapshot(&open_db(tmp.path()).unwrap());
+
+    assert_eq!(second, first);
 }
 
 #[test]
@@ -43,74 +51,86 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
 
     let tmp = NamedTempFile::new().unwrap();
     create_pre_cleanup_db(tmp.path());
-    {
-        let conn = Connection::open(tmp.path()).unwrap();
-        conn.execute_batch(
-            "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
+    // With parse_diagnostics already in place, the marker upgrade runs the only UPDATE on
+    // sessions, so the trigger fails that upgrade and no earlier one.
+    Connection::open(tmp.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE parse_diagnostics (file_path TEXT PRIMARY KEY);
+             INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
              INSERT INTO messages (session_id, role, text) VALUES
                  ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
              CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE ON sessions
              BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
         )
         .unwrap();
-    }
+
     let error = open_db(tmp.path()).err().unwrap();
-    assert!(error.to_string().contains("injected migration failure"));
-    {
-        let conn = Connection::open(tmp.path()).unwrap();
-        assert!(
-            !table_def(&conn, "sessions")
-                .unwrap()
-                .unwrap()
-                .contains("chunks_indexed")
-        );
-        conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
-            .unwrap();
-    }
-    for pass in 0..2 {
-        let mut conn = open_db(tmp.path()).unwrap();
-        let complete: i64 = conn
-            .query_row(
-                "SELECT chunks_indexed FROM sessions WHERE session_id = 's1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(complete, 1);
-        let stats = index_chunks(&mut conn).unwrap();
-        assert_eq!(stats.sessions_chunked, if pass == 0 { 2 } else { 0 });
-        assert_eq!(stats.chunks_created, if pass == 0 { 1 } else { 0 });
-        let original: (String, Option<i64>, Option<i64>) = conn
-            .query_row(
-                "SELECT content, src_rowid_lo, src_rowid_hi FROM qa_chunks WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(original, ("q\na".to_owned(), None, None));
-        let (id, embedding): (i64, Vec<u8>) = conn
-            .query_row("SELECT chunk_id, embedding FROM vec_chunks", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(embedding, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]));
-        let markers: Vec<(String, i64)> = conn
-            .prepare("SELECT session_id, chunks_indexed FROM sessions ORDER BY session_id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(
-            markers,
-            [
-                ("empty".to_owned(), 0),
-                ("pending".to_owned(), 0),
-                ("s1".to_owned(), 1),
-            ]
-        );
-    }
+
+    assert_eq!(error.to_string(), "injected migration failure");
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT name FROM pragma_table_info('sessions')"),
+        [
+            "session_id",
+            "source",
+            "file_path",
+            "project",
+            "slug",
+            "timestamp",
+            "mtime",
+            "session_type",
+            "files_scanned",
+            "file_size",
+        ]
+    );
+    conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
+        .unwrap();
+    drop(conn);
+
+    let mut conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, chunks_indexed) FROM sessions ORDER BY session_id"
+        ),
+        [r#"["empty",null]"#, r#"["pending",null]"#, r#"["s1",1]"#]
+    );
+    let first = index_chunks(&mut conn).unwrap();
+    drop(conn);
+    let mut conn = open_db(tmp.path()).unwrap();
+    let second = index_chunks(&mut conn).unwrap();
+
+    assert_eq!(
+        [
+            (first.sessions_chunked, first.chunks_created),
+            (second.sessions_chunked, second.chunks_created),
+        ],
+        [(2, 1), (0, 0)]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, chunks_indexed) FROM sessions ORDER BY session_id"
+        ),
+        [r#"["empty",0]"#, r#"["pending",0]"#, r#"["s1",1]"#]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
+             FROM qa_chunks ORDER BY id"
+        ),
+        [
+            r#"[1,"s1","q\na",0,null,null]"#,
+            r#"[2,"pending","new question",null,2,2]"#
+        ]
+    );
+    assert_eq!(
+        embeddings(&conn),
+        [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
+    );
 }
 
 #[test]
@@ -137,22 +157,37 @@ fn test_session_type_migration_adds_column_preserving_rows() {
 
     let conn = open_db(tmp.path()).unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 1, "existing session row must survive the migration");
-
-    let session_type: Option<String> = conn
-        .query_row(
-            "SELECT session_type FROM sessions WHERE session_id = 's1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        session_type, None,
-        "pre-existing rows get NULL session_type"
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime,
+                               file_size, session_type, files_scanned, chunks_indexed)
+             FROM sessions"
+        ),
+        [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
     );
+}
+
+/// The schema version with every schema object, so a test can show that an open changed nothing.
+fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
+    (
+        conn.query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap(),
+        collect_strings(
+            conn,
+            "SELECT json_array(type, name, tbl_name, sql) FROM sqlite_master ORDER BY type, name",
+        ),
+    )
+}
+
+/// Every stored embedding as `(rowid, chunk_id, sub_idx, embedding)`.
+fn embeddings(conn: &Connection) -> Vec<(i64, i64, i64, Vec<u8>)> {
+    conn.prepare("SELECT rowid, chunk_id, sub_idx, embedding FROM vec_chunks ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
 }
 
 fn create_old_schema_db(path: &Path) {
@@ -345,70 +380,44 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
 
     let conn = open_db(tmp.path()).unwrap();
 
-    let cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(qa_chunks)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    for gone in ["chunk_hash", "user_text", "assistant_text"] {
-        assert!(
-            !cols.contains(&gone.to_owned()),
-            "column {gone} should be dropped, got {cols:?}"
-        );
-    }
-
-    let (id, content): (i64, String) = conn
-        .query_row("SELECT id, content FROM qa_chunks WHERE id = 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
-    assert_eq!(id, 1);
-    assert_eq!(content, "q\na");
-
-    let vec_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        vec_count, 1,
-        "vec_chunks row must survive and stay linked to qa_chunks"
+        collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
+        [
+            "id",
+            "session_id",
+            "content",
+            "timestamp",
+            "src_rowid_lo",
+            "src_rowid_hi",
+            "generation",
+        ]
     );
-
-    let tbl: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedded_chunk_ids'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tbl, 0, "embedded_chunk_ids table should be dropped");
-
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi,
+                               generation)
+             FROM qa_chunks"
+        ),
+        [r#"[1,"s1","q\na",0,null,null,0]"#]
+    );
+    assert_eq!(
+        embeddings(&conn),
+        [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name = 'embedded_chunk_ids'"
+        ),
+        Vec::<String>::new()
+    );
+    let schema = schema_snapshot(&conn);
     drop(conn);
-    let conn = open_db(tmp.path()).unwrap();
-    let cols2: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(qa_chunks)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    assert!(
-        !cols2.contains(&"chunk_hash".to_owned()),
-        "re-open must stay migrated, got {cols2:?}"
-    );
-    let vec_count2: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(vec_count2, 1, "re-open must keep vec row linked");
+
+    let reopened = open_db(tmp.path()).unwrap();
+
+    assert_eq!(schema_snapshot(&reopened), schema);
 }
 
 const SESSIONS_FULL: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
@@ -990,84 +999,58 @@ fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_l
     );
     let conn = Connection::open(tmp.path()).unwrap();
     seed_chunk(&conn, 1, "existing content");
-    let vector = vec![0.25_f32; EMBEDDING_DIMS];
+    let embedding = f32_as_bytes(&[0.25_f32; EMBEDDING_DIMS]);
     conn.execute(
         "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (1, 0, ?1)",
-        [f32_as_bytes(&vector)],
+        [&embedding],
     )
     .unwrap();
-    assert!(
-        !table_def(&conn, "qa_chunks")
-            .unwrap()
-            .unwrap()
-            .contains("generation")
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
+    drop(conn);
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, content, generation) FROM qa_chunks"
+        ),
+        [r#"[1,"existing content",0]"#]
     );
-    assert!(table_def(&conn, "qa_chunk_generation").unwrap().is_none());
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
-    drop(conn);
-
-    let conn = open_db(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
-    let (content, generation): (String, i64) = conn
-        .query_row(
-            "SELECT content, generation FROM qa_chunks WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(content, "existing content");
-    assert_eq!(generation, 0, "legacy rows receive the migration default");
-    let saved: (i64, Vec<u8>, i64, i64) = conn
-        .query_row(
-            "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(saved.1, f32_as_bytes(&vector));
-    assert_eq!((saved.2, saved.3), (1, 0));
     seed_chunk(&conn, 2, "new content");
-    let new_generation: i64 = conn
-        .query_row("SELECT generation FROM qa_chunks WHERE id = 2", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_ne!(new_generation, generation);
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, content, generation) FROM qa_chunks ORDER BY id"
+        ),
+        [r#"[1,"existing content",0]"#, r#"[2,"new content",1]"#]
+    );
     drop(conn);
 
     let conn = open_db(tmp.path()).unwrap();
-    let reopened: (i64, Vec<u8>, i64, i64) = conn
-        .query_row(
-            "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(reopened, saved);
     conn.execute(
         "UPDATE qa_chunks SET src_rowid_lo = 1, src_rowid_hi = 2",
         [],
     )
     .unwrap();
-    let generations: Vec<i64> = conn
-        .prepare("SELECT generation FROM qa_chunks ORDER BY id")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(generations, vec![generation, new_generation]);
+
+    assert_eq!(embeddings(&conn), [(1, 1, 0, embedding.to_vec())]);
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, content, generation) FROM qa_chunks ORDER BY id"
+        ),
+        [r#"[1,"existing content",0]"#, r#"[2,"new content",1]"#]
+    );
     conn.execute("DELETE FROM qa_chunks WHERE id = 2", [])
         .unwrap();
     seed_chunk(&conn, 2, "new content");
-    let replacement: i64 = conn
-        .query_row("SELECT generation FROM qa_chunks WHERE id = 2", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert!(
-        replacement > new_generation,
-        "re-open must not reset the counter"
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, content, generation) FROM qa_chunks ORDER BY id"
+        ),
+        [r#"[1,"existing content",0]"#, r#"[2,"new content",2]"#]
     );
 }
 
