@@ -341,8 +341,7 @@ type ResolveArtifacts<'a> = &'a dyn Fn() -> Result<(PathBuf, Option<ProbeRecords
 /// steps. Commands take it as their only model input, so tests reach the loader each command
 /// picks.
 pub(crate) struct ModelHost<'a> {
-    /// Called each time a command loads the model or reports whether it is ready, so a command
-    /// that does neither skips the SHA-256 check.
+    /// Called per load, so a command that never loads the model skips the SHA-256 check.
     pub(crate) resolve: ResolveArtifacts<'a>,
     pub(crate) steps: &'a LoadSteps<'a>,
 }

@@ -1,4 +1,3 @@
-use crate::model::tests::FakeHost;
 use crate::tests::{bare_empty_db, payload_keys, printed_envelope};
 use crate::{embedder, open_or_create_db};
 
@@ -19,11 +18,7 @@ fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
     .unwrap();
     drop(conn);
 
-    let out = FakeHost::healthy()
-        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
-            run_status_in(false, &Some(db_path), host)
-        })
-        .unwrap();
+    let out = run_status_with(false, &Some(db_path), || true).unwrap();
 
     assert_eq!(
         out.markdown,
@@ -44,11 +39,7 @@ fn status_without_a_database_reports_zero_counts_and_does_not_create_it() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("missing.db");
 
-    let out = FakeHost::healthy()
-        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
-            run_status_in(false, &Some(db_path.clone()), host)
-        })
-        .unwrap();
+    let out = run_status_with(false, &Some(db_path.clone()), || true).unwrap();
 
     assert_eq!(out.markdown, "");
     assert_eq!(
@@ -70,19 +61,7 @@ fn status_of_a_table_less_file_reports_zero_counts_and_a_missing_model_without_d
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
-    let not_installed = || Err(model::DegradedReason::NotInstalled);
-    let out = FakeHost::healthy()
-        .run(|steps| {
-            run_status_in(
-                false,
-                &Some(db_path),
-                &model::ModelHost {
-                    resolve: &not_installed,
-                    steps,
-                },
-            )
-        })
-        .unwrap();
+    let out = run_status_with(false, &Some(db_path), || false).unwrap();
 
     assert_eq!(
         out.markdown,
@@ -104,11 +83,7 @@ fn freeze_status_payload_key_set() {
     let frozen = ["embedded", "model_ready", "qa_chunks", "sessions"];
 
     let missing = tempfile::TempDir::new().unwrap();
-    let no_db = FakeHost::healthy()
-        .serve(missing.path(), &missing.path().join("probe"), |host| {
-            run_status_in(false, &Some(missing.path().join("absent.db")), host)
-        })
-        .unwrap();
+    let no_db = run_status_with(false, &Some(missing.path().join("absent.db")), || true).unwrap();
     assert_eq!(
         payload_keys(&no_db.data),
         frozen,
@@ -121,11 +96,7 @@ fn freeze_status_payload_key_set() {
         let conn = open_or_create_db(&db_path).unwrap();
         db::seed_session(&conn, "s1");
     }
-    let with_db = FakeHost::healthy()
-        .serve(dir.path(), &dir.path().join("probe"), |host| {
-            run_status_in(false, &Some(db_path), host)
-        })
-        .unwrap();
+    let with_db = run_status_with(false, &Some(db_path), || true).unwrap();
     assert_eq!(
         payload_keys(&with_db.data),
         frozen,

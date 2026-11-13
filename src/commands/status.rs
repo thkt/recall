@@ -5,24 +5,25 @@ use anyhow::Result;
 
 use crate::commands::build_markdown;
 use crate::envelope::CommandOutput;
-use crate::model;
+use crate::model::{self, cached_artifacts};
 use crate::runtime::info as cli_info;
 use crate::{db, require_current_schema, resolve_db_path};
 
 pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    run_status_in(verbose, db_path, &model::HOST)
+    run_status_with(verbose, db_path, || {
+        cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false)
+    })
 }
 
-/// Reports the model ready when the host resolves its artifacts; the model host is the only
-/// injected input.
-fn run_status_in(
+/// Takes only whether the model is ready, so status never starts the probe or loads the model.
+fn run_status_with(
     verbose: bool,
     db_path: &Option<PathBuf>,
-    host: &model::ModelHost<'_>,
+    model_ready: impl FnOnce() -> bool,
 ) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
 
-    let model_ok = (host.resolve)().is_ok();
+    let model_ok = model_ready();
 
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));
