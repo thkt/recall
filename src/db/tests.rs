@@ -134,6 +134,37 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
 }
 
 #[test]
+fn a_failed_parse_diagnostics_upgrade_leaves_the_schema_and_the_session_times_as_they_were() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_schema(tmp.path(), SESSIONS_FULL, "trigram", QA_FULL, VEC_FULL);
+    let conn = Connection::open(tmp.path()).unwrap();
+    seed_session(&conn, "s1");
+    conn.execute_batch(
+        "CREATE TRIGGER fail_upgrade BEFORE UPDATE ON sessions
+         BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+    )
+    .unwrap();
+    let schema = schema_snapshot(&conn);
+    drop(conn);
+
+    let error = open_db(tmp.path()).err().unwrap();
+
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(
+        (
+            error.to_string(),
+            schema_snapshot(&conn),
+            collect_strings(&conn, "SELECT json_array(session_id, mtime) FROM sessions"),
+        ),
+        (
+            "injected migration failure".to_owned(),
+            schema,
+            vec![r#"["s1",0.0]"#.to_owned()],
+        )
+    );
+}
+
+#[test]
 fn test_session_type_migration_adds_column_preserving_rows() {
     let tmp = NamedTempFile::new().unwrap();
     {
