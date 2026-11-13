@@ -6,7 +6,10 @@ use crate::commands::search::run_search_in;
 use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError};
 use crate::model::tests::FakeHost;
-use crate::tests::{bare_empty_db, mock_loader, search_command, seed_healthy_index};
+use crate::open_or_create_db;
+use crate::tests::{
+    bare_empty_db, mock_loader, printed_envelope, search_command, seed_healthy_index,
+};
 
 use super::*;
 
@@ -1039,4 +1042,120 @@ fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
 
     assert_eq!(out.data["healthy"], true);
     assert_eq!(host.probes.get(), 2, "doctor runs the probe every time");
+}
+
+/// The number of sessions the index at `db_path` holds.
+fn stored_session_count(db_path: &Path) -> i64 {
+    let (conn, _) = db::open_db_readonly(db_path).unwrap();
+    conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_runs_every_index_check()
+ {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    conn.execute(
+        "UPDATE embedding_identity SET fingerprint = 'other-model'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "select the matching --model-manifest and index, or build this model in a separate --db-path",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["model: select the matching --model-manifest and index, or build this model in a separate --db-path"],
+        })
+    );
+}
+
+#[test]
+fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cached_sessions() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    conn.execute_batch(
+        "DROP TABLE messages_vocab;
+         DROP TABLE messages;
+         CREATE VIRTUAL TABLE messages USING fts5(session_id UNINDEXED, role, text, tokenize='unicode61');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  schema [FAIL] database schema is out of date -> run `recall rebuild`\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    {
+                        "detail": "database schema is out of date",
+                        "name": "schema",
+                        "ok": false,
+                        "remedy": "run `recall rebuild`",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["schema: run `recall rebuild`"],
+        })
+    );
+    assert_eq!(stored_session_count(&db_path), 1);
 }
