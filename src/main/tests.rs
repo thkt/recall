@@ -5,7 +5,7 @@ use std::fs;
 use super::*;
 use crate::commands::search::{SearchArgs, run_search_with};
 use crate::commands::show::{DEFAULT_WINDOW, run_show};
-use crate::commands::status::run_status;
+use crate::commands::status::run_status_with;
 
 #[cfg(unix)]
 #[test]
@@ -433,7 +433,7 @@ fn read_commands_use_pre_generation_index_without_migrating_it() {
     drop(conn);
 
     let db_path = Some(path.clone());
-    let status = run_status(false, &db_path).unwrap();
+    let status = run_status_with(false, &db_path, || true).unwrap();
     assert_eq!(status.data["sessions"], 1);
     assert_eq!(status.data["qa_chunks"], 1);
     assert_eq!(status.data["embedded"], 1);
