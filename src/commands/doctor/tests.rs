@@ -848,7 +848,7 @@ fn check_orphan_chunks_errors_when_table_missing() {
 }
 
 #[test]
-fn run_doctor_wrapper_reports_on_healthy_db_with_verbose_output() {
+fn verbose_doctor_of_a_healthy_index_prints_the_database_path() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -870,7 +870,7 @@ fn run_doctor_wrapper_reports_on_healthy_db_with_verbose_output() {
 }
 
 #[test]
-fn run_doctor_reports_unhealthy_on_never_indexed_db() {
+fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_index_check() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     drop(rusqlite::Connection::open(&db_path).unwrap());
