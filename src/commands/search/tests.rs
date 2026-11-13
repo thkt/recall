@@ -106,7 +106,7 @@ fn search_lists_each_match_with_its_date_slug_project_id_excerpt_and_inspect_lin
                  (2, 'a1b2c3d4-e5f6-7890-1234-567890abcdef', 'user', 'how to implement authentication');
              INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) VALUES
                  (7, 'b2c3d4e5-f6a7-8901-2345-67890abcdef1', 'Q: how to implement authentication' || char(10) || 'A: start with the login test', 1709251200000, 1, 1),
-                 (42, 'a1b2c3d4-e5f6-7890-1234-567890abcdef', 'Q: how to implement authentication' || char(10) || 'A: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs', 1709251200000, 2, 2);",
+                 (42, 'a1b2c3d4-e5f6-7890-1234-567890abcdef', 'Q: how to implement authentication' || char(10) || 'A: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs, then log each refresh with the client id so that a reused refresh token revokes every token issued from the same login', 1709251200000, 2, 2);",
         )
         .unwrap();
 
@@ -126,7 +126,7 @@ fn search_lists_each_match_with_its_date_slug_project_id_excerpt_and_inspect_lin
             "    /home/me/project\n",
             "    ID: a1b2c3d4-e5f6-7890-1234-567890abcdef\n",
             "    > Q: how to implement authentication\n",
-            "    > A: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs\n",
+            "    > A: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs, then log each refresh with the client id so that a reused refresh token revokes every token issued from the same login\n",
             "    inspect: recall show a1b2c3d4-e5f6-7890-1234-567890abcdef --chunk 42 --window 3\n",
             "\n",
             "[2] 2024-03-01 | add-login-tests | other [claude]\n",
@@ -145,7 +145,7 @@ fn search_lists_each_match_with_its_date_slug_project_id_excerpt_and_inspect_lin
                 "results": [
                     {
                         "chunk": 42,
-                        "excerpt": "Q: how to implement authentication\nA: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs",
+                        "excerpt": "Q: how to implement authentication\nA: use short-lived JWT access tokens, rotate the refresh token on every use, keep it in an httpOnly cookie, and check the signature and the expiry of the access token on every request before the handler runs, then log each refresh with the client id so that a reused refresh token revokes every token issued from the same login",
                         "inspect": "recall show a1b2c3d4-e5f6-7890-1234-567890abcdef --chunk 42 --window 3",
                         "project": "/home/me/project",
                         "session_id": "a1b2c3d4-e5f6-7890-1234-567890abcdef",
