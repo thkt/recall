@@ -425,10 +425,7 @@ fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -479,10 +476,7 @@ fn doctor_fix_recovers_not_installed_model_to_healthy() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -587,10 +581,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -1198,10 +1189,7 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
     )
     .unwrap();
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -1374,10 +1362,7 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
     .unwrap();
     conn.execute("DROP TABLE embedding_identity", []).unwrap();
     drop(conn);
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
@@ -1434,10 +1419,7 @@ fn doctor_fix_of_a_database_file_it_cannot_open_still_installs_a_missing_model()
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     fs::write(&db_path, b"this is not a sqlite database").unwrap();
-    let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::NotInstalled),
-        ..FakeHost::healthy()
-    };
+    let host = FakeHost::not_installed();
 
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {

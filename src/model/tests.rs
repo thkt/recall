@@ -330,6 +330,14 @@ impl FakeHost {
         }
     }
 
+    /// A host with nothing cached, as before the first `recall model download`.
+    pub(crate) fn not_installed() -> Self {
+        Self {
+            artifacts: Cell::new(CachedArtifacts::NotInstalled),
+            ..Self::healthy()
+        }
+    }
+
     /// What a successful `recall model download` leaves in the cache.
     pub(crate) fn install(&self) {
         self.artifacts.set(CachedArtifacts::Verified);
