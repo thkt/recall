@@ -20,7 +20,7 @@ fn test_open_db_creates_schema() {
 }
 
 #[test]
-fn test_sqlite_vec_version_matches_pinned() {
+fn an_opened_database_runs_sqlite_vec_v0_1_9() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
 
@@ -41,7 +41,8 @@ fn test_open_db_idempotent() {
 }
 
 #[test]
-fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
+fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions()
+ {
     use crate::indexer::index_chunks;
 
     let tmp = NamedTempFile::new().unwrap();
@@ -453,14 +454,14 @@ fn test_schema_state_current_on_freshly_opened_db() {
 }
 
 #[test]
-fn test_schema_state_empty_when_no_sessions_table() {
+fn a_database_without_a_sessions_table_has_an_empty_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Empty);
 }
 
 #[test]
-fn test_schema_state_stale_when_sessions_only() {
+fn a_database_with_only_a_sessions_table_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = Connection::open(tmp.path()).unwrap();
     conn.execute_batch(&format!("CREATE TABLE sessions ({SESSIONS_FULL});"))
@@ -469,7 +470,7 @@ fn test_schema_state_stale_when_sessions_only() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_messages_vocab() {
+fn an_index_without_its_vocabulary_table_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(tmp.path(), SESSIONS_FULL, FTS_TOKENIZER, QA_FULL, VEC_FULL);
     let conn = Connection::open(tmp.path()).unwrap();
@@ -478,7 +479,7 @@ fn test_schema_state_stale_missing_messages_vocab() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_session_type() {
+fn an_index_whose_sessions_lack_a_type_column_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -492,7 +493,7 @@ fn test_schema_state_stale_missing_session_type() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_sub_idx() {
+fn an_index_whose_embeddings_lack_a_sub_index_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -506,7 +507,7 @@ fn test_schema_state_stale_missing_sub_idx() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_src_rowid() {
+fn an_index_whose_chunks_lack_a_message_range_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -520,7 +521,7 @@ fn test_schema_state_stale_missing_src_rowid() {
 }
 
 #[test]
-fn test_schema_state_stale_with_chunk_hash() {
+fn an_index_whose_chunks_still_carry_a_hash_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -534,7 +535,7 @@ fn test_schema_state_stale_with_chunk_hash() {
 }
 
 #[test]
-fn test_schema_state_stale_non_trigram_tokenizer() {
+fn an_index_tokenized_without_trigrams_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(tmp.path(), SESSIONS_FULL, "unicode61", QA_FULL, VEC_FULL);
     let conn = Connection::open(tmp.path()).unwrap();
@@ -552,7 +553,7 @@ fn test_stale_wal_note_immutable_nonempty_wal_is_some() {
 }
 
 #[test]
-fn test_stale_wal_note_direct_is_none() {
+fn a_read_that_sees_the_write_ahead_log_gets_no_stale_snapshot_note() {
     let tmp = NamedTempFile::new().unwrap();
     let wal = wal_path(tmp.path());
     fs::write(&wal, b"uncommitted").unwrap();
@@ -565,7 +566,7 @@ fn test_stale_wal_note_direct_is_none() {
 }
 
 #[test]
-fn test_stale_wal_note_absent_or_empty_wal_is_none() {
+fn a_read_from_the_last_checkpoint_gets_no_note_when_the_write_ahead_log_is_missing_or_empty() {
     let tmp = NamedTempFile::new().unwrap();
     assert!(stale_wal_note(tmp.path(), OpenTier::Immutable).is_none());
     let wal = wal_path(tmp.path());
@@ -577,8 +578,7 @@ fn test_stale_wal_note_absent_or_empty_wal_is_none() {
 
 #[cfg(unix)]
 #[test]
-fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_index_実行案内を含まずコピーベース手順を含む()
- {
+fn stale_snapshot_note_in_a_read_only_directory_asks_to_index_a_copy_with_its_sidecar_files() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -619,7 +619,7 @@ fn writable_dir_immutable_tier_非空_wal_で_stale_wal_note_は従来文言を�
 }
 
 #[test]
-fn test_open_db_readonly_writable_dir_is_direct_and_read_only() {
+fn a_read_only_open_in_a_writable_directory_opens_the_live_database_and_rejects_writes() {
     let tmp = NamedTempFile::new().unwrap();
     {
         let conn = open_db(tmp.path()).unwrap();
@@ -688,7 +688,7 @@ fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
 }
 
 #[test]
-fn test_open_db_readonly_missing_file_in_writable_dir_errors() {
+fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let missing = dir.path().join("nope.db");
     assert!(
@@ -699,7 +699,7 @@ fn test_open_db_readonly_missing_file_in_writable_dir_errors() {
 
 #[cfg(unix)]
 #[test]
-fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
+fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -871,8 +871,7 @@ fn attach_readonly_wal_only_db() -> ReadOnlyMount {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn open_db_readonly_on_a_read_only_mount_without_shm_falls_back_to_the_immutable_tier_and_reads_sqlite_master_successfully()
- {
+fn a_database_on_a_read_only_mount_without_a_shared_memory_file_opens_from_its_last_checkpoint() {
     let mount = attach_readonly_wal_only_db();
 
     let (conn, tier) = open_db_readonly(&mount.db_path())
@@ -924,7 +923,7 @@ mod root_skip;
 
 #[cfg(unix)]
 #[test]
-fn skip_if_root_は_create_成功時に_probe_を消し_write_bits_を_0o755_へ復元して_true_を返す() {
+fn root_check_on_a_writable_directory_reports_root_and_restores_the_directory() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -971,7 +970,7 @@ fn skip_if_root_は_0o555_dir_で_create_失敗なら_probe_を残さず_false_�
 #[cfg(unix)]
 #[test]
 #[should_panic(expected = "-shm sidecar")]
-fn assert_copy_based_remedy_は_shm_言及を欠く_note_を拒否する() {
+fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
     root_skip::assert_copy_based_remedy(
         "read-only open cannot see uncommitted changes in the write-ahead log; \
          the directory is read-only, so copy the DB together with its `-wal` \
@@ -984,7 +983,7 @@ fn assert_copy_based_remedy_は_shm_言及を欠く_note_を拒否する() {
 #[cfg(unix)]
 #[test]
 #[should_panic(expected = "cannot run a bare")]
-fn assert_copy_based_remedy_は_裸の_recall_index_案内を含む_note_を拒否する() {
+fn copy_remedy_check_rejects_a_note_that_also_offers_a_bare_recall_index() {
     root_skip::assert_copy_based_remedy(
         "read-only open cannot see uncommitted changes in the write-ahead log; \
          copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
@@ -996,18 +995,19 @@ fn assert_copy_based_remedy_は_裸の_recall_index_案内を含む_note_を拒�
 
 #[cfg(unix)]
 #[test]
-fn canary_は非_root_で_green_root_では_panic_してスイートを赤化する() {
+fn the_unit_suite_fails_when_run_as_root() {
     root_skip::assert_root_canary();
 }
 
 #[cfg(unix)]
 #[test]
-fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
+fn db_tests_spell_the_root_probe_file_only_through_skip_if_root() {
     root_skip::assert_probe_literal_not_inlined(include_str!("tests.rs"), "src/db/tests.rs");
 }
 
 #[test]
-fn generation_upgrade_preserves_embeddings_and_reopen_keeps_generation_identity() {
+fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_later_insert_a_new_generation()
+ {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
