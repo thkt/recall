@@ -756,6 +756,11 @@ fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
             ],
         })
     );
+    assert_eq!(
+        host.probes.get(),
+        2,
+        "the model is probed again after the download"
+    );
 }
 
 #[test]
@@ -971,8 +976,7 @@ fn verbose_doctor_of_a_healthy_index_prints_the_database_path() {
 #[test]
 fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_index_check() {
     let db_dir = tempfile::TempDir::new().unwrap();
-    let db_path = db_dir.path().join("recall.db");
-    drop(rusqlite::Connection::open(&db_path).unwrap());
+    let db_path = bare_empty_db(db_dir.path());
 
     let out = FakeHost::healthy()
         .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
@@ -1167,13 +1171,6 @@ fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
     assert_eq!(host.probes.get(), 2, "doctor runs the probe every time");
 }
 
-/// The number of sessions the index at `db_path` holds.
-fn stored_session_count(db_path: &Path) -> i64 {
-    let (conn, _) = db::open_db_readonly(db_path).unwrap();
-    conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap()
-}
-
 /// The rows `sql` reads from the index at `db_path`, each built by `row`.
 fn stored_rows<T>(
     db_path: &Path,
@@ -1303,7 +1300,11 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
             "notes": ["schema: run `recall rebuild`"],
         })
     );
-    assert_eq!(stored_session_count(&db_path), 1);
+    assert_eq!(
+        stored_rows(&db_path, "SELECT session_id FROM sessions", |r| r
+            .get::<_, String>(0)),
+        ["s1"]
+    );
 }
 
 #[test]
