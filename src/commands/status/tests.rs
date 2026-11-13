@@ -1,49 +1,55 @@
-use crate::tests::{bare_empty_db, payload_keys};
+use crate::tests::{bare_empty_db, payload_keys, printed_envelope};
 use crate::{embedder, open_or_create_db};
 
 use super::*;
 
 #[test]
-fn run_status_counts_distinct_embedded_chunks_not_subembedding_rows() {
+fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
     db::seed_session(&conn, "s1");
     db::seed_chunk(&conn, 1, "one chunk, two sub-embeddings");
-    let emb = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
-    for sub_idx in 0..2 {
-        conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, ?2)",
-            rusqlite::params![embedder::f32_as_bytes(&emb), sub_idx],
-        )
-        .unwrap();
-    }
+    let embedding = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0), (?1, 1, 1)",
+        [embedder::f32_as_bytes(&embedding)],
+    )
+    .unwrap();
     drop(conn);
 
-    let out = run_status(false, &Some(db_path)).unwrap();
+    let out = run_status_with(false, &Some(db_path), || true).unwrap();
 
     assert_eq!(
-        out.data["embedded"], 1,
-        "one qa_chunk with two sub-embedding rows is one embedded chunk, not two"
+        out.markdown,
+        "Sessions: 1\nQA chunks: 1\nEmbedded: 1/1\nModel: ready\n"
     );
-    assert_eq!(out.data["qa_chunks"], 1);
-    assert!(
-        out.markdown.contains("Embedded: 1/1"),
-        "human output must not overstate coverage past the qa_chunks total, got: {}",
-        out.markdown
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "embedded": 1, "model_ready": true, "qa_chunks": 1, "sessions": 1 },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
 #[test]
-fn run_status_does_not_create_db_when_absent() {
+fn status_without_a_database_reports_zero_counts_and_does_not_create_it() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("missing.db");
 
-    let out = run_status(false, &Some(db_path.clone())).unwrap();
+    let out = run_status_with(false, &Some(db_path.clone()), || true).unwrap();
 
-    assert_eq!(out.data["sessions"], 0);
-    assert_eq!(out.data["qa_chunks"], 0);
-    assert_eq!(out.data["embedded"], 0);
+    assert_eq!(out.markdown, "");
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "embedded": 0, "model_ready": true, "qa_chunks": 0, "sessions": 0 },
+            "degraded": false,
+            "notes": [],
+        })
+    );
     assert!(
         !db_path.exists(),
         "status must not create the database while reporting"
@@ -51,23 +57,33 @@ fn run_status_does_not_create_db_when_absent() {
 }
 
 #[test]
-fn run_status_on_existing_empty_db_reports_zero_counts() {
+fn status_of_a_table_less_file_reports_zero_counts_and_a_missing_model_without_degrading() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
 
-    let out = run_status(false, &Some(db_path)).unwrap();
+    let out = run_status_with(false, &Some(db_path), || false).unwrap();
 
-    assert_eq!(out.data["sessions"], 0);
-    assert_eq!(out.data["qa_chunks"], 0);
-    assert_eq!(out.data["embedded"], 0);
+    assert_eq!(
+        out.markdown,
+        "Sessions: 0\nQA chunks: 0\nEmbedded: 0/0\nModel: not installed (run `recall model download`)\n"
+    );
+    // DR 0001: status reports a missing model on stdout without degrading or adding a note.
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "embedded": 0, "model_ready": false, "qa_chunks": 0, "sessions": 0 },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }
 
 #[test]
-fn freeze_status_payload_key_set_both_branches() {
+fn freeze_status_payload_key_set() {
     let frozen = ["embedded", "model_ready", "qa_chunks", "sessions"];
 
     let missing = tempfile::TempDir::new().unwrap();
-    let no_db = run_status(false, &Some(missing.path().join("absent.db"))).unwrap();
+    let no_db = run_status_with(false, &Some(missing.path().join("absent.db")), || true).unwrap();
     assert_eq!(
         payload_keys(&no_db.data),
         frozen,
@@ -80,7 +96,7 @@ fn freeze_status_payload_key_set_both_branches() {
         let conn = open_or_create_db(&db_path).unwrap();
         db::seed_session(&conn, "s1");
     }
-    let with_db = run_status(false, &Some(db_path)).unwrap();
+    let with_db = run_status_with(false, &Some(db_path), || true).unwrap();
     assert_eq!(
         payload_keys(&with_db.data),
         frozen,

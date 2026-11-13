@@ -10,9 +10,20 @@ use crate::runtime::info as cli_info;
 use crate::{db, require_current_schema, resolve_db_path};
 
 pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
+    run_status_with(verbose, db_path, || {
+        cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false)
+    })
+}
+
+/// Takes only whether the model is ready, so status never starts the probe or loads the model.
+pub(crate) fn run_status_with(
+    verbose: bool,
+    db_path: &Option<PathBuf>,
+    model_ready: impl FnOnce() -> bool,
+) -> Result<CommandOutput> {
     let path = resolve_db_path(db_path)?;
 
-    let model_ok = cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false);
+    let model_ok = model_ready();
 
     if !path.exists() {
         cli_info(&format!("database not found at {}", path.display()));

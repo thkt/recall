@@ -5,7 +5,7 @@ use std::fs;
 use super::*;
 use crate::commands::search::{SearchArgs, run_search_with};
 use crate::commands::show::{DEFAULT_WINDOW, run_show};
-use crate::commands::status::run_status;
+use crate::commands::status::run_status_with;
 
 #[cfg(unix)]
 #[test]
@@ -433,7 +433,7 @@ fn read_commands_use_pre_generation_index_without_migrating_it() {
     drop(conn);
 
     let db_path = Some(path.clone());
-    let status = run_status(false, &db_path).unwrap();
+    let status = run_status_with(false, &db_path, || true).unwrap();
     assert_eq!(status.data["sessions"], 1);
     assert_eq!(status.data["qa_chunks"], 1);
     assert_eq!(status.data["embedded"], 1);
@@ -459,6 +459,19 @@ fn read_commands_use_pre_generation_index_without_migrating_it() {
         .query_row("SELECT embedding FROM vec_chunks", [], |r| r.get(0))
         .unwrap();
     assert_eq!(saved, embedder::f32_as_bytes(&vector));
+}
+
+/// The `--json` envelope a command prints for an output.
+pub(crate) fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
+    serde_json::from_str(&render_json_success(out)).unwrap()
+}
+
+/// What a failing command reports: its exit code and the `--json` error envelope.
+pub(crate) fn reported(err: &anyhow::Error) -> (ExitCode, String) {
+    (
+        classify_exit_code(err),
+        render_json_error(&error_envelope(err)),
+    )
 }
 
 pub(crate) fn payload_keys(v: &serde_json::Value) -> Vec<String> {
