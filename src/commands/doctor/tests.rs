@@ -1479,3 +1479,55 @@ fn doctor_fix_of_an_index_built_for_another_model_leaves_a_missing_model_uninsta
         })
     );
 }
+
+#[test]
+fn doctor_fix_of_a_database_file_it_cannot_open_still_installs_a_missing_model() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    fs::write(&db_path, b"this is not a sqlite database").unwrap();
+    let host = FakeHost {
+        artifacts: Cell::new(CachedArtifacts::NotInstalled),
+        ..FakeHost::healthy()
+    };
+
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                host.install();
+                Ok(())
+            })
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "Recovered model\n",
+            "  integrity [FAIL] cannot open database: file is not a database -> remove the database file and run `recall index`\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    {
+                        "detail": "cannot open database: file is not a database",
+                        "name": "integrity",
+                        "ok": false,
+                        "remedy": "remove the database file and run `recall index`",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": true,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["integrity: remove the database file and run `recall index`"],
+        })
+    );
+}
