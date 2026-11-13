@@ -1116,7 +1116,8 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
     conn.execute_batch(
         "DROP TABLE messages_vocab;
          DROP TABLE messages;
-         CREATE VIRTUAL TABLE messages USING fts5(session_id UNINDEXED, role, text, tokenize='unicode61');",
+         CREATE VIRTUAL TABLE messages USING fts5(session_id UNINDEXED, role, text, tokenize='unicode61');
+         CREATE VIRTUAL TABLE messages_vocab USING fts5vocab(messages, row);",
     )
     .unwrap();
     drop(conn);
