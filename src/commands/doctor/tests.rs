@@ -1210,3 +1210,68 @@ fn doctor_fix_that_cannot_write_the_index_is_degraded_and_says_why() {
         })
     );
 }
+
+#[test]
+fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
+        rusqlite::params![embedder::f32_as_bytes(&orphan)],
+    )
+    .unwrap();
+    conn.execute("DROP TABLE embedding_identity", []).unwrap();
+    drop(conn);
+
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [FAIL] 1 embedding(s) reference a missing chunk -> recall doctor --fix\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    {
+                        "detail": "1 embedding(s) reference a missing chunk",
+                        "name": "orphan_embeddings",
+                        "ok": false,
+                        "remedy": "recall doctor --fix",
+                    },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "select the matching --model-manifest and index, or build this model in a separate --db-path",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": [
+                "orphan_embeddings: recall doctor --fix",
+                "model: select the matching --model-manifest and index, or build this model in a separate --db-path",
+            ],
+        })
+    );
+}
