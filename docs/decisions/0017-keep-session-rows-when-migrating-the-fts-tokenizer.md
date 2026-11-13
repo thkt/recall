@@ -29,7 +29,7 @@ When `open_db` met a `messages` table built with an older tokenizer, `migrate_ft
 
 Chosen option: "Copy every row into a new table", because it is the only option that loses no session text: the full-text table stores each message's text, so the new tokenizer can index it again without the session logs.
 
-`migrate_fts_if_needed` takes the write lock with an immediate transaction and checks the tokenizer inside it, as the other migrations in src/db.rs do, so an opener that waited for the lock finds the table already migrated. It then creates the table under a temporary name from the same definition `create_schema` uses (`messages_table_sql`), copies `rowid, session_id, role, text` into it, drops `messages_vocab` and the old `messages`, and renames the new table to `messages`. `create_schema` recreates `messages_vocab` afterwards. `sessions`, `qa_chunks` and `vec_chunks` are not touched. Before the copy it prints a one-line notice with the number of messages.
+`migrate_fts_if_needed` takes the write lock with an immediate transaction and checks the tokenizer inside it, as the `parse_diagnostics`, `file_size` and `qa_chunk_generation` migrations do, so an opener that waited for the lock finds the table already migrated. It then creates the table under a temporary name from the same definition `create_schema` uses (`messages_table_sql`), copies `rowid, session_id, role, text` into it, drops `messages_vocab` and the old `messages`, and renames the new table to `messages`. `create_schema` recreates `messages_vocab` afterwards. `sessions`, `qa_chunks` and `vec_chunks` are not touched. Before the copy it prints a one-line notice.
 
 ### Consequences
 
@@ -38,6 +38,8 @@ Chosen option: "Copy every row into a new table", because it is the only option 
 - Bad, because a kept session from an index older than 3e3eab0 (2026-03-14) keeps the text that parser stored, including the `system-reminder` and `command-name` tags the noise filter now drops, and its old chunks keep their content without rowid ranges (search falls back to `instr`). This lasts until the root returns: then the session is parsed again, or deleted if its log is gone
 - Bad, because the copy holds the write lock for the whole retokenize: 7.7 s for 100,000 synthetic messages of about 500 characters with the sqlite3 CLI, so a larger index approaches the 30 s `busy_timeout` of a concurrent `SessionEnd` hook
 - Bad, because the file grows during the copy (114 MB to 479 MB in that measurement); SQLite reuses the freed pages later and never shrinks the file on its own
+- Bad, because the copy can fail where the deletion could not, for example on a full disk; the transaction then rolls back, and every later writer open tries the copy again and fails the same way until space is freed
+- Bad, because the migrations after this one now meet the old `qa_chunks` and `vec_chunks` that the deletion used to drop first. Several of them check the table shape outside the write lock, so two writers opening the same old index at once can make one fail its open (its next open succeeds), and `migrate_vec_chunks_if_needed` still prints its "embeddings schema changed" warning for an old `vec_chunks`
 
 ### Confirmation
 
@@ -98,7 +100,7 @@ Challenge (2026-11-13): Conditional GO. It holds while the migration checks the 
 
 ### Trade-offs
 
-Both migrations are followed by the same full parse of the sessions whose logs are present. The copy adds the write lock held for the retokenize (7.7 s per 100,000 messages in the measurement) and keeps the sessions of a missing root, which the deletion lost. Openers that wait for the lock re-check the tokenizer inside their own immediate transaction and skip the copy; one whose wait passes the 30 s `busy_timeout` fails that run, and its next run finds the migrated table. In WAL mode the copy is written to the `-wal` file first, so disk use peaks at about the old database plus the new table.
+Both migrations are followed by the same full parse of the sessions whose logs are present. The copy adds the write lock held for the retokenize (7.7 s per 100,000 messages in the measurement) and keeps the sessions of a missing root, which the deletion lost. Openers that wait for the lock re-check the tokenizer inside their own immediate transaction and skip the copy; one whose wait passes the 30 s `busy_timeout` fails that run, and its next run finds the migrated table. In WAL mode the copy is written to the `-wal` file first, and that file is not truncated after a checkpoint, so disk use can peak above the old database plus the new table.
 
 ### Reassessment Triggers
 
