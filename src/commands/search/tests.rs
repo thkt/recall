@@ -274,8 +274,8 @@ fn search_strips_control_characters_from_the_printed_excerpt() {
             "\n",
         )
     );
-    // The --json excerpt still carries the raw control characters; that gap
-    // is tracked apart from this test, so the comparison leaves it out.
+    // The --json excerpt still carries the raw control characters (#426), so
+    // the comparison leaves it out.
     let mut envelope = printed_envelope(&out);
     envelope["data"]["results"][0]
         .as_object_mut()
