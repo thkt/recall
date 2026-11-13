@@ -216,7 +216,8 @@ pub(crate) fn run_doctor(
     })
 }
 
-/// Picks the always-probe loader; the model host is the only injected model input.
+/// Diagnoses the index at `db_path` against `host`, always probing the model (DR 0013). Under
+/// `--fix`, `recover_model` stands for the model download.
 fn run_doctor_in<R>(
     verbose: bool,
     fix: bool,
