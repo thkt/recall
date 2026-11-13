@@ -176,7 +176,7 @@ enum ModelRecovery {
 }
 
 fn check_model_with_optional_recovery<F, R>(
-    fix: bool,
+    recover: bool,
     load_embedder: F,
     recover_model: R,
 ) -> (DoctorCheck, ModelRecovery)
@@ -185,7 +185,7 @@ where
     R: FnOnce() -> Result<(), RecallError>,
 {
     let initial = check_model(&load_embedder);
-    if !fix || initial.is_fully_usable() {
+    if !recover || initial.is_fully_usable() {
         return (initial, ModelRecovery::Skipped);
     }
     match recover_model() {
