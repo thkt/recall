@@ -20,28 +20,20 @@ fn write_show_header(
     verbose: bool,
     extra: &[String],
 ) -> fmt::Result {
-    writeln!(buf, "# {}", ansi::strip_control_chars(&session.slug))?;
-    writeln!(
-        buf,
-        "- session_id: {}",
-        ansi::strip_control_chars(&session.session_id)
-    )?;
+    let slug = ansi::strip_control_chars(&session.slug);
+    let session_id = ansi::strip_control_chars(&session.session_id);
+    let project = ansi::strip_control_chars(&session.project);
+    writeln!(buf, "# {slug}")?;
+    writeln!(buf, "- session_id: {session_id}")?;
     writeln!(buf, "- date: {}", format_timestamp(session.timestamp))?;
-    writeln!(
-        buf,
-        "- project: {}",
-        ansi::strip_control_chars(&session.project)
-    )?;
+    writeln!(buf, "- project: {project}")?;
     writeln!(buf, "- source: {}", session.source)?;
     for line in extra {
         writeln!(buf, "{line}")?;
     }
     if verbose {
-        writeln!(
-            buf,
-            "- file: {}",
-            ansi::strip_control_chars(&session.file_path)
-        )?;
+        let file = ansi::strip_control_chars(&session.file_path);
+        writeln!(buf, "- file: {file}")?;
     }
     writeln!(buf)
 }
