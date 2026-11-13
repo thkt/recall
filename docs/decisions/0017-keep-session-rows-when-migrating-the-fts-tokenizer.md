@@ -29,7 +29,7 @@ When `open_db` met a `messages` table built with an older tokenizer, `migrate_ft
 
 Chosen option: "Copy every row into a new table", because it is the only option that loses no session text: the full-text table stores each message's text, so the new tokenizer can index it again without the session logs.
 
-`migrate_fts_if_needed` takes the write lock with an immediate transaction and checks the tokenizer inside it, as the `parse_diagnostics`, `file_size` and `qa_chunk_generation` migrations do, so an opener that waited for the lock finds the table already migrated. It then creates the table under a temporary name from the same definition `create_schema` uses (`messages_table_sql`), copies `rowid, session_id, role, text` into it, drops `messages_vocab` and the old `messages`, and renames the new table to `messages`. `create_schema` recreates `messages_vocab` afterwards. `sessions`, `qa_chunks` and `vec_chunks` are not touched. Before the copy it prints a one-line notice.
+`migrate_fts_if_needed` takes the write lock with an immediate transaction and checks the tokenizer inside it, as the `parse_diagnostics`, `file_size` and `qa_chunk_generation` migrations do, so an opener that waited for the lock finds the table already migrated. It then creates the table under a temporary name from the same definition `create_schema` uses (`messages_table_sql`), copies `rowid, session_id, role, text` of every message that belongs to a session into it, drops `messages_vocab` and the old `messages`, renames the new table to `messages`, and recreates `messages_vocab`, all in the same transaction, so a later migration that fails leaves a consistent table. `sessions`, `qa_chunks` and `vec_chunks` are not touched. Before the copy it prints a one-line notice.
 
 ### Consequences
 
@@ -94,7 +94,7 @@ This decision supersedes, in DR 0007, the Decision Driver that lets a worst-case
 
 Only some indexes reach this migration. The tokenizer became `trigram` in d1d2172 (2026-03-24). Since da5a4c0 (2026-10-16), `open_or_create_db` runs `check_index` before `open_db` and refuses a legacy index that holds vectors. The migration therefore runs only on an index built before 2026-03-24 that never stored an embedding and that no writer has opened since: an earlier `recall index` already ran the deleting migration on it.
 
-Issue #437; the measurement used a synthetic database in a scratch directory.
+Issue #437.
 
 Challenge (2026-11-13): Conditional GO. It holds while the migration checks the tokenizer inside an immediate transaction and this record states that the copy keeps only the sessions whose logs are missing. Both critic-design passes returned "weakened"; their corrections are in the sections above.
 

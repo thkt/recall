@@ -180,6 +180,10 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// The vocabulary view over `messages` that `schema_state` requires.
+const MESSAGES_VOCAB_SQL: &str =
+    "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);";
+
 /// The full-text table of message text under `name`; `create_schema` and the tokenizer migration
 /// both build it from here.
 fn messages_table_sql(name: &str) -> String {
@@ -260,9 +264,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         );"
     ))?;
 
-    conn.execute_batch(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);",
-    )?;
+    conn.execute_batch(MESSAGES_VOCAB_SQL)?;
 
     migrate_chunks_indexed_if_needed(conn)?;
 
@@ -449,10 +451,12 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
             "DROP TABLE IF EXISTS messages_retokenized;
              {}
              INSERT INTO messages_retokenized (rowid, session_id, role, text)
-                 SELECT rowid, session_id, role, text FROM messages;
+                 SELECT rowid, session_id, role, text FROM messages
+                 WHERE session_id IN (SELECT session_id FROM sessions);
              DROP TABLE IF EXISTS messages_vocab;
              DROP TABLE messages;
-             ALTER TABLE messages_retokenized RENAME TO messages;",
+             ALTER TABLE messages_retokenized RENAME TO messages;
+             {MESSAGES_VOCAB_SQL}",
             messages_table_sql("messages_retokenized")
         ))?;
     }

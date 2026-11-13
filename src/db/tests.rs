@@ -188,11 +188,13 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
     let tmp = NamedTempFile::new().unwrap();
     create_old_schema_db(tmp.path());
     // Rowids with gaps, as deleted sessions leave them; chunks find their messages by rowid.
+    // Rowid 9 belongs to no session, so the copy leaves it behind.
     Connection::open(tmp.path())
         .unwrap()
         .execute_batch(
             "INSERT INTO messages (rowid, session_id, role, text)
-                 VALUES (3, 's1', 'assistant', 'help is here'), (7, 's1', 'user', 'thanks');",
+                 VALUES (3, 's1', 'assistant', 'help is here'), (7, 's1', 'user', 'thanks'),
+                        (9, 'gone', 'user', 'a message whose session row is gone');",
         )
         .unwrap();
 
