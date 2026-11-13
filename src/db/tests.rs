@@ -183,61 +183,91 @@ fn create_old_schema_db(path: &Path) {
 }
 
 #[test]
-fn test_fts_migration_rebuilds_on_schema_change() {
+fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_keeps_its_sessions()
+{
     let tmp = NamedTempFile::new().unwrap();
     create_old_schema_db(tmp.path());
 
     let conn = open_db(tmp.path()).unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 0);
-
-    let sql: String = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='messages'",
+    assert_eq!(
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
             [],
-            |r| r.get(0),
+            |r| r.get::<_, String>(0)
         )
-        .unwrap();
-    assert!(sql.contains(FTS_TOKENIZER));
+        .unwrap(),
+        format!(
+            "CREATE VIRTUAL TABLE \"messages\" USING fts5(\n            session_id UNINDEXED,\n            role,\n            text,\n            tokenize='{FTS_TOKENIZER}'\n        )"
+        )
+    );
+    assert_eq!(
+        conn.prepare("SELECT session_id, slug FROM sessions")
+            .unwrap()
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+        [("s1".to_owned(), "slug".to_owned())]
+    );
+    assert_eq!(
+        conn.prepare(
+            "SELECT rowid, session_id, role, text FROM messages WHERE messages MATCH 'hel'"
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>(),
+        [(1, "s1".to_owned(), "user".to_owned(), "hello".to_owned())]
+    );
 }
 
 #[test]
-fn test_fts_migration_cascades_to_embedding_tables() {
+fn opening_the_oldest_index_shape_keeps_its_chunks_and_reaches_the_current_schema() {
     let tmp = NamedTempFile::new().unwrap();
     create_old_schema_db(tmp.path());
-
-    let conn = Connection::open(tmp.path()).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE qa_chunks (
-                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
-                user_text TEXT NOT NULL, assistant_text TEXT,
-                content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
-            );",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO qa_chunks VALUES (1, 's1', 'q', 'a', 'content', 0, 'hash1')",
-        [],
-    )
-    .unwrap();
-    drop(conn);
+    Connection::open(tmp.path())
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE qa_chunks (
+                 id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+                 user_text TEXT NOT NULL, assistant_text TEXT,
+                 content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
+             );
+             INSERT INTO qa_chunks VALUES (1, 's1', 'q', 'a', 'content', 0, 'hash1');",
+        )
+        .unwrap();
 
     let conn = open_db(tmp.path()).unwrap();
 
-    let sessions: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(sessions, 0, "sessions should be cleared by migration");
-
-    let chunks: i64 = conn
-        .query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))
-        .unwrap();
+    assert!(matches!(schema_state(&conn), Ok(SchemaState::Current)));
     assert_eq!(
-        chunks, 0,
-        "qa_chunks should be cleared by migration cascade"
+        conn.prepare("SELECT id, session_id, content FROM qa_chunks")
+            .unwrap()
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+        [(1, "s1".to_owned(), "content".to_owned())]
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
     );
 }
 
