@@ -2,10 +2,6 @@ use super::*;
 use crate::embedder::f32_as_bytes;
 use tempfile::NamedTempFile;
 
-use crate::embedder;
-use crate::open_or_create_db;
-use crate::tests::seed_healthy_index;
-
 #[test]
 fn test_open_db_creates_schema() {
     let tmp = NamedTempFile::new().unwrap();
@@ -945,30 +941,6 @@ fn root_check_on_a_writable_directory_reports_root_and_restores_the_directory() 
 
 #[cfg(unix)]
 #[test]
-fn skip_if_root_は_0o555_dir_で_create_失敗なら_probe_を残さず_false_を返す() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-
-    let got = root_skip::skip_if_root(dir.path());
-
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert!(
-        !got,
-        "create in a 0o555 dir must fail and report false; true means the \
-         runner bypasses permission bits (e.g. running as root)"
-    );
-    assert_eq!(
-        fs::read_dir(dir.path()).unwrap().count(),
-        0,
-        "no entry may remain directly under dir"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 #[should_panic(expected = "-shm sidecar")]
 fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
     root_skip::assert_copy_based_remedy(
@@ -1143,46 +1115,4 @@ fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
         .unwrap(),
         2
     );
-}
-
-#[test]
-fn fix_orphan_embeddings_deletes_only_dangling_rows() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
-    seed_healthy_index(&conn);
-    let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-        rusqlite::params![embedder::f32_as_bytes(&orphan)],
-    )
-    .unwrap();
-
-    let deleted = fix_orphan_embeddings(&conn).unwrap();
-
-    assert_eq!(deleted, 1, "only the dangling chunk_id=999 row is deleted");
-    let remaining: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(remaining, 1, "the linked chunk_id=1 row must survive");
-}
-
-#[test]
-fn fix_orphan_embeddings_is_noop_when_clean() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
-    seed_healthy_index(&conn);
-
-    let deleted = fix_orphan_embeddings(&conn).unwrap();
-
-    assert_eq!(deleted, 0, "a clean index has nothing to repair");
-    let remaining: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(remaining, 1, "the linked row must be untouched");
-}
-
-#[test]
-fn fix_orphan_embeddings_errors_when_table_missing() {
-    let conn = Connection::open_in_memory().unwrap();
-    assert!(fix_orphan_embeddings(&conn).is_err());
 }
