@@ -152,6 +152,14 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(digest_hex(&h.finalize()))
 }
 pub fn cache_dir() -> PathBuf {
+    // A unit test that reaches the host's cache hashes the real model and starts the probe from
+    // the unit-test binary (#427). The ignored public-model test stages its model there instead.
+    #[cfg(test)]
+    assert!(
+        env::var_os("RECALL_MODEL_DIR").is_some(),
+        "a unit test reached the host's model cache; pass the command a FakeHost or a readiness \
+         closure, or stage a model with RECALL_MODEL_DIR"
+    );
     cache::cache_dir("recall", selected())
 }
 pub struct VerifiedArtifacts {

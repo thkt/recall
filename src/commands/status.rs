@@ -16,7 +16,7 @@ pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<Com
 }
 
 /// Takes only whether the model is ready, so status never starts the probe or loads the model.
-fn run_status_with(
+pub(crate) fn run_status_with(
     verbose: bool,
     db_path: &Option<PathBuf>,
     model_ready: impl FnOnce() -> bool,
