@@ -12,6 +12,20 @@ use super::*;
 /// The markdown of a text-only search for "authentication" in the index of "authentication flow".
 const AUTHENTICATION_FLOW_MATCH_MARKDOWN: &str = "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n";
 
+/// The `--json` results of the same search.
+fn authentication_flow_match_results() -> serde_json::Value {
+    serde_json::json!([{
+        "chunk": null,
+        "excerpt": "**authentication** flow",
+        "inspect": "recall show s1",
+        "project": "/p",
+        "session_id": "s1",
+        "slug": "slug",
+        "source": "claude",
+        "timestamp": 0,
+    }])
+}
+
 /// An index whose only session, `s1`, holds one user message.
 fn index_with_one_message(dir: &Path, text: &str) -> PathBuf {
     let db_path = dir.join("recall.db");
@@ -39,18 +53,7 @@ fn search_without_the_model_installed_returns_text_matches_and_says_how_to_downl
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({
-            "data": {
-                "results": [{
-                    "chunk": null,
-                    "excerpt": "**authentication** flow",
-                    "inspect": "recall show s1",
-                    "project": "/p",
-                    "session_id": "s1",
-                    "slug": "slug",
-                    "source": "claude",
-                    "timestamp": 0,
-                }],
-            },
+            "data": { "results": authentication_flow_match_results() },
             "degraded": true,
             "notes": ["semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search"],
         })
@@ -71,18 +74,7 @@ fn search_whose_model_fails_to_load_returns_text_matches_with_an_unavailable_not
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({
-            "data": {
-                "results": [{
-                    "chunk": null,
-                    "excerpt": "**authentication** flow",
-                    "inspect": "recall show s1",
-                    "project": "/p",
-                    "session_id": "s1",
-                    "slug": "slug",
-                    "source": "claude",
-                    "timestamp": 0,
-                }],
-            },
+            "data": { "results": authentication_flow_match_results() },
             "degraded": true,
             "notes": ["semantic search unavailable: embedding model unavailable; results from text search only"],
         })
@@ -431,15 +423,8 @@ fn search_by_file_without_a_query_lists_its_session_without_loading_the_model() 
     let out = run_search_with(
         SearchArgs {
             query: None,
-            project: None,
-            days: None,
-            source: None,
             file: Some("/proj/a.rs".to_owned()),
-            limit: 10,
-            exclude_current: false,
-            include_current: false,
-            only_current: false,
-            include_automated: false,
+            ..search_command("")
         },
         &Some(db_path),
         no_load,
