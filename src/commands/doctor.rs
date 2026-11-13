@@ -268,21 +268,23 @@ where
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
     let mut wal_note: Option<String> = None;
-    let mut checks = match db::open_db_readonly(&path) {
+    let (mut checks, identity_error) = match db::open_db_readonly(&path) {
         Ok((conn, tier)) => {
             wal_note = db::stale_wal_note(&path, tier);
-            match db::schema_state(&conn) {
+            let identity = model::check_index(&conn, model::selected());
+            let checks = match db::schema_state(&conn) {
                 Ok(db::SchemaState::Current) => {
                     // An index built for another model, or a legacy one kept for rollback, stays
                     // unwritten.
-                    if fix && model::check_index(&conn, model::selected()).is_ok() {
+                    if fix && identity.is_ok() {
                         repairs = Some(vec![RepairOutcome {
                             name: "orphan_embeddings",
                             result: db::open_existing_db(&path)
                                 .and_then(|writer| fix_orphan_embeddings(&writer)),
                         }]);
                     }
-                    // Each check reads in a new transaction, so it sees the repair.
+                    // Each check reads in a new transaction and sees the repair. An index opened
+                    // immutable sits in a read-only directory, where the repair fails instead.
                     db_checks(&conn)
                 }
                 Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
@@ -292,15 +294,14 @@ where
                 )],
                 Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
-            }
+            };
+            (checks, identity.err())
         }
-        Err(e) => open_failure_checks(e),
+        Err(e) => (open_failure_checks(e), None),
     };
     let (mut model_check, model_recovery) =
         check_model_with_optional_recovery(fix, load_embedder, recover_model);
-    if let Ok((conn, _)) = db::open_db_readonly(&path)
-        && let Err(error) = model::check_index(&conn, model::selected())
-    {
+    if let Some(error) = identity_error {
         model_check = DoctorCheck::fail("model", error.to_string(), MODEL_INDEX_REMEDY);
     }
     checks.push(model_check);
