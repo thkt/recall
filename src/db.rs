@@ -447,11 +447,13 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Opens an existing index for writing. Unlike `open_db`, it never creates the file, migrates the
-/// schema, changes the journal mode or binds a model identity.
+/// Opens an existing index for writing with the flags `open_db` uses, minus CREATE. Unlike
+/// `open_db`, it never creates the file, migrates the schema, changes the journal mode or binds a
+/// model identity.
 pub(crate) fn open_existing_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec()?;
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut flags = OpenFlags::default();
+    flags.remove(OpenFlags::SQLITE_OPEN_CREATE);
     let conn = Connection::open_with_flags(path, flags)?;
     conn.busy_timeout(Duration::from_secs(30))?;
     Ok(conn)
