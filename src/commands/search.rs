@@ -277,16 +277,16 @@ fn extract_parent_session(file_path: &str) -> Option<&str> {
 fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> fmt::Result {
     let s = &r.session;
     let date = format_timestamp(s.timestamp);
-    let proj_name = if s.project.is_empty() {
+    let slug = ansi::strip_control_chars(&s.slug);
+    let project = ansi::strip_control_chars(&s.project);
+    let proj_name = if project.is_empty() {
         "unknown"
     } else {
-        Path::new(&s.project)
+        Path::new(project.as_ref())
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
     };
-    let slug = ansi::strip_control_chars(&s.slug);
-    let project = ansi::strip_control_chars(&s.project);
     writeln!(
         w,
         "[{}] {} | {} | {} [{}]",
