@@ -90,6 +90,11 @@ fn probe_distinguishes_success_unavailable_failure_and_reaps_timeouts() {
     );
 }
 #[test]
+#[should_panic(expected = "a unit test reached the host's model cache")]
+fn a_unit_test_that_reads_the_model_cache_without_a_staged_model_fails() {
+    let _ = cached_artifacts();
+}
+#[test]
 #[ignore = "requires explicitly staged public model artifacts"]
 fn public_model_contract_cache_and_loader() {
     assert!(env::var_os("RECALL_MODEL_DIR").is_some());
