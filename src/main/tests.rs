@@ -466,6 +466,14 @@ pub(crate) fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
     serde_json::from_str(&render_json_success(out)).unwrap()
 }
 
+/// What a failing command reports: its exit code and the `--json` error envelope.
+pub(crate) fn reported(err: &anyhow::Error) -> (ExitCode, String) {
+    (
+        classify_exit_code(err),
+        render_json_error(&error_envelope(err)),
+    )
+}
+
 pub(crate) fn payload_keys(v: &serde_json::Value) -> Vec<String> {
     let mut keys: Vec<String> = v
         .as_object()

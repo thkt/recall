@@ -1,13 +1,5 @@
 use super::*;
-use crate::envelope::render_json_error;
-
-/// What a failing command reports: its exit code and the `--json` error envelope.
-fn reported(err: &anyhow::Error) -> (ExitCode, String) {
-    (
-        classify_exit_code(err),
-        render_json_error(&error_envelope(err)),
-    )
-}
+use crate::tests::reported;
 
 #[test]
 fn a_usage_error_exits_64_and_points_at_the_help() {

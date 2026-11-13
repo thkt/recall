@@ -1,19 +1,9 @@
 use std::process::ExitCode;
 
-use crate::envelope::render_json_error;
-use crate::error::{classify_exit_code, error_envelope};
 use crate::open_or_create_db;
-use crate::tests::{bare_empty_db, printed_envelope};
+use crate::tests::{bare_empty_db, printed_envelope, reported};
 
 use super::*;
-
-/// What a failing `recall show` reports: its exit code and the `--json` error envelope.
-fn reported(err: &anyhow::Error) -> (ExitCode, String) {
-    (
-        classify_exit_code(err),
-        render_json_error(&error_envelope(err)),
-    )
-}
 
 /// An index where abc-123 holds a user and an assistant message and abc-456 shares its prefix.
 fn setup_show_db() -> (tempfile::TempDir, PathBuf) {
