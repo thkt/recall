@@ -437,17 +437,17 @@ fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
 
 /// Moves a `messages` table built with an older tokenizer onto `FTS_TOKENIZER` by copying every
 /// row, rowid included, into a new table. Sessions, chunks and the chunks' message rowid ranges
-/// (DR 0005) stay, so no session is lost and nothing needs indexing again.
+/// (DR 0005) stay, so the sessions of a missing or unreadable root are not lost (DR 0017).
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     // Checked inside the write lock, so an opener that waited for it sees the table migrated.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_def(&tx, "messages")?.is_some_and(|sql| !sql.contains(FTS_TOKENIZER)) {
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
         info(&format!(
-            "recall: moving {count} message(s) onto the {FTS_TOKENIZER} tokenizer; this runs once"
+            "recall: rebuilding the full-text index for the {FTS_TOKENIZER} tokenizer; sessions are kept"
         ));
         tx.execute_batch(&format!(
-            "{}
+            "DROP TABLE IF EXISTS messages_retokenized;
+             {}
              INSERT INTO messages_retokenized (rowid, session_id, role, text)
                  SELECT rowid, session_id, role, text FROM messages;
              DROP TABLE IF EXISTS messages_vocab;

@@ -187,20 +187,17 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
 {
     let tmp = NamedTempFile::new().unwrap();
     create_old_schema_db(tmp.path());
+    // Rowids with gaps, as deleted sessions leave them; chunks find their messages by rowid.
+    Connection::open(tmp.path())
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO messages (rowid, session_id, role, text)
+                 VALUES (3, 's1', 'assistant', 'help is here'), (7, 's1', 'user', 'thanks');",
+        )
+        .unwrap();
 
     let conn = open_db(tmp.path()).unwrap();
 
-    assert_eq!(
-        conn.query_row(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
-            [],
-            |r| r.get::<_, String>(0)
-        )
-        .unwrap(),
-        format!(
-            "CREATE VIRTUAL TABLE \"messages\" USING fts5(\n            session_id UNINDEXED,\n            role,\n            text,\n            tokenize='{FTS_TOKENIZER}'\n        )"
-        )
-    );
     assert_eq!(
         conn.prepare("SELECT session_id, slug FROM sessions")
             .unwrap()
@@ -210,9 +207,10 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
             .collect::<Vec<_>>(),
         [("s1".to_owned(), "slug".to_owned())]
     );
+    // A trigram index matches a word's inner three letters; the older tokenizers do not.
     assert_eq!(
         conn.prepare(
-            "SELECT rowid, session_id, role, text FROM messages WHERE messages MATCH 'hel'"
+            "SELECT rowid, role, text FROM messages WHERE messages MATCH 'hel' ORDER BY rowid"
         )
         .unwrap()
         .query_map([], |r| {
@@ -220,13 +218,38 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
             ))
         })
         .unwrap()
         .map(Result::unwrap)
         .collect::<Vec<_>>(),
-        [(1, "s1".to_owned(), "user".to_owned(), "hello".to_owned())]
+        [
+            (1, "user".to_owned(), "hello".to_owned()),
+            (3, "assistant".to_owned(), "help is here".to_owned()),
+        ]
+    );
+    assert_eq!(
+        conn.prepare("SELECT rowid FROM messages ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>(),
+        [1, 3, 7]
+    );
+    let schema_version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    let reopened = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        reopened
+            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        schema_version,
+        "a second open must not migrate the table again"
     );
 }
 
