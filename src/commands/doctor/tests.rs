@@ -123,21 +123,45 @@ fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
     .unwrap();
     drop(conn);
 
-    let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-    assert_eq!(out.data["healthy"], false);
-    assert!(out.degraded);
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "orphan_embeddings")
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), host, no_recover)
+        })
         .unwrap();
-    assert_eq!(check["ok"], false);
-    assert!(
-        out.notes.iter().any(|n| n.contains("recall doctor --fix")),
-        "remedy note must point at the --fix repair, got: {:?}",
-        out.notes
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [FAIL] 1 embedding(s) reference a missing chunk -> recall doctor --fix\n",
+            "  orphan_chunks [ok]\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    {
+                        "detail": "1 embedding(s) reference a missing chunk",
+                        "name": "orphan_embeddings",
+                        "ok": false,
+                        "remedy": "recall doctor --fix",
+                    },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["orphan_embeddings: recall doctor --fix"],
+        })
     );
 }
 
@@ -351,16 +375,46 @@ fn doctor_flags_orphan_chunk_referencing_missing_session() {
     .unwrap();
     drop(conn);
 
-    let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-    let check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "orphan_chunks")
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), host, no_recover)
+        })
         .unwrap();
-    assert_eq!(check["ok"], false);
-    assert_eq!(out.data["healthy"], false);
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [FAIL] 1 chunk(s) reference a missing session -> recall rebuild\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    {
+                        "detail": "1 chunk(s) reference a missing session",
+                        "name": "orphan_chunks",
+                        "ok": false,
+                        "remedy": "recall rebuild",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["orphan_chunks: recall rebuild"],
+        })
+    );
 }
 
 #[test]
@@ -806,34 +860,34 @@ fn doctor_without_fix_leaves_model_recovered_null() {
 fn doctor_reports_unhealthy_and_does_not_create_db_when_absent() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("missing.db");
+    let host = FakeHost::healthy();
 
-    let out = run_doctor_with(
-        false,
-        false,
-        &Some(db_path.clone()),
-        mock_loader,
-        no_recover,
-    )
-    .unwrap();
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), model_host, no_recover)
+        })
+        .unwrap();
 
-    assert_eq!(out.data["healthy"], false);
-    assert!(out.degraded);
-    assert!(
-        out.data
-            .get("repaired")
-            .is_some_and(serde_json::Value::is_null),
-        "got: {:?}",
-        out.data
-    );
-    assert!(
-        out.notes.iter().any(|n| n.contains("recall index")),
-        "got: {:?}",
-        out.notes
+    assert_eq!(out.markdown, "");
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["no index: run `recall index`"],
+        })
     );
     assert!(
         !db_path.exists(),
         "doctor must not create the database while diagnosing"
     );
+    assert_eq!(host.probes.get(), 0, "a missing index loads no model");
 }
 
 #[test]
@@ -842,28 +896,41 @@ fn doctor_reports_unhealthy_on_unopenable_database() {
     let db_path = db_dir.path().join("recall.db");
     fs::write(&db_path, b"this is not a sqlite database").unwrap();
 
-    let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
-
-    assert_eq!(out.data["healthy"], false);
-    assert!(out.degraded);
-    let integrity = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "integrity")
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), host, no_recover)
+        })
         .unwrap();
-    assert_eq!(integrity["ok"], false);
-    assert!(
-        integrity["detail"]
-            .as_str()
-            .unwrap()
-            .contains("cannot open database"),
-        "got: {integrity}"
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  integrity [FAIL] cannot open database: file is not a database -> remove the database file and run `recall index`\n",
+            "  model [ok]\n",
+        )
     );
-    assert!(
-        out.notes.iter().any(|n| n.contains("recall index")),
-        "remedy must point at re-indexing a removed DB, got: {:?}",
-        out.notes
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    {
+                        "detail": "cannot open database: file is not a database",
+                        "name": "integrity",
+                        "ok": false,
+                        "remedy": "remove the database file and run `recall index`",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["integrity: remove the database file and run `recall index`"],
+        })
     );
 }
 
@@ -945,11 +1012,38 @@ fn verbose_doctor_of_a_healthy_index_prints_the_database_path() {
         })
         .unwrap();
 
-    assert!(out.data["healthy"].is_boolean(), "got: {}", out.data);
-    assert!(
-        out.markdown.contains(&db_path.display().to_string()),
-        "verbose output must show the DB path, got: {}",
-        out.markdown
+    assert_eq!(
+        out.markdown,
+        format!(
+            concat!(
+                "Health: healthy\n",
+                "  integrity [ok]\n",
+                "  orphan_embeddings [ok]\n",
+                "  orphan_chunks [ok]\n",
+                "  model [ok]\n",
+                "DB: {}\n",
+            ),
+            db_path.display()
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": true,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": false,
+            "notes": [],
+        })
     );
 }
 
@@ -965,20 +1059,30 @@ fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_inde
         })
         .unwrap();
 
-    assert_eq!(
-        out.data["healthy"], false,
-        "never-indexed DB must be unhealthy, got: {}",
-        out.data
+    let detail = format!(
+        "no index: database has never been indexed; recall cannot confirm this file ({}) was created by recall — verify the path if this is unexpected",
+        db_path.display()
     );
-    let index_check = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "index");
-    assert!(
-        index_check.is_some_and(|c| c["ok"] == false),
-        "expected a failing `index` check, got: {}",
-        out.data
+    assert_eq!(
+        out.markdown,
+        format!("Health: degraded\n  index [FAIL] {detail} -> run `recall index`\n  model [ok]\n")
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": detail, "name": "index", "ok": false, "remedy": "run `recall index`" },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["index: run `recall index`"],
+        })
     );
 }
 
@@ -994,20 +1098,42 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
         .unwrap();
     }
 
-    let out = run_doctor_with(false, false, &Some(db_path), mock_loader, no_recover).unwrap();
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
 
-    let schema = out.data["checks"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["name"] == "schema")
-        .unwrap_or_else(|| panic!("expected a `schema` check, got: {}", out.data));
-    assert_eq!(schema["ok"], false);
-    assert!(
-        schema["detail"].as_str().unwrap().contains("out of date"),
-        "got: {schema}"
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  schema [FAIL] database schema is out of date -> run `recall rebuild`\n",
+            "  model [ok]\n",
+        )
     );
-    assert_eq!(out.data["healthy"], false);
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    {
+                        "detail": "database schema is out of date",
+                        "name": "schema",
+                        "ok": false,
+                        "remedy": "run `recall rebuild`",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["schema: run `recall rebuild`"],
+        })
+    );
 }
 
 #[test]
