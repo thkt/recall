@@ -665,28 +665,19 @@ fn stale_snapshot_note_in_a_writable_directory_with_a_leftover_write_probe_file_
 #[test]
 fn a_read_only_open_in_a_writable_directory_opens_the_live_database_and_rejects_writes() {
     let tmp = NamedTempFile::new().unwrap();
-    {
-        let conn = open_db(tmp.path()).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
-    }
+    drop(open_db(tmp.path()).unwrap());
 
     let (conn, tier) = open_db_readonly(tmp.path()).unwrap();
-    assert_eq!(
-        tier,
-        OpenTier::Direct,
-        "writable dir must select Direct tier"
-    );
-
-    let err = conn
+    let error = conn
         .execute("CREATE TABLE probe_write (x INTEGER)", [])
-        .expect_err("read-only connection must reject a write");
-    let rusqlite::Error::SqliteFailure(inner, _) = &err else {
-        panic!("expected a SqliteFailure, got {err:?}");
-    };
+        .unwrap_err();
+
     assert_eq!(
-        inner.code,
-        rusqlite::ErrorCode::ReadOnly,
-        "write must fail with SQLITE_READONLY, got {err:?}"
+        (tier, error.to_string()),
+        (
+            OpenTier::Direct,
+            "attempt to write a readonly database".to_owned()
+        )
     );
 }
 
@@ -735,9 +726,15 @@ fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
 fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let missing = dir.path().join("nope.db");
-    assert!(
-        open_db_readonly(&missing).is_err(),
-        "a missing DB in a writable dir must error, not silently open"
+
+    let error = open_db_readonly(&missing).err().unwrap();
+
+    assert_eq!(
+        (error.to_string(), file_names(dir.path())),
+        (
+            format!("unable to open database file: {}", missing.display()),
+            Vec::<String>::new()
+        )
     );
 }
 
@@ -756,16 +753,45 @@ fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails() {
 
     let result = open_db_readonly(&missing);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        result.is_err(),
-        "a missing DB in a read-only dir errors even after the immutable fallback"
+
+    // The URI in the error shows the open fell back to reading from the last checkpoint.
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        format!(
+            "unable to open database file: file:{}?immutable=1",
+            missing.display()
+        )
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn test_encode_uri_path_escapes_reserved_bytes() {
-    let encoded = encode_uri_path(Path::new("/a b/c?d.db"));
-    assert_eq!(encoded, "/a%20b/c%3Fd.db");
+fn a_database_in_a_read_only_directory_whose_path_has_a_space_and_a_question_mark_opens_from_its_last_checkpoint()
+ {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::TempDir::new().unwrap();
+    let dir = root.path().join("a b?c");
+    fs::create_dir(&dir).unwrap();
+    let db = dir.join("recall.db");
+    seed_session(&open_db(&db).unwrap(), "s1");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    if root_skip::skip_if_root(&dir) {
+        return;
+    }
+
+    let opened = open_db_readonly(&db);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (conn, tier) = opened.unwrap();
+    assert_eq!(
+        (
+            tier,
+            collect_strings(&conn, "SELECT session_id FROM sessions")
+        ),
+        (OpenTier::Immutable, vec!["s1".to_owned()])
+    );
 }
 
 #[test]
@@ -906,14 +932,18 @@ fn stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_
 }
 
 #[test]
-fn a_missing_parent_directory_stays_classified_writable_so_the_original_error_propagates() {
+fn a_read_only_open_under_a_missing_directory_fails_without_creating_the_directory() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("nonexistent_subdir").join("recall.db");
 
-    assert!(
-        !dir_is_unwritable(&db),
-        "a missing parent directory must not be classified unwritable \
-         (the write probe's NotFound failure does not count as unwritable)"
+    let error = open_db_readonly(&db).err().unwrap();
+
+    assert_eq!(
+        (error.to_string(), file_names(dir.path())),
+        (
+            format!("unable to open database file: {}", db.display()),
+            Vec::<String>::new()
+        )
     );
 }
 
