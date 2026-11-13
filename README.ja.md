@@ -215,10 +215,10 @@ WAL 内のコミット済み変更は通常の読取り専用接続で読み、S
 
 ```sh
 recall doctor           # 壊れたインデックスを診断する。報告のみで、修復はしない
-recall doctor --fix     # 孤立した embedding も削除し、検査をやり直す
+recall doctor --fix     # 孤立した embedding の削除とモデルの復旧もして、検査をやり直す
 ```
 
-4つの検査を実行します。SQLite `quick_check`、孤立した embedding、孤立したチャンク、モデルの load-and-embed プローブです。失敗した検査ごとに対処コマンド（孤立した embedding には `recall doctor --fix`、`recall rebuild`、`recall model download`、または破損したDBを削除してからの再 `recall index`）を表示します。`--fix` は、孤立した embedding の検査が数える `vec_chunks` の行を削除し、すべての検査をやり直します。報告は修復後の状態を表します。`--json` では、修復した行数を検査ごとに `repaired` に出します（例: `{"orphan_embeddings": 3}`）。`--fix` がないときと、スキーマが古い索引や別のモデルの索引のように修復しなかったときは `null` です。`--fix` がなければ、`doctor` は報告だけをします。モデルの検査が失敗するか、モデルがないとき、`--fix` は選んだモデルもダウンロードして検証します（約 558 MB とトークナイザー）。ただし、別のモデルで作った索引のときは、そのモデルでは使えないので、ダウンロードしません。`--json` の `model_recovered` は、ダウンロードを試したときは `true` か `false`、試さなかったときは `null` です。モデル未インストールは失敗ではなく info として報告します — モデルがなくても検索はFTS5のみで動くため、インデックスは healthy のままです。`--json` では、検査か `--fix` の修復が失敗すると `degraded: true` を立て、各対処を `notes` に列挙します。
+4つの検査を実行します。SQLite `quick_check`、孤立した embedding、孤立したチャンク、モデルの load-and-embed プローブです。失敗した検査ごとに対処コマンド（孤立した embedding には `recall doctor --fix`、`recall rebuild`、`recall model download`、または破損したDBを削除してからの再 `recall index`）を表示します。`--fix` は、孤立した embedding の検査が数える `vec_chunks` の行を削除し、すべての検査をやり直します。報告は修復後の状態を表します。`--json` では、修復した行数を検査ごとに `repaired` に出します（例: `{"orphan_embeddings": 3}`）。`--fix` がないときと、スキーマが古い索引や別のモデルの索引のように修復しなかったときは `null` です。`--fix` がなければ、`doctor` は報告だけをします。索引のファイルがあり、モデルの検査が失敗するか、モデルがないとき、`--fix` は選んだモデルもダウンロードして検証します（約 558 MB とトークナイザー）。索引のモデルの identity の検査が通らないとき（別のモデルで作った索引や、identity のない古いベクトル索引）は、ダウンロードしません。`--json` の `model_recovered` は、ダウンロードを試したときは `true` か `false`、試さなかったときは `null` です。モデル未インストールは失敗ではなく info として報告します — モデルがなくても検索はFTS5のみで動くため、インデックスは healthy のままです。`--json` では、検査か `--fix` の修復が失敗すると `degraded: true` を立て、各対処を `notes` に列挙します。
 
 ### Hook
 
