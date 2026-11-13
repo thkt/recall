@@ -865,22 +865,57 @@ fn doctor_fix_failure_marks_transient_recovery_retryable() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
+    let host = FakeHost {
+        probe_result: || anyhow::bail!("isolated model probe failed"),
+        ..FakeHost::healthy()
+    };
 
-    let failing = || Err(DegradedReason::ProbeFailed);
-    let recover = || Err(RecallError::TempFailure("download interrupted".to_owned()));
-    let out = run_doctor_with(false, true, &Some(db_path), failing, recover).unwrap();
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                Err(RecallError::TempFailure("download interrupted".to_owned()))
+            })
+        })
+        .unwrap();
 
-    assert_eq!(out.data["model_recovered"], false);
-    assert_eq!(out.data["model_recovery_retryable"], true);
     assert_eq!(
-        out.data["healthy"], false,
-        "a model that stays unloadable keeps the degraded flag"
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "Model recovery failed: download interrupted\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] model not loadable: model probe failed -> recall model download\n",
+        )
     );
-    assert!(
-        out.markdown
-            .contains("Model recovery failed: download interrupted"),
-        "human output must name the recovery failure, got: {}",
-        out.markdown
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "model not loadable: model probe failed",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "recall model download",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": false,
+                "model_recovery_retryable": true,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": true,
+            "notes": [
+                "model: recall model download",
+                "fix: model: recovery failed: download interrupted",
+            ],
+        })
     );
 }
 
@@ -891,45 +926,55 @@ fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
     let conn = open_or_create_db(&db_path).unwrap();
     seed_healthy_index(&conn);
     drop(conn);
-
-    let calls = Cell::new(0u32);
-    let loader = || {
-        calls.set(calls.get() + 1);
-        Err(DegradedReason::ProbeFailed)
+    let host = FakeHost {
+        probe_result: || anyhow::bail!("isolated model probe failed"),
+        ..FakeHost::healthy()
     };
-    let recover = || Ok(());
-    let out = run_doctor_with(false, true, &Some(db_path), loader, recover).unwrap();
+
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || Ok(()))
+        })
+        .unwrap();
 
     assert_eq!(
-        out.data["model_recovered"], false,
-        "a re-fetch that leaves the probe failing did not recover the model"
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "Repaired orphan_embeddings: 0 row(s)\n",
+            "Model recovery failed: re-fetched model still fails its probe\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model [FAIL] model not loadable: model probe failed -> recall model download\n",
+        )
     );
     assert_eq!(
-        out.data["model_recovery_retryable"], false,
-        "a deterministic post-verify probe failure will not clear on retry"
-    );
-    assert_eq!(
-        out.data["healthy"], false,
-        "the model is still unloadable, so the index stays degraded"
-    );
-    assert_eq!(
-        calls.get(),
-        2,
-        "recovery must trigger a second, re-probe load even when it still faults"
-    );
-    assert!(
-        out.markdown
-            .contains("Model recovery failed: re-fetched model still fails its probe"),
-        "human output must name the still-faulting re-probe as a failure, got: {}",
-        out.markdown
-    );
-    assert!(
-        out.notes
-            .iter()
-            .any(|n| n
-                .contains("fix: model: recovery failed: re-fetched model still fails its probe")),
-        "the still-faulting re-probe must reach notes, got: {:?}",
-        out.notes
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "model not loadable: model probe failed",
+                        "name": "model",
+                        "ok": false,
+                        "remedy": "recall model download",
+                    },
+                ],
+                "healthy": false,
+                "model_recovered": false,
+                "model_recovery_retryable": false,
+                "repaired": { "orphan_embeddings": 0 },
+            },
+            "degraded": true,
+            "notes": [
+                "model: recall model download",
+                "fix: model: recovery failed: re-fetched model still fails its probe",
+            ],
+        })
     );
 }
 
