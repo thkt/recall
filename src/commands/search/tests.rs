@@ -266,19 +266,13 @@ fn search_strips_control_characters_from_the_printed_excerpt() {
             "\n",
         )
     );
-    // The --json excerpt still carries the raw control characters (#426), so
-    // the comparison leaves it out.
-    let mut envelope = printed_envelope(&out);
-    envelope["data"]["results"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("excerpt");
     assert_eq!(
-        envelope,
+        printed_envelope(&out),
         serde_json::json!({
             "data": {
                 "results": [{
                     "chunk": 1,
+                    "excerpt": "authentication failed at login",
                     "inspect": "recall show s1 --chunk 1 --window 3",
                     "project": "/p",
                     "session_id": "s1",

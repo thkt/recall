@@ -27,6 +27,24 @@ fn a_degraded_success_envelope_carries_its_notes() {
 }
 
 #[test]
+fn a_success_envelope_strips_control_characters_from_every_string_value_and_note() {
+    let out = CommandOutput::with_notes(
+        String::new(),
+        serde_json::json!({
+            "session": { "slug": "fix-\u{1b}[1mlogin\u{1b}[0m", "lines": ["a\u{7}", "tab\there\nnext"] },
+            "count": 2,
+        }),
+        true,
+        vec!["see /work/\u{1b}]0;PROJ\u{7}app".into()],
+    );
+
+    assert_eq!(
+        render_json_success(&out),
+        r#"{"data":{"count":2,"session":{"lines":["a","tab here\nnext"],"slug":"fix-login"}},"degraded":true,"notes":["see /work/app"]}"#
+    );
+}
+
+#[test]
 fn an_error_envelope_leaves_out_an_absent_next_step_and_empty_candidates() {
     let env = ErrorEnvelope {
         error: ErrorPayload {

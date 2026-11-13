@@ -1,5 +1,8 @@
-use serde::Serialize;
+use std::borrow::Cow;
 
+use serde::{Serialize, Serializer};
+
+use crate::ansi;
 use crate::error::ErrorCode;
 
 #[derive(Debug)]
@@ -35,11 +38,28 @@ impl CommandOutput {
     }
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct SuccessEnvelope<'a> {
-    pub data: &'a serde_json::Value,
-    pub degraded: bool,
-    pub notes: &'a [String],
+#[derive(Serialize)]
+struct SuccessEnvelope<'a> {
+    data: Stripped<'a>,
+    degraded: bool,
+    notes: Vec<Cow<'a, str>>,
+}
+
+/// Serializes a JSON value with control characters removed from every string in it. Object keys
+/// stay as they are, since the commands name them.
+struct Stripped<'a>(&'a serde_json::Value);
+
+impl Serialize for Stripped<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            serde_json::Value::String(s) => serializer.serialize_str(&ansi::strip_control_chars(s)),
+            serde_json::Value::Array(items) => serializer.collect_seq(items.iter().map(Stripped)),
+            serde_json::Value::Object(map) => {
+                serializer.collect_map(map.iter().map(|(key, value)| (key, Stripped(value))))
+            }
+            other => other.serialize(serializer),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -58,11 +78,16 @@ pub(crate) struct ErrorPayload {
     pub retryable: bool,
 }
 
+/// Session content reaches these strings, so the envelope strips every one of them (DR 0001).
 pub(crate) fn render_json_success(out: &CommandOutput) -> String {
     let env = SuccessEnvelope {
-        data: &out.data,
+        data: Stripped(&out.data),
         degraded: out.degraded,
-        notes: &out.notes,
+        notes: out
+            .notes
+            .iter()
+            .map(|note| ansi::strip_control_chars(note))
+            .collect(),
     };
     serde_json::to_string(&env).expect("SuccessEnvelope is always serializable")
 }
