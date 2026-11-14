@@ -17,6 +17,17 @@ fn test_open_db_creates_schema() {
         ),
         ["[0,0,0,0,0]"]
     );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+        ),
+        [
+            "idx_qa_chunks_session",
+            "idx_sessions_project",
+            "idx_sessions_timestamp"
+        ]
+    );
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
 }
 
@@ -794,6 +805,7 @@ fn failing_to_remove_the_write_probe_warns_with_its_path_and_the_error() {
     let dir = tempfile::TempDir::new().unwrap();
     let log = dir.path().join("log");
     let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(crate::LOG_FILTER_DEFAULT)
         .with_writer(Mutex::new(fs::File::create(&log).unwrap()))
         .with_ansi(false)
         .without_time()
