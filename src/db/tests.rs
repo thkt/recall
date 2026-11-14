@@ -961,7 +961,7 @@ mod root_skip;
 
 #[cfg(unix)]
 #[test]
-fn root_check_treats_a_directory_it_can_write_as_root_and_restores_its_mode() {
+fn root_check_treats_a_directory_it_can_write_as_root_and_sets_its_mode_to_0o755() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
