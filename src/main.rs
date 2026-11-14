@@ -59,7 +59,7 @@ struct Cli {
     #[arg(long, short, global = true)]
     verbose: bool,
 
-    /// Database file path (default: ~/.local/share/recall/recall.db, env: RECALL_DB)
+    /// Database file path (default: ~/.local/share/recall/indexes/<manifest-sha256>/recall.db, env: RECALL_DB)
     #[arg(long, env = "RECALL_DB", global = true)]
     db_path: Option<PathBuf>,
 
