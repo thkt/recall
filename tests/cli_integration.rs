@@ -1412,6 +1412,61 @@ fn text_read_commands_on_a_stale_snapshot_in_a_read_only_directory_print_the_not
 
 #[cfg(unix)]
 #[test]
+fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
+    let no_sessions = TempDir::new().unwrap();
+    assert_eq!(exit_code(recall(no_sessions.path()).arg("index")), 0);
+    let no_schema = TempDir::new().unwrap();
+    rusqlite::Connection::open(no_schema.path().join("recall.db"))
+        .unwrap()
+        .execute_batch("PRAGMA journal_mode = WAL;")
+        .unwrap();
+    let _ = fs::remove_file(no_sessions.path().join("recall.db-shm"));
+    fs::write(
+        no_sessions.path().join("recall.db-wal"),
+        b"uncheckpointed-frames",
+    )
+    .unwrap();
+    fs::write(
+        no_schema.path().join("recall.db-wal"),
+        b"uncheckpointed-frames",
+    )
+    .unwrap();
+    let _no_sessions_read_only = ReadOnlyDir::new(no_sessions.path());
+    let _no_schema_read_only = ReadOnlyDir::new(no_schema.path());
+    if root_skip::skip_if_root(no_sessions.path()) {
+        return;
+    }
+    // Every session may sit in the log this snapshot cannot read.
+    let text = (
+        Some(0),
+        String::new(),
+        format!("{NO_SESSIONS_INDEXED}note: {READ_ONLY_DIR_NOTE}\n"),
+    );
+
+    assert_eq!(
+        outcome(recall(no_sessions.path()).args(["search", "anything"])),
+        text
+    );
+    assert_eq!(
+        json_outcome(recall(no_sessions.path()).args(["search", "anything", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": []},
+                "degraded": true,
+                "notes": [READ_ONLY_DIR_NOTE],
+            }),
+            NO_SESSIONS_INDEXED.to_owned()
+        )
+    );
+    assert_eq!(
+        outcome(recall(no_schema.path()).args(["search", "anything"])),
+        text
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn cli_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {
     root_skip::assert_probe_literal_not_inlined(
         include_str!("cli_integration.rs"),

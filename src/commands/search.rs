@@ -88,9 +88,16 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
     }
 }
 
-fn search_idle_output() -> CommandOutput {
+/// `wal_note` says the sessions may sit in a write-ahead log this snapshot cannot read.
+fn search_idle_output(wal_note: Option<String>) -> CommandOutput {
     done("No sessions indexed. Run `recall index` first.");
-    CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
+    let notes: Vec<Note> = wal_note.into_iter().map(Note::new).collect();
+    CommandOutput::with_notes(
+        String::new(),
+        serde_json::json!({ "results": [] }),
+        !notes.is_empty(),
+        notes,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -177,19 +184,19 @@ where
     let path = resolve_db_path(db_path)?;
 
     if !path.exists() {
-        return Ok(search_idle_output());
+        return Ok(search_idle_output(None));
     }
 
     let (conn, tier) = db::open_db_readonly(&path)?;
+    let wal_note = db::stale_wal_note(&path, tier);
     match db::schema_state(&conn)? {
-        db::SchemaState::Empty => return Ok(search_idle_output()),
+        db::SchemaState::Empty => return Ok(search_idle_output(wal_note)),
         state => require_current_schema(state)?,
     }
-    let wal_note = db::stale_wal_note(&path, tier);
 
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     if session_count == 0 {
-        return Ok(search_idle_output());
+        return Ok(search_idle_output(wal_note));
     }
 
     let identity_error = if query.is_some() {
