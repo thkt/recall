@@ -679,18 +679,26 @@ fn stale_snapshot_note_in_a_writable_directory_with_a_leftover_write_probe_file_
 
 #[test]
 fn a_read_only_open_in_a_writable_directory_opens_the_live_database_and_rejects_writes() {
-    let tmp = NamedTempFile::new().unwrap();
-    drop(open_db(tmp.path()).unwrap());
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    // The writer stays open, so its row sits in the write-ahead log without a checkpoint.
+    let writer = open_db(&db).unwrap();
+    seed_session(&writer, "s1");
 
-    let (conn, tier) = open_db_readonly(tmp.path()).unwrap();
+    let (conn, tier) = open_db_readonly(&db).unwrap();
     let error = conn
         .execute("CREATE TABLE probe_write (x INTEGER)", [])
         .unwrap_err();
 
     assert_eq!(
-        (tier, error.to_string()),
+        (
+            tier,
+            collect_strings(&conn, "SELECT session_id FROM sessions"),
+            error.to_string()
+        ),
         (
             OpenTier::Direct,
+            vec!["s1".to_owned()],
             "attempt to write a readonly database".to_owned()
         )
     );
