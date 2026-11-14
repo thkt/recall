@@ -10,7 +10,7 @@ use crate::commands::classify::{
     open_classification_file, read_classification_origin, reclassify_sessions,
     reclassify_sessions_with, run_classify,
 };
-use crate::db::{collect_strings, setup_test_db};
+use crate::db::{CHUNK_ROWS, collect_strings, setup_test_db};
 use crate::embedder::{MockEmbedder, embed_recent_chunks};
 use crate::envelope::render_json_error;
 use crate::error::error_envelope;
@@ -28,7 +28,7 @@ fn bodies_and_vectors(conn: &Connection) -> Vec<Vec<String>> {
     [
         "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, files_scanned, chunks_indexed) FROM sessions ORDER BY session_id",
         "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
-        "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks ORDER BY id",
+        CHUNK_ROWS,
         "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
         "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
     ].iter().map(|sql| collect_strings(conn, sql)).collect()

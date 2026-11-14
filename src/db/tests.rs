@@ -193,10 +193,6 @@ fn test_session_type_migration_adds_column_preserving_rows() {
     );
 }
 
-/// Every chunk row, every column, in id order.
-const CHUNK_ROWS: &str = "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, \
-     src_rowid_hi, generation) FROM qa_chunks ORDER BY id";
-
 /// The schema version with every schema object, so a test can show that an open changed nothing.
 fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
     (
