@@ -89,6 +89,24 @@ fn help_text(db: &Path) -> String {
     )
 }
 
+/// What a `--json` run shows the user, with stdout parsed as one JSON value.
+fn json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
+    let (code, stdout, stderr) = outcome(cmd);
+    let envelope = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout should be one JSON value, got {stdout:?}: {e}"));
+    (code, envelope, stderr)
+}
+
+const NO_SESSIONS_INDEXED: &str = "No sessions indexed. Run `recall index` first.\n";
+
+/// What `status` and `doctor` print on stderr when `db` does not exist.
+fn database_not_found(db: &Path) -> String {
+    format!(
+        "database not found at {}\nrun `recall index` to create the index.\n",
+        db.display()
+    )
+}
+
 const NO_QUERY: &str = "A search query is required. Usage: recall search \"query\" or recall index";
 const ONLY_CURRENT_WITHOUT_A_SESSION_ID: &str = "error: --only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session\n";
 
@@ -155,20 +173,22 @@ fn show_without_database_exits_usage() {
 #[test]
 fn search_without_an_index_says_to_run_recall_index_and_creates_no_file() {
     let dir = TempDir::new().unwrap();
+
     assert_eq!(
-        exit_code(recall(dir.path()).args(["search", "anything"])),
-        0
+        outcome(recall(dir.path()).args(["search", "anything"])),
+        (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
     );
-    assert!(
-        !dir.path().join("recall.db").exists(),
-        "missing-DB search must not create the index file"
-    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 #[test]
 fn a_bare_word_runs_a_search_for_it() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).args(["someword"])), 0);
+
+    assert_eq!(
+        outcome(recall(dir.path()).arg("someword")),
+        (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
+    );
 }
 
 #[test]
@@ -304,18 +324,20 @@ fn status_json_emits_stats_envelope() {
 
 #[test]
 fn search_of_an_index_without_sessions_says_to_run_recall_index_in_text_and_json() {
-    let human = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(human.path()).arg("index")), 0);
-    let human_code = exit_code(recall(human.path()).args(["search", "anything"]));
+    let dir = TempDir::new().unwrap();
+    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
 
-    let json = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(json.path()).arg("index")), 0);
-    let json_code = exit_code(recall(json.path()).args(["search", "anything", "--json"]));
-
-    assert_eq!(human_code, 0, "empty-index search (human) should exit 0");
     assert_eq!(
-        json_code, human_code,
-        "--json must not change the exit code of an empty-index search"
+        outcome(recall(dir.path()).args(["search", "anything"])),
+        (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
+    );
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "anything", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({"data": {"results": []}, "degraded": false, "notes": []}),
+            NO_SESSIONS_INDEXED.to_owned()
+        )
     );
 }
 
@@ -503,30 +525,20 @@ fn doctor_json_of_an_index_without_the_model_reports_it_healthy_with_the_model_a
 #[test]
 fn status_json_without_index_reports_zero_counts() {
     let dir = TempDir::new().unwrap();
-    let hf_home = TempDir::new().unwrap();
-    let out = recall(dir.path())
-        .env("HF_HOME", hf_home.path())
-        .args(["status", "--json"])
-        .output()
-        .expect("spawn recall binary");
+
     assert_eq!(
-        out.status.code(),
-        Some(0),
-        "status --json should exit 0 without an index"
+        json_outcome(recall(dir.path()).args(["status", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"embedded": 0, "model_ready": false, "qa_chunks": 0, "sessions": 0},
+                "degraded": false,
+                "notes": [],
+            }),
+            database_not_found(&dir.path().join("recall.db"))
+        )
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
-    assert_eq!(
-        v["data"]["sessions"],
-        serde_json::json!(0),
-        "no index means zero sessions, got: {stdout}"
-    );
-    assert_eq!(
-        v["data"]["model_ready"],
-        serde_json::json!(false),
-        "an empty HF cache means the model is not installed, got: {stdout}"
-    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 fn setup_cached_default_model(root: &Path) -> PathBuf {
@@ -558,30 +570,58 @@ fn setup_cached_default_model(root: &Path) -> PathBuf {
 #[test]
 fn status_json_without_index_reports_model_ready_when_cached() {
     let dir = TempDir::new().unwrap();
-    let hf_home = TempDir::new().unwrap();
-    let manifest = setup_cached_default_model(hf_home.path());
-    let out = recall(dir.path())
-        .env("HF_HOME", hf_home.path())
-        .env("RECALL_MODEL_DIR", hf_home.path())
-        .arg("--model-manifest")
-        .arg(manifest)
-        .args(["status", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "status --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+    let model_dir = TempDir::new().unwrap();
+    let manifest = setup_cached_default_model(model_dir.path());
+
     assert_eq!(
-        v["data"]["model_ready"],
-        serde_json::json!(true),
-        "no-database branch must report the cached model as ready, got: {stdout}"
+        json_outcome(
+            recall(dir.path())
+                .env("RECALL_MODEL_DIR", model_dir.path())
+                .arg("--model-manifest")
+                .arg(manifest)
+                .args(["status", "--json"])
+        ),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"embedded": 0, "model_ready": true, "qa_chunks": 0, "sessions": 0},
+                "degraded": false,
+                "notes": [],
+            }),
+            database_not_found(&dir.path().join("recall.db"))
+        )
+    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
+}
+
+#[test]
+fn doctor_without_an_index_says_to_run_recall_index() {
+    let dir = TempDir::new().unwrap();
+    let hint = database_not_found(&dir.path().join("recall.db"));
+
+    assert_eq!(
+        outcome(recall(dir.path()).arg("doctor")),
+        (Some(0), String::new(), hint.clone())
     );
     assert_eq!(
-        v["data"]["sessions"],
-        serde_json::json!(0),
-        "status must not create the DB; counts stay zero, got: {stdout}"
+        json_outcome(recall(dir.path()).args(["doctor", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "checks": [],
+                    "healthy": false,
+                    "model_recovered": null,
+                    "model_recovery_retryable": null,
+                    "repaired": null,
+                },
+                "degraded": true,
+                "notes": ["no index: run `recall index`"],
+            }),
+            hint
+        )
     );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 fn seed_two_matching_sessions(dir: &Path) {
