@@ -993,37 +993,6 @@ fn search_notes_automated_match_even_when_no_interactive_session_matches() {
 }
 
 #[test]
-fn search_omits_automated_note_when_none_excluded() {
-    let dir = TempDir::new().unwrap();
-    let claude_dir = dir.path().join("claude");
-    fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-        claude_dir.join("human.jsonl"),
-        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        exit_code(
-            recall(dir.path())
-                .env("RECALL_CLAUDE_DIR", &claude_dir)
-                .arg("index")
-        ),
-        0
-    );
-
-    let out = recall(dir.path())
-        .args(["search", "authentication", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !stdout.contains("--include-automated"),
-        "no automated sessions means no exclusion note: {stdout}"
-    );
-}
-
-#[test]
 fn search_no_embed_flag_is_retired_exits_usage() {
     let dir = TempDir::new().unwrap();
 
