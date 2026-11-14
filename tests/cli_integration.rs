@@ -54,7 +54,7 @@ fn show_without_database_exits_usage() {
 }
 
 #[test]
-fn search_empty_index_exits_success() {
+fn search_without_an_index_says_to_run_recall_index_and_creates_no_file() {
     let dir = TempDir::new().unwrap();
     assert_eq!(
         exit_code(recall(dir.path()).args(["search", "anything"])),
@@ -67,7 +67,7 @@ fn search_empty_index_exits_success() {
 }
 
 #[test]
-fn bare_query_shorthand_expands_to_search() {
+fn a_bare_word_runs_a_search_for_it() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).args(["someword"])), 0);
 }
@@ -262,7 +262,7 @@ fn status_json_emits_stats_envelope() {
 }
 
 #[test]
-fn search_empty_index_json_exit_code_matches_human() {
+fn search_of_an_index_without_sessions_says_to_run_recall_index_in_text_and_json() {
     let human = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(human.path()).arg("index")), 0);
     let human_code = exit_code(recall(human.path()).args(["search", "anything"]));
@@ -402,7 +402,7 @@ fn rebuild_json_emits_structured_embed_summary() {
 }
 
 #[test]
-fn doctor_json_freezes_diagnostic_envelope_key_set() {
+fn doctor_json_of_an_index_without_the_model_reports_it_healthy_with_the_model_as_info() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
     let out = recall(dir.path())
@@ -1205,7 +1205,7 @@ fn show_on_an_index_from_an_older_version_asks_for_a_rebuild() {
 }
 
 #[test]
-fn show_from_a_writable_directory_reads_the_write_ahead_log_without_a_note() {
+fn show_from_a_writable_directory_adds_no_stale_snapshot_note() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
 
@@ -1227,7 +1227,7 @@ fn show_from_a_writable_directory_reads_the_write_ahead_log_without_a_note() {
 
 #[cfg(unix)]
 #[test]
-fn immutable_open_with_stale_wal_surfaces_degraded_note() {
+fn read_commands_on_a_stale_snapshot_in_a_read_only_directory_ask_to_index_a_copy() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
     let read_only = ReadOnlyDir::new(dir.path());
@@ -1308,7 +1308,7 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
 
 #[cfg(unix)]
 #[test]
-fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
+fn cli_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {
     root_skip::assert_probe_literal_not_inlined(
         include_str!("cli_integration.rs"),
         "tests/cli_integration.rs",
@@ -1317,7 +1317,7 @@ fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
 
 #[cfg(unix)]
 #[test]
-fn integration_canary_は非_root_で_green_root_では_panic_で赤化する() {
+fn the_cli_integration_suite_fails_when_run_as_root() {
     root_skip::assert_root_canary();
 }
 
