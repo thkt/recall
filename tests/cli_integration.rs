@@ -810,27 +810,29 @@ const BOTH_SEEDED_SESSIONS: &str = concat!(
     "\n",
 );
 
-/// The tracing line carries a timestamp and color codes, so tests look for its message.
-const EXCLUDE_CURRENT_HAS_NO_EFFECT: &str =
-    "--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set\n";
+/// What `recall search hello --exclude-current` prints on stderr when no session id is set.
+const EXCLUDE_CURRENT_HAS_NO_EFFECT_STDERR: &str = concat!(
+    "warning: --exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set\n",
+    model_not_installed!(),
+    "\n",
+);
 
 #[test]
 fn search_exclude_current_with_a_whitespace_only_session_id_lists_every_session_and_warns() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--exclude-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "  ")
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), BOTH_SEEDED_SESSIONS);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(EXCLUDE_CURRENT_HAS_NO_EFFECT),
-        "a whitespace-only id counts as unset, so --exclude-current warns: {stderr}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello", "--exclude-current"])
+                .env("CLAUDE_CODE_SESSION_ID", "  ")
+        ),
+        (
+            Some(0),
+            BOTH_SEEDED_SESSIONS.to_owned(),
+            EXCLUDE_CURRENT_HAS_NO_EFFECT_STDERR.to_owned()
+        )
     );
 }
 
@@ -857,17 +859,13 @@ fn search_exclude_current_without_a_session_id_lists_every_session_and_warns() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--exclude-current"])
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(0));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), BOTH_SEEDED_SESSIONS);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(EXCLUDE_CURRENT_HAS_NO_EFFECT),
-        "--exclude-current without the env must warn that it has no effect: {stderr}"
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "hello", "--exclude-current"])),
+        (
+            Some(0),
+            BOTH_SEEDED_SESSIONS.to_owned(),
+            EXCLUDE_CURRENT_HAS_NO_EFFECT_STDERR.to_owned()
+        )
     );
 }
 
