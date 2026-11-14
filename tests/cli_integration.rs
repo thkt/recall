@@ -666,30 +666,17 @@ fn search_excludes_current_session_by_env_default() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let baseline = recall(dir.path())
-        .args(["search", "hello"])
-        .output()
-        .expect("spawn recall binary");
-    let baseline_out = String::from_utf8_lossy(&baseline.stdout);
-    assert!(
-        baseline_out.contains("ID: s1") && baseline_out.contains("ID: s2"),
-        "baseline (no env) should list both sessions, got: {baseline_out}"
-    );
-
-    let out = recall(dir.path())
-        .args(["search", "hello"])
-        .env("CLAUDE_CODE_SESSION_ID", "s1")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ID: s2"),
-        "the non-current session must remain, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("ID: s1"),
-        "the invoking session (s1) must be excluded by default, got: {stdout}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello"])
+                .env("CLAUDE_CODE_SESSION_ID", "s1")
+        ),
+        (
+            Some(0),
+            S2_MATCH.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -698,16 +685,17 @@ fn search_include_current_keeps_invoking_session() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--include-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "s1")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ID: s1") && stdout.contains("ID: s2"),
-        "--include-current must keep the invoking session, got: {stdout}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello", "--include-current"])
+                .env("CLAUDE_CODE_SESSION_ID", "s1")
+        ),
+        (
+            Some(0),
+            BOTH_SEEDED_SESSIONS.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -716,20 +704,17 @@ fn search_only_current_restricts_to_invoking_session() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--only-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "s1")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ID: s1"),
-        "--only-current must keep the invoking session, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("ID: s2"),
-        "--only-current must drop other sessions, got: {stdout}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello", "--only-current"])
+                .env("CLAUDE_CODE_SESSION_ID", "s1")
+        ),
+        (
+            Some(0),
+            S1_MATCH.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -746,6 +731,18 @@ fn only_current_without_env_exits_usage() {
         )
     );
 }
+
+/// `recall search hello` when it lists only `s2` of `seed_two_matching_sessions`.
+const S2_MATCH: &str = concat!(
+    "Found 1 sessions:\n",
+    "\n",
+    "[1] 2026-03-01 | s2 | proj [claude]\n",
+    "    /proj\n",
+    "    ID: s2\n",
+    "    > hello world recall\n",
+    "    inspect: recall show s2 --chunk 2 --window 3\n",
+    "\n",
+);
 
 /// What `recall search hello` prints when it lists both sessions of `seed_two_matching_sessions`.
 const BOTH_SEEDED_SESSIONS: &str = concat!(
@@ -913,17 +910,21 @@ fn index_claude_sessions(dir: &Path, sessions: &[(&str, &[&str])]) {
     );
 }
 
-fn search_stdout(dir: &Path, args: &[&str]) -> String {
-    let out = recall(dir)
-        .arg("search")
-        .args(args)
-        .arg("--json")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+/// The `--json` row of a session whose only turn is `authentication notes` on 2026-03-01.
+fn authentication_notes_match(session_id: &str, chunk: u64) -> serde_json::Value {
+    serde_json::json!({
+        "chunk": chunk,
+        "excerpt": "authentication notes",
+        "inspect": format!("recall show {session_id} --chunk {chunk} --window 3"),
+        "project": "/proj",
+        "session_id": session_id,
+        "slug": session_id,
+        "source": "claude",
+        "timestamp": 1_772_323_200_000_i64,
+    })
 }
 
+const AUTOMATED_EXCLUDED_NOTE: &str = "1 automated session(s) matching this search were excluded by default; use --include-automated to include them";
 const AUTOMATED_OPENER: &str = r#"{"type":"user","cwd":"/other","message":{"role":"user","content":"<command-message>clear</command-message>"},"timestamp":"2026-03-01T00:00:00Z"}"#;
 const AUTOMATED_AUTH_TURN: &str = r#"{"type":"user","cwd":"/other","message":{"role":"user","content":"authentication flow review"},"timestamp":"2026-03-01T00:01:00Z"}"#;
 const HUMAN_AUTH: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#;
@@ -941,11 +942,17 @@ fn search_notes_automated_sessions_that_match_the_query() {
         ],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication"]);
-
-    assert!(
-        stdout.contains("1 automated session(s)") && stdout.contains("--include-automated"),
-        "a matching automated session must be counted in the note: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("human", 3), authentication_notes_match("human2", 4)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, AUTOMATED_EXCLUDED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -957,11 +964,17 @@ fn search_omits_automated_note_when_no_automated_session_matches_the_query() {
         &[("auto", &[AUTOMATED_OPENER]), ("human", &[HUMAN_AUTH])],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication"]);
-
-    assert!(
-        !stdout.contains("--include-automated"),
-        "an automated session that does not match the query was not excluded from it: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("human", 2)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -976,11 +989,23 @@ fn search_omits_automated_note_when_filters_exclude_the_automated_match() {
         ],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication", "--project", "/proj"]);
-
-    assert!(
-        !stdout.contains("--include-automated"),
-        "--project /proj already rules out the /other automated session: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args([
+            "search",
+            "authentication",
+            "--project",
+            "/proj",
+            "--json"
+        ])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("human", 3)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -995,11 +1020,17 @@ fn search_notes_automated_match_even_when_no_interactive_session_matches() {
         ],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication"]);
-
-    assert!(
-        stdout.contains(r#""results":[]"#) && stdout.contains("1 automated session(s)"),
-        "with no interactive hit, the note is the only pointer to the automated match: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": []},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, AUTOMATED_EXCLUDED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -1610,40 +1641,41 @@ fn recall_search_with_a_not_query_returns_only_the_sessions_without_the_excluded
         ],
     );
 
-    let out = recall(dir.path())
-        .args(["search", "authentication NOT deployment"])
-        .output()
-        .expect("spawn recall binary");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "authentication NOT deployment"])),
+        (
+            Some(0),
+            concat!(
+                "Found 1 sessions:\n",
+                "\n",
+                "[1] 2026-03-01 | wanted | proj [claude]\n",
+                "    /proj\n",
+                "    ID: wanted\n",
+                "    > authentication notes\n",
+                "    inspect: recall show wanted --chunk 3 --window 3\n",
+                "\n",
+            )
+            .to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
+    );
+}
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "{stdout}");
-    assert!(
-        stdout.contains("ID: wanted"),
-        "the session without the excluded word must be returned: {stdout}"
-    );
-    assert!(
-        !stdout.contains("ID: excluded") && !stdout.contains("ID: unrelated"),
-        "sessions with the excluded word or without the first word must be absent: {stdout}"
-    );
+const INCOMPLETE_RESULTS_NOTE: &str = "results may be incomplete: some matched sessions that could have ranked in these results were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild";
+
+fn result_ids(envelope: &serde_json::Value) -> Vec<&str> {
+    envelope["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["session_id"].as_str().unwrap())
+        .collect()
 }
 
 fn user_line(text: &str, timestamp: &str) -> String {
     format!(
         r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"{text}"}},"timestamp":"{timestamp}"}}"#
     )
-}
-
-fn search_envelope(dir: &Path, args: &[&str]) -> serde_json::Value {
-    let stdout = search_stdout(dir, args);
-    serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"))
-}
-
-fn first_session_id(envelope: &serde_json::Value) -> String {
-    envelope["data"]["results"][0]["session_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no first result in: {envelope}"))
-        .to_owned()
 }
 
 fn mark_source_unknown(dir: &Path, session_id: &str) {
@@ -1655,16 +1687,6 @@ fn mark_source_unknown(dir: &Path, session_id: &str) {
         )
         .unwrap();
     assert_eq!(changed, 1, "session {session_id} should exist in the index");
-}
-
-fn incomplete_note(envelope: &serde_json::Value) -> Option<String> {
-    envelope["notes"]
-        .as_array()
-        .unwrap_or_else(|| panic!("notes should be an array, got: {envelope}"))
-        .iter()
-        .filter_map(|n| n.as_str())
-        .find(|n| n.contains("incomplete"))
-        .map(str::to_owned)
 }
 
 #[test]
@@ -1692,23 +1714,39 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
         ],
     );
 
-    let default_limit = search_envelope(dir.path(), &["authentication"]);
-    let limit_one = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+    let (_, default_limit, _) =
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"]));
 
     assert_eq!(
-        first_session_id(&default_limit),
-        "z-newest",
-        "the recency blend should put the newest session first: {default_limit}"
+        result_ids(&default_limit),
+        ["z-newest", "a5", "a4", "a3", "a2", "a1"]
     );
     assert_eq!(
-        limit_one["data"]["results"].as_array().map(Vec::len),
-        Some(1),
-        "{limit_one}"
-    );
-    assert_eq!(
-        first_session_id(&limit_one),
-        first_session_id(&default_limit),
-        "--limit 1 must print the head of the default limit: {limit_one}"
+        json_outcome(recall(dir.path()).args([
+            "search",
+            "authentication",
+            "--limit",
+            "1",
+            "--json"
+        ])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [{
+                    "chunk": 6,
+                    "excerpt": "authentication notes",
+                    "inspect": "recall show z-newest --chunk 6 --window 3",
+                    "project": "/proj",
+                    "session_id": "z-newest",
+                    "slug": "z-newest",
+                    "source": "claude",
+                    "timestamp": 32_472_144_000_000_i64,
+                }]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -1723,13 +1761,34 @@ fn search_that_skips_only_an_unknown_source_session_outside_the_results_adds_no_
     index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
     mark_source_unknown(dir.path(), "weird");
 
-    let envelope = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+    // Its stderr holds a tracing warning with a timestamp for the skipped session.
+    let (code, envelope, _) = json_outcome(recall(dir.path()).args([
+        "search",
+        "authentication",
+        "--limit",
+        "1",
+        "--json",
+    ]));
 
-    assert_eq!(first_session_id(&envelope), "valid", "{envelope}");
     assert_eq!(
-        incomplete_note(&envelope),
-        None,
-        "a skipped session that cannot reach the results must not raise the note: {envelope}"
+        (code, envelope),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [{
+                    "chunk": 1,
+                    "excerpt": "authentication",
+                    "inspect": "recall show valid --chunk 1 --window 3",
+                    "project": "/proj",
+                    "session_id": "valid",
+                    "slug": "valid",
+                    "source": "claude",
+                    "timestamp": 1_772_323_200_000_i64,
+                }]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            })
+        )
     );
 }
 
@@ -1741,14 +1800,24 @@ fn search_that_skips_an_unknown_source_session_that_could_rank_says_so_in_the_no
     index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
     mark_source_unknown(dir.path(), "weird");
 
-    let envelope = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+    // Its stderr holds a tracing warning with a timestamp for the skipped session.
+    let (code, envelope, _) = json_outcome(recall(dir.path()).args([
+        "search",
+        "authentication",
+        "--limit",
+        "1",
+        "--json",
+    ]));
 
-    let note = incomplete_note(&envelope).unwrap_or_else(|| {
-        panic!("a skipped session that could rank must raise the note: {envelope}")
-    });
-    assert_eq!(envelope["degraded"], true, "{envelope}");
-    assert!(
-        note.contains("could have ranked"),
-        "the note must say a skipped session could have ranked in the results: {note}"
+    assert_eq!(
+        (code, envelope),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("valid", 1)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, INCOMPLETE_RESULTS_NOTE],
+            })
+        )
     );
 }
