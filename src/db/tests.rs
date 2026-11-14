@@ -436,12 +436,23 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
         ),
         Vec::<String>::new()
     );
-    let schema = schema_snapshot(&conn);
+    let stored = (
+        schema_snapshot(&conn),
+        collect_strings(&conn, CHUNK_ROWS),
+        embeddings(&conn),
+    );
     drop(conn);
 
     let reopened = open_db(tmp.path()).unwrap();
 
-    assert_eq!(schema_snapshot(&reopened), schema);
+    assert_eq!(
+        (
+            schema_snapshot(&reopened),
+            collect_strings(&reopened, CHUNK_ROWS),
+            embeddings(&reopened)
+        ),
+        stored
+    );
 }
 
 const SESSIONS_FULL: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
@@ -1025,6 +1036,17 @@ fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_l
         [&embedding],
     )
     .unwrap();
+    assert_eq!(
+        collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
+        [
+            "id",
+            "session_id",
+            "content",
+            "timestamp",
+            "src_rowid_lo",
+            "src_rowid_hi"
+        ]
+    );
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
     drop(conn);
 
