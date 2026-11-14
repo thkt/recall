@@ -8,7 +8,7 @@ use tracing::warn;
 use crate::ansi;
 use crate::commands::build_markdown;
 use crate::compat::filter::escape_like;
-use crate::envelope::CommandOutput;
+use crate::envelope::{CommandOutput, Note};
 use crate::error::RecallError;
 use crate::parser::Source;
 use crate::{db, parser};
@@ -315,7 +315,7 @@ pub(crate) fn run_show(
     match (shown, wal_note) {
         (Ok(mut out), Some(note)) => {
             out.degraded = true;
-            out.notes.push(note);
+            out.notes.push(Note::new(note));
             Ok(out)
         }
         (Ok(out), None) => Ok(out),

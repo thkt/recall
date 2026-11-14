@@ -539,7 +539,7 @@ fn emit_success_preserves_text_newlines_and_json_envelope() {
             text.to_owned(),
             serde_json::json!({"messages": [{"text": "回答\n\"引用\""}]}),
             true,
-            vec!["diagnostic\nwith \"quotes\"".to_owned()],
+            vec!["diagnostic\nwith \"quotes\"".into()],
         );
         let mut buf = Vec::new();
         assert_eq!(

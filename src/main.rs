@@ -42,7 +42,7 @@ use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand};
 use rusqlite::Connection;
 
-use crate::envelope::{CommandOutput, render_json_error, render_json_success};
+use crate::envelope::{CommandOutput, render_json_error, render_json_success, render_text_notes};
 use crate::error::{RecallError, classify_exit_code, download_error, error_envelope};
 use crate::output::{WriteOutcome, write_result};
 
@@ -266,7 +266,11 @@ fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
 }
 
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
-    emit_success_to(out, json_mode, &mut io::stdout().lock())
+    let written = emit_success_to(out, json_mode, &mut io::stdout().lock());
+    if !json_mode {
+        eprint!("{}", render_text_notes(out));
+    }
+    written
 }
 
 fn emit_success_to<W: Write>(

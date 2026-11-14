@@ -288,6 +288,19 @@ fn s1_match() -> serde_json::Value {
     })
 }
 
+/// `recall show s1` when `seed_indexed_session` indexed `s1`.
+const SHOW_S1: &str = concat!(
+    "# s1\n",
+    "- session_id: s1\n",
+    "- date: 2026-03-01\n",
+    "- project: /proj\n",
+    "- source: claude\n",
+    "\n",
+    "## [user]\n",
+    "hello world recall\n",
+    "\n",
+);
+
 /// The `--json` data of `recall show s1` when `seed_indexed_session` indexed `s1`.
 fn show_s1() -> serde_json::Value {
     serde_json::json!({
@@ -513,22 +526,7 @@ fn show_without_json_keeps_human_output() {
 
     assert_eq!(
         outcome(recall(dir.path()).args(["show", "s1"])),
-        (
-            Some(0),
-            concat!(
-                "# s1\n",
-                "- session_id: s1\n",
-                "- date: 2026-03-01\n",
-                "- project: /proj\n",
-                "- source: claude\n",
-                "\n",
-                "## [user]\n",
-                "hello world recall\n",
-                "\n",
-            )
-            .to_owned(),
-            String::new()
-        )
+        (Some(0), SHOW_S1.to_owned(), String::new())
     );
 }
 
@@ -1364,6 +1362,50 @@ fn read_commands_on_a_stale_snapshot_in_a_read_only_directory_ask_to_index_a_cop
             format!(
                 r#"{{"error":{{"code":"DATA_ERROR","message":"{READ_ONLY_DIR_NOTE}","retryable":false}}}}"#
             ) + "\n"
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn text_read_commands_on_a_stale_snapshot_in_a_read_only_directory_print_the_note_on_stderr() {
+    let dir = TempDir::new().unwrap();
+    seed_stale_wal(dir.path());
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+    let note = format!("note: {READ_ONLY_DIR_NOTE}\n");
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["show", "s1"])),
+        (Some(0), SHOW_S1.to_owned(), note.clone())
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "hello"])),
+        (
+            Some(0),
+            S1_MATCH.to_owned(),
+            format!("{MODEL_NOT_INSTALLED_STDERR}{note}")
+        )
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).arg("status")),
+        (Some(0), STATUS_OF_ONE_SESSION.to_owned(), note.clone())
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).arg("doctor")),
+        (
+            Some(0),
+            concat!(
+                "Health: healthy\n",
+                "  integrity [ok]\n",
+                "  orphan_embeddings [ok]\n",
+                "  orphan_chunks [ok]\n",
+                "  model [ok] model not installed; search runs FTS-only\n",
+            )
+            .to_owned(),
+            format!("{MODEL_NOT_INSTALLED_STDERR}{note}")
         )
     );
 }

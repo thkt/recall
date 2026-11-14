@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::commands::build_markdown;
 use crate::embedding::Embed;
-use crate::envelope::CommandOutput;
+use crate::envelope::{CommandOutput, Note};
 use crate::error::RecallError;
 use crate::model::{self, DegradedReason, EmbedderDegraded};
 use crate::parser::Source;
@@ -70,14 +70,15 @@ pub(crate) struct SearchArgs {
     pub(crate) include_automated: bool,
 }
 
-fn search_fallback_notes(reason: DegradedReason) -> Vec<String> {
+/// The loader has already printed this note on stderr, so a text run does not print it again.
+fn search_fallback_notes(reason: DegradedReason) -> Vec<Note> {
     EmbedderDegraded(reason)
         .user_note("recall model download")
-        .map(|note| vec![format!("semantic search unavailable: {note}")])
+        .map(|note| vec![Note::shown(format!("semantic search unavailable: {note}"))])
         .unwrap_or_default()
 }
 
-fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool, Vec<String>) {
+fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool, Vec<Note>) {
     match load {
         Ok(_) => (false, Vec::new()),
         Err(reason) => {
@@ -199,9 +200,9 @@ where
     let (mut degraded, mut notes, embedder) = if let Some(error) = identity_error {
         (
             true,
-            vec![format!(
+            vec![Note::new(format!(
                 "semantic search unavailable: {error}; results are text-only"
-            )],
+            ))],
             None,
         )
     } else if query.is_some() {
@@ -228,26 +229,24 @@ where
 
     if outcome.vec_degraded {
         degraded = true;
-        notes.push(
-            "semantic search unavailable: vector query failed at runtime; results are text-only"
-                .to_owned(),
-        );
+        notes.push(Note::new(
+            "semantic search unavailable: vector query failed at runtime; results are text-only",
+        ));
     }
 
     if outcome.results_incomplete {
         degraded = true;
-        notes.push(
-            "results may be incomplete: some matched sessions that could have ranked in these results were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild"
-                .to_owned(),
-        );
+        notes.push(Note::new(
+            "results may be incomplete: some matched sessions that could have ranked in these results were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild",
+        ));
     }
 
     let automated =
         search::count_excluded_automated(&conn, query.as_deref(), &options).unwrap_or(0);
     if automated > 0 {
-        notes.push(format!(
+        notes.push(Note::new(format!(
             "{automated} automated session(s) matching this search were excluded by default; use --include-automated to include them"
-        ));
+        )));
     }
 
     let markdown = render_results(&results);
@@ -257,7 +256,7 @@ where
 
     if let Some(note) = wal_note {
         degraded = true;
-        notes.push(note);
+        notes.push(Note::new(note));
     }
 
     Ok(CommandOutput::with_notes(markdown, data, degraded, notes))

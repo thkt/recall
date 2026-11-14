@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::Embed;
-use crate::envelope::CommandOutput;
+use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, DegradedReason, ModelHost, degrade_with_warn};
 use crate::runtime::{done, home_dir, info as cli_info, warning};
 use crate::{ansi, embedder, index_observer, indexer};
@@ -90,9 +90,10 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         outcome.degraded_note.is_none() || outcome.failed_count == 0,
         "model-absent and embed-stop degradation are mutually exclusive"
     );
+    // index_and_report and report_indexed_sessions print every note but the embed failure.
     let mut notes = Vec::new();
     if let Some(note) = &outcome.degraded_note {
-        notes.push(note.clone());
+        notes.push(Note::shown(note.clone()));
     }
     if outcome.failed_count > 0 {
         let raw = outcome.first_error.as_deref().unwrap_or("unknown error");
@@ -100,22 +101,23 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
             .chars()
             .take(EMBED_ERROR_NOTE_MAX_CHARS)
             .collect();
-        notes.push(format!(
+        notes.push(Note::new(format!(
             "{n} chunk(s) failed to embed ({err}); rerun `recall index` to retry",
             n = outcome.failed_count,
-        ));
+        )));
     }
     for skipped in &outcome.skipped_roots {
-        notes.push(skipped.note());
+        notes.push(Note::shown(skipped.note()));
     }
     if let Some(note) = preserved_embedded_note(outcome.preserved_embedded) {
-        notes.push(note);
+        notes.push(Note::shown(note));
     }
     notes.extend(
         outcome
             .parse_diagnostics
             .iter()
-            .flat_map(indexer::FileParseDiagnostics::notes),
+            .flat_map(indexer::FileParseDiagnostics::notes)
+            .map(Note::shown),
     );
     let degraded = !notes.is_empty();
     let skipped_roots: Vec<_> = outcome
