@@ -1101,7 +1101,7 @@ fn show_on_an_immutable_open_with_stale_wal_surfaces_degraded_note() {
         Some(1),
         "{envelope}"
     );
-    root_skip::assert_copy_based_remedy(envelope["notes"][0].as_str().unwrap(), "show");
+    assert_copy_based_remedy(envelope["notes"][0].as_str().unwrap(), "show");
 }
 
 #[cfg(unix)]
@@ -1128,7 +1128,7 @@ fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log()
         message.contains("No session found matching 's2'"),
         "{message}"
     );
-    root_skip::assert_copy_based_remedy(message, "show");
+    assert_copy_based_remedy(message, "show");
 }
 
 /// An index from before the trigram tokenizer and before embeddings: one session whose log
@@ -1274,7 +1274,7 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
     assert_eq!(error["error"]["retryable"], false);
     assert!(error["error"].get("next_step").is_none(), "{error}");
     let message = error["error"]["message"].as_str().unwrap();
-    root_skip::assert_copy_based_remedy(message, "classify");
+    assert_copy_based_remedy(message, "classify");
 
     for (name, out) in &outputs {
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1302,7 +1302,7 @@ fn immutable_open_with_stale_wal_surfaces_degraded_note() {
             .unwrap_or_else(|| {
                 panic!("{name} should carry the stale write-ahead-log note, got: {stdout}")
             });
-        root_skip::assert_copy_based_remedy(remedy, name);
+        assert_copy_based_remedy(remedy, name);
     }
 }
 
@@ -1322,10 +1322,35 @@ fn integration_canary_は非_root_で_green_root_では_panic_で赤化する() 
 }
 
 #[cfg(unix)]
+#[track_caller]
+fn assert_copy_based_remedy(note: &str, context: &str) {
+    assert!(
+        note.contains("write-ahead log"),
+        "[{context}] note must carry the write-ahead-log wording, got: {note}"
+    );
+    assert!(
+        note.contains("recall index --db-path <copy>"),
+        "[{context}] note must guide a copy-based `recall index --db-path` remedy, got: {note}"
+    );
+    assert!(
+        note.contains("-wal"),
+        "[{context}] note must name the -wal sidecar file to copy, got: {note}"
+    );
+    assert!(
+        note.contains("-shm"),
+        "[{context}] note must name the -shm sidecar file to copy, got: {note}"
+    );
+    assert!(
+        !note.contains("run `recall index`"),
+        "[{context}] a read-only location cannot run a bare `recall index`; got: {note}"
+    );
+}
+
+#[cfg(unix)]
 #[test]
 #[should_panic(expected = "-shm sidecar")]
 fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
-    root_skip::assert_copy_based_remedy(
+    assert_copy_based_remedy(
         "read-only open cannot see uncommitted changes in the write-ahead log; \
          the directory is read-only, so copy the DB together with its `-wal` \
          sidecar file elsewhere and run `recall index --db-path <copy>` to \
@@ -1338,7 +1363,7 @@ fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
 #[test]
 #[should_panic(expected = "cannot run a bare")]
 fn copy_remedy_check_rejects_a_note_that_also_offers_a_bare_recall_index() {
-    root_skip::assert_copy_based_remedy(
+    assert_copy_based_remedy(
         "read-only open cannot see uncommitted changes in the write-ahead log; \
          copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
          files elsewhere and run `recall index --db-path <copy>`, or run \

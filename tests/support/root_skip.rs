@@ -40,27 +40,3 @@ pub fn assert_probe_literal_not_inlined(source: &str, file_label: &str) {
          not duplicated inline in {file_label}"
     );
 }
-
-#[track_caller]
-pub fn assert_copy_based_remedy(note: &str, context: &str) {
-    assert!(
-        note.contains("write-ahead log"),
-        "[{context}] note must carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        note.contains("recall index --db-path <copy>"),
-        "[{context}] note must guide a copy-based `recall index --db-path` remedy, got: {note}"
-    );
-    assert!(
-        note.contains("-wal"),
-        "[{context}] note must name the -wal sidecar file to copy, got: {note}"
-    );
-    assert!(
-        note.contains("-shm"),
-        "[{context}] note must name the -shm sidecar file to copy, got: {note}"
-    );
-    assert!(
-        !note.contains("run `recall index`"),
-        "[{context}] a read-only location cannot run a bare `recall index`; got: {note}"
-    );
-}

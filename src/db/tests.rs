@@ -957,10 +957,6 @@ fn a_path_without_a_parent_component_stays_classified_writable() {
 
 #[cfg(unix)]
 #[path = "../../tests/support/root_skip.rs"]
-#[allow(
-    dead_code,
-    reason = "assert_copy_based_remedy serves the CLI tests, where its self-tests live"
-)]
 mod root_skip;
 
 #[cfg(unix)]
