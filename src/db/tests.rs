@@ -32,7 +32,7 @@ fn test_open_db_creates_schema() {
 }
 
 #[test]
-fn an_opened_database_runs_sqlite_vec_v0_1_9() {
+fn an_opened_database_runs_the_pinned_sqlite_vec() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
 
@@ -740,7 +740,8 @@ fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
 
 #[cfg(unix)]
 #[test]
-fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails() {
+fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_after_trying_the_last_checkpoint()
+ {
     use std::os::unix::fs::PermissionsExt;
 
     // A path under /tmp holds only bytes the URI keeps as they are, so the expected URI below can
@@ -968,7 +969,7 @@ mod root_skip;
 
 #[cfg(unix)]
 #[test]
-fn root_check_on_a_writable_directory_reports_root_and_restores_the_directory() {
+fn root_check_treats_a_directory_it_can_write_as_root_and_restores_its_mode() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
