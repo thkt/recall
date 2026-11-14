@@ -38,24 +38,6 @@ impl Note {
     }
 }
 
-impl From<String> for Note {
-    fn from(text: String) -> Self {
-        Self::new(text)
-    }
-}
-
-impl From<&str> for Note {
-    fn from(text: &str) -> Self {
-        Self::new(text)
-    }
-}
-
-impl Serialize for Note {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.text)
-    }
-}
-
 impl CommandOutput {
     pub(crate) fn ok(markdown: String, data: serde_json::Value) -> Self {
         Self {

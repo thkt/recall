@@ -6,6 +6,7 @@ use super::*;
 use crate::commands::search::{SearchArgs, run_search_with};
 use crate::commands::show::{DEFAULT_WINDOW, run_show};
 use crate::commands::status::run_status_with;
+use crate::envelope::Note;
 
 #[cfg(unix)]
 #[test]
@@ -539,7 +540,7 @@ fn emit_success_preserves_text_newlines_and_json_envelope() {
             text.to_owned(),
             serde_json::json!({"messages": [{"text": "回答\n\"引用\""}]}),
             true,
-            vec!["diagnostic\nwith \"quotes\"".into()],
+            vec![Note::new("diagnostic\nwith \"quotes\"")],
         );
         let mut buf = Vec::new();
         assert_eq!(
@@ -561,7 +562,7 @@ fn emit_success_preserves_text_newlines_and_json_envelope() {
         let envelope: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(
             envelope,
-            serde_json::json!({"data": out.data, "degraded": true, "notes": out.notes}),
+            serde_json::json!({"data": out.data, "degraded": true, "notes": ["diagnostic\nwith \"quotes\""]}),
         );
         assert_eq!(buf.last(), Some(&b'\n'));
     }
