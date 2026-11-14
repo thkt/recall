@@ -27,6 +27,8 @@ fn recall(dir: &Path) -> Command {
         .env_remove("__RECALL_GEMMA_PROBE")
         .env_remove("__RECALL_GEMMA_SPEC")
         .env_remove("CLAUDE_CODE_SESSION_ID")
+        // clap colours its errors and help when this is set, even into a pipe.
+        .env_remove("CLICOLOR_FORCE")
         .env_remove("RUST_LOG");
     cmd
 }
