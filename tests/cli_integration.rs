@@ -29,28 +29,121 @@ fn exit_code(cmd: &mut Command) -> i32 {
         .expect("process returned an exit code")
 }
 
+/// What a run shows the user: its exit code, stdout and stderr.
+fn outcome(cmd: &mut Command) -> (Option<i32>, String, String) {
+    let out = cmd.output().expect("spawn recall binary");
+    (
+        out.status.code(),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `recall --help`, whose `--db-path` line names the `RECALL_DB` that `recall()` sets.
+fn help_text(db: &Path) -> String {
+    format!(
+        concat!(
+            "Search past Claude Code and Codex sessions\n",
+            "\n",
+            "Usage: recall [OPTIONS] [COMMAND]\n",
+            "\n",
+            "Commands:\n",
+            "  index     Parse, chunk, and embed new session logs (incremental)\n",
+            "  rebuild   Re-parse and re-embed every present session; a missing or unreadable source root keeps its existing index\n",
+            "  model     Manage the embedding model\n",
+            "  search    Search indexed sessions (default when query is provided)\n",
+            "  show      Show full conversation of a session\n",
+            "  classify  Classify existing sessions from source provenance and their first user turn\n",
+            "  status    Show index and embedding status\n",
+            "  doctor    Diagnose a broken index: corruption, orphaned rows, and a live model load probe. Read-only by default; `--fix` repairs orphan embeddings, recovers the model, and re-runs the checks. Other remedies point at index/rebuild/model download\n",
+            "  help      Print this message or the help of the given subcommand(s)\n",
+            "\n",
+            "Options:\n",
+            "  -v, --verbose\n",
+            "          Show diagnostic output\n",
+            "      --db-path <DB_PATH>\n",
+            "          Database file path (default: ~/.local/share/recall/recall.db, env: RECALL_DB) [env: RECALL_DB={}]\n",
+            "      --model-manifest <MODEL_MANIFEST>\n",
+            "          Pinned Gemma model manifest. Select an older saved manifest to roll back [env: RECALL_MODEL_MANIFEST=]\n",
+            "      --json\n",
+            "          Emit a machine-readable JSON envelope instead of human-readable text\n",
+            "  -h, --help\n",
+            "          Print help\n",
+        ),
+        db.display()
+    )
+}
+
+const NO_QUERY: &str = "A search query is required. Usage: recall search \"query\" or recall index";
+const ONLY_CURRENT_WITHOUT_A_SESSION_ID: &str = "error: --only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session\n";
+
 #[test]
 fn unknown_flag_exits_usage() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).arg("--no-such-flag")), 64);
+
+    assert_eq!(
+        outcome(recall(dir.path()).arg("--no-such-flag")),
+        (
+            Some(64),
+            String::new(),
+            concat!(
+                "error: unexpected argument '--no-such-flag' found\n",
+                "\n",
+                "Usage: recall [OPTIONS] [COMMAND]\n",
+                "\n",
+                "For more information, try '--help'.\n",
+            )
+            .to_owned()
+        )
+    );
 }
 
 #[test]
 fn no_subcommand_exits_usage() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(&mut recall(dir.path())), 64);
+
+    assert_eq!(
+        outcome(&mut recall(dir.path())),
+        (Some(64), String::new(), format!("error: {NO_QUERY}\n"))
+    );
 }
 
 #[test]
 fn help_exits_success() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).arg("--help")), 0);
+
+    assert_eq!(
+        outcome(recall(dir.path()).arg("--help")),
+        (
+            Some(0),
+            help_text(&dir.path().join("recall.db")),
+            String::new()
+        )
+    );
 }
 
 #[test]
 fn show_without_database_exits_usage() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).args(["show", "deadbeef"])), 64);
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["show", "deadbeef"])),
+        (
+            Some(64),
+            String::new(),
+            "error: Database not found. Run `recall index` first.\n".to_owned()
+        )
+    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 #[test]
@@ -219,23 +312,18 @@ fn search_json_emits_success_envelope_with_results() {
 #[test]
 fn no_subcommand_json_emits_error_envelope_on_stderr() {
     let dir = TempDir::new().unwrap();
-    let out = recall(dir.path())
-        .arg("--json")
-        .output()
-        .expect("spawn recall binary");
+
     assert_eq!(
-        out.status.code(),
-        Some(64),
-        "missing query is a usage error (64)"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(r#""error""#) && stderr.contains(r#""code":"USAGE_ERROR""#),
-        "stderr should be a JSON error envelope with USAGE_ERROR, got: {stderr}"
-    );
-    assert!(
-        stderr.contains(r#""next_step""#),
-        "the error envelope should carry next_step guidance, got: {stderr}"
+        outcome(recall(dir.path()).arg("--json")),
+        (
+            Some(64),
+            String::new(),
+            concat!(
+                r#"{"error":{"code":"USAGE_ERROR","message":"A search query is required. Usage: recall search \"query\" or recall index","next_step":"See `recall --help`; if the index is missing, run `recall index` first.","retryable":false}}"#,
+                "\n"
+            )
+            .to_owned()
+        )
     );
 }
 
@@ -639,9 +727,14 @@ fn search_only_current_restricts_to_invoking_session() {
 #[test]
 fn only_current_without_env_exits_usage() {
     let dir = TempDir::new().unwrap();
+
     assert_eq!(
-        exit_code(recall(dir.path()).args(["search", "hello", "--only-current"])),
-        64
+        outcome(recall(dir.path()).args(["search", "hello", "--only-current"])),
+        (
+            Some(64),
+            String::new(),
+            ONLY_CURRENT_WITHOUT_A_SESSION_ID.to_owned()
+        )
     );
 }
 
@@ -701,7 +794,7 @@ fn search_only_current_with_a_whitespace_only_session_id_exits_usage() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr),
-        "error: --only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session\n"
+        ONLY_CURRENT_WITHOUT_A_SESSION_ID
     );
 }
 
@@ -935,9 +1028,23 @@ fn search_omits_automated_note_when_none_excluded() {
 #[test]
 fn search_no_embed_flag_is_retired_exits_usage() {
     let dir = TempDir::new().unwrap();
+
     assert_eq!(
-        exit_code(recall(dir.path()).args(["search", "anything", "--no-embed"])),
-        64
+        outcome(recall(dir.path()).args(["search", "anything", "--no-embed"])),
+        (
+            Some(64),
+            String::new(),
+            concat!(
+                "error: unexpected argument '--no-embed' found\n",
+                "\n",
+                "  tip: to pass '--no-embed' as a value, use '-- --no-embed'\n",
+                "\n",
+                "Usage: recall search <QUERY>\n",
+                "\n",
+                "For more information, try '--help'.\n",
+            )
+            .to_owned()
+        )
     );
 }
 
