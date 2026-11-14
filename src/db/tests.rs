@@ -717,7 +717,9 @@ fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
 fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails() {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::TempDir::new().unwrap();
+    // A path under /tmp holds only bytes the URI keeps as they are, so the expected URI below can
+    // be written from the plain path, whatever TMPDIR is.
+    let dir = tempfile::TempDir::new_in("/tmp").unwrap();
     let missing = dir.path().join("nope.db");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
