@@ -266,27 +266,37 @@ fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
 }
 
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
-    let written = emit_success_to(out, json_mode, &mut io::stdout().lock());
-    if !json_mode {
-        eprint!("{}", render_text_notes(out));
-    }
-    written
+    emit_success_to(
+        out,
+        json_mode,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
 }
 
-fn emit_success_to<W: Write>(
+/// Writes the result to `w` and, in a text run whose result was written, the notes the command
+/// has not shown to `notes`.
+fn emit_success_to<W: Write, E: Write>(
     out: &CommandOutput,
     json_mode: bool,
     w: &mut W,
+    notes: &mut E,
 ) -> io::Result<WriteOutcome> {
     let body = if json_mode {
         Cow::Owned(render_json_success(out))
     } else {
         Cow::Borrowed(out.markdown.as_str())
     };
-    if body.is_empty() {
-        return Ok(WriteOutcome::Written);
+    let written = if body.is_empty() {
+        Ok(WriteOutcome::Written)
+    } else {
+        write_result(w, &body)
+    };
+    if !json_mode && matches!(written, Ok(WriteOutcome::Written)) {
+        // A closed stderr must not fail a run whose result was written, as a closed stdout does not.
+        let _ = notes.write_all(render_text_notes(out).as_bytes());
     }
-    write_result(w, &body)
+    written
 }
 
 fn emit_error(err: &anyhow::Error, json_mode: bool) {

@@ -212,9 +212,82 @@ fn emit_success_propagates_non_pipe_write_error() {
     let out = CommandOutput::ok("hello".to_owned(), serde_json::Value::Null);
     let mut writer = FailingWriter;
 
-    let err = emit_success_to(&out, false, &mut writer).unwrap_err();
+    let err = emit_success_to(&out, false, &mut writer, &mut io::sink()).unwrap_err();
 
     assert_eq!(err.kind(), ErrorKind::Other);
+}
+
+struct ClosedPipe;
+
+impl Write for ClosedPipe {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::from(ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn result_with_notes() -> CommandOutput {
+    CommandOutput::with_notes(
+        "result\n".to_owned(),
+        serde_json::json!({}),
+        true,
+        vec![Note::shown("already printed"), Note::new("stale snapshot")],
+    )
+}
+
+#[test]
+fn a_text_run_writes_its_result_then_the_notes_it_has_not_shown() {
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+
+    let written = emit_success_to(&result_with_notes(), false, &mut stdout, &mut stderr).unwrap();
+
+    assert_eq!(
+        (
+            written,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap()
+        ),
+        (
+            WriteOutcome::Written,
+            "result\n".to_owned(),
+            "note: stale snapshot\n".to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_json_run_leaves_its_notes_in_the_envelope() {
+    let mut stderr = Vec::new();
+
+    emit_success_to(&result_with_notes(), true, &mut io::sink(), &mut stderr).unwrap();
+
+    assert_eq!(stderr, b"");
+}
+
+#[test]
+fn a_text_run_whose_stderr_is_closed_still_reports_its_result_written() {
+    let written = emit_success_to(
+        &result_with_notes(),
+        false,
+        &mut Vec::new(),
+        &mut ClosedPipe,
+    )
+    .unwrap();
+
+    assert_eq!(written, WriteOutcome::Written);
+}
+
+#[test]
+fn a_text_run_whose_stdout_is_closed_prints_no_notes() {
+    let mut stderr = Vec::new();
+
+    let written =
+        emit_success_to(&result_with_notes(), false, &mut ClosedPipe, &mut stderr).unwrap();
+
+    assert_eq!((written, stderr), (WriteOutcome::PipeClosed, Vec::new()));
 }
 
 #[test]
@@ -544,7 +617,7 @@ fn emit_success_preserves_text_newlines_and_json_envelope() {
         );
         let mut buf = Vec::new();
         assert_eq!(
-            emit_success_to(&out, false, &mut buf).unwrap(),
+            emit_success_to(&out, false, &mut buf, &mut io::sink()).unwrap(),
             WriteOutcome::Written,
         );
         let expected = if text.is_empty() || text.ends_with('\n') {
@@ -556,7 +629,7 @@ fn emit_success_preserves_text_newlines_and_json_envelope() {
 
         buf.clear();
         assert_eq!(
-            emit_success_to(&out, true, &mut buf).unwrap(),
+            emit_success_to(&out, true, &mut buf, &mut io::sink()).unwrap(),
             WriteOutcome::Written,
         );
         let envelope: serde_json::Value = serde_json::from_slice(&buf).unwrap();
