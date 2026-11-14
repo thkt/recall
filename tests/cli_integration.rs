@@ -336,14 +336,37 @@ const MODEL_NOT_INSTALLED_STDERR: &str = concat!(model_not_installed!(), "\n");
 const MODEL_NOT_INSTALLED_INDEX_NOTE: &str = model_not_installed!();
 
 /// What an `index` or `rebuild --json` run shows, without the stage timings that differ on
-/// every run. Its stderr carries those timings too, so callers check single lines of it.
+/// every run. Its stderr carries those timings too, so it can only be checked line by line.
 fn index_json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
     let (code, mut envelope, stderr) = json_outcome(cmd);
-    envelope["data"]["observations"]
+    let seconds = envelope["data"]["observations"]
         .as_object_mut()
         .and_then(|observations| observations.remove("seconds"))
         .unwrap_or_else(|| panic!("an index envelope carries its stage seconds: {envelope}"));
+    assert!(seconds["total"].is_number(), "{seconds}");
     (code, envelope, stderr)
+}
+
+/// An `index` or `rebuild --json` envelope without the model: the model note first, then
+/// `notes`.
+fn index_envelope(
+    counts: &[(&str, u64)],
+    parse_diagnostics: &serde_json::Value,
+    notes: &[String],
+) -> serde_json::Value {
+    let notes = [&[MODEL_NOT_INSTALLED_INDEX_NOTE.to_owned()], notes].concat();
+    serde_json::json!({
+        "data": {
+            "embedded": 0,
+            "failed_count": 0,
+            "observations": {"counts": index_counts(counts)},
+            "parse_diagnostics": parse_diagnostics,
+            "preserved_embedded": 0,
+            "skipped_roots": [],
+        },
+        "degraded": true,
+        "notes": notes,
+    })
 }
 
 /// The index observation counts: the ones given, and 0 for every other.
@@ -517,21 +540,7 @@ fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model() 
 
     assert_eq!(
         (code, envelope),
-        (
-            Some(0),
-            serde_json::json!({
-                "data": {
-                    "embedded": 0,
-                    "failed_count": 0,
-                    "observations": {"counts": index_counts(&[])},
-                    "parse_diagnostics": [],
-                    "preserved_embedded": 0,
-                    "skipped_roots": [],
-                },
-                "degraded": true,
-                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
-            })
-        )
+        (Some(0), index_envelope(&[], &serde_json::json!([]), &[]))
     );
     // Only a run of the binary reaches the stage lines the observer writes to stderr.
     assert!(
@@ -555,18 +564,7 @@ fn rebuild_json_reparses_an_unchanged_session_and_reports_it_unembedded() {
         (code, envelope),
         (
             Some(0),
-            serde_json::json!({
-                "data": {
-                    "embedded": 0,
-                    "failed_count": 0,
-                    "observations": {"counts": index_counts(ONE_SESSION_PARSED_AND_CHUNKED)},
-                    "parse_diagnostics": [],
-                    "preserved_embedded": 0,
-                    "skipped_roots": [],
-                },
-                "degraded": true,
-                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
-            })
+            index_envelope(ONE_SESSION_PARSED_AND_CHUNKED, &serde_json::json!([]), &[])
         )
     );
 }
@@ -1415,40 +1413,21 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         "{}: 1 incomplete final line(s), possibly still being written; wait for the next append, then rerun `recall index`; if the writer has stopped, repair the source file",
         path.display()
     );
-    let envelope = |counts: &[(&str, u64)]| {
-        serde_json::json!({
-            "data": {
-                "embedded": 0,
-                "failed_count": 0,
-                "observations": {"counts": index_counts(counts)},
-                "parse_diagnostics": [{
-                    "file_path": path.to_str().unwrap(),
-                    "incomplete_tail_lines": 1,
-                    "invalid_json_lines": 1,
-                    "invalid_utf8_lines": 1,
-                    "read_error": false,
-                    "source": "claude",
-                }],
-                "preserved_embedded": 0,
-                "skipped_roots": [],
-            },
-            "degraded": true,
-            "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE, skipped_lines, incomplete_tail],
-        })
-    };
+    let diagnostics = serde_json::json!([{
+        "file_path": path.to_str().unwrap(),
+        "incomplete_tail_lines": 1,
+        "invalid_json_lines": 1,
+        "invalid_utf8_lines": 1,
+        "read_error": false,
+        "source": "claude",
+    }]);
+    let notes = [skipped_lines.clone(), incomplete_tail.clone()];
+    // The second file, the excluded Codex log, is discovered and read as empty.
     let parsed = [
-        ("chunks_created_committed", 1),
-        ("chunks_pending_snapshot", 1),
-        ("chunks_remaining_snapshot", 1),
-        ("chunks_unattempted", 1),
-        ("files_discovered", 2),
-        ("files_empty", 1),
-        ("files_updated", 1),
-        ("files_updated_committed", 1),
-        ("sessions_chunk_pending", 1),
-        ("sessions_chunked_committed", 1),
-        ("sessions_stored", 1),
-    ];
+        ONE_SESSION_PARSED_AND_CHUNKED,
+        &[("files_discovered", 2), ("files_empty", 1)],
+    ]
+    .concat();
     let unchanged = [
         ("chunks_pending_snapshot", 1),
         ("chunks_remaining_snapshot", 1),
@@ -1460,24 +1439,33 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     ];
 
     let (code, first, first_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
-    assert_eq!((code, first), (Some(0), envelope(&parsed)));
+    assert_eq!(
+        (code, first),
+        (Some(0), index_envelope(&parsed, &diagnostics, &notes))
+    );
     let (code, second, second_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
-    assert_eq!((code, second), (Some(0), envelope(&unchanged)));
+    assert_eq!(
+        (code, second),
+        (Some(0), index_envelope(&unchanged, &diagnostics, &notes))
+    );
     let (code, rebuilt, rebuilt_stderr) = index_json_outcome(&mut run(&["rebuild", "--json"]));
-    assert_eq!((code, rebuilt), (Some(0), envelope(&parsed)));
+    assert_eq!(
+        (code, rebuilt),
+        (Some(0), index_envelope(&parsed, &diagnostics, &notes))
+    );
     let (code, stdout, stderr) = outcome(&mut run(&["index"]));
     assert_eq!((code, stdout), (Some(0), String::new()));
     // Stage timings fill the rest of stderr, so these lines are checked one by one.
     assert!(
-        stderr.contains("1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
+        stderr.contains("\n1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
         "{stderr}"
     );
     assert!(
-        stderr.contains(&format!("warning: {skipped_lines}\n")),
+        stderr.contains(&format!("\nwarning: {skipped_lines}\n")),
         "{stderr}"
     );
     assert!(
-        stderr.contains(&format!("warning: {incomplete_tail}\n")),
+        stderr.contains(&format!("\nwarning: {incomplete_tail}\n")),
         "{stderr}"
     );
     // The skipped lines hold conversation text, which no output may repeat.
@@ -1501,29 +1489,22 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         (code, repaired),
         (
             Some(0),
-            serde_json::json!({
-                "data": {
-                    "embedded": 0,
-                    "failed_count": 0,
-                    "observations": {"counts": index_counts(&[
-                        ("chunks_pending_snapshot", 1),
-                        ("chunks_reconciled_created_committed", 1),
-                        ("chunks_remaining_snapshot", 1),
-                        ("chunks_removed_committed", 1),
-                        ("chunks_unattempted", 1),
-                        ("files_discovered", 2),
-                        ("files_empty", 1),
-                        ("files_updated", 1),
-                        ("files_updated_committed", 1),
-                        ("sessions_stored", 1),
-                    ])},
-                    "parse_diagnostics": [],
-                    "preserved_embedded": 0,
-                    "skipped_roots": [],
-                },
-                "degraded": true,
-                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
-            })
+            index_envelope(
+                &[
+                    ("chunks_pending_snapshot", 1),
+                    ("chunks_reconciled_created_committed", 1),
+                    ("chunks_remaining_snapshot", 1),
+                    ("chunks_removed_committed", 1),
+                    ("chunks_unattempted", 1),
+                    ("files_discovered", 2),
+                    ("files_empty", 1),
+                    ("files_updated", 1),
+                    ("files_updated_committed", 1),
+                    ("sessions_stored", 1),
+                ],
+                &serde_json::json!([]),
+                &[]
+            )
         )
     );
     assert_eq!(
@@ -1580,52 +1561,28 @@ fn index_reports_real_file_read_failure_then_recovers() {
         (code, unreadable),
         (
             Some(0),
-            serde_json::json!({
-                "data": {
-                    "embedded": 0,
-                    "failed_count": 0,
-                    "observations": {"counts": index_counts(&[
-                        ("files_discovered", 1),
-                        ("files_failed", 1),
-                    ])},
-                    "parse_diagnostics": [{
-                        "file_path": path.to_str().unwrap(),
-                        "incomplete_tail_lines": 0,
-                        "invalid_json_lines": 0,
-                        "invalid_utf8_lines": 0,
-                        "read_error": true,
-                        "source": "claude",
-                    }],
-                    "preserved_embedded": 0,
-                    "skipped_roots": [],
-                },
-                "degraded": true,
-                "notes": [
-                    MODEL_NOT_INSTALLED_INDEX_NOTE,
-                    format!(
-                        "{}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained",
-                        path.display()
-                    ),
-                ],
-            })
+            index_envelope(
+                &[("files_discovered", 1), ("files_failed", 1)],
+                &serde_json::json!([{
+                    "file_path": path.to_str().unwrap(),
+                    "incomplete_tail_lines": 0,
+                    "invalid_json_lines": 0,
+                    "invalid_utf8_lines": 0,
+                    "read_error": true,
+                    "source": "claude",
+                }]),
+                &[format!(
+                    "{}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained",
+                    path.display()
+                )]
+            )
         )
     );
     assert_eq!(
         (recovered_code, recovered),
         (
             Some(0),
-            serde_json::json!({
-                "data": {
-                    "embedded": 0,
-                    "failed_count": 0,
-                    "observations": {"counts": index_counts(ONE_SESSION_PARSED_AND_CHUNKED)},
-                    "parse_diagnostics": [],
-                    "preserved_embedded": 0,
-                    "skipped_roots": [],
-                },
-                "degraded": true,
-                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
-            })
+            index_envelope(ONE_SESSION_PARSED_AND_CHUNKED, &serde_json::json!([]), &[])
         )
     );
 }
@@ -1778,14 +1735,12 @@ fn classify_warns_once_when_a_session_source_is_missing() {
 #[test]
 fn recall_search_with_a_not_query_returns_only_the_sessions_without_the_excluded_word() {
     let dir = TempDir::new().unwrap();
-    let turn = |text: &str| {
-        format!(
-            r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"{text}"}},"timestamp":"2026-03-01T00:00:00Z"}}"#
-        )
-    };
-    let wanted = turn("authentication notes");
-    let excluded = turn("authentication and deployment notes");
-    let unrelated = turn("checklist for release");
+    let wanted = user_line("authentication notes", "2026-03-01T00:00:00Z");
+    let excluded = user_line(
+        "authentication and deployment notes",
+        "2026-03-01T00:00:00Z",
+    );
+    let unrelated = user_line("checklist for release", "2026-03-01T00:00:00Z");
     index_claude_sessions(
         dir.path(),
         &[
@@ -1868,12 +1823,26 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
         ],
     );
 
-    let (_, default_limit, _) =
+    let (code, default_limit, stderr) =
         json_outcome(recall(dir.path()).args(["search", "authentication", "--json"]));
 
+    // a1 to a5 differ only in age, so their order shifts as they grow older; the head and the
+    // count do not.
     assert_eq!(
-        result_ids(&default_limit),
-        ["z-newest", "a5", "a4", "a3", "a2", "a1"]
+        (
+            code,
+            result_ids(&default_limit)[0],
+            result_ids(&default_limit).len(),
+            &default_limit["notes"],
+            stderr
+        ),
+        (
+            Some(0),
+            "z-newest",
+            6,
+            &serde_json::json!([MODEL_NOT_INSTALLED_NOTE]),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
     assert_eq!(
         json_outcome(recall(dir.path()).args([
