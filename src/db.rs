@@ -355,8 +355,9 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
         return Ok(());
     };
 
-    // Drops no embedding: `model::check_index` refuses an old table that holds rows before a
-    // writer opens the index.
+    // No warning: the writers open the index through `open_or_create_db`, whose
+    // `model::check_index` refuses an old table that holds rows in an index without a model
+    // identity, so the table dropped here is empty.
     if !sql.contains("sub_idx") {
         let tx = conn.transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
