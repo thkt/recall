@@ -2,25 +2,37 @@ use super::*;
 use crate::embedder::f32_as_bytes;
 use tempfile::NamedTempFile;
 
-use crate::embedder;
-use crate::open_or_create_db;
-use crate::tests::seed_healthy_index;
-
 #[test]
 fn test_open_db_creates_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
 
-    for table in ["sessions", "messages", "qa_chunks", "messages_vocab"] {
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0, "table {table} should be empty");
-    }
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(
+                 (SELECT COUNT(*) FROM sessions), (SELECT COUNT(*) FROM messages),
+                 (SELECT COUNT(*) FROM qa_chunks), (SELECT COUNT(*) FROM vec_chunks),
+                 (SELECT COUNT(*) FROM messages_vocab))"
+        ),
+        ["[0,0,0,0,0]"]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+        ),
+        [
+            "idx_qa_chunks_session",
+            "idx_sessions_project",
+            "idx_sessions_timestamp"
+        ]
+    );
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
 }
 
 #[test]
-fn test_sqlite_vec_version_matches_pinned() {
+fn an_opened_database_runs_the_pinned_sqlite_vec() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
 
@@ -36,84 +48,120 @@ fn test_sqlite_vec_version_matches_pinned() {
 #[test]
 fn test_open_db_idempotent() {
     let tmp = NamedTempFile::new().unwrap();
-    let _conn1 = open_db(tmp.path()).unwrap();
-    let _conn2 = open_db(tmp.path()).unwrap();
+    let first = schema_snapshot(&open_db(tmp.path()).unwrap());
+
+    let second = schema_snapshot(&open_db(tmp.path()).unwrap());
+
+    assert_eq!(second, first);
 }
 
 #[test]
-fn chunk_completion_upgrade_is_atomic_repeatable_and_preserves_embeddings() {
+fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions()
+ {
     use crate::indexer::index_chunks;
 
     let tmp = NamedTempFile::new().unwrap();
-    create_pre_cleanup_db(tmp.path());
-    {
-        let conn = Connection::open(tmp.path()).unwrap();
-        conn.execute_batch(
-            "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
-             INSERT INTO messages (session_id, role, text) VALUES
-                 ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
-             CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE ON sessions
-             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
-        )
-        .unwrap();
-    }
+    let conn = open_db(tmp.path()).unwrap();
+    // The marker upgrade is the only one that writes chunks_indexed, so the trigger fails it alone.
+    conn.execute_batch(
+        "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
+         INSERT INTO messages (session_id, role, text) VALUES
+             ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
+         INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 's1', 'q\na', 0);
+         ALTER TABLE sessions DROP COLUMN chunks_indexed;
+         CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE OF chunks_indexed ON sessions
+         BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+        [f32_as_bytes(&[0.1f32; EMBEDDING_DIMS])],
+    )
+    .unwrap();
+    let schema = schema_snapshot(&conn);
+    drop(conn);
+
     let error = open_db(tmp.path()).err().unwrap();
-    assert!(error.to_string().contains("injected migration failure"));
-    {
-        let conn = Connection::open(tmp.path()).unwrap();
-        assert!(
-            !table_def(&conn, "sessions")
-                .unwrap()
-                .unwrap()
-                .contains("chunks_indexed")
-        );
-        conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
-            .unwrap();
-    }
-    for pass in 0..2 {
-        let mut conn = open_db(tmp.path()).unwrap();
-        let complete: i64 = conn
-            .query_row(
-                "SELECT chunks_indexed FROM sessions WHERE session_id = 's1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(complete, 1);
-        let stats = index_chunks(&mut conn).unwrap();
-        assert_eq!(stats.sessions_chunked, if pass == 0 { 2 } else { 0 });
-        assert_eq!(stats.chunks_created, if pass == 0 { 1 } else { 0 });
-        let original: (String, Option<i64>, Option<i64>) = conn
-            .query_row(
-                "SELECT content, src_rowid_lo, src_rowid_hi FROM qa_chunks WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(original, ("q\na".to_owned(), None, None));
-        let (id, embedding): (i64, Vec<u8>) = conn
-            .query_row("SELECT chunk_id, embedding FROM vec_chunks", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .unwrap();
-        assert_eq!(id, 1);
-        assert_eq!(embedding, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]));
-        let markers: Vec<(String, i64)> = conn
-            .prepare("SELECT session_id, chunks_indexed FROM sessions ORDER BY session_id")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        assert_eq!(
-            markers,
-            [
-                ("empty".to_owned(), 0),
-                ("pending".to_owned(), 0),
-                ("s1".to_owned(), 1),
-            ]
-        );
-    }
+
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(
+        (error.to_string(), schema_snapshot(&conn)),
+        ("injected migration failure".to_owned(), schema)
+    );
+    conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
+        .unwrap();
+    drop(conn);
+
+    let mut conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, chunks_indexed) FROM sessions ORDER BY session_id"
+        ),
+        [r#"["empty",null]"#, r#"["pending",null]"#, r#"["s1",1]"#]
+    );
+    let first = index_chunks(&mut conn).unwrap();
+    drop(conn);
+    let mut conn = open_db(tmp.path()).unwrap();
+    let second = index_chunks(&mut conn).unwrap();
+
+    assert_eq!(
+        [
+            (first.sessions_chunked, first.chunks_created),
+            (second.sessions_chunked, second.chunks_created),
+        ],
+        [(2, 1), (0, 0)]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, chunks_indexed) FROM sessions ORDER BY session_id"
+        ),
+        [r#"["empty",0]"#, r#"["pending",0]"#, r#"["s1",1]"#]
+    );
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","q\na",0,null,null,1]"#,
+            r#"[2,"pending","new question",null,2,2,2]"#
+        ]
+    );
+    assert_eq!(
+        embeddings(&conn),
+        [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
+    );
+}
+
+#[test]
+fn a_failed_parse_diagnostics_upgrade_leaves_the_schema_and_the_session_times_as_they_were() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    seed_session(&conn, "s1");
+    conn.execute_batch(
+        "DROP TABLE parse_diagnostics;
+         CREATE TRIGGER fail_upgrade BEFORE UPDATE OF mtime ON sessions
+         BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+    )
+    .unwrap();
+    let schema = schema_snapshot(&conn);
+    drop(conn);
+
+    let error = open_db(tmp.path()).err().unwrap();
+
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(
+        (
+            error.to_string(),
+            schema_snapshot(&conn),
+            collect_strings(&conn, "SELECT json_array(session_id, mtime) FROM sessions"),
+        ),
+        (
+            "injected migration failure".to_owned(),
+            schema,
+            vec![r#"["s1",0.0]"#.to_owned()],
+        )
+    );
 }
 
 #[test]
@@ -140,22 +188,36 @@ fn test_session_type_migration_adds_column_preserving_rows() {
 
     let conn = open_db(tmp.path()).unwrap();
 
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(count, 1, "existing session row must survive the migration");
-
-    let session_type: Option<String> = conn
-        .query_row(
-            "SELECT session_type FROM sessions WHERE session_id = 's1'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        session_type, None,
-        "pre-existing rows get NULL session_type"
+        collect_strings(&conn, SESSION_ROWS),
+        [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
     );
+}
+
+const SESSION_ROWS: &str = "SELECT json_array(session_id, source, file_path, project, slug, \
+     timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions \
+     ORDER BY session_id";
+
+/// The schema version with every schema object, so a test can show that an open changed nothing.
+fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
+    (
+        conn.query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap(),
+        collect_strings(
+            conn,
+            "SELECT json_array(type, name, tbl_name, sql) FROM sqlite_master ORDER BY type, name",
+        ),
+    )
+}
+
+/// Every stored embedding as `(rowid, chunk_id, sub_idx, embedding)`.
+fn embeddings(conn: &Connection) -> Vec<(i64, i64, i64, Vec<u8>)> {
+    conn.prepare("SELECT rowid, chunk_id, sub_idx, embedding FROM vec_chunks ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
 }
 
 fn create_old_schema_db(path: &Path) {
@@ -201,58 +263,39 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
     let conn = open_db(tmp.path()).unwrap();
 
     assert_eq!(
-        conn.prepare("SELECT session_id, slug FROM sessions")
-            .unwrap()
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>(),
-        [("s1".to_owned(), "slug".to_owned())]
+        collect_strings(&conn, SESSION_ROWS),
+        [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid"
+        ),
+        [
+            r#"[1,"s1","user","hello"]"#,
+            r#"[3,"s1","assistant","help is here"]"#,
+            r#"[7,"s1","user","thanks"]"#
+        ]
     );
     // A trigram index matches a word's inner three letters; the older tokenizers do not.
     assert_eq!(
-        conn.prepare(
-            "SELECT rowid, role, text FROM messages WHERE messages MATCH 'hel' ORDER BY rowid"
-        )
-        .unwrap()
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .unwrap()
-        .map(Result::unwrap)
-        .collect::<Vec<_>>(),
+        collect_strings(
+            &conn,
+            "SELECT json_array(rowid, session_id, role, text) FROM messages
+             WHERE messages MATCH 'hel' ORDER BY rowid"
+        ),
         [
-            (1, "user".to_owned(), "hello".to_owned()),
-            (3, "assistant".to_owned(), "help is here".to_owned()),
+            r#"[1,"s1","user","hello"]"#,
+            r#"[3,"s1","assistant","help is here"]"#
         ]
     );
-    assert_eq!(
-        conn.prepare("SELECT rowid FROM messages ORDER BY rowid")
-            .unwrap()
-            .query_map([], |r| r.get::<_, i64>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>(),
-        [1, 3, 7]
-    );
-    let schema_version: i64 = conn
-        .query_row("PRAGMA schema_version", [], |r| r.get(0))
-        .unwrap();
+    let schema = schema_snapshot(&conn);
     drop(conn);
 
     let reopened = open_db(tmp.path()).unwrap();
 
-    assert_eq!(
-        reopened
-            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        schema_version,
-        "a second open must not migrate the table again"
-    );
+    // A second open must not migrate the table again.
+    assert_eq!(schema_snapshot(&reopened), schema);
 }
 
 #[test]
@@ -347,71 +390,48 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
     create_pre_cleanup_db(tmp.path());
 
     let conn = open_db(tmp.path()).unwrap();
+    let (schema, chunks, vectors) = (
+        schema_snapshot(&conn),
+        collect_strings(&conn, CHUNK_ROWS),
+        embeddings(&conn),
+    );
 
-    let cols: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(qa_chunks)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    for gone in ["chunk_hash", "user_text", "assistant_text"] {
-        assert!(
-            !cols.contains(&gone.to_owned()),
-            "column {gone} should be dropped, got {cols:?}"
-        );
-    }
-
-    let (id, content): (i64, String) = conn
-        .query_row("SELECT id, content FROM qa_chunks WHERE id = 1", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
-    assert_eq!(id, 1);
-    assert_eq!(content, "q\na");
-
-    let vec_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
     assert_eq!(
-        vec_count, 1,
-        "vec_chunks row must survive and stay linked to qa_chunks"
+        collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
+        [
+            "id",
+            "session_id",
+            "content",
+            "timestamp",
+            "src_rowid_lo",
+            "src_rowid_hi",
+            "generation",
+        ]
     );
-
-    let tbl: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='embedded_chunk_ids'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(tbl, 0, "embedded_chunk_ids table should be dropped");
-
+    assert_eq!(chunks, [r#"[1,"s1","q\na",0,null,null,0]"#]);
+    assert_eq!(
+        vectors,
+        [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name = 'embedded_chunk_ids'"
+        ),
+        Vec::<String>::new()
+    );
     drop(conn);
-    let conn = open_db(tmp.path()).unwrap();
-    let cols2: Vec<String> = {
-        let mut stmt = conn.prepare("PRAGMA table_info(qa_chunks)").unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    assert!(
-        !cols2.contains(&"chunk_hash".to_owned()),
-        "re-open must stay migrated, got {cols2:?}"
+
+    let reopened = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        (
+            schema_snapshot(&reopened),
+            collect_strings(&reopened, CHUNK_ROWS),
+            embeddings(&reopened)
+        ),
+        (schema, chunks, vectors)
     );
-    let vec_count2: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM vec_chunks v JOIN qa_chunks c ON c.id = v.chunk_id",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(vec_count2, 1, "re-open must keep vec row linked");
 }
 
 const SESSIONS_FULL: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
@@ -446,21 +466,14 @@ fn build_schema(path: &Path, sessions_cols: &str, tokenizer: &str, qa_cols: &str
 }
 
 #[test]
-fn test_schema_state_current_on_freshly_opened_db() {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_db(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
-}
-
-#[test]
-fn test_schema_state_empty_when_no_sessions_table() {
+fn a_database_without_a_sessions_table_has_an_empty_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Empty);
 }
 
 #[test]
-fn test_schema_state_stale_when_sessions_only() {
+fn a_database_with_only_a_sessions_table_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = Connection::open(tmp.path()).unwrap();
     conn.execute_batch(&format!("CREATE TABLE sessions ({SESSIONS_FULL});"))
@@ -469,7 +482,7 @@ fn test_schema_state_stale_when_sessions_only() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_messages_vocab() {
+fn an_index_without_its_vocabulary_table_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(tmp.path(), SESSIONS_FULL, FTS_TOKENIZER, QA_FULL, VEC_FULL);
     let conn = Connection::open(tmp.path()).unwrap();
@@ -478,7 +491,7 @@ fn test_schema_state_stale_missing_messages_vocab() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_session_type() {
+fn an_index_whose_sessions_lack_a_type_column_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -492,7 +505,7 @@ fn test_schema_state_stale_missing_session_type() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_sub_idx() {
+fn an_index_whose_embeddings_lack_a_sub_index_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -506,7 +519,7 @@ fn test_schema_state_stale_missing_sub_idx() {
 }
 
 #[test]
-fn test_schema_state_stale_missing_src_rowid() {
+fn an_index_whose_chunks_lack_a_message_range_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -520,7 +533,7 @@ fn test_schema_state_stale_missing_src_rowid() {
 }
 
 #[test]
-fn test_schema_state_stale_with_chunk_hash() {
+fn an_index_whose_chunks_still_carry_a_hash_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
@@ -534,25 +547,45 @@ fn test_schema_state_stale_with_chunk_hash() {
 }
 
 #[test]
-fn test_schema_state_stale_non_trigram_tokenizer() {
+fn an_index_tokenized_without_trigrams_has_a_stale_schema() {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(tmp.path(), SESSIONS_FULL, "unicode61", QA_FULL, VEC_FULL);
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
 }
 
-#[test]
-fn test_stale_wal_note_immutable_nonempty_wal_is_some() {
-    let tmp = NamedTempFile::new().unwrap();
-    let wal = wal_path(tmp.path());
-    fs::write(&wal, b"uncommitted").unwrap();
-    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
-    fs::remove_file(&wal).ok();
-    assert!(note.is_some(), "immutable tier + non-empty -wal must warn");
+const WRITABLE_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
+     write-ahead log; run `recall index` to checkpoint them.";
+const READ_ONLY_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
+     write-ahead log; the directory is read-only, so copy the DB together with its `-wal` \
+     (and `-shm`, if present) sidecar files elsewhere and run `recall index --db-path <copy>` \
+     to checkpoint them there.";
+
+fn file_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
-fn test_stale_wal_note_direct_is_none() {
+fn test_stale_wal_note_immutable_nonempty_wal_is_some() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
+
+    let note = stale_wal_note(&db, OpenTier::Immutable);
+
+    assert_eq!(
+        (note.as_deref(), file_names(dir.path())),
+        (Some(WRITABLE_DIR_NOTE), vec!["recall.db-wal".to_owned()])
+    );
+}
+
+#[test]
+fn a_read_that_sees_the_write_ahead_log_gets_no_stale_snapshot_note() {
     let tmp = NamedTempFile::new().unwrap();
     let wal = wal_path(tmp.path());
     fs::write(&wal, b"uncommitted").unwrap();
@@ -565,7 +598,7 @@ fn test_stale_wal_note_direct_is_none() {
 }
 
 #[test]
-fn test_stale_wal_note_absent_or_empty_wal_is_none() {
+fn a_read_from_the_last_checkpoint_gets_no_note_when_the_write_ahead_log_is_missing_or_empty() {
     let tmp = NamedTempFile::new().unwrap();
     assert!(stale_wal_note(tmp.path(), OpenTier::Immutable).is_none());
     let wal = wal_path(tmp.path());
@@ -577,14 +610,12 @@ fn test_stale_wal_note_absent_or_empty_wal_is_none() {
 
 #[cfg(unix)]
 #[test]
-fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_index_実行案内を含まずコピーベース手順を含む()
- {
+fn stale_snapshot_note_in_a_read_only_directory_asks_to_index_a_copy_with_its_sidecar_files() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
-    let wal = wal_path(&db);
-    fs::write(&wal, b"uncommitted").unwrap();
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
     if root_skip::skip_if_root(dir.path()) {
@@ -594,112 +625,94 @@ fn read_only_dir_immutable_tier_非空_wal_で_stale_wal_note_は裸の_recall_i
     let note = stale_wal_note(&db, OpenTier::Immutable);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
-    let note = note.expect("non-empty -wal on Immutable tier must warn");
-    root_skip::assert_copy_based_remedy(&note, "read-only dir immutable tier");
-}
-
-#[test]
-fn writable_dir_immutable_tier_非空_wal_で_stale_wal_note_は従来文言を含む() {
-    let tmp = NamedTempFile::new().unwrap();
-    let wal = wal_path(tmp.path());
-    fs::write(&wal, b"uncommitted").unwrap();
-
-    let note = stale_wal_note(tmp.path(), OpenTier::Immutable);
-    fs::remove_file(&wal).ok();
-
-    let note = note.expect("non-empty -wal on Immutable tier must warn");
-    assert!(
-        note.contains("write-ahead log"),
-        "note must carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        note.contains("run `recall index`"),
-        "writable dir must keep the legacy bare `recall index` wording, got: {note}"
-    );
-}
-
-#[test]
-fn test_open_db_readonly_writable_dir_is_direct_and_read_only() {
-    let tmp = NamedTempFile::new().unwrap();
-    {
-        let conn = open_db(tmp.path()).unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").ok();
-    }
-
-    let (conn, tier) = open_db_readonly(tmp.path()).unwrap();
-    assert_eq!(
-        tier,
-        OpenTier::Direct,
-        "writable dir must select Direct tier"
-    );
-
-    let err = conn
-        .execute("CREATE TABLE probe_write (x INTEGER)", [])
-        .expect_err("read-only connection must reject a write");
-    let rusqlite::Error::SqliteFailure(inner, _) = &err else {
-        panic!("expected a SqliteFailure, got {err:?}");
-    };
-    assert_eq!(
-        inner.code,
-        rusqlite::ErrorCode::ReadOnly,
-        "write must fail with SQLITE_READONLY, got {err:?}"
-    );
+    assert_eq!(note.as_deref(), Some(READ_ONLY_DIR_NOTE));
 }
 
 #[cfg(unix)]
 #[test]
-fn test_is_readonly_dir_error_writable_dir_rejects_immutable_fallback() {
-    use rusqlite::ffi::Error as FfiError;
-
-    let cantopen = rusqlite::Error::SqliteFailure(FfiError::new(14), None);
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let db = dir.path().join("recall.db");
-
-    assert!(
-        !is_readonly_dir_error(&db, &cantopen),
-        "CannotOpen in a writable dir is not read-only media; the immutable fallback must not fire"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn test_is_readonly_dir_error_readonly_dir_selects_immutable_fallback() {
-    use rusqlite::ffi::Error as FfiError;
+fn stale_snapshot_note_in_a_directory_that_refuses_the_owner_new_files_asks_to_index_a_copy() {
     use std::os::unix::fs::PermissionsExt;
 
-    let cantopen = rusqlite::Error::SqliteFailure(FfiError::new(14), None);
-
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
+    // The group may write, so the mode does not read as read-only, but the owner may not.
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o575)).unwrap();
 
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
-    let got = is_readonly_dir_error(&db, &cantopen);
+    let note = stale_wal_note(&db, OpenTier::Immutable);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert!(
-        got,
-        "CannotOpen in a read-only (0o555) dir is read-only media; the immutable fallback must fire"
+    assert_eq!(note.as_deref(), Some(READ_ONLY_DIR_NOTE));
+}
+
+#[test]
+fn stale_snapshot_note_in_a_writable_directory_with_a_leftover_write_probe_file_asks_to_run_recall_index()
+ {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    fs::write(wal_path(&db), b"uncommitted").unwrap();
+    let leftover = write_probe_path(dir.path());
+    fs::write(&leftover, b"stale").unwrap();
+
+    let note = stale_wal_note(&db, OpenTier::Immutable);
+
+    assert_eq!(
+        (note.as_deref(), fs::read_to_string(&leftover).unwrap()),
+        (Some(WRITABLE_DIR_NOTE), "stale".to_owned())
     );
 }
 
 #[test]
-fn test_open_db_readonly_missing_file_in_writable_dir_errors() {
+fn a_read_only_open_in_a_writable_directory_opens_the_live_database_and_rejects_writes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    // The writer stays open, so its row sits in the write-ahead log without a checkpoint.
+    let writer = open_db(&db).unwrap();
+    seed_session(&writer, "s1");
+
+    let (conn, tier) = open_db_readonly(&db).unwrap();
+    let error = conn
+        .execute("CREATE TABLE probe_write (x INTEGER)", [])
+        .unwrap_err();
+
+    assert_eq!(
+        (
+            tier,
+            collect_strings(&conn, "SELECT session_id FROM sessions"),
+            error.to_string()
+        ),
+        (
+            OpenTier::Direct,
+            vec!["s1".to_owned()],
+            "attempt to write a readonly database".to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let missing = dir.path().join("nope.db");
-    assert!(
-        open_db_readonly(&missing).is_err(),
-        "a missing DB in a writable dir must error, not silently open"
+
+    let error = open_db_readonly(&missing).err().unwrap();
+
+    assert_eq!(
+        (error.to_string(), file_names(dir.path())),
+        (
+            format!("unable to open database file: {}", missing.display()),
+            Vec::<String>::new()
+        )
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
+fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_after_trying_the_last_checkpoint()
+ {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -712,74 +725,76 @@ fn test_open_db_readonly_missing_file_in_readonly_dir_takes_immutable_branch() {
 
     let result = open_db_readonly(&missing);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        result.is_err(),
-        "a missing DB in a read-only dir errors even after the immutable fallback"
-    );
-}
 
-#[test]
-fn test_encode_uri_path_escapes_reserved_bytes() {
-    let encoded = encode_uri_path(Path::new("/a b/c?d.db"));
-    assert_eq!(encoded, "/a%20b/c%3Fd.db");
-}
-
-#[test]
-fn write_probe_reports_a_writable_directory_as_writable_and_leaves_no_probe_file_behind() {
-    let dir = tempfile::TempDir::new().unwrap();
-
-    let result = dir_write_probe_fails(dir.path());
-
-    assert!(
-        !result,
-        "a writable directory must not be reported as unwritable"
-    );
-    let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().collect();
-    assert!(
-        entries.is_empty(),
-        "probe file must be removed after a successful write, got entries: {entries:?}"
+    // The URI in the error shows the open fell back to reading from the last checkpoint. The
+    // URI-delimiter test checks the escaping on its own, so the path here goes through it as is.
+    assert_eq!(
+        result.err().unwrap().to_string(),
+        format!(
+            "unable to open database file: file:{}?immutable=1",
+            encode_uri_path(&missing)
+        )
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn write_probe_reports_a_directory_with_cleared_write_bits_as_unwritable() {
+fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_from_its_last_checkpoint()
+ {
     use std::os::unix::fs::PermissionsExt;
 
-    let dir = tempfile::TempDir::new().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let root = tempfile::TempDir::new().unwrap();
+    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it. The bytes of
+    // `日` must reach the URI as the same bytes.
+    let dir = root.path().join("a%20b#c?d日");
+    fs::create_dir(&dir).unwrap();
+    let db = dir.join("recall.db");
+    seed_session(&open_db(&db).unwrap(), "s1");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
 
-    if root_skip::skip_if_root(dir.path()) {
+    if root_skip::skip_if_root(&dir) {
         return;
     }
 
-    let result = dir_write_probe_fails(dir.path());
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let opened = open_db_readonly(&db);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
-    assert!(
-        result,
-        "a directory with cleared write bits (0o555) must be reported as unwritable (EACCES -> PermissionDenied)"
+    let (conn, tier) = opened.unwrap();
+    assert_eq!(
+        (
+            tier,
+            collect_strings(&conn, "SELECT session_id FROM sessions")
+        ),
+        (OpenTier::Immutable, vec!["s1".to_owned()])
     );
 }
 
+// The expected line holds the POSIX error text.
+#[cfg(unix)]
 #[test]
-fn a_leftover_probe_file_reads_as_ambiguous_so_the_directory_stays_classified_writable() {
+fn failing_to_remove_the_write_probe_warns_with_its_path_and_the_error() {
+    use std::sync::Mutex;
+    use tracing::subscriber::with_default;
+
     let dir = tempfile::TempDir::new().unwrap();
-    let leftover = dir
-        .path()
-        .join(format!(".recall-write-probe-{}", process::id()));
-    fs::write(&leftover, b"stale").unwrap();
+    let log = dir.path().join("log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(crate::LOG_FILTER_DEFAULT)
+        .with_writer(Mutex::new(fs::File::create(&log).unwrap()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
 
-    assert!(
-        !dir_write_probe_fails(dir.path()),
-        "a pre-existing probe file (AlreadyExists) must classify the directory \
-         as writable, not read-only"
+    with_default(subscriber, || {
+        remove_write_probe(Path::new("/nonexistent-recall-dir/.recall-write-probe-0"));
+    });
+
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        " WARN recall::db: failed to remove write probe \
+         probe=/nonexistent-recall-dir/.recall-write-probe-0 \
+         error=No such file or directory (os error 2)\n"
     );
-}
-
-#[test]
-fn probe_cleanup_failure_warns_instead_of_failing_the_read() {
-    remove_write_probe(Path::new("/nonexistent-recall-dir/.recall-write-probe-0"));
 }
 
 #[cfg(target_os = "macos")]
@@ -871,8 +886,7 @@ fn attach_readonly_wal_only_db() -> ReadOnlyMount {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn open_db_readonly_on_a_read_only_mount_without_shm_falls_back_to_the_immutable_tier_and_reads_sqlite_master_successfully()
- {
+fn a_database_on_a_read_only_mount_without_a_shared_memory_file_opens_from_its_last_checkpoint() {
     let mount = attach_readonly_wal_only_db();
 
     let (conn, tier) = open_db_readonly(&mount.db_path())
@@ -893,20 +907,24 @@ fn stale_wal_note_on_a_read_only_mount_steers_to_the_copy_based_recall_index_db_
  {
     let mount = attach_readonly_wal_only_db();
 
-    let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable)
-        .expect("non-empty -wal on a read-only mount must warn");
-    root_skip::assert_copy_based_remedy(&note, "read-only mount immutable tier");
+    let note = stale_wal_note(&mount.db_path(), OpenTier::Immutable);
+
+    assert_eq!(note.as_deref(), Some(READ_ONLY_DIR_NOTE));
 }
 
 #[test]
-fn a_missing_parent_directory_stays_classified_writable_so_the_original_error_propagates() {
+fn a_read_only_open_under_a_missing_directory_fails_without_creating_the_directory() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("nonexistent_subdir").join("recall.db");
 
-    assert!(
-        !dir_is_unwritable(&db),
-        "a missing parent directory must not be classified unwritable \
-         (the write probe's NotFound failure does not count as unwritable)"
+    let error = open_db_readonly(&db).err().unwrap();
+
+    assert_eq!(
+        (error.to_string(), file_names(dir.path())),
+        (
+            format!("unable to open database file: {}", db.display()),
+            Vec::<String>::new()
+        )
     );
 }
 
@@ -924,7 +942,7 @@ mod root_skip;
 
 #[cfg(unix)]
 #[test]
-fn skip_if_root_は_create_成功時に_probe_を消し_write_bits_を_0o755_へ復元して_true_を返す() {
+fn root_check_treats_a_directory_it_can_write_as_root_and_sets_its_mode_to_0o755() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
@@ -946,156 +964,96 @@ fn skip_if_root_は_create_成功時に_probe_を消し_write_bits_を_0o755_へ
 
 #[cfg(unix)]
 #[test]
-fn skip_if_root_は_0o555_dir_で_create_失敗なら_probe_を残さず_false_を返す() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
-
-    let got = root_skip::skip_if_root(dir.path());
-
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-
-    assert!(
-        !got,
-        "create in a 0o555 dir must fail and report false; true means the \
-         runner bypasses permission bits (e.g. running as root)"
-    );
-    assert_eq!(
-        fs::read_dir(dir.path()).unwrap().count(),
-        0,
-        "no entry may remain directly under dir"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "-shm sidecar")]
-fn assert_copy_based_remedy_は_shm_言及を欠く_note_を拒否する() {
-    root_skip::assert_copy_based_remedy(
-        "read-only open cannot see uncommitted changes in the write-ahead log; \
-         the directory is read-only, so copy the DB together with its `-wal` \
-         sidecar file elsewhere and run `recall index --db-path <copy>` to \
-         checkpoint it there.",
-        "negative self-test",
-    );
-}
-
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "cannot run a bare")]
-fn assert_copy_based_remedy_は_裸の_recall_index_案内を含む_note_を拒否する() {
-    root_skip::assert_copy_based_remedy(
-        "read-only open cannot see uncommitted changes in the write-ahead log; \
-         copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
-         files elsewhere and run `recall index --db-path <copy>`, or run \
-         `recall index` to checkpoint them.",
-        "negative self-test",
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn canary_は非_root_で_green_root_では_panic_してスイートを赤化する() {
+fn the_unit_suite_fails_when_run_as_root() {
     root_skip::assert_root_canary();
 }
 
 #[cfg(unix)]
 #[test]
-fn root_probe_文字列は_skip_if_root_の定義以外に重複しない() {
+fn db_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {
     root_skip::assert_probe_literal_not_inlined(include_str!("tests.rs"), "src/db/tests.rs");
 }
 
 #[test]
-fn generation_upgrade_preserves_embeddings_and_reopen_keeps_generation_identity() {
+fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_later_insert_a_new_generation()
+ {
     let tmp = NamedTempFile::new().unwrap();
     build_schema(
         tmp.path(),
         SESSIONS_FULL,
-        "trigram",
+        FTS_TOKENIZER,
         QA_NO_GENERATION,
         VEC_FULL,
     );
     let conn = Connection::open(tmp.path()).unwrap();
     seed_chunk(&conn, 1, "existing content");
-    let vector = vec![0.25_f32; EMBEDDING_DIMS];
+    let embedding = f32_as_bytes(&[0.25_f32; EMBEDDING_DIMS]);
     conn.execute(
         "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (1, 0, ?1)",
-        [f32_as_bytes(&vector)],
+        [&embedding],
     )
     .unwrap();
-    assert!(
-        !table_def(&conn, "qa_chunks")
-            .unwrap()
-            .unwrap()
-            .contains("generation")
+    assert_eq!(
+        collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
+        [
+            "id",
+            "session_id",
+            "content",
+            "timestamp",
+            "src_rowid_lo",
+            "src_rowid_hi"
+        ]
     );
-    assert!(table_def(&conn, "qa_chunk_generation").unwrap().is_none());
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name = 'qa_chunk_generation'"
+        ),
+        Vec::<String>::new()
+    );
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
     drop(conn);
 
     let conn = open_db(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
-    let (content, generation): (String, i64) = conn
-        .query_row(
-            "SELECT content, generation FROM qa_chunks WHERE id = 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(content, "existing content");
-    assert_eq!(generation, 0, "legacy rows receive the migration default");
-    let saved: (i64, Vec<u8>, i64, i64) = conn
-        .query_row(
-            "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(saved.1, f32_as_bytes(&vector));
-    assert_eq!((saved.2, saved.3), (1, 0));
+
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [r#"[1,"s1","existing content",0,null,null,0]"#]
+    );
     seed_chunk(&conn, 2, "new content");
-    let new_generation: i64 = conn
-        .query_row("SELECT generation FROM qa_chunks WHERE id = 2", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert_ne!(new_generation, generation);
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","existing content",0,null,null,0]"#,
+            r#"[2,"s1","new content",0,null,null,1]"#
+        ]
+    );
     drop(conn);
 
     let conn = open_db(tmp.path()).unwrap();
-    let reopened: (i64, Vec<u8>, i64, i64) = conn
-        .query_row(
-            "SELECT rowid, embedding, chunk_id, sub_idx FROM vec_chunks",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .unwrap();
-    assert_eq!(reopened, saved);
     conn.execute(
         "UPDATE qa_chunks SET src_rowid_lo = 1, src_rowid_hi = 2",
         [],
     )
     .unwrap();
-    let generations: Vec<i64> = conn
-        .prepare("SELECT generation FROM qa_chunks ORDER BY id")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(generations, vec![generation, new_generation]);
+
+    assert_eq!(embeddings(&conn), [(1, 1, 0, embedding.to_vec())]);
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","existing content",0,1,2,0]"#,
+            r#"[2,"s1","new content",0,1,2,1]"#
+        ]
+    );
     conn.execute("DELETE FROM qa_chunks WHERE id = 2", [])
         .unwrap();
     seed_chunk(&conn, 2, "new content");
-    let replacement: i64 = conn
-        .query_row("SELECT generation FROM qa_chunks WHERE id = 2", [], |r| {
-            r.get(0)
-        })
-        .unwrap();
-    assert!(
-        replacement > new_generation,
-        "re-open must not reset the counter"
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","existing content",0,1,2,0]"#,
+            r#"[2,"s1","new content",0,null,null,2]"#
+        ]
     );
 }
 
@@ -1114,75 +1072,41 @@ fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
     )
     .unwrap();
     drop(conn);
+
     let conn = open_db(tmp.path()).unwrap();
-    let stamp: (Option<f64>, i64) = conn
-        .query_row("SELECT mtime, file_size FROM sessions", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
-    assert_eq!(stamp, (None, 42));
-    let text: String = conn
-        .query_row("SELECT text FROM messages", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(text, "kept");
+
+    assert_eq!(
+        (
+            collect_strings(&conn, SESSION_ROWS),
+            collect_strings(
+                &conn,
+                "SELECT json_array(rowid, session_id, role, text) FROM messages"
+            )
+        ),
+        (
+            vec![r#"["s","claude","/f","/p","slug",0,null,42,null,null,null]"#.to_owned()],
+            vec![r#"[1,"s","user","kept"]"#.to_owned()]
+        )
+    );
     conn.execute("UPDATE sessions SET mtime = 456", []).unwrap();
     conn.execute("INSERT INTO parse_diagnostics (file_path, source, invalid_json_lines) VALUES ('/s.jsonl', 'claude', 2)", []).unwrap();
     drop(conn);
+
     let conn = open_db(tmp.path()).unwrap();
+
     assert_eq!(
-        conn.query_row("SELECT mtime FROM sessions", [], |r| r.get::<_, f64>(0))
-            .unwrap(),
-        456.0
-    );
-    assert_eq!(
-        conn.query_row(
-            "SELECT invalid_json_lines FROM parse_diagnostics",
-            [],
-            |r| r.get::<_, i64>(0)
+        (
+            collect_strings(&conn, SESSION_ROWS),
+            collect_strings(
+                &conn,
+                "SELECT json_array(file_path, source, invalid_json_lines, invalid_utf8_lines,
+                                   incomplete_tail_lines, read_error)
+                 FROM parse_diagnostics"
+            )
+        ),
+        (
+            vec![r#"["s","claude","/f","/p","slug",0,456.0,42,null,null,null]"#.to_owned()],
+            vec![r#"["/s.jsonl","claude",2,0,0,0]"#.to_owned()]
         )
-        .unwrap(),
-        2
     );
-}
-
-#[test]
-fn fix_orphan_embeddings_deletes_only_dangling_rows() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
-    seed_healthy_index(&conn);
-    let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-        rusqlite::params![embedder::f32_as_bytes(&orphan)],
-    )
-    .unwrap();
-
-    let deleted = fix_orphan_embeddings(&conn).unwrap();
-
-    assert_eq!(deleted, 1, "only the dangling chunk_id=999 row is deleted");
-    let remaining: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(remaining, 1, "the linked chunk_id=1 row must survive");
-}
-
-#[test]
-fn fix_orphan_embeddings_is_noop_when_clean() {
-    let db_dir = tempfile::TempDir::new().unwrap();
-    let conn = open_or_create_db(&db_dir.path().join("recall.db")).unwrap();
-    seed_healthy_index(&conn);
-
-    let deleted = fix_orphan_embeddings(&conn).unwrap();
-
-    assert_eq!(deleted, 0, "a clean index has nothing to repair");
-    let remaining: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(remaining, 1, "the linked row must be untouched");
-}
-
-#[test]
-fn fix_orphan_embeddings_errors_when_table_missing() {
-    let conn = Connection::open_in_memory().unwrap();
-    assert!(fix_orphan_embeddings(&conn).is_err());
 }

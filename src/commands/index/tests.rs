@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use crate::db::collect_strings;
 use crate::envelope::render_json_success;
 use crate::model::tests::FakeHost;
 use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
@@ -303,14 +304,6 @@ fn body_snapshot(conn: &Connection) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
     )
 }
 
-fn session_file_paths(conn: &Connection) -> Vec<String> {
-    let mut stmt = conn
-        .prepare("SELECT path FROM session_files ORDER BY path")
-        .unwrap();
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-    rows.map(Result::unwrap).collect()
-}
-
 fn reset_to_legacy_state(conn: &Connection) {
     conn.execute("UPDATE sessions SET files_scanned = NULL", [])
         .unwrap();
@@ -428,7 +421,7 @@ fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_me
         "backfill must not change messages / qa_chunks / vec_chunks row counts or id sets"
     );
     assert_eq!(
-        session_file_paths(&conn),
+        collect_strings(&conn, "SELECT path FROM session_files ORDER BY path"),
         vec![
             "/proj/marker_a.rs".to_owned(),
             "/proj/marker_b.rs".to_owned(),

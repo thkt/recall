@@ -74,7 +74,7 @@ fn dir_is_unwritable(db_path: &Path) -> bool {
 }
 
 fn dir_write_probe_fails(dir: &Path) -> bool {
-    let probe = dir.join(format!(".recall-write-probe-{}", process::id()));
+    let probe = write_probe_path(dir);
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -89,6 +89,11 @@ fn dir_write_probe_fails(dir: &Path) -> bool {
             io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
         ),
     }
+}
+
+/// The file `dir_write_probe_fails` creates in `dir`.
+fn write_probe_path(dir: &Path) -> PathBuf {
+    dir.join(format!(".recall-write-probe-{}", process::id()))
 }
 
 fn remove_write_probe(probe: &Path) {
@@ -508,6 +513,17 @@ pub(crate) fn seed_session_file(conn: &Connection, session_id: &str, path: &str)
         [session_id, path],
     )
     .unwrap();
+}
+
+#[cfg(test)]
+pub(crate) const CHUNK_ROWS: &str = "SELECT json_array(id, session_id, content, timestamp, \
+     src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks ORDER BY id";
+
+#[cfg(test)]
+pub(crate) fn collect_strings(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(Result::unwrap).collect()
 }
 
 #[cfg(test)]

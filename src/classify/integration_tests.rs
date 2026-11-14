@@ -10,24 +10,15 @@ use crate::commands::classify::{
     open_classification_file, read_classification_origin, reclassify_sessions,
     reclassify_sessions_with, run_classify,
 };
-use crate::db::setup_test_db;
+use crate::db::{CHUNK_ROWS, collect_strings, setup_test_db};
 use crate::embedder::{MockEmbedder, embed_recent_chunks};
 use crate::envelope::render_json_error;
 use crate::error::error_envelope;
 use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
 use crate::search::{SearchOptions, search, search_with_embedder};
 
-fn strings(conn: &Connection, sql: &str) -> Vec<String> {
-    conn.prepare(sql)
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect()
-}
-
 fn labels(conn: &Connection) -> Vec<String> {
-    strings(
+    collect_strings(
         conn,
         "SELECT json_array(session_id, session_type) FROM sessions ORDER BY session_id",
     )
@@ -37,10 +28,10 @@ fn bodies_and_vectors(conn: &Connection) -> Vec<Vec<String>> {
     [
         "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime, file_size, files_scanned, chunks_indexed) FROM sessions ORDER BY session_id",
         "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid",
-        "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks ORDER BY id",
+        CHUNK_ROWS,
         "SELECT json_array(rowid, chunk_id, sub_idx, hex(embedding)) FROM vec_chunks ORDER BY rowid",
         "SELECT json_array(session_id, path) FROM session_files ORDER BY session_id, path",
-    ].iter().map(|sql| strings(conn, sql)).collect()
+    ].iter().map(|sql| collect_strings(conn, sql)).collect()
 }
 
 fn persistent_files(path: &Path) -> Vec<Option<(Vec<u8>, fs::Permissions)>> {
@@ -68,7 +59,7 @@ fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
          INSERT INTO sessions VALUES ('synthetic', 'claude', '/missing-synthetic.jsonl', '/p', 's', 0, 123, 'interactive');
          INSERT INTO messages VALUES ('synthetic', 'user', '<command-message>run</command-message>');",
     ).unwrap();
-    let schema = strings(
+    let schema = collect_strings(
         &conn,
         "SELECT coalesce(sql, name) FROM sqlite_master ORDER BY name",
     );
@@ -89,14 +80,14 @@ fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
     }
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
-        strings(
+        collect_strings(
             &conn,
             "SELECT coalesce(sql, name) FROM sqlite_master ORDER BY name"
         ),
         schema
     );
     assert_eq!(
-        strings(
+        collect_strings(
             &conn,
             "SELECT json_array(mtime, session_type) FROM sessions"
         ),
@@ -125,21 +116,21 @@ fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
     assert_eq!(applied.data["automated"], 1);
     let conn = Connection::open(&path).unwrap();
     assert_eq!(
-        strings(
+        collect_strings(
             &conn,
             "SELECT json_array(mtime, session_type) FROM sessions"
         ),
         ["[null,\"automated\"]"]
     );
     assert_eq!(
-        strings(
+        collect_strings(
             &conn,
             "SELECT name FROM sqlite_master WHERE name = 'parse_diagnostics'"
         ),
         ["parse_diagnostics"]
     );
     assert_eq!(
-        strings(&conn, "SELECT text FROM messages"),
+        collect_strings(&conn, "SELECT text FROM messages"),
         ["<command-message>run</command-message>"]
     );
 }
@@ -502,7 +493,7 @@ fn reclassification_retains_unverifiable_labels_and_falls_back_only_for_null_row
     for _ in 0..2 {
         reclassify_sessions(&mut conn, true, false).unwrap();
         assert_eq!(
-            strings(&conn, "SELECT DISTINCT session_type FROM sessions"),
+            collect_strings(&conn, "SELECT DISTINCT session_type FROM sessions"),
             ["automated"]
         );
     }
@@ -556,7 +547,7 @@ fn reclassification_retries_after_a_writer_commits_during_source_read() {
     assert_eq!(reads, 2);
     assert_eq!(outcomes.len(), 1);
     assert_eq!(
-        strings(&conn, "SELECT session_type FROM sessions"),
+        collect_strings(&conn, "SELECT session_type FROM sessions"),
         ["automated"]
     );
 }
