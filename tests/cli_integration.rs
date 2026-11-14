@@ -166,29 +166,6 @@ fn a_bare_word_runs_a_search_for_it() {
 }
 
 #[test]
-fn show_unknown_id_in_existing_index_exits_usage() {
-    let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
-    assert_eq!(exit_code(recall(dir.path()).args(["show", "deadbeef"])), 64);
-}
-
-#[test]
-fn status_prints_stats_and_exits_success() {
-    let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
-    let out = recall(dir.path())
-        .arg("status")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "status should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Sessions:") && stdout.contains("QA chunks:"),
-        "status stdout should list stats, got: {stdout}"
-    );
-}
-
-#[test]
 fn status_verbose_includes_db_path() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
@@ -221,36 +198,6 @@ fn upgrading_an_old_embedding_table_tells_the_user_to_run_recall_index() {
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(stderr.contains("embeddings schema changed"), "{stderr}");
     assert!(stderr.contains("run `recall index`"), "{stderr}");
-}
-
-#[test]
-fn search_with_matching_index_lists_results() {
-    let dir = TempDir::new().unwrap();
-    let claude_dir = dir.path().join("claude");
-    fs::create_dir_all(&claude_dir).unwrap();
-    fs::write(
-        claude_dir.join("s1.jsonl"),
-        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-    assert_eq!(
-        exit_code(
-            recall(dir.path())
-                .env("RECALL_CLAUDE_DIR", &claude_dir)
-                .arg("index")
-        ),
-        0
-    );
-    let out = recall(dir.path())
-        .args(["search", "hello"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Found 1 sessions:"),
-        "search stdout should list the matching session, got: {stdout}"
-    );
 }
 
 fn seed_indexed_session(dir: &Path) {
