@@ -757,7 +757,7 @@ fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails() {
 
 #[cfg(unix)]
 #[test]
-fn a_database_in_a_read_only_directory_whose_path_has_a_space_and_a_question_mark_opens_from_its_last_checkpoint()
+fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_from_its_last_checkpoint()
  {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1010,7 +1010,7 @@ fn the_unit_suite_fails_when_run_as_root() {
 
 #[cfg(unix)]
 #[test]
-fn db_tests_spell_the_root_probe_file_only_through_skip_if_root() {
+fn db_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {
     root_skip::assert_probe_literal_not_inlined(include_str!("tests.rs"), "src/db/tests.rs");
 }
 
