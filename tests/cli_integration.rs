@@ -83,7 +83,7 @@ fn help_text(db: &Path) -> String {
             "  -v, --verbose\n",
             "          Show diagnostic output\n",
             "      --db-path <DB_PATH>\n",
-            "          Database file path (default: ~/.local/share/recall/indexes/<manifest-sha256>/recall.db, env: RECALL_DB) [env: RECALL_DB={}]\n",
+            "          Database file path (default: <data dir>/recall/indexes/<manifest-sha256>/recall.db, where <data dir> is an absolute XDG_DATA_HOME or ~/.local/share; env: RECALL_DB) [env: RECALL_DB={}]\n",
             "      --model-manifest <MODEL_MANIFEST>\n",
             "          Pinned Gemma model manifest. Select an older saved manifest to roll back [env: RECALL_MODEL_MANIFEST=]\n",
             "      --json\n",
