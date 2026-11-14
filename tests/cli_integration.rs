@@ -459,7 +459,7 @@ fn show_without_json_keeps_human_output() {
 }
 
 #[test]
-fn index_json_emits_structured_embed_summary() {
+fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model() {
     let dir = TempDir::new().unwrap();
     let out = recall(dir.path())
         .args(["index", "--json"])
@@ -497,7 +497,7 @@ fn index_json_emits_structured_embed_summary() {
 }
 
 #[test]
-fn rebuild_json_emits_structured_embed_summary() {
+fn rebuild_json_reparses_an_unchanged_session_and_reports_it_unembedded() {
     let dir = TempDir::new().unwrap();
     let out = recall(dir.path())
         .args(["rebuild", "--json"])
