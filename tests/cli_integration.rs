@@ -225,22 +225,24 @@ fn status_verbose_includes_db_path() {
 }
 
 #[test]
-fn upgrading_an_old_embedding_table_tells_the_user_to_run_recall_index() {
+fn indexing_over_an_empty_old_embedding_table_replaces_it_without_a_warning() {
     let dir = TempDir::new().unwrap();
     rusqlite::Connection::open(dir.path().join("recall.db"))
         .unwrap()
         .execute_batch("CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB);")
         .unwrap();
 
-    let out = recall(dir.path())
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
+    let (code, envelope, stderr) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
-    assert!(stderr.contains("embeddings schema changed"), "{stderr}");
-    assert!(stderr.contains("run `recall index`"), "{stderr}");
+    assert_eq!(
+        (code, envelope),
+        (Some(0), index_envelope(&[], &serde_json::json!([]), &[]))
+    );
+    assert!(!stderr.contains("warning:"), "{stderr}");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "anything"])),
+        (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
+    );
 }
 
 fn seed_indexed_session(dir: &Path) {
