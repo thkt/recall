@@ -15,7 +15,7 @@ pub(crate) struct CommandOutput {
 
 /// A note on a command's result. `--json` carries every note; a text run prints on stderr the
 /// notes the command has not shown already (#403).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct Note {
     pub text: String,
     /// The command already put this in its text output, on stdout or stderr.

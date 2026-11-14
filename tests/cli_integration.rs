@@ -1465,6 +1465,82 @@ fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
     );
 }
 
+#[test]
+fn text_search_and_status_print_the_notes_they_add_on_stderr() {
+    let automated = TempDir::new().unwrap();
+    index_claude_sessions(
+        automated.path(),
+        &[
+            ("auto", &[AUTOMATED_OPENER, AUTOMATED_AUTH_TURN]),
+            ("human", &[HUMAN_AUTH]),
+        ],
+    );
+    let other_model = TempDir::new().unwrap();
+    seed_indexed_session(other_model.path());
+    rusqlite::Connection::open(other_model.path().join("recall.db"))
+        .unwrap()
+        .execute(
+            "UPDATE embedding_identity SET fingerprint = 'another model'",
+            [],
+        )
+        .unwrap();
+    let unknown_source = TempDir::new().unwrap();
+    index_claude_sessions(
+        unknown_source.path(),
+        &[
+            (
+                "valid",
+                &[&user_line("authentication notes", "2026-03-01T00:00:00Z")],
+            ),
+            (
+                "weird",
+                &[&user_line("authentication notes", "2026-03-01T00:00:00Z")],
+            ),
+        ],
+    );
+    mark_source_unknown(unknown_source.path(), "weird");
+
+    let identity_note = "note: semantic search unavailable: index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest; results are text-only\n";
+
+    assert_eq!(
+        outcome(recall(automated.path()).args(["search", "authentication"])),
+        (
+            Some(0),
+            concat!(
+                "Found 1 sessions:\n",
+                "\n",
+                "[1] 2026-03-01 | human | proj [claude]\n",
+                "    /proj\n",
+                "    ID: human\n",
+                "    > authentication notes\n",
+                "    inspect: recall show human --chunk 3 --window 3\n",
+                "\n",
+            )
+            .to_owned(),
+            format!("{MODEL_NOT_INSTALLED_STDERR}note: {AUTOMATED_EXCLUDED_NOTE}\n")
+        )
+    );
+    assert_eq!(
+        outcome(recall(other_model.path()).args(["search", "hello"])),
+        (Some(0), S1_MATCH.to_owned(), identity_note.to_owned())
+    );
+    assert_eq!(
+        outcome(recall(other_model.path()).arg("status")),
+        (
+            Some(0),
+            STATUS_OF_ONE_SESSION.to_owned(),
+            identity_note.to_owned()
+        )
+    );
+    // A tracing line with a timestamp logs the skipped session before the note.
+    let (_, _, stderr) =
+        outcome(recall(unknown_source.path()).args(["search", "authentication", "--limit", "1"]));
+    assert!(
+        stderr.ends_with(&format!("\nnote: {INCOMPLETE_RESULTS_NOTE}\n")),
+        "{stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn cli_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {

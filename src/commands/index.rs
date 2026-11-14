@@ -90,7 +90,8 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         outcome.degraded_note.is_none() || outcome.failed_count == 0,
         "model-absent and embed-stop degradation are mutually exclusive"
     );
-    // index_and_report and report_indexed_sessions print every note but the embed failure.
+    // index_and_report, report_indexed_sessions and run_legacy_backfill print every note but the
+    // embed failure, which reaches stderr only as a tracing log line without the remedy.
     let mut notes = Vec::new();
     if let Some(note) = &outcome.degraded_note {
         notes.push(Note::shown(note.clone()));
