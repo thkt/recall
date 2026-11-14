@@ -51,16 +51,14 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
 
     let tmp = NamedTempFile::new().unwrap();
     create_pre_cleanup_db(tmp.path());
-    // With parse_diagnostics already in place, the marker upgrade runs the only UPDATE on
-    // sessions, so the trigger fails that upgrade and no earlier one.
+    // The marker upgrade is the only one that writes chunks_indexed, so the trigger fails it alone.
     Connection::open(tmp.path())
         .unwrap()
         .execute_batch(
-            "CREATE TABLE parse_diagnostics (file_path TEXT PRIMARY KEY);
-             INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
+            "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
              INSERT INTO messages (session_id, role, text) VALUES
                  ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
-             CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE ON sessions
+             CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE OF chunks_indexed ON sessions
              BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
         )
         .unwrap();
@@ -117,14 +115,10 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
         [r#"["empty",0]"#, r#"["pending",0]"#, r#"["s1",1]"#]
     );
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi)
-             FROM qa_chunks ORDER BY id"
-        ),
+        collect_strings(&conn, CHUNK_ROWS),
         [
-            r#"[1,"s1","q\na",0,null,null]"#,
-            r#"[2,"pending","new question",null,2,2]"#
+            r#"[1,"s1","q\na",0,null,null,0]"#,
+            r#"[2,"pending","new question",null,2,2,1]"#
         ]
     );
     assert_eq!(
@@ -136,11 +130,11 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
 #[test]
 fn a_failed_parse_diagnostics_upgrade_leaves_the_schema_and_the_session_times_as_they_were() {
     let tmp = NamedTempFile::new().unwrap();
-    build_schema(tmp.path(), SESSIONS_FULL, "trigram", QA_FULL, VEC_FULL);
+    build_schema(tmp.path(), SESSIONS_FULL, FTS_TOKENIZER, QA_FULL, VEC_FULL);
     let conn = Connection::open(tmp.path()).unwrap();
     seed_session(&conn, "s1");
     conn.execute_batch(
-        "CREATE TRIGGER fail_upgrade BEFORE UPDATE ON sessions
+        "CREATE TRIGGER fail_upgrade BEFORE UPDATE OF mtime ON sessions
          BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
     )
     .unwrap();
@@ -198,6 +192,10 @@ fn test_session_type_migration_adds_column_preserving_rows() {
         [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
     );
 }
+
+/// Every chunk row, every column, in id order.
+const CHUNK_ROWS: &str = "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, \
+     src_rowid_hi, generation) FROM qa_chunks ORDER BY id";
 
 /// The schema version with every schema object, so a test can show that an open changed nothing.
 fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
@@ -424,12 +422,7 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
         ]
     );
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi,
-                               generation)
-             FROM qa_chunks"
-        ),
+        collect_strings(&conn, CHUNK_ROWS),
         [r#"[1,"s1","q\na",0,null,null,0]"#]
     );
     assert_eq!(
@@ -1012,7 +1005,7 @@ fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_l
     build_schema(
         tmp.path(),
         SESSIONS_FULL,
-        "trigram",
+        FTS_TOKENIZER,
         QA_NO_GENERATION,
         VEC_FULL,
     );
@@ -1030,19 +1023,16 @@ fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_l
     let conn = open_db(tmp.path()).unwrap();
 
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(id, content, generation) FROM qa_chunks"
-        ),
-        [r#"[1,"existing content",0]"#]
+        collect_strings(&conn, CHUNK_ROWS),
+        [r#"[1,"s1","existing content",0,null,null,0]"#]
     );
     seed_chunk(&conn, 2, "new content");
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(id, content, generation) FROM qa_chunks ORDER BY id"
-        ),
-        [r#"[1,"existing content",0]"#, r#"[2,"new content",1]"#]
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","existing content",0,null,null,0]"#,
+            r#"[2,"s1","new content",0,null,null,1]"#
+        ]
     );
     drop(conn);
 
@@ -1055,21 +1045,21 @@ fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_l
 
     assert_eq!(embeddings(&conn), [(1, 1, 0, embedding.to_vec())]);
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(id, content, generation) FROM qa_chunks ORDER BY id"
-        ),
-        [r#"[1,"existing content",0]"#, r#"[2,"new content",1]"#]
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","existing content",0,1,2,0]"#,
+            r#"[2,"s1","new content",0,1,2,1]"#
+        ]
     );
     conn.execute("DELETE FROM qa_chunks WHERE id = 2", [])
         .unwrap();
     seed_chunk(&conn, 2, "new content");
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(id, content, generation) FROM qa_chunks ORDER BY id"
-        ),
-        [r#"[1,"existing content",0]"#, r#"[2,"new content",2]"#]
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","existing content",0,1,2,0]"#,
+            r#"[2,"s1","new content",0,null,null,2]"#
+        ]
     );
 }
 
