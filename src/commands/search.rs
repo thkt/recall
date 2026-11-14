@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::Args;
-use tracing::warn;
 
 use crate::commands::build_markdown;
 use crate::embedding::Embed;
@@ -13,7 +12,7 @@ use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::model::{self, DegradedReason, EmbedderDegraded};
 use crate::parser::Source;
-use crate::runtime::done;
+use crate::runtime::{done, warning};
 use crate::{ansi, db, search};
 use crate::{
     format_timestamp, require_current_schema, resolve_db_path, try_load_embedder_cached_with,
@@ -121,7 +120,7 @@ fn resolve_current_session(
         Some(id) => Ok(CurrentSession::Exclude(id)),
         None => {
             if flags.exclude {
-                warn!("--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set");
+                warning("--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set");
             }
             Ok(CurrentSession::Ignore)
         }
