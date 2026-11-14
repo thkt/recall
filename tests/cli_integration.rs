@@ -95,11 +95,16 @@ fn help_text(db: &Path) -> String {
     )
 }
 
-/// What a `--json` run shows the user, with stdout parsed as one JSON value.
+/// What a `--json` run shows the user, with stdout parsed as the one-line envelope it prints.
 fn json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
     let (code, stdout, stderr) = outcome(cmd);
-    let envelope = serde_json::from_str(&stdout)
-        .unwrap_or_else(|e| panic!("stdout should be one JSON value, got {stdout:?}: {e}"));
+    let envelope = stdout
+        .strip_suffix('\n')
+        .filter(|line| !line.contains('\n'))
+        .and_then(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| {
+            panic!("stdout should be one JSON line; exit {code:?}, stdout {stdout:?}, stderr {stderr:?}")
+        });
     (code, envelope, stderr)
 }
 
@@ -195,6 +200,7 @@ fn a_bare_word_runs_a_search_for_it() {
         outcome(recall(dir.path()).arg("someword")),
         (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
     );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 #[test]
@@ -784,17 +790,17 @@ fn search_exclude_current_with_a_whitespace_only_session_id_lists_every_session_
 fn search_only_current_with_a_whitespace_only_session_id_exits_usage() {
     let dir = TempDir::new().unwrap();
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--only-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "  ")
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(64));
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
     assert_eq!(
-        String::from_utf8_lossy(&out.stderr),
-        ONLY_CURRENT_WITHOUT_A_SESSION_ID
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello", "--only-current"])
+                .env("CLAUDE_CODE_SESSION_ID", "  ")
+        ),
+        (
+            Some(64),
+            String::new(),
+            ONLY_CURRENT_WITHOUT_A_SESSION_ID.to_owned()
+        )
     );
 }
 
@@ -1156,7 +1162,8 @@ fn index_upgrading_a_pre_trigram_index_keeps_the_sessions_of_a_missing_root_sear
     seed_pre_trigram_index(dir.path());
 
     // Its stderr carries stage timings and the read warning #445 reports, so only the code counts.
-    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
+    let (index_code, _, index_stderr) = outcome(recall(dir.path()).arg("index"));
+    assert_eq!(index_code, Some(0), "{index_stderr}");
 
     assert_eq!(
         outcome(recall(dir.path()).arg("status")),
