@@ -326,8 +326,82 @@ fn doctor_of_a_sound_index_without_the_model() -> serde_json::Value {
     })
 }
 
-const MODEL_NOT_INSTALLED_STDERR: &str =
-    "note: embedding model not installed; run `recall model download` to enable semantic search.\n";
+macro_rules! model_not_installed {
+    () => {
+        "note: embedding model not installed; run `recall model download` to enable semantic search."
+    };
+}
+const MODEL_NOT_INSTALLED_STDERR: &str = concat!(model_not_installed!(), "\n");
+/// The same line as an `index --json` note.
+const MODEL_NOT_INSTALLED_INDEX_NOTE: &str = model_not_installed!();
+
+/// What an `index` or `rebuild --json` run shows, without the stage timings that differ on
+/// every run. Its stderr carries those timings too, so it can only be checked line by line.
+fn index_json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
+    let (code, mut envelope, stderr) = json_outcome(cmd);
+    let seconds = envelope["data"]["observations"]
+        .as_object_mut()
+        .and_then(|observations| observations.remove("seconds"))
+        .unwrap_or_else(|| panic!("an index envelope carries its stage seconds: {envelope}"));
+    assert!(seconds["total"].is_number(), "{seconds}");
+    (code, envelope, stderr)
+}
+
+/// An `index` or `rebuild --json` envelope without the model: the model note first, then
+/// `notes`.
+fn index_envelope(
+    counts: &[(&str, u64)],
+    parse_diagnostics: &serde_json::Value,
+    notes: &[String],
+) -> serde_json::Value {
+    let notes = [&[MODEL_NOT_INSTALLED_INDEX_NOTE.to_owned()], notes].concat();
+    serde_json::json!({
+        "data": {
+            "embedded": 0,
+            "failed_count": 0,
+            "observations": {"counts": index_counts(counts)},
+            "parse_diagnostics": parse_diagnostics,
+            "preserved_embedded": 0,
+            "skipped_roots": [],
+        },
+        "degraded": true,
+        "notes": notes,
+    })
+}
+
+/// The index observation counts: the ones given, and 0 for every other.
+fn index_counts(nonzero: &[(&str, u64)]) -> serde_json::Value {
+    let mut counts = serde_json::json!({
+        "chunks_created_committed": 0, "chunks_failed": 0, "chunks_matched_committed": 0,
+        "chunks_pending_snapshot": 0, "chunks_reconciled_created_committed": 0,
+        "chunks_remaining_snapshot": 0, "chunks_removed_committed": 0, "chunks_save_failed": 0,
+        "chunks_saved": 0, "chunks_stale": 0, "chunks_unattempted": 0,
+        "embeddings_reused_committed": 0, "files_deferred": 0, "files_discovered": 0,
+        "files_empty": 0, "files_failed": 0, "files_remaining": 0, "files_unchanged": 0,
+        "files_updated": 0, "files_updated_committed": 0, "inference_batches": 0,
+        "inference_chunks": 0, "sessions_chunk_pending": 0, "sessions_chunk_remaining": 0,
+        "sessions_chunked_committed": 0, "sessions_chunked_empty": 0, "sessions_stored": 0,
+    });
+    for (name, value) in nonzero {
+        assert!(counts.get(name).is_some(), "no index count is named {name}");
+        counts[name] = (*value).into();
+    }
+    counts
+}
+
+/// The counts of a run that parses and chunks one new session, or one that `rebuild` re-parses.
+const ONE_SESSION_PARSED_AND_CHUNKED: &[(&str, u64)] = &[
+    ("chunks_created_committed", 1),
+    ("chunks_pending_snapshot", 1),
+    ("chunks_remaining_snapshot", 1),
+    ("chunks_unattempted", 1),
+    ("files_discovered", 1),
+    ("files_updated", 1),
+    ("files_updated_committed", 1),
+    ("sessions_chunk_pending", 1),
+    ("sessions_chunked_committed", 1),
+    ("sessions_stored", 1),
+];
 const MODEL_NOT_INSTALLED_NOTE: &str = "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search";
 const STATUS_OF_ONE_SESSION: &str = "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n";
 
@@ -459,63 +533,39 @@ fn show_without_json_keeps_human_output() {
 }
 
 #[test]
-fn index_json_emits_structured_embed_summary() {
+fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model() {
     let dir = TempDir::new().unwrap();
-    let out = recall(dir.path())
-        .args(["index", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "index --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+
+    let (code, envelope, stderr) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+
     assert_eq!(
-        v["data"]["embedded"],
-        serde_json::json!(0),
-        "an empty index embeds nothing, got: {stdout}"
+        (code, envelope),
+        (Some(0), index_envelope(&[], &serde_json::json!([]), &[]))
     );
-    assert_eq!(
-        v["data"]["failed_count"],
-        serde_json::json!(0),
-        "an empty index has no embed failures, got: {stdout}"
+    // Only a run of the binary reaches the stage lines the observer writes to stderr.
+    assert!(
+        stderr.starts_with("index: total: started (not yet complete)\n"),
+        "{stderr}"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for stage in [
-        "model_load_probe",
-        "enumeration",
-        "fts_transaction",
-        "chunking",
-        "pending_extraction",
-    ] {
-        assert!(
-            stderr.contains(&format!("index: {stage}: started")),
-            "{stderr}"
-        );
-    }
-    assert!(v["data"]["observations"]["seconds"]["total"].is_number());
-    assert_eq!(v["data"]["observations"]["counts"]["files_discovered"], 0);
 }
 
 #[test]
-fn rebuild_json_emits_structured_embed_summary() {
+fn rebuild_json_reparses_an_unchanged_session_and_reports_it_unembedded() {
     let dir = TempDir::new().unwrap();
-    let out = recall(dir.path())
-        .args(["rebuild", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "rebuild --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
-    assert_eq!(
-        v["data"]["embedded"],
-        serde_json::json!(0),
-        "an empty rebuild embeds nothing, got: {stdout}"
+    seed_indexed_session(dir.path());
+
+    let (code, envelope, _) = index_json_outcome(
+        recall(dir.path())
+            .env("RECALL_CLAUDE_DIR", dir.path().join("claude"))
+            .args(["rebuild", "--json"]),
     );
+
     assert_eq!(
-        v["data"]["failed_count"],
-        serde_json::json!(0),
-        "an empty rebuild has no embed failures, got: {stdout}"
+        (code, envelope),
+        (
+            Some(0),
+            index_envelope(ONE_SESSION_PARSED_AND_CHUNKED, &serde_json::json!([]), &[])
+        )
     );
 }
 
@@ -666,30 +716,17 @@ fn search_excludes_current_session_by_env_default() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let baseline = recall(dir.path())
-        .args(["search", "hello"])
-        .output()
-        .expect("spawn recall binary");
-    let baseline_out = String::from_utf8_lossy(&baseline.stdout);
-    assert!(
-        baseline_out.contains("ID: s1") && baseline_out.contains("ID: s2"),
-        "baseline (no env) should list both sessions, got: {baseline_out}"
-    );
-
-    let out = recall(dir.path())
-        .args(["search", "hello"])
-        .env("CLAUDE_CODE_SESSION_ID", "s1")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ID: s2"),
-        "the non-current session must remain, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("ID: s1"),
-        "the invoking session (s1) must be excluded by default, got: {stdout}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello"])
+                .env("CLAUDE_CODE_SESSION_ID", "s1")
+        ),
+        (
+            Some(0),
+            S2_MATCH.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -698,16 +735,17 @@ fn search_include_current_keeps_invoking_session() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--include-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "s1")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ID: s1") && stdout.contains("ID: s2"),
-        "--include-current must keep the invoking session, got: {stdout}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello", "--include-current"])
+                .env("CLAUDE_CODE_SESSION_ID", "s1")
+        ),
+        (
+            Some(0),
+            BOTH_SEEDED_SESSIONS.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -716,20 +754,17 @@ fn search_only_current_restricts_to_invoking_session() {
     let dir = TempDir::new().unwrap();
     seed_two_matching_sessions(dir.path());
 
-    let out = recall(dir.path())
-        .args(["search", "hello", "--only-current"])
-        .env("CLAUDE_CODE_SESSION_ID", "s1")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("ID: s1"),
-        "--only-current must keep the invoking session, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains("ID: s2"),
-        "--only-current must drop other sessions, got: {stdout}"
+    assert_eq!(
+        outcome(
+            recall(dir.path())
+                .args(["search", "hello", "--only-current"])
+                .env("CLAUDE_CODE_SESSION_ID", "s1")
+        ),
+        (
+            Some(0),
+            S1_MATCH.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -746,6 +781,18 @@ fn only_current_without_env_exits_usage() {
         )
     );
 }
+
+/// `recall search hello` when it lists only `s2` of `seed_two_matching_sessions`.
+const S2_MATCH: &str = concat!(
+    "Found 1 sessions:\n",
+    "\n",
+    "[1] 2026-03-01 | s2 | proj [claude]\n",
+    "    /proj\n",
+    "    ID: s2\n",
+    "    > hello world recall\n",
+    "    inspect: recall show s2 --chunk 2 --window 3\n",
+    "\n",
+);
 
 /// What `recall search hello` prints when it lists both sessions of `seed_two_matching_sessions`.
 const BOTH_SEEDED_SESSIONS: &str = concat!(
@@ -846,55 +893,57 @@ fn classify_reports_and_dry_run_previews() {
         "index should build the DB and exit 0"
     );
 
-    let dry = recall(dir.path())
-        .args(["classify", "--all", "--dry-run"])
-        .output()
-        .expect("spawn recall binary");
     assert_eq!(
-        dry.status.code(),
-        Some(0),
-        "classify --dry-run should exit 0"
+        outcome(recall(dir.path()).args(["classify", "--all", "--dry-run"])),
+        (
+            Some(0),
+            concat!(
+                "s1 [automated] <command-message>clear</command-message>\n",
+                "dry-run: 1 session(s) would be classified (1 automated, 0 interactive)\n",
+            )
+            .to_owned(),
+            String::new()
+        )
     );
-    let dry_out = String::from_utf8_lossy(&dry.stdout);
-    assert!(dry_out.contains("dry-run"), "dry-run output: {dry_out}");
-
-    let run = recall(dir.path())
-        .args(["classify", "--all"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(run.status.code(), Some(0), "classify --all should exit 0");
-    let out = String::from_utf8_lossy(&run.stdout);
-    assert!(out.contains("classified"), "classify output: {out}");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["classify", "--all"])),
+        (
+            Some(0),
+            "classified 1 session(s): 1 automated, 0 interactive\n".to_owned(),
+            String::new()
+        )
+    );
 }
 
 #[test]
 fn classify_preview_of_missing_database_keeps_the_path_absent() {
     let dir = TempDir::new().unwrap();
-    for path in [
-        dir.path().join("recall.db"),
-        dir.path().join("absent/nested/recall.db"),
-    ] {
-        for all in [false, true] {
-            let mut cmd = recall(dir.path());
-            cmd.arg("--db-path")
-                .arg(&path)
-                .args(["classify", "--dry-run", "--json"]);
-            if all {
-                cmd.arg("--all");
-            }
-            let out = cmd.output().unwrap();
-            assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
-            let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-            assert_eq!(
-                envelope,
-                serde_json::json!({
-                    "data": {"classified":0,"automated":0,"interactive":0,"dry_run":true},
-                    "degraded": false, "notes": []
-                })
-            );
-            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-        }
-    }
+    let nothing_classified = serde_json::json!({
+        "data": {"automated": 0, "classified": 0, "dry_run": true, "interactive": 0},
+        "degraded": false,
+        "notes": [],
+    });
+
+    assert_eq!(
+        json_outcome(
+            recall(dir.path())
+                .arg("--db-path")
+                .arg(dir.path().join("recall.db"))
+                .args(["classify", "--dry-run", "--json"])
+        ),
+        (Some(0), nothing_classified.clone(), String::new())
+    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
+    assert_eq!(
+        json_outcome(
+            recall(dir.path())
+                .arg("--db-path")
+                .arg(dir.path().join("absent/nested/recall.db"))
+                .args(["classify", "--dry-run", "--json", "--all"])
+        ),
+        (Some(0), nothing_classified, String::new())
+    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 fn index_claude_sessions(dir: &Path, sessions: &[(&str, &[&str])]) {
@@ -913,17 +962,21 @@ fn index_claude_sessions(dir: &Path, sessions: &[(&str, &[&str])]) {
     );
 }
 
-fn search_stdout(dir: &Path, args: &[&str]) -> String {
-    let out = recall(dir)
-        .arg("search")
-        .args(args)
-        .arg("--json")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    String::from_utf8_lossy(&out.stdout).into_owned()
+/// The `--json` row of a session whose only turn is `authentication notes` on 2026-03-01.
+fn authentication_notes_match(session_id: &str, chunk: u64) -> serde_json::Value {
+    serde_json::json!({
+        "chunk": chunk,
+        "excerpt": "authentication notes",
+        "inspect": format!("recall show {session_id} --chunk {chunk} --window 3"),
+        "project": "/proj",
+        "session_id": session_id,
+        "slug": session_id,
+        "source": "claude",
+        "timestamp": 1_772_323_200_000_i64,
+    })
 }
 
+const AUTOMATED_EXCLUDED_NOTE: &str = "1 automated session(s) matching this search were excluded by default; use --include-automated to include them";
 const AUTOMATED_OPENER: &str = r#"{"type":"user","cwd":"/other","message":{"role":"user","content":"<command-message>clear</command-message>"},"timestamp":"2026-03-01T00:00:00Z"}"#;
 const AUTOMATED_AUTH_TURN: &str = r#"{"type":"user","cwd":"/other","message":{"role":"user","content":"authentication flow review"},"timestamp":"2026-03-01T00:01:00Z"}"#;
 const HUMAN_AUTH: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"authentication notes"},"timestamp":"2026-03-01T00:00:00Z"}"#;
@@ -941,11 +994,17 @@ fn search_notes_automated_sessions_that_match_the_query() {
         ],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication"]);
-
-    assert!(
-        stdout.contains("1 automated session(s)") && stdout.contains("--include-automated"),
-        "a matching automated session must be counted in the note: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("human", 3), authentication_notes_match("human2", 4)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, AUTOMATED_EXCLUDED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -957,11 +1016,17 @@ fn search_omits_automated_note_when_no_automated_session_matches_the_query() {
         &[("auto", &[AUTOMATED_OPENER]), ("human", &[HUMAN_AUTH])],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication"]);
-
-    assert!(
-        !stdout.contains("--include-automated"),
-        "an automated session that does not match the query was not excluded from it: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("human", 2)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -976,11 +1041,23 @@ fn search_omits_automated_note_when_filters_exclude_the_automated_match() {
         ],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication", "--project", "/proj"]);
-
-    assert!(
-        !stdout.contains("--include-automated"),
-        "--project /proj already rules out the /other automated session: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args([
+            "search",
+            "authentication",
+            "--project",
+            "/proj",
+            "--json"
+        ])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("human", 3)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -995,11 +1072,17 @@ fn search_notes_automated_match_even_when_no_interactive_session_matches() {
         ],
     );
 
-    let stdout = search_stdout(dir.path(), &["authentication"]);
-
-    assert!(
-        stdout.contains(r#""results":[]"#) && stdout.contains("1 automated session(s)"),
-        "with no interactive hit, the note is the only pointer to the automated match: {stdout}"
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": []},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, AUTOMATED_EXCLUDED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -1313,63 +1396,84 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     contents
         .extend_from_slice(b"{broken-secret-body\n\xff\n{\"type\":\"progress\"}\n{\"message\":");
     fs::write(&path, contents).unwrap();
+    // Excluded Codex events are not parse loss.
     fs::write(codex.join("ignored.jsonl"), "{\"type\":\"event_msg\"}\n").unwrap();
     let run = |args: &[&str]| {
-        recall(dir.path())
-            .env("HF_HOME", dir.path().join("empty-cache"))
-            .env("RECALL_CLAUDE_DIR", &claude)
+        let mut cmd = recall(dir.path());
+        cmd.env("RECALL_CLAUDE_DIR", &claude)
             .env("RECALL_CODEX_DIR", &codex)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        cmd
     };
-    for command in ["index", "index", "rebuild"] {
-        let out = run(&[command, "--json"]);
-        assert_eq!(out.status.code(), Some(0));
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["data", "degraded", "notes"]);
-        assert_eq!(v["degraded"], true);
-        let diagnostics = v["data"]["parse_diagnostics"].as_array().unwrap();
-        assert_eq!(diagnostics.len(), 1, "excluded Codex events are not loss");
-        assert_eq!(
-            diagnostics[0],
-            serde_json::json!({
-                "file_path": path.to_str().unwrap(), "source": "claude",
-                "invalid_json_lines": 1, "invalid_utf8_lines": 1,
-                "incomplete_tail_lines": 1, "read_error": false,
-            })
-        );
-        let notes = v["notes"].as_array().unwrap();
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap().contains("recall model download"))
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap().contains("repair the source"))
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap().contains("next append"))
-        );
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("secret-"));
-        assert!(!String::from_utf8_lossy(&out.stderr).contains("secret-"));
-    }
-    let out = run(&["index"]);
-    assert_eq!(out.status.code(), Some(0));
-    let human = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let skipped_lines = format!(
+        "{}: skipped 1 invalid JSON line(s) and 1 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)",
+        path.display()
     );
-    assert!(human.contains("1 invalid JSON") && human.contains("1 invalid UTF-8"));
-    assert!(human.contains("1 incomplete final line") && human.contains("next append"));
-    assert!(!human.contains("secret-"));
+    let incomplete_tail = format!(
+        "{}: 1 incomplete final line(s), possibly still being written; wait for the next append, then rerun `recall index`; if the writer has stopped, repair the source file",
+        path.display()
+    );
+    let diagnostics = serde_json::json!([{
+        "file_path": path.to_str().unwrap(),
+        "incomplete_tail_lines": 1,
+        "invalid_json_lines": 1,
+        "invalid_utf8_lines": 1,
+        "read_error": false,
+        "source": "claude",
+    }]);
+    let notes = [skipped_lines.clone(), incomplete_tail.clone()];
+    // The second file, the excluded Codex log, is discovered and read as empty.
+    let parsed = [
+        ONE_SESSION_PARSED_AND_CHUNKED,
+        &[("files_discovered", 2), ("files_empty", 1)],
+    ]
+    .concat();
+    let unchanged = [
+        ("chunks_pending_snapshot", 1),
+        ("chunks_remaining_snapshot", 1),
+        ("chunks_unattempted", 1),
+        ("files_discovered", 2),
+        ("files_empty", 1),
+        ("files_unchanged", 1),
+        ("sessions_stored", 1),
+    ];
+
+    let (code, first, first_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
+    assert_eq!(
+        (code, first),
+        (Some(0), index_envelope(&parsed, &diagnostics, &notes))
+    );
+    let (code, second, second_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
+    assert_eq!(
+        (code, second),
+        (Some(0), index_envelope(&unchanged, &diagnostics, &notes))
+    );
+    let (code, rebuilt, rebuilt_stderr) = index_json_outcome(&mut run(&["rebuild", "--json"]));
+    assert_eq!(
+        (code, rebuilt),
+        (Some(0), index_envelope(&parsed, &diagnostics, &notes))
+    );
+    let (code, stdout, stderr) = outcome(&mut run(&["index"]));
+    assert_eq!((code, stdout), (Some(0), String::new()));
+    // Stage timings fill the rest of stderr, so these lines are checked one by one.
+    assert!(
+        stderr.contains("\n1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("\nwarning: {skipped_lines}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("\nwarning: {incomplete_tail}\n")),
+        "{stderr}"
+    );
+    // The skipped lines hold conversation text, which no output may repeat.
+    assert!(!first_stderr.contains("secret-"), "{first_stderr}");
+    assert!(!second_stderr.contains("secret-"), "{second_stderr}");
+    assert!(!rebuilt_stderr.contains("secret-"), "{rebuilt_stderr}");
+    assert!(!stderr.contains("secret-"), "{stderr}");
+
     fs::write(
         &path,
         [
@@ -1379,17 +1483,52 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         .concat(),
     )
     .unwrap();
-    let out = run(&["index", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
+    let (code, repaired, _) = index_json_outcome(&mut run(&["index", "--json"]));
+
     assert_eq!(
-        v["degraded"], true,
-        "model absence still degrades the repaired index"
+        (code, repaired),
+        (
+            Some(0),
+            index_envelope(
+                &[
+                    ("chunks_pending_snapshot", 1),
+                    ("chunks_reconciled_created_committed", 1),
+                    ("chunks_remaining_snapshot", 1),
+                    ("chunks_removed_committed", 1),
+                    ("chunks_unattempted", 1),
+                    ("files_discovered", 2),
+                    ("files_empty", 1),
+                    ("files_updated", 1),
+                    ("files_updated_committed", 1),
+                    ("sessions_stored", 1),
+                ],
+                &serde_json::json!([]),
+                &[]
+            )
+        )
     );
-    let out = run(&["show", "partial", "--json"]);
-    assert_eq!(out.status.code(), Some(0));
-    let body = String::from_utf8_lossy(&out.stdout);
-    assert!(body.contains("secret-conversation-body") && body.contains("repaired-answer"));
+    assert_eq!(
+        json_outcome(&mut run(&["show", "partial", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "messages": [
+                        {"role": "user", "text": "secret-conversation-body"},
+                        {"role": "assistant", "text": "repaired-answer"},
+                    ],
+                    "project": "",
+                    "session_id": "partial",
+                    "slug": "partial",
+                    "source": "claude",
+                    "timestamp": null,
+                },
+                "degraded": false,
+                "notes": [],
+            }),
+            String::new()
+        )
+    );
 }
 
 #[cfg(unix)]
@@ -1407,31 +1546,45 @@ fn index_reports_real_file_read_failure_then_recovers() {
     )
     .unwrap();
     let run = || {
-        recall(dir.path())
-            .env("HF_HOME", dir.path().join("empty-cache"))
-            .env("RECALL_CLAUDE_DIR", &claude)
-            .args(["index", "--json"])
-            .output()
-            .unwrap()
+        let mut cmd = recall(dir.path());
+        cmd.env("RECALL_CLAUDE_DIR", &claude)
+            .args(["index", "--json"]);
+        cmd
     };
+
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-    let out = run();
+    let (code, unreadable, _) = index_json_outcome(&mut run());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["data"]["parse_diagnostics"][0]["read_error"], true);
-    assert_eq!(v["degraded"], true);
-    assert!(
-        v["notes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n.as_str().unwrap().contains("check file access"))
+    let (recovered_code, recovered, _) = index_json_outcome(&mut run());
+
+    assert_eq!(
+        (code, unreadable),
+        (
+            Some(0),
+            index_envelope(
+                &[("files_discovered", 1), ("files_failed", 1)],
+                &serde_json::json!([{
+                    "file_path": path.to_str().unwrap(),
+                    "incomplete_tail_lines": 0,
+                    "invalid_json_lines": 0,
+                    "invalid_utf8_lines": 0,
+                    "read_error": true,
+                    "source": "claude",
+                }]),
+                &[format!(
+                    "{}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained",
+                    path.display()
+                )]
+            )
+        )
     );
-    let out = run();
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
+    assert_eq!(
+        (recovered_code, recovered),
+        (
+            Some(0),
+            index_envelope(ONE_SESSION_PARSED_AND_CHUNKED, &serde_json::json!([]), &[])
+        )
+    );
 }
 
 const SESSION_LINE: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#;
@@ -1467,11 +1620,16 @@ fn index_stderr_summarizes_new_and_unchanged_runs_in_order() {
     let dir = TempDir::new().unwrap();
     let claude_dir = write_session(dir.path(), SESSION_LINE);
 
+    // Stage timings fill the rest of stderr, and the first summary line ends in the run's time.
     let first = index_stderr(dir.path(), &claude_dir);
-    assert_in_order(&first, "Indexed 1 sessions in ", "Created 1 chunks");
+    assert_in_order(&first, "\nIndexed 1 sessions in ", "\nCreated 1 chunks\n");
 
     let second = index_stderr(dir.path(), &claude_dir);
-    assert_in_order(&second, "1 sessions up to date", "Chunks up to date");
+    assert_in_order(
+        &second,
+        "\n1 sessions up to date\n",
+        "\nChunks up to date\n",
+    );
 }
 
 #[test]
@@ -1483,8 +1641,8 @@ fn index_stderr_summarizes_files_with_unresolved_parse_diagnostics() {
     let unchanged = index_stderr(dir.path(), &claude_dir);
 
     assert!(
-        unchanged.contains("1 sessions stored; 1 file(s) with unresolved parsing diagnostics"),
-        "got: {unchanged}"
+        unchanged.contains("\n1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
+        "{unchanged}"
     );
 }
 
@@ -1497,8 +1655,8 @@ fn index_stderr_warns_when_a_root_with_indexed_sessions_is_unavailable() {
     let stderr = index_stderr(dir.path(), &dir.path().join("absent"));
 
     assert!(
-        stderr.contains("claude root unavailable — preserved 1 existing session(s)"),
-        "got: {stderr}"
+        stderr.contains("\nwarning: claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions\n"),
+        "{stderr}"
     );
 }
 
@@ -1522,48 +1680,38 @@ fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() 
         cmd
     };
     let search_hello = || {
-        let out = isolated()
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .args(["search", "hello"])
-            .output()
-            .expect("spawn recall binary");
-        assert_eq!(out.status.code(), Some(0), "search should exit 0");
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        let mut cmd = isolated();
+        cmd.env_remove("CLAUDE_CONFIG_DIR")
+            .args(["search", "hello"]);
+        cmd
     };
-
-    let first = isolated()
-        .env("CLAUDE_CONFIG_DIR", &config_dir)
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(first.status.code(), Some(0), "first index should exit 0");
-    let before = search_hello();
-    assert!(
-        before.contains("Found 1 sessions:"),
-        "premise: the first index should store the session, got: {before}"
+    let found_the_session = (
+        Some(0),
+        S1_MATCH.to_owned(),
+        MODEL_NOT_INSTALLED_STDERR.to_owned(),
     );
 
-    let second = isolated()
-        .env("CLAUDE_CONFIG_DIR", "")
-        .current_dir(&work_dir)
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(second.status.code(), Some(0), "second index should exit 0");
-    let after = search_hello();
+    let (code, _, stderr) = outcome(
+        isolated()
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .arg("index"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(outcome(&mut search_hello()), found_the_session);
 
-    assert!(
-        after.contains("Found 1 sessions:"),
-        "an empty CLAUDE_CONFIG_DIR run should keep the indexed session, got: {after}"
+    let (code, _, stderr) = outcome(
+        isolated()
+            .env("CLAUDE_CONFIG_DIR", "")
+            .current_dir(&work_dir)
+            .arg("index"),
     );
-    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(outcome(&mut search_hello()), found_the_session);
+    // Stage timings fill the rest of stderr, so the warning is checked as one whole line.
     assert!(
-        stderr.contains("claude root could not be fully read — preserved 1 existing session(s)"),
-        "the empty CLAUDE_CONFIG_DIR run should report the Claude root as not read, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("check that the root is an absolute path"),
-        "the note should point at the root's path, got: {stderr}"
+        stderr.contains("\nwarning: claude root could not be fully read — preserved 1 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions\n"),
+        "{stderr}"
     );
 }
 
@@ -1574,33 +1722,25 @@ fn classify_warns_once_when_a_session_source_is_missing() {
     index_stderr(dir.path(), &claude_dir);
     fs::remove_file(claude_dir.join("s1.jsonl")).unwrap();
 
-    let out = recall(dir.path())
-        .args(["classify", "--all"])
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(0), "classify should exit 0");
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
-        stderr
-            .matches("warning: provenance unavailable (missing file): 1 session(s)")
-            .count(),
-        1,
-        "got: {stderr}"
+        outcome(recall(dir.path()).args(["classify", "--all"])),
+        (
+            Some(0),
+            "classified 0 session(s): 0 automated, 0 interactive\n".to_owned(),
+            "warning: provenance unavailable (missing file): 1 session(s); existing labels retained, unclassified rows use first-turn fallback\n".to_owned()
+        )
     );
 }
 
 #[test]
 fn recall_search_with_a_not_query_returns_only_the_sessions_without_the_excluded_word() {
     let dir = TempDir::new().unwrap();
-    let turn = |text: &str| {
-        format!(
-            r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"{text}"}},"timestamp":"2026-03-01T00:00:00Z"}}"#
-        )
-    };
-    let wanted = turn("authentication notes");
-    let excluded = turn("authentication and deployment notes");
-    let unrelated = turn("checklist for release");
+    let wanted = user_line("authentication notes", "2026-03-01T00:00:00Z");
+    let excluded = user_line(
+        "authentication and deployment notes",
+        "2026-03-01T00:00:00Z",
+    );
+    let unrelated = user_line("checklist for release", "2026-03-01T00:00:00Z");
     index_claude_sessions(
         dir.path(),
         &[
@@ -1610,40 +1750,41 @@ fn recall_search_with_a_not_query_returns_only_the_sessions_without_the_excluded
         ],
     );
 
-    let out = recall(dir.path())
-        .args(["search", "authentication NOT deployment"])
-        .output()
-        .expect("spawn recall binary");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "authentication NOT deployment"])),
+        (
+            Some(0),
+            concat!(
+                "Found 1 sessions:\n",
+                "\n",
+                "[1] 2026-03-01 | wanted | proj [claude]\n",
+                "    /proj\n",
+                "    ID: wanted\n",
+                "    > authentication notes\n",
+                "    inspect: recall show wanted --chunk 3 --window 3\n",
+                "\n",
+            )
+            .to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
+    );
+}
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert_eq!(out.status.code(), Some(0), "{stdout}");
-    assert!(
-        stdout.contains("ID: wanted"),
-        "the session without the excluded word must be returned: {stdout}"
-    );
-    assert!(
-        !stdout.contains("ID: excluded") && !stdout.contains("ID: unrelated"),
-        "sessions with the excluded word or without the first word must be absent: {stdout}"
-    );
+const INCOMPLETE_RESULTS_NOTE: &str = "results may be incomplete: some matched sessions that could have ranked in these results were excluded because their index rows were unreadable or carry an unrecognized source; for unreadable rows, run `recall index` to rebuild";
+
+fn result_ids(envelope: &serde_json::Value) -> Vec<&str> {
+    envelope["data"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| result["session_id"].as_str().unwrap())
+        .collect()
 }
 
 fn user_line(text: &str, timestamp: &str) -> String {
     format!(
         r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"{text}"}},"timestamp":"{timestamp}"}}"#
     )
-}
-
-fn search_envelope(dir: &Path, args: &[&str]) -> serde_json::Value {
-    let stdout = search_stdout(dir, args);
-    serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"))
-}
-
-fn first_session_id(envelope: &serde_json::Value) -> String {
-    envelope["data"]["results"][0]["session_id"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no first result in: {envelope}"))
-        .to_owned()
 }
 
 fn mark_source_unknown(dir: &Path, session_id: &str) {
@@ -1655,16 +1796,6 @@ fn mark_source_unknown(dir: &Path, session_id: &str) {
         )
         .unwrap();
     assert_eq!(changed, 1, "session {session_id} should exist in the index");
-}
-
-fn incomplete_note(envelope: &serde_json::Value) -> Option<String> {
-    envelope["notes"]
-        .as_array()
-        .unwrap_or_else(|| panic!("notes should be an array, got: {envelope}"))
-        .iter()
-        .filter_map(|n| n.as_str())
-        .find(|n| n.contains("incomplete"))
-        .map(str::to_owned)
 }
 
 #[test]
@@ -1692,23 +1823,53 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
         ],
     );
 
-    let default_limit = search_envelope(dir.path(), &["authentication"]);
-    let limit_one = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+    let (code, default_limit, stderr) =
+        json_outcome(recall(dir.path()).args(["search", "authentication", "--json"]));
 
+    // a1 to a5 differ only in age, so their order shifts as they grow older; the head and the
+    // count do not.
     assert_eq!(
-        first_session_id(&default_limit),
-        "z-newest",
-        "the recency blend should put the newest session first: {default_limit}"
+        (
+            code,
+            result_ids(&default_limit)[0],
+            result_ids(&default_limit).len(),
+            &default_limit["notes"],
+            stderr
+        ),
+        (
+            Some(0),
+            "z-newest",
+            6,
+            &serde_json::json!([MODEL_NOT_INSTALLED_NOTE]),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
     assert_eq!(
-        limit_one["data"]["results"].as_array().map(Vec::len),
-        Some(1),
-        "{limit_one}"
-    );
-    assert_eq!(
-        first_session_id(&limit_one),
-        first_session_id(&default_limit),
-        "--limit 1 must print the head of the default limit: {limit_one}"
+        json_outcome(recall(dir.path()).args([
+            "search",
+            "authentication",
+            "--limit",
+            "1",
+            "--json"
+        ])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [{
+                    "chunk": 6,
+                    "excerpt": "authentication notes",
+                    "inspect": "recall show z-newest --chunk 6 --window 3",
+                    "project": "/proj",
+                    "session_id": "z-newest",
+                    "slug": "z-newest",
+                    "source": "claude",
+                    "timestamp": 32_472_144_000_000_i64,
+                }]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -1723,13 +1884,34 @@ fn search_that_skips_only_an_unknown_source_session_outside_the_results_adds_no_
     index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
     mark_source_unknown(dir.path(), "weird");
 
-    let envelope = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+    // Its stderr holds a tracing warning with a timestamp for the skipped session.
+    let (code, envelope, _) = json_outcome(recall(dir.path()).args([
+        "search",
+        "authentication",
+        "--limit",
+        "1",
+        "--json",
+    ]));
 
-    assert_eq!(first_session_id(&envelope), "valid", "{envelope}");
     assert_eq!(
-        incomplete_note(&envelope),
-        None,
-        "a skipped session that cannot reach the results must not raise the note: {envelope}"
+        (code, envelope),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [{
+                    "chunk": 1,
+                    "excerpt": "authentication",
+                    "inspect": "recall show valid --chunk 1 --window 3",
+                    "project": "/proj",
+                    "session_id": "valid",
+                    "slug": "valid",
+                    "source": "claude",
+                    "timestamp": 1_772_323_200_000_i64,
+                }]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            })
+        )
     );
 }
 
@@ -1741,14 +1923,24 @@ fn search_that_skips_an_unknown_source_session_that_could_rank_says_so_in_the_no
     index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
     mark_source_unknown(dir.path(), "weird");
 
-    let envelope = search_envelope(dir.path(), &["authentication", "--limit", "1"]);
+    // Its stderr holds a tracing warning with a timestamp for the skipped session.
+    let (code, envelope, _) = json_outcome(recall(dir.path()).args([
+        "search",
+        "authentication",
+        "--limit",
+        "1",
+        "--json",
+    ]));
 
-    let note = incomplete_note(&envelope).unwrap_or_else(|| {
-        panic!("a skipped session that could rank must raise the note: {envelope}")
-    });
-    assert_eq!(envelope["degraded"], true, "{envelope}");
-    assert!(
-        note.contains("could have ranked"),
-        "the note must say a skipped session could have ranked in the results: {note}"
+    assert_eq!(
+        (code, envelope),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [authentication_notes_match("valid", 1)]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, INCOMPLETE_RESULTS_NOTE],
+            })
+        )
     );
 }
