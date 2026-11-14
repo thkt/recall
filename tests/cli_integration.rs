@@ -16,6 +16,12 @@ fn recall(dir: &Path) -> Command {
         .env("RECALL_CLAUDE_DIR", dir.join("no-claude"))
         .env("RECALL_CODEX_DIR", dir.join("no-codex"))
         .env_remove("RECALL_CODEX_ARCHIVED_DIR")
+        // Keep the model cache and the probe record off the developer's own directories.
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env("HF_HOME", dir.join("hf"))
+        .env_remove("__RECALL_GEMMA_PROBE")
+        .env_remove("__RECALL_GEMMA_SPEC")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("RUST_LOG");
     cmd
