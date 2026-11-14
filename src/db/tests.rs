@@ -771,7 +771,7 @@ fn a_database_in_a_read_only_directory_whose_path_has_a_space_and_a_question_mar
 }
 
 #[test]
-fn probe_cleanup_failure_warns_instead_of_failing_the_read() {
+fn failing_to_remove_the_write_probe_warns_with_its_path_and_the_error() {
     use std::sync::Mutex;
     use tracing::subscriber::with_default;
 
