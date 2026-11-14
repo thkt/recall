@@ -288,6 +288,19 @@ fn s1_match() -> serde_json::Value {
     })
 }
 
+/// `recall show s1` when `seed_indexed_session` indexed `s1`.
+const SHOW_S1: &str = concat!(
+    "# s1\n",
+    "- session_id: s1\n",
+    "- date: 2026-03-01\n",
+    "- project: /proj\n",
+    "- source: claude\n",
+    "\n",
+    "## [user]\n",
+    "hello world recall\n",
+    "\n",
+);
+
 /// The `--json` data of `recall show s1` when `seed_indexed_session` indexed `s1`.
 fn show_s1() -> serde_json::Value {
     serde_json::json!({
@@ -513,22 +526,7 @@ fn show_without_json_keeps_human_output() {
 
     assert_eq!(
         outcome(recall(dir.path()).args(["show", "s1"])),
-        (
-            Some(0),
-            concat!(
-                "# s1\n",
-                "- session_id: s1\n",
-                "- date: 2026-03-01\n",
-                "- project: /proj\n",
-                "- source: claude\n",
-                "\n",
-                "## [user]\n",
-                "hello world recall\n",
-                "\n",
-            )
-            .to_owned(),
-            String::new()
-        )
+        (Some(0), SHOW_S1.to_owned(), String::new())
     );
 }
 
@@ -1365,6 +1363,212 @@ fn read_commands_on_a_stale_snapshot_in_a_read_only_directory_ask_to_index_a_cop
                 r#"{{"error":{{"code":"DATA_ERROR","message":"{READ_ONLY_DIR_NOTE}","retryable":false}}}}"#
             ) + "\n"
         )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn text_read_commands_on_a_stale_snapshot_in_a_read_only_directory_print_the_note_on_stderr() {
+    let dir = TempDir::new().unwrap();
+    seed_stale_wal(dir.path());
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+    let note = format!("note: {READ_ONLY_DIR_NOTE}\n");
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["show", "s1"])),
+        (Some(0), SHOW_S1.to_owned(), note.clone())
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "hello"])),
+        (
+            Some(0),
+            S1_MATCH.to_owned(),
+            format!("{MODEL_NOT_INSTALLED_STDERR}{note}")
+        )
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).arg("status")),
+        (Some(0), STATUS_OF_ONE_SESSION.to_owned(), note.clone())
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).arg("doctor")),
+        (
+            Some(0),
+            concat!(
+                "Health: healthy\n",
+                "  integrity [ok]\n",
+                "  orphan_embeddings [ok]\n",
+                "  orphan_chunks [ok]\n",
+                "  model [ok] model not installed; search runs FTS-only\n",
+            )
+            .to_owned(),
+            format!("{MODEL_NOT_INSTALLED_STDERR}{note}")
+        )
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
+    let no_sessions = TempDir::new().unwrap();
+    assert_eq!(exit_code(recall(no_sessions.path()).arg("index")), 0);
+    let no_schema = TempDir::new().unwrap();
+    rusqlite::Connection::open(no_schema.path().join("recall.db"))
+        .unwrap()
+        .execute_batch("PRAGMA journal_mode = WAL;")
+        .unwrap();
+    let _ = fs::remove_file(no_sessions.path().join("recall.db-shm"));
+    fs::write(
+        no_sessions.path().join("recall.db-wal"),
+        b"uncheckpointed-frames",
+    )
+    .unwrap();
+    fs::write(
+        no_schema.path().join("recall.db-wal"),
+        b"uncheckpointed-frames",
+    )
+    .unwrap();
+    let _no_sessions_read_only = ReadOnlyDir::new(no_sessions.path());
+    let _no_schema_read_only = ReadOnlyDir::new(no_schema.path());
+    if root_skip::skip_if_root(no_sessions.path()) {
+        return;
+    }
+    // Every session may sit in the log this snapshot cannot read.
+    let text = (
+        Some(0),
+        String::new(),
+        format!("{NO_SESSIONS_INDEXED}note: {READ_ONLY_DIR_NOTE}\n"),
+    );
+
+    assert_eq!(
+        outcome(recall(no_sessions.path()).args(["search", "anything"])),
+        text
+    );
+    assert_eq!(
+        json_outcome(recall(no_sessions.path()).args(["search", "anything", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": []},
+                "degraded": true,
+                "notes": [READ_ONLY_DIR_NOTE],
+            }),
+            NO_SESSIONS_INDEXED.to_owned()
+        )
+    );
+    assert_eq!(
+        outcome(recall(no_schema.path()).args(["search", "anything"])),
+        text
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_the_error() {
+    let dir = TempDir::new().unwrap();
+    rusqlite::Connection::open(dir.path().join("recall.db"))
+        .unwrap()
+        .execute_batch(
+            "PRAGMA journal_mode = WAL; CREATE TABLE sessions (session_id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+    fs::write(dir.path().join("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+    // The newer schema may sit in the log this snapshot cannot read.
+    let error = (
+        Some(65),
+        String::new(),
+        format!(
+            "error: database schema is out of date; run `recall rebuild` to migrate it; {READ_ONLY_DIR_NOTE}\n"
+        ),
+    );
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "anything"])),
+        error
+    );
+    assert_eq!(outcome(recall(dir.path()).arg("status")), error);
+}
+
+#[test]
+fn text_search_and_status_print_the_notes_they_add_on_stderr() {
+    let automated = TempDir::new().unwrap();
+    index_claude_sessions(
+        automated.path(),
+        &[
+            ("auto", &[AUTOMATED_OPENER, AUTOMATED_AUTH_TURN]),
+            ("human", &[HUMAN_AUTH]),
+        ],
+    );
+    let other_model = TempDir::new().unwrap();
+    seed_indexed_session(other_model.path());
+    rusqlite::Connection::open(other_model.path().join("recall.db"))
+        .unwrap()
+        .execute(
+            "UPDATE embedding_identity SET fingerprint = 'another model'",
+            [],
+        )
+        .unwrap();
+    let unknown_source = TempDir::new().unwrap();
+    index_claude_sessions(
+        unknown_source.path(),
+        &[
+            (
+                "valid",
+                &[&user_line("authentication notes", "2026-03-01T00:00:00Z")],
+            ),
+            (
+                "weird",
+                &[&user_line("authentication notes", "2026-03-01T00:00:00Z")],
+            ),
+        ],
+    );
+    mark_source_unknown(unknown_source.path(), "weird");
+
+    let identity_note = "note: semantic search unavailable: index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest; results are text-only\n";
+
+    assert_eq!(
+        outcome(recall(automated.path()).args(["search", "authentication"])),
+        (
+            Some(0),
+            concat!(
+                "Found 1 sessions:\n",
+                "\n",
+                "[1] 2026-03-01 | human | proj [claude]\n",
+                "    /proj\n",
+                "    ID: human\n",
+                "    > authentication notes\n",
+                "    inspect: recall show human --chunk 3 --window 3\n",
+                "\n",
+            )
+            .to_owned(),
+            format!("{MODEL_NOT_INSTALLED_STDERR}note: {AUTOMATED_EXCLUDED_NOTE}\n")
+        )
+    );
+    assert_eq!(
+        outcome(recall(other_model.path()).args(["search", "hello"])),
+        (Some(0), S1_MATCH.to_owned(), identity_note.to_owned())
+    );
+    assert_eq!(
+        outcome(recall(other_model.path()).arg("status")),
+        (
+            Some(0),
+            STATUS_OF_ONE_SESSION.to_owned(),
+            identity_note.to_owned()
+        )
+    );
+    // A tracing line with a timestamp logs the skipped session before the note.
+    let (_, _, stderr) =
+        outcome(recall(unknown_source.path()).args(["search", "authentication", "--limit", "1"]));
+    assert!(
+        stderr.ends_with(&format!("\nnote: {INCOMPLETE_RESULTS_NOTE}\n")),
+        "{stderr}"
     );
 }
 

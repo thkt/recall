@@ -9,7 +9,7 @@ use crate::commands::build_markdown;
 use crate::db;
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::{EMBEDDING_DIMS, Embed};
-use crate::envelope::CommandOutput;
+use crate::envelope::{CommandOutput, Note};
 use crate::error::{RecallError, download_error};
 use crate::model::{self, DegradedReason, download_and_verify_model};
 use crate::runtime::info as cli_info;
@@ -245,7 +245,8 @@ where
                 "model_recovery_retryable": null,
             }),
             true,
-            vec!["no index: run `recall index`".to_owned()],
+            // The two lines above already tell a text reader.
+            vec![Note::shown("no index: run `recall index`")],
         ));
     }
 
@@ -294,7 +295,7 @@ where
     let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
     if let Some(note) = wal_note {
         output.degraded = true;
-        output.notes.push(note);
+        output.notes.push(Note::new(note));
     }
     Ok(output)
 }
@@ -322,20 +323,21 @@ fn doctor_notes(
     checks: &[DoctorCheck],
     repairs: &Option<Vec<RepairOutcome>>,
     model_recovery: &ModelRecovery,
-) -> Vec<String> {
-    let mut notes: Vec<String> = checks
+) -> Vec<Note> {
+    // The report on stdout already shows each remedy and failure.
+    let mut notes: Vec<Note> = checks
         .iter()
-        .filter_map(|c| c.remedy.map(|r| format!("{}: {}", c.name, r)))
+        .filter_map(|c| c.remedy.map(|r| Note::shown(format!("{}: {}", c.name, r))))
         .collect();
     if let Some(outcomes) = repairs {
         for o in outcomes {
             if let Err(e) = &o.result {
-                notes.push(format!("fix: {}: repair failed: {e}", o.name));
+                notes.push(Note::shown(format!("fix: {}: repair failed: {e}", o.name)));
             }
         }
     }
     if let ModelRecovery::Failed(e) = model_recovery {
-        notes.push(format!("fix: model: recovery failed: {e}"));
+        notes.push(Note::shown(format!("fix: model: recovery failed: {e}")));
     }
     notes
 }

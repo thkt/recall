@@ -42,7 +42,7 @@ use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand};
 use rusqlite::Connection;
 
-use crate::envelope::{CommandOutput, render_json_error, render_json_success};
+use crate::envelope::{CommandOutput, render_json_error, render_json_success, render_text_notes};
 use crate::error::{RecallError, classify_exit_code, download_error, error_envelope};
 use crate::output::{WriteOutcome, write_result};
 
@@ -265,24 +265,51 @@ fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
     }
 }
 
-fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
-    emit_success_to(out, json_mode, &mut io::stdout().lock())
+/// `require_current_schema` for a snapshot that may miss the write-ahead log: the newer schema may
+/// sit in that log, so `wal_note` joins the error.
+fn require_current_schema_in_snapshot(
+    state: db::SchemaState,
+    wal_note: Option<&str>,
+) -> Result<(), RecallError> {
+    require_current_schema(state).map_err(|error| match wal_note {
+        Some(note) => RecallError::DatabaseRead(format!("{error}; {note}")),
+        None => error,
+    })
 }
 
-fn emit_success_to<W: Write>(
+fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
+    emit_success_to(
+        out,
+        json_mode,
+        &mut io::stdout().lock(),
+        &mut io::stderr().lock(),
+    )
+}
+
+/// Writes the result to `w` and, in a text run whose result did not fail to write, the notes the
+/// command has not shown to `notes`, so a reader that closed stdout early still gets them. A note
+/// the command already put in its result on stdout is not repeated there.
+fn emit_success_to<W: Write, E: Write>(
     out: &CommandOutput,
     json_mode: bool,
     w: &mut W,
+    notes: &mut E,
 ) -> io::Result<WriteOutcome> {
     let body = if json_mode {
         Cow::Owned(render_json_success(out))
     } else {
         Cow::Borrowed(out.markdown.as_str())
     };
-    if body.is_empty() {
-        return Ok(WriteOutcome::Written);
+    let written = if body.is_empty() {
+        Ok(WriteOutcome::Written)
+    } else {
+        write_result(w, &body)
+    };
+    if !json_mode && written.is_ok() {
+        // A closed stderr must not fail a run whose result was written, as a closed stdout does not.
+        let _ = notes.write_all(render_text_notes(out).as_bytes());
     }
-    write_result(w, &body)
+    written
 }
 
 fn emit_error(err: &anyhow::Error, json_mode: bool) {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::commands::search::run_search_in;
 use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError};
+use crate::envelope::render_text_notes;
 use crate::model::tests::{CachedArtifacts, FakeHost};
 use crate::open_or_create_db;
 use crate::tests::{bare_empty_db, printed_envelope, search_command, seed_healthy_index};
@@ -62,6 +63,8 @@ fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
             "  model [ok]\n",
         )
     );
+    // The report already shows its note, so a text run adds no stderr line for it.
+    assert_eq!(render_text_notes(&out), "");
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({
@@ -1327,6 +1330,8 @@ fn doctor_fix_that_cannot_write_the_index_is_degraded_and_says_why() {
             "  model [ok]\n",
         )
     );
+    // The report already shows its note, so a text run adds no stderr line for it.
+    assert_eq!(render_text_notes(&out), "");
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({

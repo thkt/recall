@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::envelope::render_text_notes;
 use crate::model::tests::FakeHost;
 use crate::tests::{
     bare_empty_db, mock_loader, payload_keys, printed_envelope, search_command, seed_healthy_index,
@@ -565,6 +566,11 @@ fn search_whose_vector_query_fails_returns_the_text_match_with_a_text_only_note(
             "degraded": true,
             "notes": ["semantic search unavailable: vector query failed at runtime; results are text-only"],
         })
+    );
+    // A tracing line logs the failure; this note tells a text reader what it means for the results.
+    assert_eq!(
+        render_text_notes(&out),
+        "note: semantic search unavailable: vector query failed at runtime; results are text-only\n"
     );
 }
 

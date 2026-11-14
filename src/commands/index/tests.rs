@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::db::collect_strings;
-use crate::envelope::render_json_success;
+use crate::envelope::{render_json_success, render_text_notes};
 use crate::model::tests::FakeHost;
 use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
 use crate::{parser, search};
@@ -1832,5 +1832,47 @@ fn index_still_starts_the_probe_in_an_environment_search_has_recorded() {
         host.probes.get(),
         2,
         "index and rebuild run the probe every time"
+    );
+}
+
+#[test]
+fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_printed() {
+    let printed = IndexOutcome {
+        degraded_note: Some("note: embedding model not installed".to_owned()),
+        skipped_roots: vec![indexer::SkippedRoot {
+            source: parser::Source::Codex,
+            preserved_sessions: 2,
+            reason: indexer::SkippedReason::IncompleteEnumeration,
+            other_roots_reconciled: false,
+        }],
+        preserved_embedded: 1,
+        parse_diagnostics: vec![indexer::FileParseDiagnostics {
+            file_path: "/logs/s1.jsonl".into(),
+            source: parser::Source::Claude,
+            lines: parser::LineDiagnostics {
+                invalid_json_lines: 1,
+                invalid_utf8_lines: 0,
+                incomplete_tail_lines: 0,
+            },
+            read_error: false,
+        }],
+        ..IndexOutcome::default()
+    };
+    let failed = IndexOutcome {
+        failed_count: 2,
+        first_error: Some("batch failed".to_owned()),
+        ..IndexOutcome::default()
+    };
+
+    assert_eq!(
+        (
+            render_text_notes(&index_command_output(&printed)),
+            render_text_notes(&index_command_output(&failed))
+        ),
+        (
+            String::new(),
+            "note: 2 chunk(s) failed to embed (batch failed); rerun `recall index` to retry\n"
+                .to_owned()
+        )
     );
 }

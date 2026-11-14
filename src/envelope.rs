@@ -10,7 +10,32 @@ pub(crate) struct CommandOutput {
     pub markdown: String,
     pub data: serde_json::Value,
     pub degraded: bool,
-    pub notes: Vec<String>,
+    pub notes: Vec<Note>,
+}
+
+/// A note on a command's result. `--json` carries every note; a text run prints on stderr the
+/// notes the command has not shown already (#403).
+#[derive(Debug)]
+pub(crate) struct Note {
+    pub text: String,
+    /// The command already put this in its text output, on stdout or stderr.
+    pub shown: bool,
+}
+
+impl Note {
+    pub(crate) fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            shown: false,
+        }
+    }
+
+    pub(crate) fn shown(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            shown: true,
+        }
+    }
 }
 
 impl CommandOutput {
@@ -27,7 +52,7 @@ impl CommandOutput {
         markdown: String,
         data: serde_json::Value,
         degraded: bool,
-        notes: Vec<String>,
+        notes: Vec<Note>,
     ) -> Self {
         Self {
             markdown,
@@ -86,10 +111,25 @@ pub(crate) fn render_json_success(out: &CommandOutput) -> String {
         notes: out
             .notes
             .iter()
-            .map(|note| ansi::strip_control_chars(note))
+            .map(|note| ansi::strip_control_chars(&note.text))
             .collect(),
     };
     serde_json::to_string(&env).expect("SuccessEnvelope is always serializable")
+}
+
+/// The stderr lines a text run adds for the notes its command has not shown: one line each,
+/// control characters removed as in the envelope and a newline turned into a space.
+pub(crate) fn render_text_notes(out: &CommandOutput) -> String {
+    out.notes
+        .iter()
+        .filter(|note| !note.shown)
+        .map(|note| {
+            format!(
+                "note: {}\n",
+                ansi::strip_control_chars(&note.text).replace('\n', " ")
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn render_json_error(env: &ErrorEnvelope) -> String {
