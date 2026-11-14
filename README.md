@@ -320,15 +320,15 @@ Gemma product latency and indexing throughput depend on corpus, hardware, checks
 
 recall uses sysexits-style exit codes instead of a generic `1`/`2` split.
 
-| Code | Name           | Meaning                                                                                                                                                                   |
-| ---- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0    | success        | Command completed successfully                                                                                                                                            |
-| 64   | `USAGE_ERROR`  | Invalid command usage, or `show` without a local index                                                                                                                    |
-| 65   | `DATA_ERROR`   | Input or index recall cannot use, such as a bad query, an index built by an older version or for another model, or a read-only index whose write-ahead log it cannot read |
-| 70   | `INTERNAL`     | Internal invariant or unsupported backend                                                                                                                                 |
-| 74   | `IO_ERROR`     | Filesystem or SQLite I/O failure                                                                                                                                          |
-| 75   | `TEMP_FAILURE` | Retryable transient failure                                                                                                                                               |
-| 104  | `UNKNOWN`      | Unclassified error path                                                                                                                                                   |
+| Code | Name           | Meaning                                                                                                                |
+| ---- | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| 0    | success        | Command completed successfully                                                                                         |
+| 64   | `USAGE_ERROR`  | Invalid command usage, such as an unknown flag or a `show` id that matches no session, or `show` without a local index |
+| 65   | `DATA_ERROR`   | A bad query, or an index the command cannot use, such as one built by an older version or for another model            |
+| 70   | `INTERNAL`     | Internal invariant or unsupported backend                                                                              |
+| 74   | `IO_ERROR`     | Filesystem or SQLite I/O failure                                                                                       |
+| 75   | `TEMP_FAILURE` | Retryable transient failure                                                                                            |
+| 104  | `UNKNOWN`      | Unclassified error path                                                                                                |
 
 ## Development
 
