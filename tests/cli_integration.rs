@@ -195,15 +195,17 @@ fn a_bare_word_runs_a_search_for_it() {
 fn status_verbose_includes_db_path() {
     let dir = TempDir::new().unwrap();
     assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
-    let out = recall(dir.path())
-        .args(["status", "--verbose"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "status --verbose should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("DB:"),
-        "verbose status stdout should list the DB path, got: {stdout}"
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["status", "--verbose"])),
+        (
+            Some(0),
+            format!(
+                "Sessions: 0\nQA chunks: 0\nEmbedded: 0/0\nModel: not installed (run `recall model download`)\nDB: {}\n",
+                dir.path().join("recall.db").display()
+            ),
+            String::new()
+        )
     );
 }
 
@@ -245,40 +247,65 @@ fn seed_indexed_session(dir: &Path) {
     );
 }
 
+/// `recall search hello` when `seed_indexed_session` indexed only `s1`.
+const S1_MATCH: &str = concat!(
+    "Found 1 sessions:\n",
+    "\n",
+    "[1] 2026-03-01 | s1 | proj [claude]\n",
+    "    /proj\n",
+    "    ID: s1\n",
+    "    > hello world recall\n",
+    "    inspect: recall show s1 --chunk 1 --window 3\n",
+    "\n",
+);
+
+/// The `--json` result row of `S1_MATCH`.
+fn s1_match() -> serde_json::Value {
+    serde_json::json!({
+        "chunk": 1,
+        "excerpt": "hello world recall",
+        "inspect": "recall show s1 --chunk 1 --window 3",
+        "project": "/proj",
+        "session_id": "s1",
+        "slug": "s1",
+        "source": "claude",
+        "timestamp": 1_772_323_200_000_i64,
+    })
+}
+
+/// The `--json` data of `recall show s1` when `seed_indexed_session` indexed `s1`.
+fn show_s1() -> serde_json::Value {
+    serde_json::json!({
+        "messages": [{"role": "user", "text": "hello world recall"}],
+        "project": "/proj",
+        "session_id": "s1",
+        "slug": "s1",
+        "source": "claude",
+        "timestamp": 1_772_323_200_000_i64,
+    })
+}
+
+const MODEL_NOT_INSTALLED_STDERR: &str =
+    "note: embedding model not installed; run `recall model download` to enable semantic search.\n";
+const MODEL_NOT_INSTALLED_NOTE: &str = "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search";
+const STATUS_OF_ONE_SESSION: &str = "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n";
+
 #[test]
 fn search_json_emits_success_envelope_with_results() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
-    let out = recall(dir.path())
-        .args(["search", "hello", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
-    let results = v["data"]["results"]
-        .as_array()
-        .unwrap_or_else(|| panic!("data.results should be an array, got: {stdout}"));
+
     assert_eq!(
-        results.len(),
-        1,
-        "the one seeded session should be the single hit, got: {stdout}"
-    );
-    assert!(
-        results[0]["session_id"].is_string() && results[0]["excerpt"].is_string(),
-        "each result row should carry session_id and excerpt, got: {stdout}"
-    );
-    let degraded = v["degraded"]
-        .as_bool()
-        .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));
-    let notes = v["notes"]
-        .as_array()
-        .unwrap_or_else(|| panic!("notes should be an array, got: {stdout}"));
-    assert_eq!(
-        degraded,
-        !notes.is_empty(),
-        "degraded must coincide with a non-empty notes list, got: {stdout}"
+        json_outcome(recall(dir.path()).args(["search", "hello", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [s1_match()]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -303,22 +330,19 @@ fn no_subcommand_json_emits_error_envelope_on_stderr() {
 #[test]
 fn status_json_emits_stats_envelope() {
     let dir = TempDir::new().unwrap();
-    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
-    let out = recall(dir.path())
-        .args(["status", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "status --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(r#""data""#),
-        "stdout should be a success envelope, got: {stdout}"
-    );
-    assert!(
-        stdout.contains(r#""sessions""#)
-            && stdout.contains(r#""qa_chunks""#)
-            && stdout.contains(r#""embedded""#),
-        "data should carry sessions/qa_chunks/embedded counters, got: {stdout}"
+    seed_indexed_session(dir.path());
+
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["status", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"embedded": 0, "model_ready": false, "qa_chunks": 1, "sessions": 1},
+                "degraded": false,
+                "notes": [],
+            }),
+            String::new()
+        )
     );
 }
 
@@ -345,19 +369,14 @@ fn search_of_an_index_without_sessions_says_to_run_recall_index_in_text_and_json
 fn search_without_json_keeps_human_output() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
-    let out = recall(dir.path())
-        .args(["search", "hello"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "search should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("Found 1 sessions:"),
-        "default output should stay human-readable, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains(r#""data""#),
-        "default output must not emit the JSON envelope, got: {stdout}"
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "hello"])),
+        (
+            Some(0),
+            S1_MATCH.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -365,21 +384,14 @@ fn search_without_json_keeps_human_output() {
 fn show_json_emits_session_envelope() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
-    let out = recall(dir.path())
-        .args(["show", "s1", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "show --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(r#""data""#) && stdout.contains(r#""session_id":"s1""#),
-        "stdout should be a success envelope carrying the session id, got: {stdout}"
-    );
-    assert!(
-        stdout.contains(r#""messages""#)
-            && stdout.contains(r#""role":"user""#)
-            && stdout.contains(r#""text":"hello world recall""#),
-        "data should carry the conversation messages, got: {stdout}"
+
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["show", "s1", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({"data": show_s1(), "degraded": false, "notes": []}),
+            String::new()
+        )
     );
 }
 
@@ -387,19 +399,25 @@ fn show_json_emits_session_envelope() {
 fn show_without_json_keeps_human_output() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
-    let out = recall(dir.path())
-        .args(["show", "s1"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "show should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("# s1") && stdout.contains("## [user]"),
-        "default output should stay human-readable markdown, got: {stdout}"
-    );
-    assert!(
-        !stdout.contains(r#""data""#),
-        "default output must not emit the JSON envelope, got: {stdout}"
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["show", "s1"])),
+        (
+            Some(0),
+            concat!(
+                "# s1\n",
+                "- session_id: s1\n",
+                "- date: 2026-03-01\n",
+                "- project: /proj\n",
+                "- source: claude\n",
+                "\n",
+                "## [user]\n",
+                "hello world recall\n",
+                "\n",
+            )
+            .to_owned(),
+            String::new()
+        )
     );
 }
 
@@ -468,57 +486,34 @@ fn rebuild_json_emits_structured_embed_summary() {
 fn doctor_json_of_an_index_without_the_model_reports_it_healthy_with_the_model_as_info() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
-    let out = recall(dir.path())
-        .args(["doctor", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "doctor --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
-    let healthy = v["data"]["healthy"]
-        .as_bool()
-        .unwrap_or_else(|| panic!("data.healthy should be a bool, got: {stdout}"));
-    assert!(
-        v["data"]
-            .get("repaired")
-            .is_some_and(serde_json::Value::is_null),
-        "a read-only doctor (no --fix) freezes repaired=null, got: {stdout}"
-    );
-    let degraded = v["degraded"]
-        .as_bool()
-        .unwrap_or_else(|| panic!("degraded should be a bool, got: {stdout}"));
+
     assert_eq!(
-        degraded, !healthy,
-        "envelope degraded must be the negation of data.healthy, got: {stdout}"
-    );
-    let checks = v["data"]["checks"]
-        .as_array()
-        .unwrap_or_else(|| panic!("data.checks should be an array, got: {stdout}"));
-    for c in checks {
-        let obj = c
-            .as_object()
-            .unwrap_or_else(|| panic!("each check should be an object, got: {stdout}"));
-        for key in ["name", "ok", "detail", "remedy"] {
-            assert!(
-                obj.contains_key(key),
-                "each check must carry the `{key}` key, got: {stdout}"
-            );
-        }
-    }
-    let mut names: Vec<&str> = checks
-        .iter()
-        .map(|c| {
-            c["name"]
-                .as_str()
-                .unwrap_or_else(|| panic!("check name should be a string, got: {stdout}"))
-        })
-        .collect();
-    names.sort_unstable();
-    assert_eq!(
-        names,
-        ["integrity", "model", "orphan_chunks", "orphan_embeddings"],
-        "a built index freezes exactly these four check tokens, got: {stdout}"
+        json_outcome(recall(dir.path()).args(["doctor", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "checks": [
+                        {"detail": null, "name": "integrity", "ok": true, "remedy": null},
+                        {"detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null},
+                        {"detail": null, "name": "orphan_chunks", "ok": true, "remedy": null},
+                        {
+                            "detail": "model not installed; search runs FTS-only",
+                            "name": "model",
+                            "ok": true,
+                            "remedy": null,
+                        },
+                    ],
+                    "healthy": true,
+                    "model_recovered": null,
+                    "model_recovery_retryable": null,
+                    "repaired": null,
+                },
+                "degraded": false,
+                "notes": [],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -1255,32 +1250,20 @@ fn index_upgrading_a_pre_trigram_index_keeps_the_sessions_of_a_missing_root_sear
     let dir = TempDir::new().unwrap();
     seed_pre_trigram_index(dir.path());
 
-    let index = recall(dir.path())
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
-    let status = recall(dir.path())
-        .arg("status")
-        .output()
-        .expect("spawn recall binary");
-    let search = recall(dir.path())
-        .args(["search", "hello"])
-        .output()
-        .expect("spawn recall binary");
+    // Its stderr carries stage timings and the read warning #445 reports, so only the code counts.
+    assert_eq!(exit_code(recall(dir.path()).arg("index")), 0);
 
     assert_eq!(
-        index.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&index.stderr)
+        outcome(recall(dir.path()).arg("status")),
+        (Some(0), STATUS_OF_ONE_SESSION.to_owned(), String::new())
     );
     assert_eq!(
-        String::from_utf8_lossy(&status.stdout),
-        "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n"
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&search.stdout),
-        "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > hello world recall\n    inspect: recall show s1 --chunk 1 --window 3\n\n"
+        outcome(recall(dir.path()).args(["search", "hello"])),
+        (
+            Some(0),
+            "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > hello world recall\n    inspect: recall show s1 --chunk 1 --window 3\n\n".to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
     );
 }
 
@@ -1292,16 +1275,18 @@ fn show_on_an_index_from_an_older_version_asks_for_a_rebuild() {
         .execute_batch("CREATE TABLE sessions (session_id TEXT PRIMARY KEY);")
         .unwrap();
 
-    let out = recall(dir.path())
-        .args(["show", "s1", "--json"])
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(65));
-    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "DATA_ERROR");
-    let message = error["error"]["message"].as_str().unwrap();
-    assert!(message.contains("run `recall rebuild`"), "{message}");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["show", "s1", "--json"])),
+        (
+            Some(65),
+            String::new(),
+            concat!(
+                r#"{"error":{"code":"DATA_ERROR","message":"database schema is out of date; run `recall rebuild` to migrate it","retryable":false}}"#,
+                "\n"
+            )
+            .to_owned()
+        )
+    );
 }
 
 #[test]
@@ -1309,20 +1294,14 @@ fn show_from_a_writable_directory_adds_no_stale_snapshot_note() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
 
-    let out = recall(dir.path())
-        .args(["show", "s1", "--json"])
-        .output()
-        .expect("spawn recall binary");
-
     assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        json_outcome(recall(dir.path()).args(["show", "s1", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({"data": show_s1(), "degraded": false, "notes": []}),
+            String::new()
+        )
     );
-    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(envelope["degraded"], false, "{envelope}");
-    assert_eq!(envelope["notes"], serde_json::json!([]), "{envelope}");
 }
 
 #[cfg(unix)]
