@@ -957,6 +957,10 @@ fn a_path_without_a_parent_component_stays_classified_writable() {
 
 #[cfg(unix)]
 #[path = "../../tests/support/root_skip.rs"]
+#[allow(
+    dead_code,
+    reason = "assert_copy_based_remedy serves the CLI tests, where its self-tests live"
+)]
 mod root_skip;
 
 #[cfg(unix)]
@@ -979,32 +983,6 @@ fn root_check_treats_a_directory_it_can_write_as_root_and_restores_its_mode() {
     );
     let mode = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o755, "dir's write bits must be restored to 0o755");
-}
-
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "-shm sidecar")]
-fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
-    root_skip::assert_copy_based_remedy(
-        "read-only open cannot see uncommitted changes in the write-ahead log; \
-         the directory is read-only, so copy the DB together with its `-wal` \
-         sidecar file elsewhere and run `recall index --db-path <copy>` to \
-         checkpoint it there.",
-        "negative self-test",
-    );
-}
-
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "cannot run a bare")]
-fn copy_remedy_check_rejects_a_note_that_also_offers_a_bare_recall_index() {
-    root_skip::assert_copy_based_remedy(
-        "read-only open cannot see uncommitted changes in the write-ahead log; \
-         copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
-         files elsewhere and run `recall index --db-path <copy>`, or run \
-         `recall index` to checkpoint them.",
-        "negative self-test",
-    );
 }
 
 #[cfg(unix)]

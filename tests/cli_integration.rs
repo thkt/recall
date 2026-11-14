@@ -1321,6 +1321,32 @@ fn integration_canary_は非_root_で_green_root_では_panic_で赤化する() 
     root_skip::assert_root_canary();
 }
 
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "-shm sidecar")]
+fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
+    root_skip::assert_copy_based_remedy(
+        "read-only open cannot see uncommitted changes in the write-ahead log; \
+         the directory is read-only, so copy the DB together with its `-wal` \
+         sidecar file elsewhere and run `recall index --db-path <copy>` to \
+         checkpoint it there.",
+        "negative self-test",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "cannot run a bare")]
+fn copy_remedy_check_rejects_a_note_that_also_offers_a_bare_recall_index() {
+    root_skip::assert_copy_based_remedy(
+        "read-only open cannot see uncommitted changes in the write-ahead log; \
+         copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
+         files elsewhere and run `recall index --db-path <copy>`, or run \
+         `recall index` to checkpoint them.",
+        "negative self-test",
+    );
+}
+
 #[test]
 fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     let dir = TempDir::new().unwrap();
