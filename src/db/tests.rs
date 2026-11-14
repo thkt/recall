@@ -61,37 +61,32 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
     use crate::indexer::index_chunks;
 
     let tmp = NamedTempFile::new().unwrap();
-    create_pre_cleanup_db(tmp.path());
+    let conn = open_db(tmp.path()).unwrap();
     // The marker upgrade is the only one that writes chunks_indexed, so the trigger fails it alone.
-    Connection::open(tmp.path())
-        .unwrap()
-        .execute_batch(
-            "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
-             INSERT INTO messages (session_id, role, text) VALUES
-                 ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
-             CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE OF chunks_indexed ON sessions
-             BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
-        )
-        .unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
+         INSERT INTO messages (session_id, role, text) VALUES
+             ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
+         INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 's1', 'q\na', 0);
+         ALTER TABLE sessions DROP COLUMN chunks_indexed;
+         CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE OF chunks_indexed ON sessions
+         BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+        [f32_as_bytes(&[0.1f32; EMBEDDING_DIMS])],
+    )
+    .unwrap();
+    let schema = schema_snapshot(&conn);
+    drop(conn);
 
     let error = open_db(tmp.path()).err().unwrap();
 
-    assert_eq!(error.to_string(), "injected migration failure");
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(
-        collect_strings(&conn, "SELECT name FROM pragma_table_info('sessions')"),
-        [
-            "session_id",
-            "source",
-            "file_path",
-            "project",
-            "slug",
-            "timestamp",
-            "mtime",
-            "session_type",
-            "files_scanned",
-            "file_size",
-        ]
+        (error.to_string(), schema_snapshot(&conn)),
+        ("injected migration failure".to_owned(), schema)
     );
     conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
         .unwrap();
@@ -128,8 +123,8 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
     assert_eq!(
         collect_strings(&conn, CHUNK_ROWS),
         [
-            r#"[1,"s1","q\na",0,null,null,0]"#,
-            r#"[2,"pending","new question",null,2,2,1]"#
+            r#"[1,"s1","q\na",0,null,null,1]"#,
+            r#"[2,"pending","new question",null,2,2,2]"#
         ]
     );
     assert_eq!(
