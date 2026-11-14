@@ -766,7 +766,8 @@ fn a_database_in_a_read_only_directory_whose_path_has_a_space_and_a_question_mar
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::TempDir::new().unwrap();
-    let dir = root.path().join("a b?c");
+    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it.
+    let dir = root.path().join("a%20b#c?d");
     fs::create_dir(&dir).unwrap();
     let db = dir.join("recall.db");
     seed_session(&open_db(&db).unwrap(), "s1");
