@@ -1663,11 +1663,16 @@ fn index_stderr_summarizes_new_and_unchanged_runs_in_order() {
     let dir = TempDir::new().unwrap();
     let claude_dir = write_session(dir.path(), SESSION_LINE);
 
+    // Stage timings fill the rest of stderr, and the first summary line ends in the run's time.
     let first = index_stderr(dir.path(), &claude_dir);
-    assert_in_order(&first, "Indexed 1 sessions in ", "Created 1 chunks");
+    assert_in_order(&first, "\nIndexed 1 sessions in ", "\nCreated 1 chunks\n");
 
     let second = index_stderr(dir.path(), &claude_dir);
-    assert_in_order(&second, "1 sessions up to date", "Chunks up to date");
+    assert_in_order(
+        &second,
+        "\n1 sessions up to date\n",
+        "\nChunks up to date\n",
+    );
 }
 
 #[test]
@@ -1679,8 +1684,8 @@ fn index_stderr_summarizes_files_with_unresolved_parse_diagnostics() {
     let unchanged = index_stderr(dir.path(), &claude_dir);
 
     assert!(
-        unchanged.contains("1 sessions stored; 1 file(s) with unresolved parsing diagnostics"),
-        "got: {unchanged}"
+        unchanged.contains("\n1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
+        "{unchanged}"
     );
 }
 
@@ -1693,8 +1698,8 @@ fn index_stderr_warns_when_a_root_with_indexed_sessions_is_unavailable() {
     let stderr = index_stderr(dir.path(), &dir.path().join("absent"));
 
     assert!(
-        stderr.contains("claude root unavailable — preserved 1 existing session(s)"),
-        "got: {stderr}"
+        stderr.contains("\nwarning: claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions\n"),
+        "{stderr}"
     );
 }
 
@@ -1718,48 +1723,38 @@ fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() 
         cmd
     };
     let search_hello = || {
-        let out = isolated()
-            .env_remove("CLAUDE_CONFIG_DIR")
-            .args(["search", "hello"])
-            .output()
-            .expect("spawn recall binary");
-        assert_eq!(out.status.code(), Some(0), "search should exit 0");
-        String::from_utf8_lossy(&out.stdout).into_owned()
+        let mut cmd = isolated();
+        cmd.env_remove("CLAUDE_CONFIG_DIR")
+            .args(["search", "hello"]);
+        cmd
     };
-
-    let first = isolated()
-        .env("CLAUDE_CONFIG_DIR", &config_dir)
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(first.status.code(), Some(0), "first index should exit 0");
-    let before = search_hello();
-    assert!(
-        before.contains("Found 1 sessions:"),
-        "premise: the first index should store the session, got: {before}"
+    let found_the_session = (
+        Some(0),
+        S1_MATCH.to_owned(),
+        MODEL_NOT_INSTALLED_STDERR.to_owned(),
     );
 
-    let second = isolated()
-        .env("CLAUDE_CONFIG_DIR", "")
-        .current_dir(&work_dir)
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(second.status.code(), Some(0), "second index should exit 0");
-    let after = search_hello();
+    let (code, _, stderr) = outcome(
+        isolated()
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .arg("index"),
+    );
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(outcome(&mut search_hello()), found_the_session);
 
-    assert!(
-        after.contains("Found 1 sessions:"),
-        "an empty CLAUDE_CONFIG_DIR run should keep the indexed session, got: {after}"
+    let (code, _, stderr) = outcome(
+        isolated()
+            .env("CLAUDE_CONFIG_DIR", "")
+            .current_dir(&work_dir)
+            .arg("index"),
     );
-    let stderr = String::from_utf8_lossy(&second.stderr);
+
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(outcome(&mut search_hello()), found_the_session);
+    // Stage timings fill the rest of stderr, so the warning is checked as one whole line.
     assert!(
-        stderr.contains("claude root could not be fully read — preserved 1 existing session(s)"),
-        "the empty CLAUDE_CONFIG_DIR run should report the Claude root as not read, got: {stderr}"
-    );
-    assert!(
-        stderr.contains("check that the root is an absolute path"),
-        "the note should point at the root's path, got: {stderr}"
+        stderr.contains("\nwarning: claude root could not be fully read — preserved 1 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions\n"),
+        "{stderr}"
     );
 }
 
