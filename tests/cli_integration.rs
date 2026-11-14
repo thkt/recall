@@ -326,8 +326,59 @@ fn doctor_of_a_sound_index_without_the_model() -> serde_json::Value {
     })
 }
 
-const MODEL_NOT_INSTALLED_STDERR: &str =
-    "note: embedding model not installed; run `recall model download` to enable semantic search.\n";
+macro_rules! model_not_installed {
+    () => {
+        "note: embedding model not installed; run `recall model download` to enable semantic search."
+    };
+}
+const MODEL_NOT_INSTALLED_STDERR: &str = concat!(model_not_installed!(), "\n");
+/// The same line as an `index --json` note.
+const MODEL_NOT_INSTALLED_INDEX_NOTE: &str = model_not_installed!();
+
+/// What an `index` or `rebuild --json` run shows, without the stage timings that differ on
+/// every run. Its stderr carries those timings too, so callers check single lines of it.
+fn index_json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
+    let (code, mut envelope, stderr) = json_outcome(cmd);
+    envelope["data"]["observations"]
+        .as_object_mut()
+        .and_then(|observations| observations.remove("seconds"))
+        .unwrap_or_else(|| panic!("an index envelope carries its stage seconds: {envelope}"));
+    (code, envelope, stderr)
+}
+
+/// The index observation counts: the ones given, and 0 for every other.
+fn index_counts(nonzero: &[(&str, u64)]) -> serde_json::Value {
+    let mut counts = serde_json::json!({
+        "chunks_created_committed": 0, "chunks_failed": 0, "chunks_matched_committed": 0,
+        "chunks_pending_snapshot": 0, "chunks_reconciled_created_committed": 0,
+        "chunks_remaining_snapshot": 0, "chunks_removed_committed": 0, "chunks_save_failed": 0,
+        "chunks_saved": 0, "chunks_stale": 0, "chunks_unattempted": 0,
+        "embeddings_reused_committed": 0, "files_deferred": 0, "files_discovered": 0,
+        "files_empty": 0, "files_failed": 0, "files_remaining": 0, "files_unchanged": 0,
+        "files_updated": 0, "files_updated_committed": 0, "inference_batches": 0,
+        "inference_chunks": 0, "sessions_chunk_pending": 0, "sessions_chunk_remaining": 0,
+        "sessions_chunked_committed": 0, "sessions_chunked_empty": 0, "sessions_stored": 0,
+    });
+    for (name, value) in nonzero {
+        assert!(counts.get(name).is_some(), "no index count is named {name}");
+        counts[name] = (*value).into();
+    }
+    counts
+}
+
+/// The counts of a run that parses and chunks one new or changed session.
+const ONE_SESSION_PARSED_AND_CHUNKED: &[(&str, u64)] = &[
+    ("chunks_created_committed", 1),
+    ("chunks_pending_snapshot", 1),
+    ("chunks_remaining_snapshot", 1),
+    ("chunks_unattempted", 1),
+    ("files_discovered", 1),
+    ("files_updated", 1),
+    ("files_updated_committed", 1),
+    ("sessions_chunk_pending", 1),
+    ("sessions_chunked_committed", 1),
+    ("sessions_stored", 1),
+];
 const MODEL_NOT_INSTALLED_NOTE: &str = "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search";
 const STATUS_OF_ONE_SESSION: &str = "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n";
 
@@ -461,61 +512,62 @@ fn show_without_json_keeps_human_output() {
 #[test]
 fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model() {
     let dir = TempDir::new().unwrap();
-    let out = recall(dir.path())
-        .args(["index", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "index --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
+
+    let (code, envelope, stderr) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+
     assert_eq!(
-        v["data"]["embedded"],
-        serde_json::json!(0),
-        "an empty index embeds nothing, got: {stdout}"
+        (code, envelope),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "embedded": 0,
+                    "failed_count": 0,
+                    "observations": {"counts": index_counts(&[])},
+                    "parse_diagnostics": [],
+                    "preserved_embedded": 0,
+                    "skipped_roots": [],
+                },
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
+            })
+        )
     );
-    assert_eq!(
-        v["data"]["failed_count"],
-        serde_json::json!(0),
-        "an empty index has no embed failures, got: {stdout}"
+    // Only a run of the binary reaches the stage lines the observer writes to stderr.
+    assert!(
+        stderr.starts_with("index: total: started (not yet complete)\n"),
+        "{stderr}"
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    for stage in [
-        "model_load_probe",
-        "enumeration",
-        "fts_transaction",
-        "chunking",
-        "pending_extraction",
-    ] {
-        assert!(
-            stderr.contains(&format!("index: {stage}: started")),
-            "{stderr}"
-        );
-    }
-    assert!(v["data"]["observations"]["seconds"]["total"].is_number());
-    assert_eq!(v["data"]["observations"]["counts"]["files_discovered"], 0);
 }
 
 #[test]
 fn rebuild_json_reparses_an_unchanged_session_and_reports_it_unembedded() {
     let dir = TempDir::new().unwrap();
-    let out = recall(dir.path())
-        .args(["rebuild", "--json"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(out.status.code(), Some(0), "rebuild --json should exit 0");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("stdout should be one JSON envelope, got {stdout:?}: {e}"));
-    assert_eq!(
-        v["data"]["embedded"],
-        serde_json::json!(0),
-        "an empty rebuild embeds nothing, got: {stdout}"
+    seed_indexed_session(dir.path());
+
+    let (code, envelope, _) = index_json_outcome(
+        recall(dir.path())
+            .env("RECALL_CLAUDE_DIR", dir.path().join("claude"))
+            .args(["rebuild", "--json"]),
     );
+
     assert_eq!(
-        v["data"]["failed_count"],
-        serde_json::json!(0),
-        "an empty rebuild has no embed failures, got: {stdout}"
+        (code, envelope),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "embedded": 0,
+                    "failed_count": 0,
+                    "observations": {"counts": index_counts(ONE_SESSION_PARSED_AND_CHUNKED)},
+                    "parse_diagnostics": [],
+                    "preserved_embedded": 0,
+                    "skipped_roots": [],
+                },
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
+            })
+        )
     );
 }
 
@@ -1346,63 +1398,94 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     contents
         .extend_from_slice(b"{broken-secret-body\n\xff\n{\"type\":\"progress\"}\n{\"message\":");
     fs::write(&path, contents).unwrap();
+    // Excluded Codex events are not parse loss.
     fs::write(codex.join("ignored.jsonl"), "{\"type\":\"event_msg\"}\n").unwrap();
     let run = |args: &[&str]| {
-        recall(dir.path())
-            .env("HF_HOME", dir.path().join("empty-cache"))
-            .env("RECALL_CLAUDE_DIR", &claude)
+        let mut cmd = recall(dir.path());
+        cmd.env("RECALL_CLAUDE_DIR", &claude)
             .env("RECALL_CODEX_DIR", &codex)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        cmd
     };
-    for command in ["index", "index", "rebuild"] {
-        let out = run(&[command, "--json"]);
-        assert_eq!(out.status.code(), Some(0));
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        let mut keys: Vec<_> = v.as_object().unwrap().keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["data", "degraded", "notes"]);
-        assert_eq!(v["degraded"], true);
-        let diagnostics = v["data"]["parse_diagnostics"].as_array().unwrap();
-        assert_eq!(diagnostics.len(), 1, "excluded Codex events are not loss");
-        assert_eq!(
-            diagnostics[0],
-            serde_json::json!({
-                "file_path": path.to_str().unwrap(), "source": "claude",
-                "invalid_json_lines": 1, "invalid_utf8_lines": 1,
-                "incomplete_tail_lines": 1, "read_error": false,
-            })
-        );
-        let notes = v["notes"].as_array().unwrap();
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap().contains("recall model download"))
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap().contains("repair the source"))
-        );
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().unwrap().contains("next append"))
-        );
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("secret-"));
-        assert!(!String::from_utf8_lossy(&out.stderr).contains("secret-"));
-    }
-    let out = run(&["index"]);
-    assert_eq!(out.status.code(), Some(0));
-    let human = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let skipped_lines = format!(
+        "{}: skipped 1 invalid JSON line(s) and 1 invalid UTF-8 line(s); repair the source file, then rerun `recall index` (use `recall rebuild` if size and mtime are unchanged)",
+        path.display()
     );
-    assert!(human.contains("1 invalid JSON") && human.contains("1 invalid UTF-8"));
-    assert!(human.contains("1 incomplete final line") && human.contains("next append"));
-    assert!(!human.contains("secret-"));
+    let incomplete_tail = format!(
+        "{}: 1 incomplete final line(s), possibly still being written; wait for the next append, then rerun `recall index`; if the writer has stopped, repair the source file",
+        path.display()
+    );
+    let envelope = |counts: &[(&str, u64)]| {
+        serde_json::json!({
+            "data": {
+                "embedded": 0,
+                "failed_count": 0,
+                "observations": {"counts": index_counts(counts)},
+                "parse_diagnostics": [{
+                    "file_path": path.to_str().unwrap(),
+                    "incomplete_tail_lines": 1,
+                    "invalid_json_lines": 1,
+                    "invalid_utf8_lines": 1,
+                    "read_error": false,
+                    "source": "claude",
+                }],
+                "preserved_embedded": 0,
+                "skipped_roots": [],
+            },
+            "degraded": true,
+            "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE, skipped_lines, incomplete_tail],
+        })
+    };
+    let parsed = [
+        ("chunks_created_committed", 1),
+        ("chunks_pending_snapshot", 1),
+        ("chunks_remaining_snapshot", 1),
+        ("chunks_unattempted", 1),
+        ("files_discovered", 2),
+        ("files_empty", 1),
+        ("files_updated", 1),
+        ("files_updated_committed", 1),
+        ("sessions_chunk_pending", 1),
+        ("sessions_chunked_committed", 1),
+        ("sessions_stored", 1),
+    ];
+    let unchanged = [
+        ("chunks_pending_snapshot", 1),
+        ("chunks_remaining_snapshot", 1),
+        ("chunks_unattempted", 1),
+        ("files_discovered", 2),
+        ("files_empty", 1),
+        ("files_unchanged", 1),
+        ("sessions_stored", 1),
+    ];
+
+    let (code, first, first_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
+    assert_eq!((code, first), (Some(0), envelope(&parsed)));
+    let (code, second, second_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
+    assert_eq!((code, second), (Some(0), envelope(&unchanged)));
+    let (code, rebuilt, rebuilt_stderr) = index_json_outcome(&mut run(&["rebuild", "--json"]));
+    assert_eq!((code, rebuilt), (Some(0), envelope(&parsed)));
+    let (code, stdout, stderr) = outcome(&mut run(&["index"]));
+    assert_eq!((code, stdout), (Some(0), String::new()));
+    // Stage timings fill the rest of stderr, so these lines are checked one by one.
+    assert!(
+        stderr.contains("1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("warning: {skipped_lines}\n")),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("warning: {incomplete_tail}\n")),
+        "{stderr}"
+    );
+    // The skipped lines hold conversation text, which no output may repeat.
+    assert!(!first_stderr.contains("secret-"), "{first_stderr}");
+    assert!(!second_stderr.contains("secret-"), "{second_stderr}");
+    assert!(!rebuilt_stderr.contains("secret-"), "{rebuilt_stderr}");
+    assert!(!stderr.contains("secret-"), "{stderr}");
+
     fs::write(
         &path,
         [
@@ -1412,17 +1495,59 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         .concat(),
     )
     .unwrap();
-    let out = run(&["index", "--json"]);
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
+    let (code, repaired, _) = index_json_outcome(&mut run(&["index", "--json"]));
+
     assert_eq!(
-        v["degraded"], true,
-        "model absence still degrades the repaired index"
+        (code, repaired),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "embedded": 0,
+                    "failed_count": 0,
+                    "observations": {"counts": index_counts(&[
+                        ("chunks_pending_snapshot", 1),
+                        ("chunks_reconciled_created_committed", 1),
+                        ("chunks_remaining_snapshot", 1),
+                        ("chunks_removed_committed", 1),
+                        ("chunks_unattempted", 1),
+                        ("files_discovered", 2),
+                        ("files_empty", 1),
+                        ("files_updated", 1),
+                        ("files_updated_committed", 1),
+                        ("sessions_stored", 1),
+                    ])},
+                    "parse_diagnostics": [],
+                    "preserved_embedded": 0,
+                    "skipped_roots": [],
+                },
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
+            })
+        )
     );
-    let out = run(&["show", "partial", "--json"]);
-    assert_eq!(out.status.code(), Some(0));
-    let body = String::from_utf8_lossy(&out.stdout);
-    assert!(body.contains("secret-conversation-body") && body.contains("repaired-answer"));
+    assert_eq!(
+        json_outcome(&mut run(&["show", "partial", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "messages": [
+                        {"role": "user", "text": "secret-conversation-body"},
+                        {"role": "assistant", "text": "repaired-answer"},
+                    ],
+                    "project": "",
+                    "session_id": "partial",
+                    "slug": "partial",
+                    "source": "claude",
+                    "timestamp": null,
+                },
+                "degraded": false,
+                "notes": [],
+            }),
+            String::new()
+        )
+    );
 }
 
 #[cfg(unix)]
@@ -1440,31 +1565,69 @@ fn index_reports_real_file_read_failure_then_recovers() {
     )
     .unwrap();
     let run = || {
-        recall(dir.path())
-            .env("HF_HOME", dir.path().join("empty-cache"))
-            .env("RECALL_CLAUDE_DIR", &claude)
-            .args(["index", "--json"])
-            .output()
-            .unwrap()
+        let mut cmd = recall(dir.path());
+        cmd.env("RECALL_CLAUDE_DIR", &claude)
+            .args(["index", "--json"]);
+        cmd
     };
+
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-    let out = run();
+    let (code, unreadable, _) = index_json_outcome(&mut run());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["data"]["parse_diagnostics"][0]["read_error"], true);
-    assert_eq!(v["degraded"], true);
-    assert!(
-        v["notes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|n| n.as_str().unwrap().contains("check file access"))
+    let (recovered_code, recovered, _) = index_json_outcome(&mut run());
+
+    assert_eq!(
+        (code, unreadable),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "embedded": 0,
+                    "failed_count": 0,
+                    "observations": {"counts": index_counts(&[
+                        ("files_discovered", 1),
+                        ("files_failed", 1),
+                    ])},
+                    "parse_diagnostics": [{
+                        "file_path": path.to_str().unwrap(),
+                        "incomplete_tail_lines": 0,
+                        "invalid_json_lines": 0,
+                        "invalid_utf8_lines": 0,
+                        "read_error": true,
+                        "source": "claude",
+                    }],
+                    "preserved_embedded": 0,
+                    "skipped_roots": [],
+                },
+                "degraded": true,
+                "notes": [
+                    MODEL_NOT_INSTALLED_INDEX_NOTE,
+                    format!(
+                        "{}: 1 file could not be read; check file access and UTF-8 path encoding, then rerun `recall index`; existing indexed data was retained",
+                        path.display()
+                    ),
+                ],
+            })
+        )
     );
-    let out = run();
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["data"]["parse_diagnostics"], serde_json::json!([]));
+    assert_eq!(
+        (recovered_code, recovered),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {
+                    "embedded": 0,
+                    "failed_count": 0,
+                    "observations": {"counts": index_counts(ONE_SESSION_PARSED_AND_CHUNKED)},
+                    "parse_diagnostics": [],
+                    "preserved_embedded": 0,
+                    "skipped_roots": [],
+                },
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_INDEX_NOTE],
+            })
+        )
+    );
 }
 
 const SESSION_LINE: &str = r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"hello world recall"},"timestamp":"2026-03-01T00:00:00Z"}"#;
