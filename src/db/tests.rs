@@ -2,6 +2,10 @@ use super::*;
 use crate::embedder::f32_as_bytes;
 use tempfile::NamedTempFile;
 
+#[path = "../../tests/support/stale_snapshot_note.rs"]
+mod stale_snapshot_note;
+use stale_snapshot_note::READ_ONLY_DIR_NOTE;
+
 #[test]
 fn test_open_db_creates_schema() {
     let tmp = NamedTempFile::new().unwrap();
@@ -556,10 +560,6 @@ fn an_index_tokenized_without_trigrams_has_a_stale_schema() {
 
 const WRITABLE_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
      write-ahead log; run `recall index` to checkpoint them.";
-const READ_ONLY_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
-     write-ahead log; the directory is read-only, so copy the DB together with its `-wal` \
-     (and `-shm`, if present) sidecar files elsewhere and run `recall index --db-path <copy>` \
-     to checkpoint them there.";
 
 fn file_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)

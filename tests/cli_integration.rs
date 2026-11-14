@@ -1,12 +1,16 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Command;
 
 use tempfile::TempDir;
 
 #[cfg(unix)]
 #[path = "support/root_skip.rs"]
 mod root_skip;
+
+#[path = "support/stale_snapshot_note.rs"]
+mod stale_snapshot_note;
+use stale_snapshot_note::READ_ONLY_DIR_NOTE;
 
 fn recall(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_recall"));
@@ -285,6 +289,32 @@ fn show_s1() -> serde_json::Value {
     })
 }
 
+/// The `--json` data of `recall status` on an index of one unembedded session.
+fn status_of_one_session() -> serde_json::Value {
+    serde_json::json!({"embedded": 0, "model_ready": false, "qa_chunks": 1, "sessions": 1})
+}
+
+/// The `--json` data of `recall doctor` on a sound index without the model installed.
+fn doctor_of_a_sound_index_without_the_model() -> serde_json::Value {
+    serde_json::json!({
+        "checks": [
+            {"detail": null, "name": "integrity", "ok": true, "remedy": null},
+            {"detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null},
+            {"detail": null, "name": "orphan_chunks", "ok": true, "remedy": null},
+            {
+                "detail": "model not installed; search runs FTS-only",
+                "name": "model",
+                "ok": true,
+                "remedy": null,
+            },
+        ],
+        "healthy": true,
+        "model_recovered": null,
+        "model_recovery_retryable": null,
+        "repaired": null,
+    })
+}
+
 const MODEL_NOT_INSTALLED_STDERR: &str =
     "note: embedding model not installed; run `recall model download` to enable semantic search.\n";
 const MODEL_NOT_INSTALLED_NOTE: &str = "semantic search unavailable: embedding model not installed; run `recall model download` to enable semantic search";
@@ -336,11 +366,7 @@ fn status_json_emits_stats_envelope() {
         json_outcome(recall(dir.path()).args(["status", "--json"])),
         (
             Some(0),
-            serde_json::json!({
-                "data": {"embedded": 0, "model_ready": false, "qa_chunks": 1, "sessions": 1},
-                "degraded": false,
-                "notes": [],
-            }),
+            serde_json::json!({"data": status_of_one_session(), "degraded": false, "notes": []}),
             String::new()
         )
     );
@@ -492,23 +518,7 @@ fn doctor_json_of_an_index_without_the_model_reports_it_healthy_with_the_model_a
         (
             Some(0),
             serde_json::json!({
-                "data": {
-                    "checks": [
-                        {"detail": null, "name": "integrity", "ok": true, "remedy": null},
-                        {"detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null},
-                        {"detail": null, "name": "orphan_chunks", "ok": true, "remedy": null},
-                        {
-                            "detail": "model not installed; search runs FTS-only",
-                            "name": "model",
-                            "ok": true,
-                            "remedy": null,
-                        },
-                    ],
-                    "healthy": true,
-                    "model_recovered": null,
-                    "model_recovery_retryable": null,
-                    "repaired": null,
-                },
+                "data": doctor_of_a_sound_index_without_the_model(),
                 "degraded": false,
                 "notes": [],
             }),
@@ -1039,101 +1049,61 @@ fn search_no_embed_flag_is_retired_exits_usage() {
 #[cfg(unix)]
 #[test]
 fn read_commands_work_in_readonly_directory() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
-
     let db = dir.path().join("recall.db");
-    for suffix in ["-wal", "-shm"] {
-        let _ = fs::remove_file(db.with_file_name(format!("recall.db{suffix}")));
-    }
-
-    let set_mode = |mode: u32| {
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(mode)).unwrap();
-    };
-    set_mode(0o555);
-
+    let _ = fs::remove_file(db.with_file_name("recall.db-wal"));
+    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
+    let read_only = ReadOnlyDir::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
-    let search_out = recall(dir.path())
-        .args(["search", "hello"])
-        .output()
-        .expect("spawn recall binary");
-    let status_out = recall(dir.path())
-        .arg("status")
-        .output()
-        .expect("spawn recall binary");
-    let classify_out = recall(dir.path())
-        .args(["classify", "--all", "--dry-run"])
-        .output()
-        .expect("spawn recall binary");
-
-    set_mode(0o755);
-
-    for (name, out) in [
-        ("search", &search_out),
-        ("status", &status_out),
-        ("classify", &classify_out),
-    ] {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("Error code 14"),
-            "{name} must not emit SQLite code 14 in a read-only dir; stderr: {stderr}"
-        );
-        assert_eq!(
-            out.status.code(),
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "hello"])),
+        (
             Some(0),
-            "{name} should exit 0 in a read-only dir; stderr: {stderr}"
-        );
-    }
-
-    for suffix in ["-wal", "-shm"] {
-        let side = db.with_file_name(format!("recall.db{suffix}"));
-        assert!(
-            !side.exists(),
-            "read-only open must not create recall.db{suffix}"
-        );
-    }
+            S1_MATCH.to_owned(),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).arg("status")),
+        (Some(0), STATUS_OF_ONE_SESSION.to_owned(), String::new())
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).args(["classify", "--all", "--dry-run"])),
+        (
+            Some(0),
+            "s1 [interactive] hello world recall\ndry-run: 1 session(s) would be classified (0 automated, 1 interactive)\n".to_owned(),
+            String::new()
+        )
+    );
+    drop(read_only);
+    assert_eq!(listing(dir.path()), ["claude", "recall.db"]);
 }
 
 #[cfg(unix)]
 #[test]
 fn status_reads_an_index_given_by_a_relative_path_from_a_read_only_working_directory() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
     let db = dir.path().join("recall.db");
-    for suffix in ["-wal", "-shm"] {
-        let _ = fs::remove_file(db.with_file_name(format!("recall.db{suffix}")));
-    }
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let _ = fs::remove_file(db.with_file_name("recall.db-wal"));
+    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
+    let _read_only = ReadOnlyDir::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
-    let out = recall(dir.path())
-        .current_dir(dir.path())
-        .env("RECALL_DB", "recall.db")
-        .arg("status")
-        .output()
-        .expect("spawn recall binary");
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
-
     assert_eq!(
-        (
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout).into_owned()
+        outcome(
+            recall(dir.path())
+                .current_dir(dir.path())
+                .env("RECALL_DB", "recall.db")
+                .arg("status")
         ),
-        (
-            Some(0),
-            "Sessions: 1\nQA chunks: 1\nEmbedded: 0/1\nModel: not installed (run `recall model download`)\n".to_owned()
-        ),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        (Some(0), STATUS_OF_ONE_SESSION.to_owned(), String::new())
     );
 }
 
@@ -1170,37 +1140,6 @@ impl Drop for ReadOnlyDir<'_> {
 
 #[cfg(unix)]
 #[test]
-fn show_on_an_immutable_open_with_stale_wal_surfaces_degraded_note() {
-    let dir = TempDir::new().unwrap();
-    seed_stale_wal(dir.path());
-    let _read_only = ReadOnlyDir::new(dir.path());
-    if root_skip::skip_if_root(dir.path()) {
-        return;
-    }
-
-    let out = recall(dir.path())
-        .args(["show", "s1", "--json"])
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(envelope["degraded"], true, "{envelope}");
-    assert_eq!(
-        envelope["notes"].as_array().map(Vec::len),
-        Some(1),
-        "{envelope}"
-    );
-    assert_copy_based_remedy(envelope["notes"][0].as_str().unwrap(), "show");
-}
-
-#[cfg(unix)]
-#[test]
 fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
@@ -1209,21 +1148,16 @@ fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log()
         return;
     }
 
-    let out = recall(dir.path())
-        .args(["show", "s2", "--json"])
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(65));
-    assert!(out.stdout.is_empty());
-    let error: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "DATA_ERROR");
-    let message = error["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("No session found matching 's2'"),
-        "{message}"
+    assert_eq!(
+        outcome(recall(dir.path()).args(["show", "s2", "--json"])),
+        (
+            Some(65),
+            String::new(),
+            format!(
+                r#"{{"error":{{"code":"DATA_ERROR","message":"No session found matching 's2'; {READ_ONLY_DIR_NOTE}","retryable":false}}}}"#
+            ) + "\n"
+        )
     );
-    assert_copy_based_remedy(message, "show");
 }
 
 /// An index from before the trigram tokenizer and before embeddings: one session whose log
@@ -1309,80 +1243,65 @@ fn show_from_a_writable_directory_adds_no_stale_snapshot_note() {
 fn read_commands_on_a_stale_snapshot_in_a_read_only_directory_ask_to_index_a_copy() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
-    let read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyDir::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
 
-    let outputs = [
-        (
-            "search",
-            recall(dir.path())
-                .args(["search", "hello", "--json"])
-                .output(),
-        ),
-        (
-            "status",
-            recall(dir.path()).args(["status", "--json"]).output(),
-        ),
-        (
-            "doctor",
-            recall(dir.path()).args(["doctor", "--json"]).output(),
-        ),
-    ];
-    let outputs: Vec<(&str, Output)> = outputs
-        .into_iter()
-        .map(|(name, out)| (name, out.expect("spawn recall binary")))
-        .collect();
-    let classify_out = recall(dir.path())
-        .args(["classify", "--all", "--dry-run", "--json"])
-        .output()
-        .expect("spawn recall binary");
-
-    drop(read_only);
-
     assert_eq!(
-        classify_out.status.code(),
-        Some(65),
-        "{}",
-        String::from_utf8_lossy(&classify_out.stderr)
+        json_outcome(recall(dir.path()).args(["show", "s1", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({"data": show_s1(), "degraded": true, "notes": [READ_ONLY_DIR_NOTE]}),
+            String::new()
+        )
     );
-    assert!(classify_out.stdout.is_empty());
-    let error: serde_json::Value = serde_json::from_slice(&classify_out.stderr).unwrap();
-    assert_eq!(error["error"]["code"], "DATA_ERROR");
-    assert_eq!(error["error"]["retryable"], false);
-    assert!(error["error"].get("next_step").is_none(), "{error}");
-    let message = error["error"]["message"].as_str().unwrap();
-    assert_copy_based_remedy(message, "classify");
-
-    for (name, out) in &outputs {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-            panic!("{name} stdout should be one JSON envelope, got {stdout:?}: {e}")
-        });
-        assert_eq!(
-            v["degraded"].as_bool(),
-            Some(true),
-            "{name} must mark degraded on an immutable open with a stale -wal, got: {stdout}"
-        );
-        let notes = v["notes"]
-            .as_array()
-            .unwrap_or_else(|| panic!("{name} notes should be an array, got: {stdout}"));
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.as_str().is_some_and(|s| s.contains("write-ahead log"))),
-            "{name} notes must carry the stale write-ahead-log warning, got: {stdout}"
-        );
-
-        let remedy = notes
-            .iter()
-            .find_map(|n| n.as_str().filter(|s| s.contains("write-ahead log")))
-            .unwrap_or_else(|| {
-                panic!("{name} should carry the stale write-ahead-log note, got: {stdout}")
-            });
-        assert_copy_based_remedy(remedy, name);
-    }
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["search", "hello", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": {"results": [s1_match()]},
+                "degraded": true,
+                "notes": [MODEL_NOT_INSTALLED_NOTE, READ_ONLY_DIR_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
+    );
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["status", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": status_of_one_session(),
+                "degraded": true,
+                "notes": [READ_ONLY_DIR_NOTE],
+            }),
+            String::new()
+        )
+    );
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["doctor", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": doctor_of_a_sound_index_without_the_model(),
+                "degraded": true,
+                "notes": [READ_ONLY_DIR_NOTE],
+            }),
+            MODEL_NOT_INSTALLED_STDERR.to_owned()
+        )
+    );
+    assert_eq!(
+        outcome(recall(dir.path()).args(["classify", "--all", "--dry-run", "--json"])),
+        (
+            Some(65),
+            String::new(),
+            format!(
+                r#"{{"error":{{"code":"DATA_ERROR","message":"{READ_ONLY_DIR_NOTE}","retryable":false}}}}"#
+            ) + "\n"
+        )
+    );
 }
 
 #[cfg(unix)]
@@ -1398,57 +1317,6 @@ fn cli_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {
 #[test]
 fn the_cli_integration_suite_fails_when_run_as_root() {
     root_skip::assert_root_canary();
-}
-
-#[cfg(unix)]
-#[track_caller]
-fn assert_copy_based_remedy(note: &str, context: &str) {
-    assert!(
-        note.contains("write-ahead log"),
-        "[{context}] note must carry the write-ahead-log wording, got: {note}"
-    );
-    assert!(
-        note.contains("recall index --db-path <copy>"),
-        "[{context}] note must guide a copy-based `recall index --db-path` remedy, got: {note}"
-    );
-    assert!(
-        note.contains("-wal"),
-        "[{context}] note must name the -wal sidecar file to copy, got: {note}"
-    );
-    assert!(
-        note.contains("-shm"),
-        "[{context}] note must name the -shm sidecar file to copy, got: {note}"
-    );
-    assert!(
-        !note.contains("run `recall index`"),
-        "[{context}] a read-only location cannot run a bare `recall index`; got: {note}"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "-shm sidecar")]
-fn copy_remedy_check_rejects_a_note_without_the_shm_sidecar() {
-    assert_copy_based_remedy(
-        "read-only open cannot see uncommitted changes in the write-ahead log; \
-         the directory is read-only, so copy the DB together with its `-wal` \
-         sidecar file elsewhere and run `recall index --db-path <copy>` to \
-         checkpoint it there.",
-        "negative self-test",
-    );
-}
-
-#[cfg(unix)]
-#[test]
-#[should_panic(expected = "cannot run a bare")]
-fn copy_remedy_check_rejects_a_note_that_also_offers_a_bare_recall_index() {
-    assert_copy_based_remedy(
-        "read-only open cannot see uncommitted changes in the write-ahead log; \
-         copy the DB together with its `-wal` (and `-shm`, if present) sidecar \
-         files elsewhere and run `recall index --db-path <copy>`, or run \
-         `recall index` to checkpoint them.",
-        "negative self-test",
-    );
 }
 
 #[test]
