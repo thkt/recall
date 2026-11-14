@@ -141,11 +141,11 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
 #[test]
 fn a_failed_parse_diagnostics_upgrade_leaves_the_schema_and_the_session_times_as_they_were() {
     let tmp = NamedTempFile::new().unwrap();
-    build_schema(tmp.path(), SESSIONS_FULL, FTS_TOKENIZER, QA_FULL, VEC_FULL);
-    let conn = Connection::open(tmp.path()).unwrap();
+    let conn = open_db(tmp.path()).unwrap();
     seed_session(&conn, "s1");
     conn.execute_batch(
-        "CREATE TRIGGER fail_upgrade BEFORE UPDATE OF mtime ON sessions
+        "DROP TABLE parse_diagnostics;
+         CREATE TRIGGER fail_upgrade BEFORE UPDATE OF mtime ON sessions
          BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
     )
     .unwrap();
@@ -415,6 +415,11 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
     create_pre_cleanup_db(tmp.path());
 
     let conn = open_db(tmp.path()).unwrap();
+    let stored = (
+        schema_snapshot(&conn),
+        collect_strings(&conn, CHUNK_ROWS),
+        embeddings(&conn),
+    );
 
     assert_eq!(
         collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
@@ -428,12 +433,9 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
             "generation",
         ]
     );
+    assert_eq!(stored.1, [r#"[1,"s1","q\na",0,null,null,0]"#]);
     assert_eq!(
-        collect_strings(&conn, CHUNK_ROWS),
-        [r#"[1,"s1","q\na",0,null,null,0]"#]
-    );
-    assert_eq!(
-        embeddings(&conn),
+        stored.2,
         [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
     );
     assert_eq!(
@@ -442,11 +444,6 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
             "SELECT name FROM sqlite_master WHERE name = 'embedded_chunk_ids'"
         ),
         Vec::<String>::new()
-    );
-    let stored = (
-        schema_snapshot(&conn),
-        collect_strings(&conn, CHUNK_ROWS),
-        embeddings(&conn),
     );
     drop(conn);
 
@@ -774,8 +771,9 @@ fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_fro
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::TempDir::new().unwrap();
-    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it.
-    let dir = root.path().join("a%20b#c?d");
+    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it, and so
+    // does each byte of the multi-byte `日`.
+    let dir = root.path().join("a%20b#c?d日");
     fs::create_dir(&dir).unwrap();
     let db = dir.join("recall.db");
     seed_session(&open_db(&db).unwrap(), "s1");
