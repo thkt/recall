@@ -389,7 +389,7 @@ fn index_counts(nonzero: &[(&str, u64)]) -> serde_json::Value {
     counts
 }
 
-/// The counts of a run that parses and chunks one new or changed session.
+/// The counts of a run that parses and chunks one new session, or one that `rebuild` re-parses.
 const ONE_SESSION_PARSED_AND_CHUNKED: &[(&str, u64)] = &[
     ("chunks_created_committed", 1),
     ("chunks_pending_snapshot", 1),
