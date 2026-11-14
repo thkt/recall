@@ -715,9 +715,7 @@ fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_after_t
  {
     use std::os::unix::fs::PermissionsExt;
 
-    // A path under /tmp holds only bytes the URI keeps as they are, so the expected URI below can
-    // be written from the plain path, whatever TMPDIR is.
-    let dir = tempfile::TempDir::new_in("/tmp").unwrap();
+    let dir = tempfile::TempDir::new().unwrap();
     let missing = dir.path().join("nope.db");
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -728,12 +726,13 @@ fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_after_t
     let result = open_db_readonly(&missing);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
-    // The URI in the error shows the open fell back to reading from the last checkpoint.
+    // The URI in the error shows the open fell back to reading from the last checkpoint. The
+    // URI-delimiter test checks the escaping on its own, so the path here goes through it as is.
     assert_eq!(
         result.err().unwrap().to_string(),
         format!(
             "unable to open database file: file:{}?immutable=1",
-            missing.display()
+            encode_uri_path(&missing)
         )
     );
 }
