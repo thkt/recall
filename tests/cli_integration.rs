@@ -20,6 +20,9 @@ fn recall(dir: &Path) -> Command {
         .env("RECALL_CLAUDE_DIR", dir.join("no-claude"))
         .env("RECALL_CODEX_DIR", dir.join("no-codex"))
         .env_remove("RECALL_CODEX_ARCHIVED_DIR")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("RECALL_TOKEN_BUDGET")
+        .env_remove("RECALL_FORWARD_PAUSE_MS")
         // Keep the model cache and the probe record off the developer's own directories.
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CACHE_HOME", dir.join("cache"))
