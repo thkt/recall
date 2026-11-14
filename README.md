@@ -275,7 +275,7 @@ Add to `~/.claude/settings.json`:
 - A missing root keeps the sessions indexed under it.
 - A root that exists but cannot be fully read keeps every session of its source for that run. For Codex, an unreadable archive also keeps the sessions under `~/.codex/sessions/`.
 
-**Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints `No sessions indexed. Run recall index first.`
+**Searching** — `recall search` reads the pre-built index; it does not index. Run `recall index` to refresh first, or register the [Hook](#hook) to auto-index when a session ends. Searching an empty index prints ``No sessions indexed. Run `recall index` first.``
 
 **Embedding** — EmbeddingGemma 2 BF16 uses fixed artifact checksums and llama.cpp/Metal, projected 768-dimensional mean-pooled/L2-normalized embeddings. Queries start at a 512-token context and grow to 8192; over-limit queries preserve EOS. Documents use tokenizer-aligned windows of at most 8192 tokens with 2048-token overlap. Generation-checked saves and pending-page bounds remain unchanged. Without verified model artifacts, indexing builds FTS5 and search falls back to keyword ranking.
 
@@ -320,15 +320,15 @@ Gemma product latency and indexing throughput depend on corpus, hardware, checks
 
 recall uses sysexits-style exit codes instead of a generic `1`/`2` split.
 
-| Code | Name           | Meaning                                      |
-| ---- | -------------- | -------------------------------------------- |
-| 0    | success        | Command completed successfully               |
-| 64   | `USAGE_ERROR`  | Invalid command usage or missing local index |
-| 65   | `DATA_ERROR`   | Malformed user input, such as a bad query    |
-| 70   | `INTERNAL`     | Internal invariant or unsupported backend    |
-| 74   | `IO_ERROR`     | Filesystem or SQLite I/O failure             |
-| 75   | `TEMP_FAILURE` | Retryable transient failure                  |
-| 104  | `UNKNOWN`      | Unclassified error path                      |
+| Code | Name           | Meaning                                                                                                                                                                   |
+| ---- | -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0    | success        | Command completed successfully                                                                                                                                            |
+| 64   | `USAGE_ERROR`  | Invalid command usage, or `show` without a local index                                                                                                                    |
+| 65   | `DATA_ERROR`   | Input or index recall cannot use, such as a bad query, an index built by an older version or for another model, or a read-only index whose write-ahead log it cannot read |
+| 70   | `INTERNAL`     | Internal invariant or unsupported backend                                                                                                                                 |
+| 74   | `IO_ERROR`     | Filesystem or SQLite I/O failure                                                                                                                                          |
+| 75   | `TEMP_FAILURE` | Retryable transient failure                                                                                                                                               |
+| 104  | `UNKNOWN`      | Unclassified error path                                                                                                                                                   |
 
 ## Development
 
