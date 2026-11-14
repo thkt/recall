@@ -67,6 +67,8 @@ No API keys. No data leaves your machine. The embedding model (EmbeddingGemma 2 
 
 ## Usage
 
+Commands report what limits a result as a note. With `--json`, the envelope lists every note in `notes`. In text output, each note the command has not already printed goes to stderr as `note: …`, such as the note that a read from a read-only directory cannot see changes still in the write-ahead log.
+
 ### Search
 
 ```sh
