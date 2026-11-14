@@ -415,7 +415,7 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
     create_pre_cleanup_db(tmp.path());
 
     let conn = open_db(tmp.path()).unwrap();
-    let stored = (
+    let (schema, chunks, vectors) = (
         schema_snapshot(&conn),
         collect_strings(&conn, CHUNK_ROWS),
         embeddings(&conn),
@@ -433,9 +433,9 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
             "generation",
         ]
     );
-    assert_eq!(stored.1, [r#"[1,"s1","q\na",0,null,null,0]"#]);
+    assert_eq!(chunks, [r#"[1,"s1","q\na",0,null,null,0]"#]);
     assert_eq!(
-        stored.2,
+        vectors,
         [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
     );
     assert_eq!(
@@ -455,7 +455,7 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
             collect_strings(&reopened, CHUNK_ROWS),
             embeddings(&reopened)
         ),
-        stored
+        (schema, chunks, vectors)
     );
 }
 
@@ -586,7 +586,6 @@ const READ_ONLY_DIR_NOTE: &str = "read-only open cannot see uncheckpointed chang
      (and `-shm`, if present) sidecar files elsewhere and run `recall index --db-path <copy>` \
      to checkpoint them there.";
 
-/// The names of the entries in `dir`, sorted.
 fn file_names(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .unwrap()
@@ -771,8 +770,8 @@ fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_fro
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::TempDir::new().unwrap();
-    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it, and so
-    // does each byte of the multi-byte `日`.
+    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it. The bytes of
+    // `日` must reach the URI as the same bytes.
     let dir = root.path().join("a%20b#c?d日");
     fs::create_dir(&dir).unwrap();
     let db = dir.join("recall.db");
@@ -1054,6 +1053,13 @@ fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_l
             "src_rowid_lo",
             "src_rowid_hi"
         ]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE name = 'qa_chunk_generation'"
+        ),
+        Vec::<String>::new()
     );
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
     drop(conn);

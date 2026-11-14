@@ -515,7 +515,6 @@ pub(crate) fn seed_session_file(conn: &Connection, session_id: &str, path: &str)
     .unwrap();
 }
 
-/// Every chunk row, every column, in id order.
 #[cfg(test)]
 pub(crate) const CHUNK_ROWS: &str = "SELECT json_array(id, session_id, content, timestamp, \
      src_rowid_lo, src_rowid_hi, generation) FROM qa_chunks ORDER BY id";
