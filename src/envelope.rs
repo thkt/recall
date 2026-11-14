@@ -117,13 +117,18 @@ pub(crate) fn render_json_success(out: &CommandOutput) -> String {
     serde_json::to_string(&env).expect("SuccessEnvelope is always serializable")
 }
 
-/// The stderr lines a text run adds for the notes its command has not shown, control characters
-/// removed as in the envelope.
+/// The stderr lines a text run adds for the notes its command has not shown: one line each,
+/// control characters removed as in the envelope and a newline turned into a space.
 pub(crate) fn render_text_notes(out: &CommandOutput) -> String {
     out.notes
         .iter()
         .filter(|note| !note.shown)
-        .map(|note| format!("note: {}\n", ansi::strip_control_chars(&note.text)))
+        .map(|note| {
+            format!(
+                "note: {}\n",
+                ansi::strip_control_chars(&note.text).replace('\n', " ")
+            )
+        })
         .collect()
 }
 

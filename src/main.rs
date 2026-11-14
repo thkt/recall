@@ -287,7 +287,8 @@ fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome
 }
 
 /// Writes the result to `w` and, in a text run whose result did not fail to write, the notes the
-/// command has not shown to `notes`. A reader that closed stdout early still sees them on stderr.
+/// command has not shown to `notes`, so a reader that closed stdout early still gets them. A note
+/// the command already put in its result on stdout is not repeated there.
 fn emit_success_to<W: Write, E: Write>(
     out: &CommandOutput,
     json_mode: bool,

@@ -94,12 +94,12 @@ fn a_text_run_prints_only_the_notes_not_yet_shown_without_control_characters() {
         vec![
             Note::shown("already on stderr"),
             Note::new("see /work/\u{1b}]0;PROJ\u{7}app"),
-            Note::new("second"),
+            Note::new("first line\nsecond line"),
         ],
     );
 
     assert_eq!(
         render_text_notes(&out),
-        "note: see /work/app\nnote: second\n"
+        "note: see /work/app\nnote: first line second line\n"
     );
 }
