@@ -666,9 +666,7 @@ fn stale_snapshot_note_in_a_writable_directory_with_a_leftover_write_probe_file_
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
     fs::write(wal_path(&db), b"uncommitted").unwrap();
-    let leftover = dir
-        .path()
-        .join(format!(".recall-write-probe-{}", process::id()));
+    let leftover = write_probe_path(dir.path());
     fs::write(&leftover, b"stale").unwrap();
 
     let note = stale_wal_note(&db, OpenTier::Immutable);

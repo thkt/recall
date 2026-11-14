@@ -74,7 +74,7 @@ fn dir_is_unwritable(db_path: &Path) -> bool {
 }
 
 fn dir_write_probe_fails(dir: &Path) -> bool {
-    let probe = dir.join(format!(".recall-write-probe-{}", process::id()));
+    let probe = write_probe_path(dir);
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -89,6 +89,11 @@ fn dir_write_probe_fails(dir: &Path) -> bool {
             io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
         ),
     }
+}
+
+/// The file `dir_write_probe_fails` creates in `dir`.
+fn write_probe_path(dir: &Path) -> PathBuf {
+    dir.join(format!(".recall-write-probe-{}", process::id()))
 }
 
 fn remove_write_probe(probe: &Path) {
