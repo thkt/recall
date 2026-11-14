@@ -281,13 +281,28 @@ fn a_text_run_whose_stderr_is_closed_still_reports_its_result_written() {
 }
 
 #[test]
-fn a_text_run_whose_stdout_is_closed_prints_no_notes() {
+fn a_text_run_whose_stdout_is_closed_still_prints_its_notes() {
     let mut stderr = Vec::new();
 
     let written =
         emit_success_to(&result_with_notes(), false, &mut ClosedPipe, &mut stderr).unwrap();
 
-    assert_eq!((written, stderr), (WriteOutcome::PipeClosed, Vec::new()));
+    assert_eq!(
+        (written, String::from_utf8(stderr).unwrap()),
+        (
+            WriteOutcome::PipeClosed,
+            "note: stale snapshot\n".to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_text_run_whose_result_fails_to_write_prints_no_notes() {
+    let mut stderr = Vec::new();
+
+    emit_success_to(&result_with_notes(), false, &mut FailingWriter, &mut stderr).unwrap_err();
+
+    assert_eq!(stderr, b"");
 }
 
 #[test]

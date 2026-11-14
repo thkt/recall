@@ -274,8 +274,8 @@ fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome
     )
 }
 
-/// Writes the result to `w` and, in a text run whose result was written, the notes the command
-/// has not shown to `notes`.
+/// Writes the result to `w` and, in a text run whose result did not fail to write, the notes the
+/// command has not shown to `notes`. A reader that closed stdout early still sees them on stderr.
 fn emit_success_to<W: Write, E: Write>(
     out: &CommandOutput,
     json_mode: bool,
@@ -292,7 +292,7 @@ fn emit_success_to<W: Write, E: Write>(
     } else {
         write_result(w, &body)
     };
-    if !json_mode && matches!(written, Ok(WriteOutcome::Written)) {
+    if !json_mode && written.is_ok() {
         // A closed stderr must not fail a run whose result was written, as a closed stdout does not.
         let _ = notes.write_all(render_text_notes(out).as_bytes());
     }
