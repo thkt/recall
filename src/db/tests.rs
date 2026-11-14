@@ -189,15 +189,14 @@ fn test_session_type_migration_adds_column_preserving_rows() {
     let conn = open_db(tmp.path()).unwrap();
 
     assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(session_id, source, file_path, project, slug, timestamp, mtime,
-                               file_size, session_type, files_scanned, chunks_indexed)
-             FROM sessions"
-        ),
+        collect_strings(&conn, SESSION_ROWS),
         [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
     );
 }
+
+const SESSION_ROWS: &str = "SELECT json_array(session_id, source, file_path, project, slug, \
+     timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions \
+     ORDER BY session_id";
 
 /// The schema version with every schema object, so a test can show that an open changed nothing.
 fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
@@ -264,58 +263,39 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
     let conn = open_db(tmp.path()).unwrap();
 
     assert_eq!(
-        conn.prepare("SELECT session_id, slug FROM sessions")
-            .unwrap()
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>(),
-        [("s1".to_owned(), "slug".to_owned())]
+        collect_strings(&conn, SESSION_ROWS),
+        [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid"
+        ),
+        [
+            r#"[1,"s1","user","hello"]"#,
+            r#"[3,"s1","assistant","help is here"]"#,
+            r#"[7,"s1","user","thanks"]"#
+        ]
     );
     // A trigram index matches a word's inner three letters; the older tokenizers do not.
     assert_eq!(
-        conn.prepare(
-            "SELECT rowid, role, text FROM messages WHERE messages MATCH 'hel' ORDER BY rowid"
-        )
-        .unwrap()
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .unwrap()
-        .map(Result::unwrap)
-        .collect::<Vec<_>>(),
+        collect_strings(
+            &conn,
+            "SELECT json_array(rowid, session_id, role, text) FROM messages
+             WHERE messages MATCH 'hel' ORDER BY rowid"
+        ),
         [
-            (1, "user".to_owned(), "hello".to_owned()),
-            (3, "assistant".to_owned(), "help is here".to_owned()),
+            r#"[1,"s1","user","hello"]"#,
+            r#"[3,"s1","assistant","help is here"]"#
         ]
     );
-    assert_eq!(
-        conn.prepare("SELECT rowid FROM messages ORDER BY rowid")
-            .unwrap()
-            .query_map([], |r| r.get::<_, i64>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>(),
-        [1, 3, 7]
-    );
-    let schema_version: i64 = conn
-        .query_row("PRAGMA schema_version", [], |r| r.get(0))
-        .unwrap();
+    let schema = schema_snapshot(&conn);
     drop(conn);
 
     let reopened = open_db(tmp.path()).unwrap();
 
-    assert_eq!(
-        reopened
-            .query_row("PRAGMA schema_version", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        schema_version,
-        "a second open must not migrate the table again"
-    );
+    // A second open must not migrate the table again.
+    assert_eq!(schema_snapshot(&reopened), schema);
 }
 
 #[test]
@@ -790,6 +770,8 @@ fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_fro
     );
 }
 
+// The expected line holds the POSIX error text.
+#[cfg(unix)]
 #[test]
 fn failing_to_remove_the_write_probe_warns_with_its_path_and_the_error() {
     use std::sync::Mutex;
@@ -1091,33 +1073,41 @@ fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
     )
     .unwrap();
     drop(conn);
+
     let conn = open_db(tmp.path()).unwrap();
-    let stamp: (Option<f64>, i64) = conn
-        .query_row("SELECT mtime, file_size FROM sessions", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
-    assert_eq!(stamp, (None, 42));
-    let text: String = conn
-        .query_row("SELECT text FROM messages", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(text, "kept");
+
+    assert_eq!(
+        (
+            collect_strings(&conn, SESSION_ROWS),
+            collect_strings(
+                &conn,
+                "SELECT json_array(rowid, session_id, role, text) FROM messages"
+            )
+        ),
+        (
+            vec![r#"["s","claude","/f","/p","slug",0,null,42,null,null,null]"#.to_owned()],
+            vec![r#"[1,"s","user","kept"]"#.to_owned()]
+        )
+    );
     conn.execute("UPDATE sessions SET mtime = 456", []).unwrap();
     conn.execute("INSERT INTO parse_diagnostics (file_path, source, invalid_json_lines) VALUES ('/s.jsonl', 'claude', 2)", []).unwrap();
     drop(conn);
+
     let conn = open_db(tmp.path()).unwrap();
+
     assert_eq!(
-        conn.query_row("SELECT mtime FROM sessions", [], |r| r.get::<_, f64>(0))
-            .unwrap(),
-        456.0
-    );
-    assert_eq!(
-        conn.query_row(
-            "SELECT invalid_json_lines FROM parse_diagnostics",
-            [],
-            |r| r.get::<_, i64>(0)
+        (
+            collect_strings(&conn, SESSION_ROWS),
+            collect_strings(
+                &conn,
+                "SELECT json_array(file_path, source, invalid_json_lines, invalid_utf8_lines,
+                                   incomplete_tail_lines, read_error)
+                 FROM parse_diagnostics"
+            )
+        ),
+        (
+            vec![r#"["s","claude","/f","/p","slug",0,456.0,42,null,null,null]"#.to_owned()],
+            vec![r#"["/s.jsonl","claude",2,0,0,0]"#.to_owned()]
         )
-        .unwrap(),
-        2
     );
 }
