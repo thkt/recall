@@ -843,55 +843,57 @@ fn classify_reports_and_dry_run_previews() {
         "index should build the DB and exit 0"
     );
 
-    let dry = recall(dir.path())
-        .args(["classify", "--all", "--dry-run"])
-        .output()
-        .expect("spawn recall binary");
     assert_eq!(
-        dry.status.code(),
-        Some(0),
-        "classify --dry-run should exit 0"
+        outcome(recall(dir.path()).args(["classify", "--all", "--dry-run"])),
+        (
+            Some(0),
+            concat!(
+                "s1 [automated] <command-message>clear</command-message>\n",
+                "dry-run: 1 session(s) would be classified (1 automated, 0 interactive)\n",
+            )
+            .to_owned(),
+            String::new()
+        )
     );
-    let dry_out = String::from_utf8_lossy(&dry.stdout);
-    assert!(dry_out.contains("dry-run"), "dry-run output: {dry_out}");
-
-    let run = recall(dir.path())
-        .args(["classify", "--all"])
-        .output()
-        .expect("spawn recall binary");
-    assert_eq!(run.status.code(), Some(0), "classify --all should exit 0");
-    let out = String::from_utf8_lossy(&run.stdout);
-    assert!(out.contains("classified"), "classify output: {out}");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["classify", "--all"])),
+        (
+            Some(0),
+            "classified 1 session(s): 1 automated, 0 interactive\n".to_owned(),
+            String::new()
+        )
+    );
 }
 
 #[test]
 fn classify_preview_of_missing_database_keeps_the_path_absent() {
     let dir = TempDir::new().unwrap();
-    for path in [
-        dir.path().join("recall.db"),
-        dir.path().join("absent/nested/recall.db"),
-    ] {
-        for all in [false, true] {
-            let mut cmd = recall(dir.path());
-            cmd.arg("--db-path")
-                .arg(&path)
-                .args(["classify", "--dry-run", "--json"]);
-            if all {
-                cmd.arg("--all");
-            }
-            let out = cmd.output().unwrap();
-            assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
-            let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-            assert_eq!(
-                envelope,
-                serde_json::json!({
-                    "data": {"classified":0,"automated":0,"interactive":0,"dry_run":true},
-                    "degraded": false, "notes": []
-                })
-            );
-            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
-        }
-    }
+    let nothing_classified = serde_json::json!({
+        "data": {"automated": 0, "classified": 0, "dry_run": true, "interactive": 0},
+        "degraded": false,
+        "notes": [],
+    });
+
+    assert_eq!(
+        json_outcome(
+            recall(dir.path())
+                .arg("--db-path")
+                .arg(dir.path().join("recall.db"))
+                .args(["classify", "--dry-run", "--json"])
+        ),
+        (Some(0), nothing_classified.clone(), String::new())
+    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
+    assert_eq!(
+        json_outcome(
+            recall(dir.path())
+                .arg("--db-path")
+                .arg(dir.path().join("absent/nested/recall.db"))
+                .args(["classify", "--dry-run", "--json", "--all"])
+        ),
+        (Some(0), nothing_classified, String::new())
+    );
+    assert_eq!(listing(dir.path()), Vec::<String>::new());
 }
 
 fn index_claude_sessions(dir: &Path, sessions: &[(&str, &[&str])]) {
@@ -1605,19 +1607,13 @@ fn classify_warns_once_when_a_session_source_is_missing() {
     index_stderr(dir.path(), &claude_dir);
     fs::remove_file(claude_dir.join("s1.jsonl")).unwrap();
 
-    let out = recall(dir.path())
-        .args(["classify", "--all"])
-        .output()
-        .expect("spawn recall binary");
-
-    assert_eq!(out.status.code(), Some(0), "classify should exit 0");
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
-        stderr
-            .matches("warning: provenance unavailable (missing file): 1 session(s)")
-            .count(),
-        1,
-        "got: {stderr}"
+        outcome(recall(dir.path()).args(["classify", "--all"])),
+        (
+            Some(0),
+            "classified 0 session(s): 0 automated, 0 interactive\n".to_owned(),
+            "warning: provenance unavailable (missing file): 1 session(s); existing labels retained, unclassified rows use first-turn fallback\n".to_owned()
+        )
     );
 }
 
