@@ -7,7 +7,7 @@ use crate::commands::build_markdown;
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, cached_artifacts};
 use crate::runtime::info as cli_info;
-use crate::{db, require_current_schema, resolve_db_path};
+use crate::{db, require_current_schema_in_snapshot, resolve_db_path};
 
 pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     run_status_with(verbose, db_path, || {
@@ -40,11 +40,12 @@ pub(crate) fn run_status_with(
     }
 
     let (conn, tier) = db::open_db_readonly(&path)?;
+    let wal_note = db::stale_wal_note(&path, tier);
 
     let (sessions, chunks, embedded) = match db::schema_state(&conn)? {
         db::SchemaState::Empty => (0, 0, 0),
         state => {
-            require_current_schema(state)?;
+            require_current_schema_in_snapshot(state, wal_note.as_deref())?;
             let sessions: i64 =
                 conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
             let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
@@ -81,10 +82,7 @@ pub(crate) fn run_status_with(
         "model_ready": model_ok,
     });
 
-    let mut notes: Vec<Note> = db::stale_wal_note(&path, tier)
-        .into_iter()
-        .map(Note::new)
-        .collect();
+    let mut notes: Vec<Note> = wal_note.into_iter().map(Note::new).collect();
     if let Err(error) = model::check_index(&conn, model::selected()) {
         notes.push(Note::new(format!(
             "semantic search unavailable: {error}; results are text-only"

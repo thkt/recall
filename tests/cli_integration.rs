@@ -1465,6 +1465,37 @@ fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_the_error() {
+    let dir = TempDir::new().unwrap();
+    rusqlite::Connection::open(dir.path().join("recall.db"))
+        .unwrap()
+        .execute_batch(
+            "PRAGMA journal_mode = WAL; CREATE TABLE sessions (session_id TEXT PRIMARY KEY);",
+        )
+        .unwrap();
+    fs::write(dir.path().join("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+    // The newer schema may sit in the log this snapshot cannot read.
+    let error = (
+        Some(65),
+        String::new(),
+        format!(
+            "error: database schema is out of date; run `recall rebuild` to migrate it; {READ_ONLY_DIR_NOTE}\n"
+        ),
+    );
+
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "anything"])),
+        error
+    );
+    assert_eq!(outcome(recall(dir.path()).arg("status")), error);
+}
+
 #[test]
 fn text_search_and_status_print_the_notes_they_add_on_stderr() {
     let automated = TempDir::new().unwrap();

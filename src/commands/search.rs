@@ -16,7 +16,8 @@ use crate::parser::Source;
 use crate::runtime::done;
 use crate::{ansi, db, search};
 use crate::{
-    format_timestamp, require_current_schema, resolve_db_path, try_load_embedder_cached_with,
+    format_timestamp, require_current_schema_in_snapshot, resolve_db_path,
+    try_load_embedder_cached_with,
 };
 
 #[derive(Debug, Args)]
@@ -191,7 +192,7 @@ where
     let wal_note = db::stale_wal_note(&path, tier);
     match db::schema_state(&conn)? {
         db::SchemaState::Empty => return Ok(search_idle_output(wal_note)),
-        state => require_current_schema(state)?,
+        state => require_current_schema_in_snapshot(state, wal_note.as_deref())?,
     }
 
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;

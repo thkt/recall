@@ -265,6 +265,18 @@ fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
     }
 }
 
+/// `require_current_schema` for a snapshot that may miss the write-ahead log: the newer schema may
+/// sit in that log, so `wal_note` joins the error.
+fn require_current_schema_in_snapshot(
+    state: db::SchemaState,
+    wal_note: Option<&str>,
+) -> Result<(), RecallError> {
+    require_current_schema(state).map_err(|error| match wal_note {
+        Some(note) => RecallError::DatabaseRead(format!("{error}; {note}")),
+        None => error,
+    })
+}
+
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
     emit_success_to(
         out,
