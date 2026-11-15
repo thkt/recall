@@ -1014,7 +1014,9 @@ fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_inde
     );
     assert_eq!(
         out.markdown,
-        format!("Health: degraded\n  index [FAIL] {detail} -> run `recall index`\n  model [ok]\n")
+        format!(
+            "Health: degraded\n  index [FAIL] {detail} -> run `recall index`\n  model_identity [ok]\n  model [ok]\n"
+        )
     );
     assert_eq!(
         printed_envelope(&out),
@@ -1022,6 +1024,7 @@ fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_inde
             "data": {
                 "checks": [
                     { "detail": detail, "name": "index", "ok": false, "remedy": "run `recall index`" },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -1104,7 +1107,9 @@ fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
     );
     assert_eq!(
         out.markdown,
-        format!("Health: degraded\n  index [FAIL] {detail} -> run `recall index`\n  model [ok]\n")
+        format!(
+            "Health: degraded\n  index [FAIL] {detail} -> run `recall index`\n  model_identity [ok]\n  model [ok]\n"
+        )
     );
     assert_eq!(
         printed_envelope(&out),
@@ -1112,6 +1117,7 @@ fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
             "data": {
                 "checks": [
                     { "detail": detail, "name": "index", "ok": false, "remedy": "run `recall index`" },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -1503,7 +1509,7 @@ fn doctor_fix_of_an_index_whose_model_identity_cannot_be_read_reports_it_and_sti
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
-            "  model_identity [FAIL] check could not run: no such column: fingerprint in SELECT fingerprint FROM embedding_identity WHERE singleton=1 at offset 7 -> remove the database file and run `recall index`\n",
+            "  model_identity [FAIL] check could not run: no such column: fingerprint in SELECT fingerprint FROM embedding_identity WHERE singleton=1 at offset 7 -> build this model in a separate --db-path\n",
             "  model [ok]\n",
         )
     );
@@ -1519,7 +1525,7 @@ fn doctor_fix_of_an_index_whose_model_identity_cannot_be_read_reports_it_and_sti
                         "detail": "check could not run: no such column: fingerprint in SELECT fingerprint FROM embedding_identity WHERE singleton=1 at offset 7",
                         "name": "model_identity",
                         "ok": false,
-                        "remedy": "remove the database file and run `recall index`",
+                        "remedy": "build this model in a separate --db-path",
                     },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
@@ -1529,7 +1535,7 @@ fn doctor_fix_of_an_index_whose_model_identity_cannot_be_read_reports_it_and_sti
                 "repaired": null,
             },
             "degraded": true,
-            "notes": ["model_identity: remove the database file and run `recall index`"],
+            "notes": ["model_identity: build this model in a separate --db-path"],
         })
     );
 }

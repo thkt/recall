@@ -58,11 +58,15 @@ impl DoctorCheck {
 const CORRUPT_DB_REMEDY: &str = "remove the database file and run `recall index`";
 const MODEL_INDEX_REMEDY: &str =
     "select the matching --model-manifest and index, or build this model in a separate --db-path";
+// The index may hold the only copy of a session whose log is gone, so this remedy keeps the file.
+const UNREADABLE_IDENTITY_REMEDY: &str = "build this model in a separate --db-path";
+
+fn could_not_run(e: impl Display) -> String {
+    format!("check could not run: {e}")
+}
 
 fn run_db_check(name: &'static str, check: impl FnOnce() -> Result<DoctorCheck>) -> DoctorCheck {
-    check().unwrap_or_else(|e| {
-        DoctorCheck::fail(name, format!("check could not run: {e}"), CORRUPT_DB_REMEDY)
-    })
+    check().unwrap_or_else(|e| DoctorCheck::fail(name, could_not_run(e), CORRUPT_DB_REMEDY))
 }
 
 fn db_checks(conn: &Connection) -> Vec<DoctorCheck> {
@@ -74,15 +78,17 @@ fn db_checks(conn: &Connection) -> Vec<DoctorCheck> {
 }
 
 fn check_model_identity(identity: Result<(), IndexIdentityError>) -> DoctorCheck {
-    run_db_check("model_identity", || match identity {
-        Ok(()) => Ok(DoctorCheck::pass("model_identity")),
-        Err(IndexIdentityError::Unreadable(e)) => Err(e.into()),
-        Err(refusal) => Ok(DoctorCheck::fail(
+    match identity {
+        Ok(()) => DoctorCheck::pass("model_identity"),
+        Err(IndexIdentityError::Unreadable(e)) => DoctorCheck::fail(
             "model_identity",
-            refusal.to_string(),
-            MODEL_INDEX_REMEDY,
-        )),
-    })
+            could_not_run(e),
+            UNREADABLE_IDENTITY_REMEDY,
+        ),
+        Err(refusal @ (IndexIdentityError::Mismatch | IndexIdentityError::LegacyVectors)) => {
+            DoctorCheck::fail("model_identity", refusal.to_string(), MODEL_INDEX_REMEDY)
+        }
+    }
 }
 
 fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
@@ -264,15 +270,10 @@ where
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
     let mut wal_note: Option<String> = None;
-    let (mut checks, refuses_model) = match db::open_db_readonly(&path) {
+    let (mut checks, identity) = match db::open_db_readonly(&path) {
         Ok((conn, tier)) => {
             wal_note = db::stale_wal_note(&path, tier);
             let identity = model::check_index(&conn, model::selected());
-            // Installing the selected model cannot make an index built for another model usable.
-            let refuses_model = matches!(
-                identity,
-                Err(IndexIdentityError::Mismatch | IndexIdentityError::LegacyVectors)
-            );
             let checks = match db::schema_state(&conn) {
                 Ok(db::SchemaState::Current) => {
                     // An index built for another model, a legacy one kept for rollback, or one
@@ -286,28 +287,25 @@ where
                     }
                     // Each check reads in a new transaction and sees the repair. An index opened
                     // immutable sits in a read-only directory, where the repair fails instead.
-                    let mut checks = db_checks(&conn);
-                    checks.push(check_model_identity(identity));
-                    checks
+                    db_checks(&conn)
                 }
-                // `recall rebuild` refuses an index whose identity check fails.
-                Ok(db::SchemaState::Stale) => vec![
-                    DoctorCheck::fail(
-                        "schema",
-                        "database schema is out of date".to_owned(),
-                        "run `recall rebuild`",
-                    ),
-                    check_model_identity(identity),
-                ],
+                Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
+                    "schema",
+                    "database schema is out of date".to_owned(),
+                    "run `recall rebuild`",
+                )],
                 Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
             };
-            (checks, refuses_model)
+            (checks, Some(identity))
         }
-        Err(e) => (open_failure_checks(e), false),
+        Err(e) => (open_failure_checks(e), None),
     };
+    // Installing the selected model cannot make an index built for another model usable.
+    let refuses_model = matches!(&identity, Some(Err(e)) if e.refuses_model());
     let (model_check, model_recovery) =
         check_model_with_optional_recovery(fix && !refuses_model, load_embedder, recover_model);
+    checks.extend(identity.map(check_model_identity));
     checks.push(model_check);
 
     let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);

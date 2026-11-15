@@ -520,6 +520,17 @@ pub enum IndexIdentityError {
     Unreadable(#[from] rusqlite::Error),
 }
 
+impl IndexIdentityError {
+    /// Whether the index belongs to another model, which the selected model cannot serve. An
+    /// identity that could not be read decides nothing about the model.
+    pub fn refuses_model(&self) -> bool {
+        match self {
+            Self::Mismatch | Self::LegacyVectors => true,
+            Self::Unreadable(_) => false,
+        }
+    }
+}
+
 pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<(), IndexIdentityError> {
     // Equal vector dimensions do not establish compatibility with legacy indexes.
     let table:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='embedding_identity' AND type='table')",[],|r|r.get(0))?;
@@ -553,7 +564,11 @@ pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<(), IndexIdent
 }
 pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    check_index(&tx, spec)?;
+    check_index(&tx, spec).map_err(|e| match e {
+        // The exit code finds a SQLite error only at the top of the error chain.
+        IndexIdentityError::Unreadable(sqlite) => anyhow::Error::from(sqlite),
+        refusal => refusal.into(),
+    })?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS embedding_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), fingerprint TEXT NOT NULL, manifest TEXT NOT NULL)")?;
     tx.execute(
         "INSERT OR IGNORE INTO embedding_identity VALUES(1,?1,?2)",
