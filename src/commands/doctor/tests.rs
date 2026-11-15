@@ -60,6 +60,7 @@ fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
             "  integrity [ok]\n",
             "  orphan_embeddings [FAIL] 1 embedding(s) reference a missing chunk -> recall doctor --fix\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -78,6 +79,7 @@ fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
                         "remedy": "recall doctor --fix",
                     },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -119,6 +121,7 @@ fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -130,6 +133,7 @@ fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -176,6 +180,7 @@ fn doctor_flags_orphan_chunk_referencing_missing_session() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [FAIL] 1 chunk(s) reference a missing session -> recall rebuild\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -192,6 +197,7 @@ fn doctor_flags_orphan_chunk_referencing_missing_session() {
                         "ok": false,
                         "remedy": "recall rebuild",
                     },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -231,6 +237,7 @@ fn doctor_fix_leaves_unrepairable_orphan_chunk_in_place() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [FAIL] 1 chunk(s) reference a missing session -> recall rebuild\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -247,6 +254,7 @@ fn doctor_fix_leaves_unrepairable_orphan_chunk_in_place() {
                         "ok": false,
                         "remedy": "recall rebuild",
                     },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -289,6 +297,7 @@ fn doctor_fix_breakdown_lists_every_repair_even_when_clean() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -300,6 +309,7 @@ fn doctor_fix_breakdown_lists_every_repair_even_when_clean() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -338,6 +348,7 @@ fn doctor_flags_model_that_fails_to_load() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [FAIL] model not loadable: model probe failed -> recall model download\n",
         )
     );
@@ -349,6 +360,7 @@ fn doctor_flags_model_that_fails_to_load() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "model not loadable: model probe failed",
                         "name": "model",
@@ -392,6 +404,7 @@ fn doctor_flags_model_dimension_mismatch() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [FAIL] embedding width 767 != expected 768 -> recall model download\n",
         )
     );
@@ -403,6 +416,7 @@ fn doctor_flags_model_dimension_mismatch() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "embedding width 767 != expected 768",
                         "name": "model",
@@ -443,6 +457,7 @@ fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok] model not installed; search runs FTS-only\n",
         )
     );
@@ -454,6 +469,7 @@ fn doctor_reports_not_installed_model_as_info_keeping_healthy() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "model not installed; search runs FTS-only",
                         "name": "model",
@@ -499,6 +515,7 @@ fn doctor_fix_recovers_not_installed_model_to_healthy() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -510,6 +527,7 @@ fn doctor_fix_recovers_not_installed_model_to_healthy() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -553,6 +571,7 @@ fn doctor_fix_recovers_unloadable_model_flipping_healthy() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -564,6 +583,7 @@ fn doctor_fix_recovers_unloadable_model_flipping_healthy() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -603,6 +623,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok] model not installed; search runs FTS-only\n",
         )
     );
@@ -614,6 +635,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "model not installed; search runs FTS-only",
                         "name": "model",
@@ -661,6 +683,7 @@ fn doctor_fix_failure_marks_transient_recovery_retryable() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [FAIL] model not loadable: model probe failed -> recall model download\n",
         )
     );
@@ -672,6 +695,7 @@ fn doctor_fix_failure_marks_transient_recovery_retryable() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "model not loadable: model probe failed",
                         "name": "model",
@@ -720,6 +744,7 @@ fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [FAIL] model not loadable: model probe failed -> recall model download\n",
         )
     );
@@ -731,6 +756,7 @@ fn doctor_fix_refetch_ok_but_probe_still_faults_reports_failed() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "model not loadable: model probe failed",
                         "name": "model",
@@ -860,6 +886,7 @@ fn doctor_flags_model_that_fails_to_embed() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [FAIL] model embed failed: embedding inference failed: mock failure -> recall model download\n",
         )
     );
@@ -871,6 +898,7 @@ fn doctor_flags_model_that_fails_to_embed() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     {
                         "detail": "model embed failed: embedding inference failed: mock failure",
                         "name": "model",
@@ -940,6 +968,7 @@ fn verbose_doctor_of_a_healthy_index_prints_the_database_path() {
                 "  integrity [ok]\n",
                 "  orphan_embeddings [ok]\n",
                 "  orphan_chunks [ok]\n",
+                "  model_identity [ok]\n",
                 "  model [ok]\n",
                 "DB: {}\n",
             ),
@@ -954,6 +983,7 @@ fn verbose_doctor_of_a_healthy_index_prints_the_database_path() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -1028,6 +1058,7 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
         concat!(
             "Health: degraded\n",
             "  schema [FAIL] database schema is out of date -> run `recall rebuild`\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -1042,6 +1073,7 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
                         "ok": false,
                         "remedy": "run `recall rebuild`",
                     },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -1140,6 +1172,7 @@ fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -1151,6 +1184,7 @@ fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -1207,7 +1241,8 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
-            "  model [FAIL] index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+            "  model_identity [FAIL] index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+            "  model [ok] model not installed; search runs FTS-only\n",
         )
     );
     assert_eq!(
@@ -1220,9 +1255,15 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
                     {
                         "detail": "index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest",
-                        "name": "model",
+                        "name": "model_identity",
                         "ok": false,
                         "remedy": "select the matching --model-manifest and index, or build this model in a separate --db-path",
+                    },
+                    {
+                        "detail": "model not installed; search runs FTS-only",
+                        "name": "model",
+                        "ok": true,
+                        "remedy": null,
                     },
                 ],
                 "healthy": false,
@@ -1231,7 +1272,7 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
                 "repaired": null,
             },
             "degraded": true,
-            "notes": ["model: select the matching --model-manifest and index, or build this model in a separate --db-path"],
+            "notes": ["model_identity: select the matching --model-manifest and index, or build this model in a separate --db-path"],
         })
     );
     assert_eq!(
@@ -1270,6 +1311,7 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
         concat!(
             "Health: degraded\n",
             "  schema [FAIL] database schema is out of date -> run `recall rebuild`\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -1284,6 +1326,7 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
                         "ok": false,
                         "remedy": "run `recall rebuild`",
                     },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": false,
@@ -1327,6 +1370,7 @@ fn doctor_fix_that_cannot_write_the_index_is_degraded_and_says_why() {
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
+            "  model_identity [ok]\n",
             "  model [ok]\n",
         )
     );
@@ -1340,6 +1384,7 @@ fn doctor_fix_that_cannot_write_the_index_is_degraded_and_says_why() {
                     { "detail": null, "name": "integrity", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
                 ],
                 "healthy": true,
@@ -1382,7 +1427,8 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
             "  integrity [ok]\n",
             "  orphan_embeddings [FAIL] 1 embedding(s) reference a missing chunk -> recall doctor --fix\n",
             "  orphan_chunks [ok]\n",
-            "  model [FAIL] legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+            "  model_identity [FAIL] legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path -> select the matching --model-manifest and index, or build this model in a separate --db-path\n",
+            "  model [ok] model not installed; search runs FTS-only\n",
         )
     );
     assert_eq!(
@@ -1400,9 +1446,15 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
                     { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
                     {
                         "detail": "legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path",
-                        "name": "model",
+                        "name": "model_identity",
                         "ok": false,
                         "remedy": "select the matching --model-manifest and index, or build this model in a separate --db-path",
+                    },
+                    {
+                        "detail": "model not installed; search runs FTS-only",
+                        "name": "model",
+                        "ok": true,
+                        "remedy": null,
                     },
                 ],
                 "healthy": false,
@@ -1413,8 +1465,71 @@ fn doctor_fix_leaves_an_orphan_embedding_in_a_legacy_index_kept_for_rollback() {
             "degraded": true,
             "notes": [
                 "orphan_embeddings: recall doctor --fix",
-                "model: select the matching --model-manifest and index, or build this model in a separate --db-path",
+                "model_identity: select the matching --model-manifest and index, or build this model in a separate --db-path",
             ],
+        })
+    );
+}
+
+#[test]
+fn doctor_fix_of_an_index_whose_model_identity_cannot_be_read_reports_it_and_still_installs_a_missing_model()
+ {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    conn.execute_batch(
+        "DROP TABLE embedding_identity;
+         CREATE TABLE embedding_identity (singleton INTEGER PRIMARY KEY, manifest TEXT);",
+    )
+    .unwrap();
+    drop(conn);
+    let host = FakeHost::not_installed();
+
+    let out = host
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
+            run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
+                host.install();
+                Ok(())
+            })
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "Recovered model\n",
+            "  integrity [ok]\n",
+            "  orphan_embeddings [ok]\n",
+            "  orphan_chunks [ok]\n",
+            "  model_identity [FAIL] check could not run: no such column: fingerprint in SELECT fingerprint FROM embedding_identity WHERE singleton=1 at offset 7 -> remove the database file and run `recall index`\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    { "detail": null, "name": "integrity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null },
+                    { "detail": null, "name": "orphan_chunks", "ok": true, "remedy": null },
+                    {
+                        "detail": "check could not run: no such column: fingerprint in SELECT fingerprint FROM embedding_identity WHERE singleton=1 at offset 7",
+                        "name": "model_identity",
+                        "ok": false,
+                        "remedy": "remove the database file and run `recall index`",
+                    },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": true,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["model_identity: remove the database file and run `recall index`"],
         })
     );
 }

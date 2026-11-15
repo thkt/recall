@@ -325,6 +325,7 @@ fn doctor_of_a_sound_index_without_the_model() -> serde_json::Value {
             {"detail": null, "name": "integrity", "ok": true, "remedy": null},
             {"detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null},
             {"detail": null, "name": "orphan_chunks", "ok": true, "remedy": null},
+            {"detail": null, "name": "model_identity", "ok": true, "remedy": null},
             {
                 "detail": "model not installed; search runs FTS-only",
                 "name": "model",
@@ -1400,6 +1401,7 @@ fn text_read_commands_on_a_stale_snapshot_in_a_read_only_directory_print_the_not
                 "  integrity [ok]\n",
                 "  orphan_embeddings [ok]\n",
                 "  orphan_chunks [ok]\n",
+                "  model_identity [ok]\n",
                 "  model [ok] model not installed; search runs FTS-only\n",
             )
             .to_owned(),

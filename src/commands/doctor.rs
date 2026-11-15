@@ -11,7 +11,7 @@ use crate::db::fix_orphan_embeddings;
 use crate::embedding::{EMBEDDING_DIMS, Embed};
 use crate::envelope::{CommandOutput, Note};
 use crate::error::{RecallError, download_error};
-use crate::model::{self, DegradedReason, download_and_verify_model};
+use crate::model::{self, DegradedReason, IndexIdentityError, download_and_verify_model};
 use crate::runtime::info as cli_info;
 use crate::{resolve_db_path, try_load_embedder_cached_with};
 
@@ -71,6 +71,18 @@ fn db_checks(conn: &Connection) -> Vec<DoctorCheck> {
         run_db_check("orphan_embeddings", || check_orphan_embeddings(conn)),
         run_db_check("orphan_chunks", || check_orphan_chunks(conn)),
     ]
+}
+
+fn check_model_identity(identity: Result<(), IndexIdentityError>) -> DoctorCheck {
+    run_db_check("model_identity", || match identity {
+        Ok(()) => Ok(DoctorCheck::pass("model_identity")),
+        Err(IndexIdentityError::Unreadable(e)) => Err(e.into()),
+        Err(refusal) => Ok(DoctorCheck::fail(
+            "model_identity",
+            refusal.to_string(),
+            MODEL_INDEX_REMEDY,
+        )),
+    })
 }
 
 fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
@@ -218,7 +230,7 @@ pub(crate) fn run_doctor(
 
 /// Diagnoses the index at `db_path` against `host`, always probing the model (DR 0013). Under
 /// `--fix`, `recover_model` stands for the model download; it runs only when the model is missing
-/// or fails its check, and the index's identity check did not fail.
+/// or fails its check, and the index was not built for another model or kept as a legacy one.
 fn run_doctor_in<R>(
     verbose: bool,
     fix: bool,
@@ -252,14 +264,19 @@ where
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
     let mut wal_note: Option<String> = None;
-    let (mut checks, identity_error) = match db::open_db_readonly(&path) {
+    let (mut checks, refuses_model) = match db::open_db_readonly(&path) {
         Ok((conn, tier)) => {
             wal_note = db::stale_wal_note(&path, tier);
             let identity = model::check_index(&conn, model::selected());
+            // Installing the selected model cannot make an index built for another model usable.
+            let refuses_model = matches!(
+                identity,
+                Err(IndexIdentityError::Mismatch | IndexIdentityError::LegacyVectors)
+            );
             let checks = match db::schema_state(&conn) {
                 Ok(db::SchemaState::Current) => {
-                    // An index built for another model, or a legacy one kept for rollback, stays
-                    // unwritten.
+                    // An index built for another model, a legacy one kept for rollback, or one
+                    // whose identity cannot be read stays unwritten.
                     if fix && identity.is_ok() {
                         repairs = Some(vec![RepairOutcome {
                             name: "orphan_embeddings",
@@ -269,27 +286,28 @@ where
                     }
                     // Each check reads in a new transaction and sees the repair. An index opened
                     // immutable sits in a read-only directory, where the repair fails instead.
-                    db_checks(&conn)
+                    let mut checks = db_checks(&conn);
+                    checks.push(check_model_identity(identity));
+                    checks
                 }
-                Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
-                    "schema",
-                    "database schema is out of date".to_owned(),
-                    "run `recall rebuild`",
-                )],
+                // `recall rebuild` refuses an index whose identity check fails.
+                Ok(db::SchemaState::Stale) => vec![
+                    DoctorCheck::fail(
+                        "schema",
+                        "database schema is out of date".to_owned(),
+                        "run `recall rebuild`",
+                    ),
+                    check_model_identity(identity),
+                ],
                 Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
             };
-            (checks, identity.err())
+            (checks, refuses_model)
         }
-        Err(e) => (open_failure_checks(e), None),
+        Err(e) => (open_failure_checks(e), false),
     };
-    // Installing the selected model cannot make an index built for another model usable.
-    let recover = fix && identity_error.is_none();
-    let (mut model_check, model_recovery) =
-        check_model_with_optional_recovery(recover, load_embedder, recover_model);
-    if let Some(error) = identity_error {
-        model_check = DoctorCheck::fail("model", error.to_string(), MODEL_INDEX_REMEDY);
-    }
+    let (model_check, model_recovery) =
+        check_model_with_optional_recovery(fix && !refuses_model, load_embedder, recover_model);
     checks.push(model_check);
 
     let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
