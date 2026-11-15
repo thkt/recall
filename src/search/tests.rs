@@ -601,7 +601,8 @@ fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_sma
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "unrelated weather topic");
-    // Both chunks hold the query, so the vector search finds them at the same distance.
+    // Both chunks hold the same text, so they have the same vector and the same distance from
+    // the query.
     insert_chunk(&conn, 1, "s1", "authentication");
     insert_chunk(&conn, 2, "s1", "authentication");
 

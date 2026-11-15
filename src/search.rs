@@ -534,8 +534,9 @@ fn fts_rows_per_session<T>(
 }
 
 /// The rowid of the best matching message of each session in `session_ids`. Of
-/// messages that match equally, the earlier one wins. Picking here, not in a
-/// `GROUP BY` or a window, keeps the message text out of the sort.
+/// messages that match equally, the earlier one wins. `MIN(rank)` with bare
+/// columns leaves that tie to SQLite, and a window sorts every matching row, so
+/// the pick runs here in one pass over the rows.
 fn best_matching_messages(
     conn: &Connection,
     fts_query: &str,
@@ -572,7 +573,7 @@ fn best_matching_messages(
             Ok(())
         });
     if let Err(e) = read {
-        warn!(error = %e, "snippet extraction failed");
+        warn!(error = %e, "best matching message lookup failed");
         return Ok(HashMap::new());
     }
     Ok(best
