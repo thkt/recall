@@ -505,7 +505,22 @@ pub fn download_and_verify_model() -> Result<(), ModelDownloadError> {
     }
 }
 
-pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<()> {
+/// Why an index cannot serve the selected model, or the read error that kept it from telling.
+#[derive(Debug, thiserror::Error)]
+pub enum IndexIdentityError {
+    #[error(
+        "index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest"
+    )]
+    Mismatch,
+    #[error(
+        "legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path"
+    )]
+    LegacyVectors,
+    #[error(transparent)]
+    Unreadable(#[from] rusqlite::Error),
+}
+
+pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<(), IndexIdentityError> {
     // Equal vector dimensions do not establish compatibility with legacy indexes.
     let table:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='embedding_identity' AND type='table')",[],|r|r.get(0))?;
     if table {
@@ -516,11 +531,11 @@ pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<()> {
                 |r| r.get(0),
             )
             .optional()?;
-        ensure!(
-            saved.as_deref() == Some(spec.identity().as_str()),
-            "index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest"
-        );
-        return Ok(());
+        return if saved.as_deref() == Some(spec.identity().as_str()) {
+            Ok(())
+        } else {
+            Err(IndexIdentityError::Mismatch)
+        };
     }
     let vectors: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='vec_chunks')",
@@ -530,10 +545,9 @@ pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<()> {
     if vectors {
         let count: bool =
             conn.query_row("SELECT EXISTS(SELECT 1 FROM vec_chunks)", [], |r| r.get(0))?;
-        ensure!(
-            !count,
-            "legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path"
-        );
+        if count {
+            return Err(IndexIdentityError::LegacyVectors);
+        }
     }
     Ok(())
 }
