@@ -53,6 +53,9 @@ pub struct IndexStats {
     pub elapsed_secs: f64,
     pub skipped_roots: Vec<SkippedRoot>,
     pub preserved_embedded: usize,
+    /// The logs the index pass took from the roots this run. A compressed copy set aside beside its
+    /// plain log is not among them.
+    pub source_logs: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -604,6 +607,7 @@ pub(crate) fn index_from_dirs_observed(
             &scan.removal,
         ),
         preserved_embedded: totals.preserved_embedded,
+        source_logs: scan.sources.into_iter().map(|(path, _)| path).collect(),
     })
 }
 

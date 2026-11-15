@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 
 use anyhow::Result;
@@ -101,15 +102,21 @@ enum RereadOutcome {
     Unavailable,
 }
 
-fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<RereadOutcome> {
+fn reread_scanned_files(
+    tx: &Transaction,
+    fpath: &Path,
+    source: &str,
+    source_logs: &HashSet<PathBuf>,
+) -> Result<RereadOutcome> {
     let Some(source) = Source::from_db(source) else {
         return Ok(RereadOutcome::Paths(Vec::new()));
     };
+    if !source_logs.contains(fpath) {
+        return Ok(RereadOutcome::Unavailable);
+    }
     match parse_session_including_empty(fpath, source) {
         Ok(Some(parsed)) => {
-            if !parsed.diagnostics.is_empty() {
-                save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
-            }
+            save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
             Ok(RereadOutcome::Paths(parsed.scanned_files))
         }
         Ok(None) => Ok(RereadOutcome::Paths(Vec::new())),
@@ -120,8 +127,11 @@ fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<
     }
 }
 
+/// Reads again only the logs in `source_logs`, the ones the index pass reads this run. A session
+/// whose log this run did not find, such as one under a missing root, waits for a run that finds it.
 pub(crate) fn backfill_session_files(
     conn: &mut Connection,
+    source_logs: &HashSet<PathBuf>,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<usize> {
     let sessions: Vec<(String, String, String)> = {
@@ -149,7 +159,7 @@ pub(crate) fn backfill_session_files(
         if let Some(cb) = on_progress {
             cb(done + 1, total);
         }
-        let scanned = match reread_scanned_files(&tx, Path::new(file_path), source)? {
+        let scanned = match reread_scanned_files(&tx, Path::new(file_path), source, source_logs)? {
             RereadOutcome::Paths(paths) => paths,
             RereadOutcome::Unavailable => continue,
         };
