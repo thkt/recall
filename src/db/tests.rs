@@ -711,7 +711,7 @@ fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
 
 #[cfg(unix)]
 #[test]
-fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_after_trying_the_last_checkpoint()
+fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_with_the_path_it_was_given()
  {
     use std::os::unix::fs::PermissionsExt;
 
@@ -726,14 +726,9 @@ fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_after_t
     let result = open_db_readonly(&missing);
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
-    // The URI in the error shows the open fell back to reading from the last checkpoint. The
-    // URI-delimiter test checks the escaping on its own, so the path here goes through it as is.
     assert_eq!(
         result.err().unwrap().to_string(),
-        format!(
-            "unable to open database file: file:{}?immutable=1",
-            encode_uri_path(&missing)
-        )
+        format!("unable to open database file: {}", missing.display())
     );
 }
 
