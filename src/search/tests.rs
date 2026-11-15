@@ -241,6 +241,38 @@ fn the_excerpt_is_the_chunk_of_the_best_matching_message() {
 }
 
 #[test]
+fn the_excerpt_of_two_messages_that_match_equally_is_the_chunk_of_the_earlier_one() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    // Both messages hold the query once and have the same length, so they rank equally.
+    let first = insert_message(&conn, "s1", "user", "authentication alpha");
+    let second = insert_message(&conn, "s1", "user", "authentication gamma");
+    insert_chunk_over(
+        &conn,
+        1,
+        "s1",
+        "authentication alpha — ALPHA_CHUNK_BODY",
+        first,
+        first,
+    );
+    insert_chunk_over(
+        &conn,
+        2,
+        "s1",
+        "authentication gamma — GAMMA_CHUNK_BODY",
+        second,
+        second,
+    );
+
+    let results = search(&conn, "authentication", &at_now()).unwrap();
+
+    assert_eq!(
+        found(&results),
+        [("s1", "authentication alpha — ALPHA_CHUNK_BODY", Some(1))]
+    );
+}
+
+#[test]
 fn the_one_chunk_containing_the_message_is_shown_in_full() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", 1709251200000);
@@ -562,6 +594,27 @@ fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() 
         hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
         ["a", "m", "q", "z"]
     );
+}
+
+#[test]
+fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_smaller_id() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "s1", "user", "unrelated weather topic");
+    // Both chunks hold the query, so the vector search finds them at the same distance.
+    insert_chunk(&conn, 1, "s1", "authentication");
+    insert_chunk(&conn, 2, "s1", "authentication");
+
+    let results = search_with_embedder(
+        &conn,
+        "authentication",
+        &at_now(),
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap()
+    .results;
+
+    assert_eq!(found(&results), [("s1", "authentication", Some(1))]);
 }
 
 #[test]
@@ -1258,6 +1311,32 @@ fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_a
     let mut matched = ids(&results);
     matched.sort_unstable();
     assert_eq!(matched, ["both", "rust-only"]);
+}
+
+#[test]
+fn a_two_letter_query_that_starts_26_equally_frequent_words_searches_the_first_25_in_word_order() {
+    let (_dir, conn) = setup_test_db();
+    // Each session holds one of the words "aba" to "abz", once.
+    for last in 'a'..='z' {
+        let word = format!("ab{last}");
+        insert_session(&conn, &word, "claude", "/proj", NOW_MS);
+        insert_message(&conn, &word, "user", &word);
+    }
+    let opts = SearchOptions {
+        limit: 30,
+        ..at_now()
+    };
+
+    let results = search(&conn, "ab", &opts).unwrap();
+
+    assert_eq!(
+        ids(&results),
+        [
+            "aba", "abb", "abc", "abd", "abe", "abf", "abg", "abh", "abi", "abj", "abk", "abl",
+            "abm", "abn", "abo", "abp", "abq", "abr", "abs", "abt", "abu", "abv", "abw", "abx",
+            "aby",
+        ]
+    );
 }
 
 #[test]
@@ -2215,6 +2294,28 @@ fn combined_filters_apply_to_the_file_list() {
     assert_eq!(ids(&outcome.results), ["keep"]);
     assert!(!outcome.vec_degraded);
     assert!(!outcome.results_incomplete);
+}
+
+#[test]
+fn a_file_list_cut_by_the_limit_lists_sessions_of_the_same_time_in_session_id_order() {
+    let (_dir, conn) = setup_test_db();
+    for sid in ["a", "b", "c"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        seed_session_file(&conn, sid, "/proj/src/a.rs");
+    }
+    for sid in ["m", "n"] {
+        insert_undated_session(&conn, sid);
+        seed_session_file(&conn, sid, "/proj/src/a.rs");
+    }
+    let opts = SearchOptions {
+        file: Some("a.rs".to_owned()),
+        limit: 4,
+        ..SearchOptions::default()
+    };
+
+    let outcome = search_with_embedder(&conn, None, &opts, None).unwrap();
+
+    assert_eq!(ids(&outcome.results), ["a", "b", "c", "m"]);
 }
 
 #[test]

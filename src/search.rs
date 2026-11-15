@@ -533,6 +533,54 @@ fn fts_rows_per_session<T>(
     Ok(picked)
 }
 
+/// The rowid of the best matching message of each session in `session_ids`. Of
+/// messages that match equally, the earlier one wins. Picking here, not in a
+/// `GROUP BY` or a window, keeps the message text out of the sort.
+fn best_matching_messages(
+    conn: &Connection,
+    fts_query: &str,
+    session_ids: &[&str],
+) -> Result<HashMap<String, i64>> {
+    if session_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        "SELECT session_id, rowid, rank FROM messages \
+         WHERE messages MATCH ? AND session_id IN ({})",
+        anon_placeholders(session_ids.len())
+    );
+    let mut params: Vec<&dyn ToSql> = vec![&fts_query];
+    params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
+    let mut stmt = conn.prepare(&sql)?;
+    let mut best: HashMap<String, (f64, i64)> = HashMap::new();
+    let read = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+            ))
+        })
+        .and_then(|rows| {
+            for row in rows {
+                let (session_id, rowid, rank) = row?;
+                let kept = best.entry(session_id).or_insert((rank, rowid));
+                if rank.total_cmp(&kept.0).then(rowid.cmp(&kept.1)).is_lt() {
+                    *kept = (rank, rowid);
+                }
+            }
+            Ok(())
+        });
+    if let Err(e) = read {
+        warn!(error = %e, "snippet extraction failed");
+        return Ok(HashMap::new());
+    }
+    Ok(best
+        .into_iter()
+        .map(|(session_id, (_, rowid))| (session_id, rowid))
+        .collect())
+}
+
 fn fetch_chunks(
     conn: &Connection,
     fts_query: Option<&str>,
@@ -543,9 +591,7 @@ fn fetch_chunks(
     let session_ids: Vec<&str> = ranked.iter().map(|(sid, _)| sid.as_str()).collect();
     let (best_hits, first_hits) = match fts_query {
         Some(q) => (
-            fts_rows_per_session(conn, q, &session_ids, "rowid, text, MIN(rank)", |row| {
-                Ok((row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-            })?,
+            best_matching_messages(conn, q, &session_ids)?,
             fts_rows_per_session(conn, q, &session_ids, "MIN(rowid)", |row| {
                 row.get::<_, i64>(1)
             })?,
@@ -557,7 +603,8 @@ fn fetch_chunks(
           AND ?2 BETWEEN c.src_rowid_lo AND c.src_rowid_hi HAVING COUNT(*) = 1";
     let mut rowid_match_stmt = conn.prepare(rowid_match_sql)?;
     let instr_match_sql = "SELECT MAX(c.content) FROM qa_chunks c \
-        WHERE c.session_id = ?1 AND c.src_rowid_lo IS NULL AND instr(c.content, ?2) > 0 \
+        WHERE c.session_id = ?1 AND c.src_rowid_lo IS NULL \
+          AND instr(c.content, (SELECT text FROM messages WHERE rowid = ?2)) > 0 \
         HAVING COUNT(*) = 1";
     let mut instr_match_stmt = conn.prepare(instr_match_sql)?;
     let snippet_sql = "SELECT snippet(messages, 2, '**', '**', '...', 20) \
@@ -566,7 +613,7 @@ fn fetch_chunks(
     let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
     Ok(build_candidates(ranked, meta_map, |sid| {
-        if let Some((rowid, text)) = best_hits.get(sid) {
+        if let Some(rowid) = best_hits.get(sid) {
             if let Some((chunk_id, content)) = row_or_default(
                 rowid_match_stmt.query_row(rusqlite::params![sid, rowid], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -576,7 +623,7 @@ fn fetch_chunks(
                 return (content, Some(chunk_id));
             }
             if let Some(content) = row_or_default(
-                instr_match_stmt.query_row(rusqlite::params![sid, text], |row| row.get(0)),
+                instr_match_stmt.query_row(rusqlite::params![sid, rowid], |row| row.get(0)),
                 sid,
             ) {
                 return (content, None);
@@ -634,8 +681,12 @@ fn vec_search(
     let embedding = model::timed("query embedding", || embedder.embed_query(query))?;
     let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
 
+    // Of the chunks of a session that the nearest-neighbor search keeps, the one with the
+    // smaller id wins a tie in distance. Which of equally distant vectors survive the LIMIT is
+    // still up to sqlite-vec, which orders them by distance alone.
     let mut sql = String::from(
-        "SELECT c.session_id, c.id, MIN(v.distance) AS d \
+        "SELECT c.session_id, c.id, v.distance AS d, row_number() OVER ( \
+         PARTITION BY c.session_id ORDER BY v.distance, c.id) AS n \
          FROM qa_chunks c \
          JOIN ( \
              SELECT chunk_id, distance FROM vec_chunks \
@@ -647,7 +698,7 @@ fn vec_search(
     );
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_search_filters(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
-    sql.push_str(" GROUP BY c.session_id ORDER BY d, c.session_id");
+    let sql = format!("SELECT session_id, id FROM ({sql}) WHERE n = 1 ORDER BY d, session_id");
 
     let limit_i64 = limit as i64;
     let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());
@@ -1102,7 +1153,7 @@ fn file_list_outcome(
         .to_owned();
     let mut params: Vec<Box<dyn ToSql>> = Vec::new();
     append_search_filters(&mut sql, &mut params, "s.session_id", opts, now_ms);
-    sql.push_str(" ORDER BY s.timestamp DESC");
+    sql.push_str(" ORDER BY s.timestamp DESC, s.session_id");
     debug_assert_eq!(
         params.len(),
         sql.matches('?').count(),

@@ -551,7 +551,7 @@ pub(crate) fn fts_expand_short_terms(
     let sql = format!(
         "SELECT term FROM {vocab_table} \
          WHERE term LIKE ?1 ESCAPE '\\' \
-         ORDER BY cnt DESC LIMIT 25"
+         ORDER BY cnt DESC, term LIMIT 25"
     );
     let mut stmt = match conn.prepare_cached(&sql) {
         Ok(s) => Some(s),
