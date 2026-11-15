@@ -102,10 +102,18 @@ enum RereadOutcome {
     Unavailable,
 }
 
-fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<RereadOutcome> {
+fn reread_scanned_files(
+    tx: &Transaction,
+    fpath: &Path,
+    source: &str,
+    source_logs: &HashSet<PathBuf>,
+) -> Result<RereadOutcome> {
     let Some(source) = Source::from_db(source) else {
         return Ok(RereadOutcome::Paths(Vec::new()));
     };
+    if !source_logs.contains(fpath) {
+        return Ok(RereadOutcome::Unavailable);
+    }
     match parse_session_including_empty(fpath, source) {
         Ok(Some(parsed)) => {
             save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
@@ -119,14 +127,14 @@ fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<
     }
 }
 
-/// Reads again only the logs in `enumerated_logs`, as the index pass does. A session whose root is
-/// missing waits until a run finds its log.
+/// Reads again only the logs in `source_logs`, the ones the index pass reads this run. A session
+/// whose log this run did not find, such as one under a missing root, waits for a run that finds it.
 pub(crate) fn backfill_session_files(
     conn: &mut Connection,
-    enumerated_logs: &HashSet<PathBuf>,
+    source_logs: &HashSet<PathBuf>,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<usize> {
-    let mut sessions: Vec<(String, String, String)> = {
+    let sessions: Vec<(String, String, String)> = {
         let unmarked_sessions_sql =
             "SELECT session_id, file_path, source FROM sessions WHERE files_scanned IS NULL";
         let mut stmt = conn.prepare(unmarked_sessions_sql)?;
@@ -139,7 +147,6 @@ pub(crate) fn backfill_session_files(
         })?;
         rows.collect::<StdResult<Vec<_>, _>>()?
     };
-    sessions.retain(|(_, file_path, _)| enumerated_logs.contains(Path::new(file_path)));
 
     if sessions.is_empty() {
         return Ok(0);
@@ -152,7 +159,7 @@ pub(crate) fn backfill_session_files(
         if let Some(cb) = on_progress {
             cb(done + 1, total);
         }
-        let scanned = match reread_scanned_files(&tx, Path::new(file_path), source)? {
+        let scanned = match reread_scanned_files(&tx, Path::new(file_path), source, source_logs)? {
             RereadOutcome::Paths(paths) => paths,
             RereadOutcome::Unavailable => continue,
         };

@@ -2377,7 +2377,7 @@ fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_once_the_
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let log = tmp.path().join("legacy.jsonl");
-    let enumerated = HashSet::from([log.clone()]);
+    let source_logs = HashSet::from([log.clone()]);
     conn.execute(
         "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('legacy', 'claude', ?1, '/p', 'slug', 0, 0.0, NULL)",
         [log.to_str().unwrap()],
@@ -2385,7 +2385,7 @@ fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_once_the_
     .unwrap();
 
     assert_eq!(
-        backfill_session_files(&mut conn, &enumerated, None).unwrap(),
+        backfill_session_files(&mut conn, &source_logs, None).unwrap(),
         0,
         "a log that cannot be read marks no session"
     );
@@ -2401,7 +2401,7 @@ fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_once_the_
     );
 
     fs::write(&log, LOG_THAT_EDITS_A_FILE).unwrap();
-    let marked = backfill_session_files(&mut conn, &enumerated, None).unwrap();
+    let marked = backfill_session_files(&mut conn, &source_logs, None).unwrap();
 
     assert_eq!(
         (
@@ -2429,7 +2429,7 @@ fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_a
     let unknown = tmp.path().join("unknown.jsonl");
     let empty = tmp.path().join("empty.jsonl");
     fs::write(&empty, "").unwrap();
-    let enumerated = HashSet::from([unknown.clone(), empty.clone()]);
+    let source_logs = HashSet::from([empty.clone()]);
     conn.execute(
         "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('mystery', 'perplexity', ?1, '/p', 'slug', 0, 0.0, NULL)",
         [unknown.to_str().unwrap()],
@@ -2442,7 +2442,7 @@ fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_a
     .unwrap();
 
     assert_eq!(
-        backfill_session_files(&mut conn, &enumerated, None).unwrap(),
+        backfill_session_files(&mut conn, &source_logs, None).unwrap(),
         2,
         "both sessions are marked done"
     );
@@ -2451,7 +2451,7 @@ fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_a
     fs::write(&unknown, LOG_THAT_EDITS_A_FILE).unwrap();
     fs::write(&empty, LOG_THAT_EDITS_A_FILE).unwrap();
     assert_eq!(
-        backfill_session_files(&mut conn, &enumerated, None).unwrap(),
+        backfill_session_files(&mut conn, &source_logs, None).unwrap(),
         0,
         "a marked session is not read again"
     );
