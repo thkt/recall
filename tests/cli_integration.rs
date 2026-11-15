@@ -1200,6 +1200,36 @@ fn status_reads_an_index_given_by_a_relative_path_from_a_read_only_working_direc
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn status_of_an_unreadable_database_in_a_read_only_directory_names_the_path_it_was_given() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new().unwrap();
+    // A URI writes the space and `#` as `%20` and `%23`.
+    let dir = root.path().join("a b#c");
+    fs::create_dir(&dir).unwrap();
+    let db = dir.join("recall.db");
+    fs::write(&db, b"").unwrap();
+    fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
+    let _read_only = ReadOnlyDir::new(&dir);
+    if root_skip::skip_if_root(&dir) {
+        return;
+    }
+
+    assert_eq!(
+        outcome(recall(root.path()).env("RECALL_DB", &db).arg("status")),
+        (
+            Some(74),
+            String::new(),
+            format!(
+                "error: unable to open database file: {}: Error code 14: unable to open database file\n",
+                db.display()
+            )
+        )
+    );
+}
+
 /// Indexes one session, then leaves a nonempty `-wal` beside the DB the way an
 /// interrupted writer does, so a read from a read-only directory sees a stale snapshot.
 fn seed_stale_wal(dir: &Path) {

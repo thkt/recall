@@ -31,19 +31,17 @@ pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {
     ensure_sqlite_vec()?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
 
-    match Connection::open_with_flags(path, flags) {
-        Ok(conn) => {
-            conn.busy_timeout(Duration::from_secs(30))?;
-            match probe_readable(&conn) {
-                Ok(()) => Ok((conn, OpenTier::Direct)),
-                Err(e) if is_readonly_dir_error(path, &e) => {
-                    drop(conn);
-                    open_immutable(path, flags)
-                }
-                Err(e) => Err(e.into()),
-            }
+    // A failed open gets no fallback. This open reads only the main file, and the open from the
+    // last checkpoint reads the same file. A `-wal` or `-shm` that a read-only directory blocks
+    // fails the probe instead.
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(Duration::from_secs(30))?;
+    match probe_readable(&conn) {
+        Ok(()) => Ok((conn, OpenTier::Direct)),
+        Err(e) if is_readonly_dir_error(path, &e) => {
+            drop(conn);
+            open_immutable(path, flags)
         }
-        Err(e) if is_readonly_dir_error(path, &e) => open_immutable(path, flags),
         Err(e) => Err(e.into()),
     }
 }
