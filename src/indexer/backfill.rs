@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 
 use anyhow::Result;
@@ -120,11 +121,14 @@ fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<
     }
 }
 
+/// Reads again only the logs in `enumerated_logs`, as the index pass does. A session whose root is
+/// missing waits until a run finds its log.
 pub(crate) fn backfill_session_files(
     conn: &mut Connection,
+    enumerated_logs: &HashSet<PathBuf>,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<usize> {
-    let sessions: Vec<(String, String, String)> = {
+    let mut sessions: Vec<(String, String, String)> = {
         let unmarked_sessions_sql =
             "SELECT session_id, file_path, source FROM sessions WHERE files_scanned IS NULL";
         let mut stmt = conn.prepare(unmarked_sessions_sql)?;
@@ -137,6 +141,7 @@ pub(crate) fn backfill_session_files(
         })?;
         rows.collect::<StdResult<Vec<_>, _>>()?
     };
+    sessions.retain(|(_, file_path, _)| enumerated_logs.contains(Path::new(file_path)));
 
     if sessions.is_empty() {
         return Ok(0);

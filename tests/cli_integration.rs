@@ -1239,11 +1239,55 @@ fn seed_pre_trigram_index(dir: &Path) {
 }
 
 #[test]
+fn indexing_an_old_index_whose_claude_root_is_missing_reports_the_preserved_session_and_no_read_error_on_each_run()
+ {
+    const MISSING_ROOT_NOTE: &str = "claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions";
+    let dir = TempDir::new().unwrap();
+    seed_pre_trigram_index(dir.path());
+    let skipped_roots = serde_json::json!([
+        {"preserved_sessions": 1, "reason": "missing_root", "source": "claude"}
+    ]);
+    let mut first_expected = index_envelope(
+        &[
+            ("chunks_created_committed", 1),
+            ("chunks_pending_snapshot", 1),
+            ("chunks_remaining_snapshot", 1),
+            ("chunks_unattempted", 1),
+            ("sessions_chunk_pending", 1),
+            ("sessions_chunked_committed", 1),
+            ("sessions_stored", 1),
+        ],
+        &serde_json::json!([]),
+        &[MISSING_ROOT_NOTE.to_owned()],
+    );
+    first_expected["data"]["skipped_roots"] = skipped_roots.clone();
+    let mut second_expected = index_envelope(
+        &[
+            ("chunks_pending_snapshot", 1),
+            ("chunks_remaining_snapshot", 1),
+            ("chunks_unattempted", 1),
+            ("sessions_stored", 1),
+        ],
+        &serde_json::json!([]),
+        &[MISSING_ROOT_NOTE.to_owned()],
+    );
+    second_expected["data"]["skipped_roots"] = skipped_roots;
+
+    let (first_code, first, _) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+    let (second_code, second, _) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+
+    assert_eq!(
+        ((first_code, first), (second_code, second)),
+        ((Some(0), first_expected), (Some(0), second_expected))
+    );
+}
+
+#[test]
 fn index_upgrading_a_pre_trigram_index_keeps_the_sessions_of_a_missing_root_searchable() {
     let dir = TempDir::new().unwrap();
     seed_pre_trigram_index(dir.path());
 
-    // Its stderr carries stage timings and the read warning #445 reports, so only the code counts.
+    // Its stderr carries stage timings, so only the code counts.
     let (index_code, _, index_stderr) = outcome(recall(dir.path()).arg("index"));
     assert_eq!(index_code, Some(0), "{index_stderr}");
 

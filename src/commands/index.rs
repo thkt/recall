@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,7 +201,7 @@ where
     let skipped_roots = stats.skipped_roots;
 
     let chunk_stats = indexer::index_chunks_observed(&mut conn, observer)?;
-    let parse_diagnostics = run_legacy_backfill(&mut conn, observer)?;
+    let parse_diagnostics = run_legacy_backfill(&mut conn, &stats.enumerated_logs, observer)?;
     if chunk_stats.chunks_created > 0 {
         done(&format!("Created {} chunks", chunk_stats.chunks_created));
     } else {
@@ -300,6 +301,7 @@ fn report_indexed_sessions(stats: &indexer::IndexStats) {
 
 fn run_legacy_backfill(
     conn: &mut Connection,
+    enumerated_logs: &HashSet<PathBuf>,
     observer: &index_observer::Observer,
 ) -> Result<Vec<indexer::FileParseDiagnostics>> {
     let backfill = observer.stage("legacy_backfill");
@@ -313,7 +315,8 @@ fn run_legacy_backfill(
     let on_backfill_progress = |done: usize, total: usize| {
         backfill.progress(done.saturating_sub(1), total, 0);
     };
-    let scanned_backfilled = indexer::backfill_session_files(conn, Some(&on_backfill_progress))?;
+    let scanned_backfilled =
+        indexer::backfill_session_files(conn, enumerated_logs, Some(&on_backfill_progress))?;
     let parse_diagnostics = indexer::load_parse_diagnostics(conn)?;
     for note in parse_diagnostics
         .iter()
