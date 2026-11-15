@@ -114,10 +114,11 @@ enum Command {
     },
     /// Show index and embedding status
     Status,
-    /// Diagnose a broken index: corruption, orphaned rows, and a live model
-    /// load probe. Read-only by default; `--fix` repairs orphan embeddings,
-    /// recovers the model, and re-runs the checks. Other remedies point at
-    /// index/rebuild/model download.
+    /// Diagnose a broken index: corruption, orphaned rows, the model identity,
+    /// and a live model load probe. Read-only by default; `--fix` repairs orphan
+    /// embeddings, recovers the model, and re-runs the checks. Other remedies
+    /// point at index/rebuild/model download, --model-manifest, or a separate
+    /// --db-path.
     Doctor {
         /// Delete dangling `vec_chunks` rows whose `chunk_id` no longer resolves
         /// to a `qa_chunks` row (the orphan_embeddings fault), and download and

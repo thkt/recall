@@ -1,6 +1,7 @@
 #![cfg(test)]
 use super::*;
 use crate::embedder::MockEmbedder;
+use crate::error::classify_exit_code;
 use std::cell::Cell;
 #[test]
 fn checksum_format_and_persisted_identity_survive_digest_updates() {
@@ -204,6 +205,24 @@ fn legacy_vectors_are_rejected_without_stamping_or_deleting_them() {
         )
         .unwrap(),
         0
+    );
+}
+#[test]
+fn binding_an_index_whose_identity_cannot_be_read_exits_as_an_io_failure() {
+    let mut c = empty_index();
+    c.execute_batch(
+        "CREATE TABLE embedding_identity(singleton INTEGER PRIMARY KEY, manifest TEXT)",
+    )
+    .unwrap();
+
+    let err = bind_index(&mut c, &ModelSpec::default()).unwrap_err();
+
+    assert_eq!(
+        (classify_exit_code(&err), err.to_string()),
+        (
+            process::ExitCode::from(74),
+            "no such column: fingerprint in SELECT fingerprint FROM embedding_identity WHERE singleton=1 at offset 7".to_owned()
+        )
     );
 }
 #[test]

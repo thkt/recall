@@ -79,7 +79,7 @@ fn help_text(db: &Path) -> String {
             "  show      Show full conversation of a session\n",
             "  classify  Classify existing sessions from source provenance and their first user turn\n",
             "  status    Show index and embedding status\n",
-            "  doctor    Diagnose a broken index: corruption, orphaned rows, and a live model load probe. Read-only by default; `--fix` repairs orphan embeddings, recovers the model, and re-runs the checks. Other remedies point at index/rebuild/model download\n",
+            "  doctor    Diagnose a broken index: corruption, orphaned rows, the model identity, and a live model load probe. Read-only by default; `--fix` repairs orphan embeddings, recovers the model, and re-runs the checks. Other remedies point at index/rebuild/model download, --model-manifest, or a separate --db-path\n",
             "  help      Print this message or the help of the given subcommand(s)\n",
             "\n",
             "Options:\n",
@@ -359,6 +359,7 @@ fn doctor_of_a_sound_index_without_the_model() -> serde_json::Value {
             {"detail": null, "name": "integrity", "ok": true, "remedy": null},
             {"detail": null, "name": "orphan_embeddings", "ok": true, "remedy": null},
             {"detail": null, "name": "orphan_chunks", "ok": true, "remedy": null},
+            {"detail": null, "name": "model_identity", "ok": true, "remedy": null},
             {
                 "detail": "model not installed; search runs FTS-only",
                 "name": "model",
@@ -1508,6 +1509,7 @@ fn text_read_commands_on_a_stale_snapshot_in_a_read_only_directory_print_the_not
                 "  integrity [ok]\n",
                 "  orphan_embeddings [ok]\n",
                 "  orphan_chunks [ok]\n",
+                "  model_identity [ok]\n",
                 "  model [ok] model not installed; search runs FTS-only\n",
             )
             .to_owned(),
