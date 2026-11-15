@@ -174,9 +174,12 @@ older binaries. Concurrent installs share a process-safe lock.
 `RECALL_MODEL_DIR` still selects an explicit directory containing `model.gguf` and
 `tokenizer.json`; it takes precedence and disables automatic legacy import.
 
-The default index is `~/.local/share/recall/indexes/<manifest-sha256>/recall.db`
-(or under absolute `XDG_DATA_HOME`). `--db-path` / `RECALL_DB` overrides the path,
-while model identity checks still apply. Different manifests use separate default indexes.
+The default index is `~/.local/share/recall/indexes/<model-identity>/recall.db`
+(or under absolute `XDG_DATA_HOME`). `<model-identity>` is the fingerprint of the model
+the selected manifest describes, the same value the index records; it is not the SHA-256
+of the manifest file. `recall status --verbose` prints the database path in use.
+`--db-path` / `RECALL_DB` overrides the path, while model identity checks still apply.
+Different manifests use separate default indexes.
 
 When upgrading from Ruri, keep the old binary and `~/.local/share/recall/recall.db`
 for rollback. Remove any old `RECALL_DB` override or choose a new `--db-path`, then
