@@ -108,9 +108,7 @@ fn reread_scanned_files(tx: &Transaction, fpath: &Path, source: &str) -> Result<
     };
     match parse_session_including_empty(fpath, source) {
         Ok(Some(parsed)) => {
-            if !parsed.diagnostics.is_empty() {
-                save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
-            }
+            save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
             Ok(RereadOutcome::Paths(parsed.scanned_files))
         }
         Ok(None) => Ok(RereadOutcome::Paths(Vec::new())),

@@ -2372,7 +2372,7 @@ const LOG_THAT_EDITS_A_FILE: &str = concat!(
 );
 
 #[test]
-fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_its_touched_files_once_the_log_is_readable()
+fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_once_the_log_is_readable_records_its_touched_files_and_drops_the_read_error()
  {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
@@ -2401,14 +2401,23 @@ fn file_backfill_leaves_a_session_whose_log_cannot_be_read_pending_and_records_i
     );
 
     fs::write(&log, LOG_THAT_EDITS_A_FILE).unwrap();
+    let marked = backfill_session_files(&mut conn, &enumerated, None).unwrap();
+
     assert_eq!(
-        backfill_session_files(&mut conn, &enumerated, None).unwrap(),
-        1,
-        "the next backfill reads the session again"
-    );
-    assert_eq!(
-        collect_strings(&conn, "SELECT session_id || ' ' || path FROM session_files"),
-        ["legacy /proj/edited.rs"]
+        (
+            marked,
+            collect_strings(&conn, "SELECT session_id || ' ' || path FROM session_files"),
+            load_parse_diagnostics(&conn)
+                .unwrap()
+                .iter()
+                .flat_map(FileParseDiagnostics::notes)
+                .collect::<Vec<_>>()
+        ),
+        (
+            1,
+            vec!["legacy /proj/edited.rs".to_owned()],
+            Vec::<String>::new()
+        )
     );
 }
 
