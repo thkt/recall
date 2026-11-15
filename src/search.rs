@@ -241,9 +241,10 @@ struct SkippedSession {
 
 #[derive(Default)]
 struct KeywordSessions {
-    /// Every matching session id in `(best_rank, session_id)` order, skipped
-    /// ones included, so fusion gives a skipped session the rank it holds.
-    order: Vec<String>,
+    /// Every matching session id with its best rank, in `(best_rank,
+    /// session_id)` order, skipped ones included, so fusion gives a skipped
+    /// session the rank it holds.
+    order: Vec<(String, f64)>,
     ranked: Vec<(f64, SessionData)>,
     /// Sessions skipped for a missing `sessions` row, an unknown source, or
     /// unreadable metadata.
@@ -294,7 +295,7 @@ fn find_keyword_sessions(
         match r {
             Ok((session_id, best_rank, session)) => {
                 rows_read += 1;
-                order.push(session_id.clone());
+                order.push((session_id.clone(), best_rank));
                 // A session whose date was read keeps its own recency factor;
                 // otherwise it counts with the largest one.
                 let best_factor = match session {
@@ -671,6 +672,13 @@ fn has_vec_data(conn: &Connection) -> Result<bool> {
         .is_some())
 }
 
+/// The closest chunk of a session that the vector search found.
+struct VecHit {
+    session_id: String,
+    chunk_id: i64,
+    distance: f64,
+}
+
 fn vec_search(
     conn: &Connection,
     embedder: &dyn Embed,
@@ -678,7 +686,7 @@ fn vec_search(
     limit: usize,
     opts: &SearchOptions,
     now_ms: i64,
-) -> Result<Vec<(String, i64)>> {
+) -> Result<Vec<VecHit>> {
     let embedding = model::timed("query embedding", || embedder.embed_query(query))?;
     let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
 
@@ -699,7 +707,7 @@ fn vec_search(
     );
     let mut filter_params: Vec<Box<dyn ToSql>> = Vec::new();
     append_search_filters(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
-    let sql = format!("SELECT session_id, id FROM ({sql}) WHERE n = 1 ORDER BY d, session_id");
+    let sql = format!("SELECT session_id, id, d FROM ({sql}) WHERE n = 1 ORDER BY d, session_id");
 
     let limit_i64 = limit as i64;
     let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());
@@ -716,7 +724,11 @@ fn vec_search(
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(refs.as_slice(), |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok(VecHit {
+            session_id: row.get(0)?,
+            chunk_id: row.get(1)?,
+            distance: row.get(2)?,
+        })
     })?;
 
     let mut hits = Vec::new();
@@ -1010,12 +1022,17 @@ pub fn search_with_embedder<'q>(
         }
     };
 
-    let vec_chunks: HashMap<String, i64> = vec_hits.iter().cloned().collect();
+    let vec_chunks: HashMap<String, i64> = vec_hits
+        .iter()
+        .map(|hit| (hit.session_id.clone(), hit.chunk_id))
+        .collect();
     let mut merged = rrf_merge_sessions(
-        found.order.iter().map(String::as_str),
-        vec_hits.iter().map(|(sid, _)| sid.as_str()),
+        found.order.iter().map(|(sid, rank)| (sid.as_str(), *rank)),
+        vec_hits
+            .iter()
+            .map(|hit| (hit.session_id.as_str(), hit.distance)),
     );
-    let fts_ids: HashSet<&str> = found.order.iter().map(String::as_str).collect();
+    let fts_ids: HashSet<&str> = found.order.iter().map(|(sid, _)| sid.as_str()).collect();
     let not_filter_failed =
         drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
     let vec_degraded = vec_degraded || not_filter_failed;

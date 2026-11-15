@@ -583,6 +583,8 @@ fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order()
 
 #[test]
 fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() {
+    // The four sessions tie in the vector search, so they share a rank there and
+    // fuse to the same score.
     let (_dir, conn) = setup_test_db();
     for (chunk_id, sid) in [(1, "m"), (2, "z"), (3, "a"), (4, "q")] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
@@ -620,24 +622,86 @@ fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_sma
 
 #[test]
 fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order() {
-    // a, d, e, h and i are found only by text, and b, c, f, g and j only by
-    // vector. Each search ranks its five sessions in id order, so the pairs
-    // (a, b), (d, c), (e, f), (h, g) and (i, j) fuse to the same score. The
-    // text-only session comes first in some pairs and second in others.
+    // a and d are found only by text, and a's shorter message ranks first. b and
+    // c are found only by vector, and b's chunk is the query itself. So a and b
+    // fuse to the same score, and so do c and d. The text-only session comes
+    // first in one pair and second in the other.
     let (_dir, conn) = setup_test_db();
-    for sid in ["a", "d", "e", "h", "i"] {
+    for (sid, message) in [
+        ("a", "authentication flow"),
+        ("d", "authentication flow described in a longer message"),
+    ] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
-        insert_message(&conn, sid, "user", "authentication flow");
+        insert_message(&conn, sid, "user", message);
     }
-    for (chunk_id, sid) in [(1, "b"), (2, "c"), (3, "f"), (4, "g"), (5, "j")] {
+    for (chunk_id, sid, chunk) in [
+        (1, "b", "authentication"),
+        (2, "c", "authentication flow review"),
+    ] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
         insert_message(&conn, sid, "user", "unrelated weather topic");
-        insert_chunk(&conn, chunk_id, sid, "authentication");
+        insert_chunk(&conn, chunk_id, sid, chunk);
     }
 
     assert_eq!(
         hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
-        ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+        ["a", "b", "c", "d"]
+    );
+}
+
+#[test]
+fn sessions_that_match_the_text_equally_are_ordered_by_the_vector_search() {
+    let (_dir, conn) = setup_test_db();
+    for sid in ["a", "b"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+    // b's chunk is the query itself, so the vector search finds b first.
+    insert_chunk(&conn, 1, "a", "authentication flow review");
+    insert_chunk(&conn, 2, "b", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["b", "a"]
+    );
+}
+
+#[test]
+fn sessions_found_equally_by_the_vector_search_are_ordered_by_the_text_search() {
+    let (_dir, conn) = setup_test_db();
+    // b's message is shorter, so the text search ranks b first.
+    for (sid, message) in [
+        ("a", "authentication flow described in a longer message"),
+        ("b", "authentication flow"),
+    ] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", message);
+    }
+    insert_chunk(&conn, 1, "a", "authentication");
+    insert_chunk(&conn, 2, "b", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["b", "a"]
+    );
+}
+
+#[test]
+fn three_equal_text_matches_share_the_middle_rank_and_follow_the_first_vector_match() {
+    // a, b and c tie in the text search at positions 0 to 2, so each takes rank 1.
+    // z is found only by the vector search, at rank 0.
+    let (_dir, conn) = setup_test_db();
+    for sid in ["a", "b", "c"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+    insert_session(&conn, "z", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "z", "user", "unrelated weather topic");
+    insert_chunk(&conn, 1, "z", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["z", "a", "b", "c"]
     );
 }
 
