@@ -72,9 +72,12 @@ fixture logs and new databases; they do not promote a production index.
 ## Index identity
 
 Default indexes live at
-`$XDG_DATA_HOME/recall/indexes/<manifest-sha256>/recall.db`, falling back to
-`~/.local/share/recall/indexes/<manifest-sha256>/recall.db`. Each database records
-the same fingerprint and manifest in `embedding_identity`. `RECALL_DB` and
+`$XDG_DATA_HOME/recall/indexes/<model-identity>/recall.db`, falling back to
+`~/.local/share/recall/indexes/<model-identity>/recall.db`. `<model-identity>` is
+`ModelSpec::identity`: the SHA-256 of the selected manifest's fields as recall serializes
+them. It is not the SHA-256 of the manifest file. `recall status --verbose` prints the
+database path in use. Each database records that value in the `fingerprint` column of
+`embedding_identity`, next to the manifest. `RECALL_DB` and
 `--db-path` still override the path, but do not override identity checks.
 
 The legacy `~/.local/share/recall/recall.db` is left in place. A nonempty vector

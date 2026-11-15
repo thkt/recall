@@ -59,8 +59,9 @@ struct Cli {
     #[arg(long, short, global = true)]
     verbose: bool,
 
-    /// Database file path (default: <data dir>/recall/indexes/<manifest-sha256>/recall.db, where
-    /// <data dir> is an absolute XDG_DATA_HOME or ~/.local/share; env: RECALL_DB)
+    /// Database file path (default: <data dir>/recall/indexes/<model-identity>/recall.db, where
+    /// <data dir> is an absolute XDG_DATA_HOME or ~/.local/share; `recall status --verbose` prints
+    /// the path in use; env: RECALL_DB)
     #[arg(long, env = "RECALL_DB", global = true)]
     db_path: Option<PathBuf>,
 
