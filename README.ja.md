@@ -159,10 +159,10 @@ recall model manifest > gemma-manifest.json   # 対応するモデル・索引�
 `RECALL_MODEL_DIR` で `model.gguf` と `tokenizer.json` のあるディレクトリを明示すると、そちらを優先し、旧キャッシュの自動取込みは行いません。
 
 既定の索引は `~/.local/share/recall/indexes/<model-identity>/recall.db` です
-（絶対パスの `XDG_DATA_HOME` があればその配下）。`<model-identity>` は、選んだmanifestが示すモデルの指紋で、
-索引にも同じ値を記録します。manifestのファイルのSHA-256ではありません。
-使っている索引のパスは `recall status --verbose` で表示できます。`--db-path` / `RECALL_DB` で変更できますが、
-モデル識別の照合は省略しません。異なるmanifestは既定の索引も分離します。
+（絶対パスの `XDG_DATA_HOME` があればその配下）。`<model-identity>` は、選んだmanifestの各フィールドからrecallが計算するSHA-256で、
+索引にも同じ値を記録します。manifestのファイルのSHA-256ではありません。空白やキーの順序を変えても、値は変わりません。
+どれかのフィールドを変えると、既定の索引も別になります。使っている索引のパスは `recall status --verbose` で表示できます。
+`--db-path` / `RECALL_DB` で変更できますが、モデル識別の照合は省略しません。
 
 旧Ruriから切り替える場合は、旧バイナリと `~/.local/share/recall/recall.db` を切戻し用に保持します。
 旧 `RECALL_DB` 指定を解除するか新しい `--db-path` を選び、`recall model download` と
