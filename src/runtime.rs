@@ -31,11 +31,6 @@ pub fn init_subscriber(filter: &str) {
         .with_writer(io::stderr)
         .try_init();
 }
-pub fn notify_schema_change(app: &str, what: &str, count: usize, remedy: &str) {
-    warning(&format!(
-        "{app}: {what} schema changed ({count} cached entries); run {remedy}"
-    ));
-}
 
 pub fn try_expand_shorthand(
     args: &[OsString],

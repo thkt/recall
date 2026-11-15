@@ -225,22 +225,56 @@ fn status_verbose_includes_db_path() {
 }
 
 #[test]
-fn upgrading_an_old_embedding_table_tells_the_user_to_run_recall_index() {
+fn indexing_over_an_empty_old_embedding_table_replaces_it_without_a_warning() {
     let dir = TempDir::new().unwrap();
     rusqlite::Connection::open(dir.path().join("recall.db"))
         .unwrap()
         .execute_batch("CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB);")
         .unwrap();
 
-    let out = recall(dir.path())
-        .arg("index")
-        .output()
-        .expect("spawn recall binary");
+    let (code, envelope, stderr) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
-    assert!(stderr.contains("embeddings schema changed"), "{stderr}");
-    assert!(stderr.contains("run `recall index`"), "{stderr}");
+    assert_eq!(
+        (code, envelope),
+        (Some(0), index_envelope(&[], &serde_json::json!([]), &[]))
+    );
+    assert!(!stderr.contains("warning:"), "{stderr}");
+    assert!(!stderr.contains("`recall index`"), "{stderr}");
+    assert_eq!(
+        outcome(recall(dir.path()).args(["search", "anything"])),
+        (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
+    );
+}
+
+#[test]
+fn indexing_over_an_old_embedding_table_with_rows_refuses_and_keeps_them() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("recall.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB);
+             INSERT INTO vec_chunks VALUES (7, x'00');",
+        )
+        .unwrap();
+
+    let (code, stdout, stderr) = outcome(recall(dir.path()).arg("index"));
+
+    assert_eq!((code, stdout.as_str()), (Some(65), ""));
+    assert!(
+        stderr.ends_with(
+            "\nerror: legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path\n"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT chunk_id FROM vec_chunks", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
 }
 
 fn seed_indexed_session(dir: &Path) {

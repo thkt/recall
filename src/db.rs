@@ -5,7 +5,7 @@ use std::process;
 use std::time::Duration;
 
 use crate::embedding::EMBEDDING_DIMS;
-use crate::runtime::{info, notify_schema_change};
+use crate::runtime::info;
 use crate::storage::ensure_sqlite_vec;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -355,11 +355,13 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
         return Ok(());
     };
 
+    // No warning: the writers open the index through `open_or_create_db`, whose
+    // `model::check_index` refuses an old table that holds rows in an index without a model
+    // identity, so the table dropped here is empty.
     if !sql.contains("sub_idx") {
         let tx = conn.transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
         tx.commit()?;
-        notify_schema_change("recall", "embeddings", 0, "`recall index`");
     }
 
     Ok(())
