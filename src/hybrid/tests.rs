@@ -23,6 +23,22 @@ fn fusion_of_vector_hits_alone_keeps_their_rank_order() {
 }
 
 #[test]
+fn sessions_tied_in_one_search_share_the_mean_of_the_positions_they_span() {
+    // y and z tie at positions 1 and 2, after x at position 0.
+    let merged = rrf_merge_sessions([("x", 1.0), ("y", 2.0), ("z", 2.0), ("w", 3.0)], []);
+
+    assert_eq!(
+        merged,
+        [
+            ("x".to_owned(), 1.0 / 60.0),
+            ("y".to_owned(), 1.0 / 61.5),
+            ("z".to_owned(), 1.0 / 61.5),
+            ("w".to_owned(), 1.0 / 63.0),
+        ]
+    );
+}
+
+#[test]
 fn fusion_of_no_hits_is_empty() {
     assert!(rrf_merge_sessions([], []).is_empty());
 }

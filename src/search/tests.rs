@@ -622,30 +622,24 @@ fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_sma
 
 #[test]
 fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order() {
-    // a and d are found only by text, and a's shorter message ranks first. b and
-    // c are found only by vector, and b's chunk is the query itself. So a and b
-    // fuse to the same score, and so do c and d. The text-only session comes
-    // first in one pair and second in the other.
+    // a, d, e, h and i are found only by text, and b, c, f, g and j only by
+    // vector. Each search finds its five sessions equally, so all five share the
+    // mean rank 2 there, and all ten fuse to the same score. Text-only and
+    // vector-only sessions alternate in session id order.
     let (_dir, conn) = setup_test_db();
-    for (sid, message) in [
-        ("a", "authentication flow"),
-        ("d", "authentication flow described in a longer message"),
-    ] {
+    for sid in ["a", "d", "e", "h", "i"] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
-        insert_message(&conn, sid, "user", message);
+        insert_message(&conn, sid, "user", "authentication flow");
     }
-    for (chunk_id, sid, chunk) in [
-        (1, "b", "authentication"),
-        (2, "c", "authentication flow review"),
-    ] {
+    for (chunk_id, sid) in [(1, "b"), (2, "c"), (3, "f"), (4, "g"), (5, "j")] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
         insert_message(&conn, sid, "user", "unrelated weather topic");
-        insert_chunk(&conn, chunk_id, sid, chunk);
+        insert_chunk(&conn, chunk_id, sid, "authentication");
     }
 
     assert_eq!(
         hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
-        ["a", "b", "c", "d"]
+        ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
     );
 }
 

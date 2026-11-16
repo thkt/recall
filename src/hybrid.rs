@@ -45,7 +45,8 @@ pub(crate) fn rrf_merge_sessions<'a>(
     vec_hits: impl IntoIterator<Item = (&'a str, f64)>,
 ) -> Vec<(String, f64)> {
     let mut scores: HashMap<String, f64> = HashMap::new();
-    // Rank each search independently: fusion uses rank, not input scores.
+    // Each search is ranked on its own. Its scores only decide which sessions
+    // share a rank.
     let fts_hits: Vec<_> = fts_hits.into_iter().collect();
     let vec_hits: Vec<_> = vec_hits.into_iter().collect();
     for (sid, rank) in tied_ranks(&fts_hits).chain(tied_ranks(&vec_hits)) {
@@ -65,7 +66,7 @@ fn tied_ranks<'a>(hits: &[(&'a str, f64)]) -> impl Iterator<Item = (&'a str, f64
         "hits must be listed best first"
     );
     let mut ranks = Vec::with_capacity(hits.len());
-    // `==` treats a distance of -0.0 and 0.0 as a tie, where `total_cmp` would not.
+    // Only exactly equal scores tie; a near-tie keeps distinct ranks.
     for tie in hits.chunk_by(|a, b| a.1 == b.1) {
         let rank = ranks.len() as f64 + (tie.len() - 1) as f64 / 2.0;
         ranks.extend(tie.iter().map(|&(sid, _)| (sid, rank)));
