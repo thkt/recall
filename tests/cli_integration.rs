@@ -1965,12 +1965,13 @@ fn index_stderr_warns_about_parse_diagnostics_after_the_backfill_and_before_the_
 
     let stderr = index_stderr(dir.path(), &claude_dir);
 
+    let parse_warning = "skipped 1 invalid JSON line(s)";
     assert_in_order(
         &stderr,
         "\nindex: legacy_backfill: committed",
-        "\nwarning: ",
+        parse_warning,
     );
-    assert_in_order(&stderr, "\nwarning: ", "\nCreated 1 chunks\n");
+    assert_in_order(&stderr, parse_warning, "\nCreated 1 chunks\n");
 }
 
 #[test]
