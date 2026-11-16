@@ -6,13 +6,13 @@ use rusqlite::{Connection, OptionalExtension};
 use tracing::warn;
 
 use crate::ansi;
-use crate::commands::build_markdown;
+use crate::commands::{ReadIndex, build_markdown};
 use crate::compat::filter::escape_like;
-use crate::envelope::{CommandOutput, Note};
+use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser::Source;
 use crate::{db, parser};
-use crate::{format_timestamp, require_current_schema, resolve_db_path};
+use crate::{format_timestamp, resolve_db_path};
 
 fn write_show_header(
     buf: &mut String,
@@ -300,28 +300,17 @@ pub(crate) fn run_show(
         );
     }
 
-    let (conn, tier) = db::open_db_readonly(&path)?;
-    let wal_note = db::stale_wal_note(&path, tier);
-    let shown = match db::schema_state(&conn)? {
+    let index = ReadIndex::open(&path)?;
+    let shown = match index.schema()? {
         db::SchemaState::Empty => Err(RecallError::Usage(
             "Database not found. Run `recall index` first.".to_owned(),
         )
         .into()),
-        state => match require_current_schema(state) {
-            Ok(()) => show_session_windowed(&conn, session_id, verbose, chunk, window),
-            Err(e) => Err(e.into()),
-        },
+        _ => show_session_windowed(&index.conn, session_id, verbose, chunk, window),
     };
-    match (shown, wal_note) {
-        (Ok(mut out), Some(note)) => {
-            out.degraded = true;
-            out.notes.push(Note::new(note));
-            Ok(out)
-        }
-        (Ok(out), None) => Ok(out),
-        // The missing schema, session or chunk may sit in the log this snapshot cannot read.
-        (Err(e), Some(note)) => Err(RecallError::DatabaseRead(format!("{e}; {note}")).into()),
-        (Err(e), None) => Err(e),
+    match shown {
+        Ok(out) => Ok(index.finish(out)),
+        Err(e) => Err(index.fail(e)),
     }
 }
 

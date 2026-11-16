@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::commands::build_markdown;
+use crate::commands::{ReadIndex, build_markdown};
 use crate::db;
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::{EMBEDDING_DIMS, Embed};
@@ -269,12 +269,12 @@ where
     }
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
-    let mut wal_note: Option<String> = None;
-    let (mut checks, identity) = match db::open_db_readonly(&path) {
-        Ok((conn, tier)) => {
-            wal_note = db::stale_wal_note(&path, tier);
-            let identity = model::check_index(&conn, model::selected());
-            let checks = match db::schema_state(&conn) {
+    let index = ReadIndex::open(&path);
+    let (mut checks, identity) = match &index {
+        Ok(index) => {
+            let conn = &index.conn;
+            let identity = model::check_index(conn, model::selected());
+            let checks = match db::schema_state(conn) {
                 Ok(db::SchemaState::Current) => {
                     // An index built for another model, a legacy one kept for rollback, or one
                     // whose identity cannot be read stays unwritten.
@@ -287,7 +287,7 @@ where
                     }
                     // Each check reads in a new transaction and sees the repair. An index opened
                     // immutable sits in a read-only directory, where the repair fails instead.
-                    db_checks(&conn)
+                    db_checks(conn)
                 }
                 Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
                     "schema",
@@ -308,12 +308,11 @@ where
     checks.extend(identity.map(check_model_identity));
     checks.push(model_check);
 
-    let mut output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
-    if let Some(note) = wal_note {
-        output.degraded = true;
-        output.notes.push(Note::new(note));
-    }
-    Ok(output)
+    let output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
+    Ok(match &index {
+        Ok(index) => index.finish(output),
+        Err(_) => output,
+    })
 }
 
 fn render_doctor_report(
