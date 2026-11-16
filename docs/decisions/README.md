@@ -23,6 +23,7 @@ This directory contains important decisions about the project.
 | [0015](0015-search-uppercase-fts5-operators-on-a-separate-path.md) | Search Uppercase FTS5 Operators on a Separate Path | accepted | 2026-11-10 |
 | [0016](0016-rank-every-match-before-cutting-search-results-to-the-limit.md) | Rank Every Match Before Cutting Search Results to the Limit | accepted | 2026-11-11 |
 | [0017](0017-keep-session-rows-when-migrating-the-fts-tokenizer.md) | Keep Session Rows When Migrating the FTS Tokenizer | accepted | 2026-11-13 |
+| [0018](0018-give-sessions-tied-in-one-search-the-mean-of-their-rrf-ranks.md) | Give Sessions Tied in One Search the Mean of Their RRF Ranks | accepted | 2026-11-16 |
 
 ## By Status
 
@@ -45,6 +46,7 @@ This directory contains important decisions about the project.
 - **0015**: Search Uppercase FTS5 Operators on a Separate Path
 - **0016**: Rank Every Match Before Cutting Search Results to the Limit
 - **0017**: Keep Session Rows When Migrating the FTS Tokenizer
+- **0018**: Give Sessions Tied in One Search the Mean of Their RRF Ranks
 
 ## About MADR Format
 
