@@ -63,10 +63,11 @@ fn path_key(path: &Path) -> Value {
 
 fn save_parse_diagnostics(
     tx: &Transaction,
-    path: &str,
+    path: &Path,
     source: Source,
     lines: LineDiagnostics,
 ) -> Result<()> {
+    let path = path_key(path);
     if lines.is_empty() {
         tx.execute("DELETE FROM parse_diagnostics WHERE file_path = ?", [path])?;
     } else {
@@ -98,14 +99,15 @@ pub(super) fn save_read_error(tx: &Transaction, path: &Path, source: Source) -> 
 /// What reading a log found.
 pub(super) enum LogRead {
     Parsed(ParseResult),
-    /// The log holds no session record.
+    /// The file name gives no session id, so the log is not opened.
     Empty,
     Unreadable,
 }
 
 /// Parses the log at `path` with `parse` and records what the read found: the
-/// parse diagnostics of a parsed log, or a read error. Every read of a log goes
-/// through here, so a read that succeeds also clears an earlier read error.
+/// parse diagnostics of a parsed log, or a read error. Every read of a log by
+/// the indexer goes through here, so a parsed log also clears an earlier read
+/// error.
 pub(super) fn read_log(
     tx: &Transaction,
     path: &Path,
@@ -114,7 +116,7 @@ pub(super) fn read_log(
 ) -> Result<LogRead> {
     match parse(path, source) {
         Ok(Some(parsed)) => {
-            save_parse_diagnostics(tx, &path.to_string_lossy(), source, parsed.diagnostics)?;
+            save_parse_diagnostics(tx, path, source, parsed.diagnostics)?;
             Ok(LogRead::Parsed(parsed))
         }
         Ok(None) => Ok(LogRead::Empty),

@@ -2459,6 +2459,30 @@ fn file_backfill_marks_sessions_with_an_unknown_source_or_an_empty_log_as_done_a
 }
 
 #[test]
+fn file_backfill_marks_a_session_whose_log_name_gives_no_session_id_as_done_without_reading_it() {
+    let (_dir, mut conn) = setup_test_db();
+    let tmp = TempDir::new().unwrap();
+    let nameless = tmp.path().join(".jsonl.zst");
+    fs::write(&nameless, LOG_THAT_EDITS_A_FILE).unwrap();
+    let source_logs = HashSet::from([nameless.clone()]);
+    conn.execute(
+        "INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, files_scanned) VALUES ('nameless', 'codex', ?1, '/p', 'slug', 0, 0.0, NULL)",
+        [nameless.to_str().unwrap()],
+    )
+    .unwrap();
+
+    let marked = backfill_session_files(&mut conn, &source_logs, None).unwrap();
+
+    assert_eq!(
+        (
+            marked,
+            collect_strings(&conn, "SELECT path FROM session_files")
+        ),
+        (1, Vec::<String>::new())
+    );
+}
+
+#[test]
 fn a_failed_chunk_completion_rolls_back_the_whole_pass_and_the_next_pass_chunks_every_session() {
     let (_dir, mut conn) = setup_test_db();
     seed_session(&conn, "empty");
@@ -3203,6 +3227,42 @@ fn failed_fts_transaction_never_reports_saved_files() {
     );
     conn.execute_batch("DROP TRIGGER fail_session;").unwrap();
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 1);
+}
+
+#[test]
+fn a_codex_log_whose_name_gives_no_session_id_counts_as_empty_without_being_opened() {
+    let (_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("codex", ".jsonl.zst");
+    // Not zstd, so opening the log would record a read error.
+    fs::write(&log.file, "not a zstd stream").unwrap();
+
+    let counts = counts_of_an_index(&mut conn, &log.opts(), true);
+
+    assert_eq!(
+        (counts, load_parse_diagnostics(&conn).unwrap().len()),
+        (
+            serde_json::json!({
+                "files_discovered": 1,
+                "files_updated": 0,
+                "files_unchanged": 0,
+                "files_empty": 1,
+                "files_failed": 0,
+                "files_deferred": 0,
+                "files_remaining": 0,
+                "files_updated_committed": 0,
+                "chunks_matched_committed": 0,
+                "embeddings_reused_committed": 0,
+                "chunks_reconciled_created_committed": 0,
+                "chunks_removed_committed": 0,
+                "sessions_chunked_committed": 0,
+                "chunks_created_committed": 0,
+                "sessions_chunk_pending": 0,
+                "sessions_chunk_remaining": 0,
+                "sessions_chunked_empty": 0,
+            }),
+            0
+        )
+    );
 }
 
 #[test]
