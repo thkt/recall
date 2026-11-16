@@ -38,22 +38,39 @@ pub(crate) fn apply_recency_boost(
     results.sort_by(|a, b| b.1.total_cmp(&a.1));
 }
 
+/// Fuses the sessions each search found, as `(session id, score)` pairs listed
+/// best first. In both searches a lower score ranks higher.
 pub(crate) fn rrf_merge_sessions<'a>(
-    fts_ids: impl IntoIterator<Item = &'a str>,
-    vec_ids: impl IntoIterator<Item = &'a str>,
+    fts_hits: impl IntoIterator<Item = (&'a str, f64)>,
+    vec_hits: impl IntoIterator<Item = (&'a str, f64)>,
 ) -> Vec<(String, f64)> {
     let mut scores: HashMap<String, f64> = HashMap::new();
-    // Enumerate each source independently: fusion uses rank, not input scores.
-    for (rank, sid) in fts_ids
-        .into_iter()
-        .enumerate()
-        .chain(vec_ids.into_iter().enumerate())
-    {
-        *scores.entry(sid.to_owned()).or_default() += 1.0 / (60.0 + rank as f64);
+    // Each search is ranked on its own. Its scores only decide which sessions
+    // share a rank.
+    let fts_hits: Vec<_> = fts_hits.into_iter().collect();
+    let vec_hits: Vec<_> = vec_hits.into_iter().collect();
+    for (sid, rank) in tied_ranks(&fts_hits).chain(tied_ranks(&vec_hits)) {
+        *scores.entry(sid.to_owned()).or_default() += 1.0 / (60.0 + rank);
     }
     let mut result: Vec<_> = scores.into_iter().collect();
     result.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     result
+}
+
+/// The rank of each hit: its position from 0, or, for hits with the same score,
+/// the mean of the positions they span. The order among tied hits then does not
+/// move the fused score, and a large tie gains no weight over its positions.
+fn tied_ranks<'a>(hits: &[(&'a str, f64)]) -> impl Iterator<Item = (&'a str, f64)> {
+    debug_assert!(
+        hits.windows(2).all(|pair| pair[0].1 <= pair[1].1),
+        "hits must be listed best first"
+    );
+    let mut ranks = Vec::with_capacity(hits.len());
+    for tie in hits.chunk_by(|a, b| a.1 == b.1) {
+        let rank = ranks.len() as f64 + (tie.len() - 1) as f64 / 2.0;
+        ranks.extend(tie.iter().map(|&(sid, _)| (sid, rank)));
+    }
+    ranks.into_iter()
 }
 
 #[cfg(test)]

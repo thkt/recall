@@ -4,7 +4,7 @@ const NOW_MS: i64 = 1_750_000_000_000;
 
 #[test]
 fn fusion_ranks_a_session_found_by_both_searches_above_sessions_found_by_one() {
-    let merged = rrf_merge_sessions(["A", "B"], ["B", "C"]);
+    let merged = rrf_merge_sessions([("A", -2.0), ("B", -1.0)], [("B", 0.1), ("C", 0.2)]);
 
     assert_eq!(
         merged.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
@@ -14,11 +14,27 @@ fn fusion_ranks_a_session_found_by_both_searches_above_sessions_found_by_one() {
 
 #[test]
 fn fusion_of_vector_hits_alone_keeps_their_rank_order() {
-    let merged = rrf_merge_sessions([], ["B", "A"]);
+    let merged = rrf_merge_sessions([], [("B", 0.1), ("A", 0.2)]);
 
     assert_eq!(
         merged.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
         ["B", "A"]
+    );
+}
+
+#[test]
+fn sessions_tied_in_one_search_share_the_mean_of_the_positions_they_span() {
+    // y and z tie at positions 1 and 2, after x at position 0.
+    let merged = rrf_merge_sessions([("x", 1.0), ("y", 2.0), ("z", 2.0), ("w", 3.0)], []);
+
+    assert_eq!(
+        merged,
+        [
+            ("x".to_owned(), 1.0 / 60.0),
+            ("y".to_owned(), 1.0 / 61.5),
+            ("z".to_owned(), 1.0 / 61.5),
+            ("w".to_owned(), 1.0 / 63.0),
+        ]
     );
 }
 

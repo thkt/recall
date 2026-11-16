@@ -583,6 +583,8 @@ fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order()
 
 #[test]
 fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() {
+    // The four sessions tie in the vector search, so they share a rank there and
+    // fuse to the same score.
     let (_dir, conn) = setup_test_db();
     for (chunk_id, sid) in [(1, "m"), (2, "z"), (3, "a"), (4, "q")] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
@@ -621,9 +623,9 @@ fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_sma
 #[test]
 fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order() {
     // a, d, e, h and i are found only by text, and b, c, f, g and j only by
-    // vector. Each search ranks its five sessions in id order, so the pairs
-    // (a, b), (d, c), (e, f), (h, g) and (i, j) fuse to the same score. The
-    // text-only session comes first in some pairs and second in others.
+    // vector. Each search finds its five sessions equally, so all five share the
+    // mean rank 2 there, and all ten fuse to the same score. Text-only and
+    // vector-only sessions alternate in session id order.
     let (_dir, conn) = setup_test_db();
     for sid in ["a", "d", "e", "h", "i"] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
@@ -638,6 +640,62 @@ fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_or
     assert_eq!(
         hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
         ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+    );
+}
+
+#[test]
+fn sessions_that_match_the_text_equally_are_ordered_by_the_vector_search() {
+    let (_dir, conn) = setup_test_db();
+    for sid in ["a", "b"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+    // b's chunk is the query itself, so the vector search finds b first.
+    insert_chunk(&conn, 1, "a", "authentication flow review");
+    insert_chunk(&conn, 2, "b", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["b", "a"]
+    );
+}
+
+#[test]
+fn sessions_found_equally_by_the_vector_search_are_ordered_by_the_text_search() {
+    let (_dir, conn) = setup_test_db();
+    // b's message is shorter, so the text search ranks b first.
+    for (sid, message) in [
+        ("a", "authentication flow described in a longer message"),
+        ("b", "authentication flow"),
+    ] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", message);
+    }
+    insert_chunk(&conn, 1, "a", "authentication");
+    insert_chunk(&conn, 2, "b", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["b", "a"]
+    );
+}
+
+#[test]
+fn three_equal_text_matches_share_the_middle_rank_and_follow_the_first_vector_match() {
+    // a, b and c tie in the text search at positions 0 to 2, so each takes rank 1.
+    // z is found only by the vector search, at rank 0.
+    let (_dir, conn) = setup_test_db();
+    for sid in ["a", "b", "c"] {
+        insert_session(&conn, sid, "claude", "/proj", NOW_MS);
+        insert_message(&conn, sid, "user", "authentication flow");
+    }
+    insert_session(&conn, "z", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "z", "user", "unrelated weather topic");
+    insert_chunk(&conn, 1, "z", "authentication");
+
+    assert_eq!(
+        hybrid_search_ids(&conn, &MockEmbedder::new(), &at_now()),
+        ["z", "a", "b", "c"]
     );
 }
 
@@ -816,11 +874,12 @@ fn recency_lifts_a_new_session_over_a_somewhat_better_older_match_in_hybrid_sear
     assert_eq!(ids(&results), ["new", "old"]);
 }
 
-/// Three year-old sessions and one new one match "authentication" by text, in
-/// the order old-a, old-b, old-c, new (the new one matches slightly worse). A
-/// year-old session found only by vector search keeps the vector leg active.
-/// After fusion the new session scores 5% below the best old one, and the 20%
-/// that recency adds to a same-day session lifts it to the front.
+/// Three year-old sessions and one new one match "authentication" by text. The
+/// old ones tie and share rank 1, and the new one, which matches slightly
+/// worse, takes rank 3. A year-old session found only by vector search keeps the
+/// vector leg active. After fusion the new session scores 5% below that vector
+/// match and 3% below the old text matches, and the 20% that recency adds to a
+/// same-day session lifts it to the front.
 fn seed_new_session_ranked_fourth_by_text(conn: &Connection) {
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     for sid in ["old-a", "old-b", "old-c"] {
