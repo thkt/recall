@@ -99,14 +99,10 @@ fn expand_single_char_term() {
     assert!(result.as_str().contains("\"audit\"") || result.as_str() == "\"a\"");
 }
 
-fn no_norm() -> QueryNormalizationConfig {
-    QueryNormalizationConfig::disabled()
-}
-
 #[test]
 fn prepare_match_query_end_to_end() {
     let conn = setup_fts_db();
-    let result = prepare_match_query(&conn, "au login", "fts_chunks_vocab", &no_norm()).unwrap();
+    let result = prepare_match_query(&conn, "au login", "fts_chunks_vocab").unwrap();
     assert!(result.as_str().contains("\"login\""), "{}", result.as_str());
     assert!(result.as_str().contains(" OR "), "{}", result.as_str());
 }
@@ -114,7 +110,7 @@ fn prepare_match_query_end_to_end() {
 #[test]
 fn prepare_match_query_expanded_group_is_executable() {
     let conn = setup_fts_db();
-    let query = prepare_match_query(&conn, "au login", "fts_chunks_vocab", &no_norm()).unwrap();
+    let query = prepare_match_query(&conn, "au login", "fts_chunks_vocab").unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH ?1",
@@ -134,7 +130,7 @@ fn prepare_match_query_expanded_group_is_executable() {
 fn prepare_match_query_empty_input() {
     let conn = setup_fts_db();
     assert_eq!(
-        prepare_match_query(&conn, "", "fts_chunks_vocab", &no_norm()),
+        prepare_match_query(&conn, "", "fts_chunks_vocab"),
         Err(SanitizeError::EmptyInput)
     );
 }
@@ -142,7 +138,7 @@ fn prepare_match_query_empty_input() {
 #[test]
 fn prepare_match_query_operators_are_quoted() {
     let conn = setup_fts_db();
-    let result = prepare_match_query(&conn, "foo OR bar", "fts_chunks_vocab", &no_norm()).unwrap();
+    let result = prepare_match_query(&conn, "foo OR bar", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"foo\" AND \"OR\" AND \"bar\"");
 }
 
@@ -150,7 +146,7 @@ fn prepare_match_query_operators_are_quoted() {
 fn prepare_match_query_rejects_invalid_vocab_table_name() {
     let conn = setup_fts_db();
     assert_eq!(
-        prepare_match_query(&conn, "au", "1vocab", &no_norm()),
+        prepare_match_query(&conn, "au", "1vocab"),
         Err(SanitizeError::InvalidVocabTable("1vocab".into()))
     );
 }
@@ -161,7 +157,7 @@ fn prepare_match_query_surfaces_non_missing_vocab_errors() {
     conn.execute("CREATE TABLE bad_vocab(term TEXT)", [])
         .unwrap();
 
-    let result = prepare_match_query(&conn, "au", "bad_vocab", &no_norm());
+    let result = prepare_match_query(&conn, "au", "bad_vocab");
     assert!(
         matches!(result, Err(SanitizeError::VocabLookupFailed(_))),
         "expected vocab lookup failure, got {result:?}"
@@ -202,21 +198,17 @@ fn expand_surfaces_non_missing_vocab_errors() {
 #[test]
 fn prepare_match_query_with_missing_vocab_degrades() {
     let conn = Connection::open_in_memory().unwrap();
-    let result = prepare_match_query(&conn, "au login", "fts_chunks_vocab", &no_norm()).unwrap();
+    let result = prepare_match_query(&conn, "au login", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"au\" AND \"login\"");
 }
 
+/// The index stores message text as written, so a query that folded full-width
+/// characters would miss the messages that contain them.
 #[test]
-fn prepare_match_query_default_normalizes_fullwidth_input() {
+fn prepare_match_query_keeps_full_width_characters_as_typed() {
     let conn = setup_fts_db();
-    let result = prepare_match_query(
-        &conn,
-        "ＬＯＧＩＮ",
-        "fts_chunks_vocab",
-        &QueryNormalizationConfig::default(),
-    )
-    .unwrap();
-    assert_eq!(result.as_str(), "\"login\"");
+    let result = prepare_match_query(&conn, "ＬＯＧＩＮ　ｱｲｳ", "fts_chunks_vocab").unwrap();
+    assert_eq!(result.as_str(), "\"ＬＯＧＩＮ\" AND \"ｱｲｳ\"");
 }
 
 fn prepare_err(conn: &Connection, sql: &str) -> rusqlite::Error {
@@ -372,55 +364,36 @@ fn drop_dangling_operators_drops_operator_at_position_zero() {
 #[test]
 fn expand_quotes_a_phrase_once_as_a_whole() {
     let conn = setup_fts_db();
-    let result = prepare_match_query(
-        &conn,
-        "\"login session\" audit",
-        "fts_chunks_vocab",
-        &no_norm(),
-    )
-    .unwrap();
+    let result = prepare_match_query(&conn, "\"login session\" audit", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"login session\" AND \"audit\"");
 }
 
 #[test]
 fn expand_quotes_a_hyphen_or_colon_term_once() {
     let conn = setup_fts_db();
-    let result =
-        prepare_match_query(&conn, "rate-limit std::io", "fts_chunks_vocab", &no_norm()).unwrap();
+    let result = prepare_match_query(&conn, "rate-limit std::io", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"rate-limit\" AND \"std::io\"");
 }
 
 #[test]
 fn expand_passes_a_phrase_with_and_or_not_words_through_verbatim() {
     let conn = setup_fts_db();
-    let result = prepare_match_query(
-        &conn,
-        "\"to be or not to be\"",
-        "fts_chunks_vocab",
-        &no_norm(),
-    )
-    .unwrap();
+    let result = prepare_match_query(&conn, "\"to be or not to be\"", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"to be or not to be\"");
 }
 
 #[test]
 fn expand_drops_the_parentheses_around_a_phrase() {
     let conn = setup_fts_db();
-    let result =
-        prepare_match_query(&conn, "(\"login session\")", "fts_chunks_vocab", &no_norm()).unwrap();
+    let result = prepare_match_query(&conn, "(\"login session\")", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"login session\"");
 }
 
 #[test]
 fn expand_splits_a_colon_word_from_the_phrase_attached_to_it() {
     let conn = setup_fts_db();
-    let result = prepare_match_query(
-        &conn,
-        "key:\"some value\" (foo)",
-        "fts_chunks_vocab",
-        &no_norm(),
-    )
-    .unwrap();
+    let result =
+        prepare_match_query(&conn, "key:\"some value\" (foo)", "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"key:\" AND \"some value\" AND \"foo\"");
 }
 

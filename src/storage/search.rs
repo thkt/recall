@@ -2,8 +2,6 @@ use std::iter::repeat_n;
 
 use rusqlite::Connection;
 
-use super::query_normalize::{QueryNormalizationConfig, normalize_for_fts};
-
 /// A quoted phrase or a bare word of a query. A phrase runs from a quote to the
 /// next quote, or to the end of the query when the quote is unclosed, and its
 /// text excludes the quotes.
@@ -204,10 +202,8 @@ pub fn prepare_match_query(
     conn: &Connection,
     query: &str,
     vocab_table: &str,
-    normalization: &QueryNormalizationConfig,
 ) -> Result<MatchFtsQuery, SanitizeError> {
-    let normalized = normalize_for_fts(query, normalization);
-    let sanitized = sanitize_fts_query(&normalized)?;
+    let sanitized = sanitize_fts_query(query)?;
     fts_expand_short_terms(conn, &sanitized, vocab_table)
 }
 

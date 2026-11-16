@@ -19,7 +19,6 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = { version = "0.11.1", default-features = false }
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
-unicode-normalization = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Artifact bytes need TLS, HTTP/2 and proxy support, without charset decoding.

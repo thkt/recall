@@ -1,6 +1,4 @@
-mod query_normalize;
 mod search;
-pub use query_normalize::QueryNormalizationConfig;
 use rusqlite::ffi::{SQLITE_OK, sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 pub use search::{
     MIN_TRIGRAM_TERM_CHARS, MatchFtsQuery, SanitizeError, prepare_match_query,
