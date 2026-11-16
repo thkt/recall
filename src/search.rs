@@ -410,30 +410,25 @@ fn fetch_session_metadata(conn: &Connection, session_ids: &[&str]) -> Result<Ses
 }
 
 fn build_candidates(
-    ranked: Vec<(String, f64)>,
-    meta_map: &mut HashMap<String, SessionData>,
+    sessions: Vec<SessionData>,
     mut get_excerpt: impl FnMut(&str) -> (String, Option<i64>),
-) -> Vec<(f64, SearchResult)> {
-    ranked
+) -> Vec<SearchResult> {
+    sessions
         .into_iter()
-        .filter_map(|(session_id, rank)| {
-            let session = meta_map.remove(&session_id)?;
-            let (excerpt, chunk_id) = get_excerpt(&session_id);
-            Some((
-                rank,
-                SearchResult {
-                    session,
-                    excerpt,
-                    chunk_id,
-                },
-            ))
+        .map(|session| {
+            let (excerpt, chunk_id) = get_excerpt(&session.session_id);
+            SearchResult {
+                session,
+                excerpt,
+                chunk_id,
+            }
         })
         .collect()
 }
 
 struct RankedSessions {
-    ranked: Vec<(String, f64)>,
-    meta_map: HashMap<String, SessionData>,
+    /// The sessions that rank highest first, cut to `limit`.
+    sessions: Vec<SessionData>,
     /// Blended rank of the `limit`-th session, or `None` when fewer than
     /// `limit` sessions were ranked.
     limit_rank: Option<f64>,
@@ -458,17 +453,8 @@ fn rank_sessions(sessions: Vec<(f64, SessionData)>, now_ms: i64, limit: usize) -
     });
     let limit_rank = at_limit(&scored, limit).map(|s| s.0);
     scored.truncate(limit);
-    let ranked = scored
-        .iter()
-        .map(|(rank, session)| (session.session_id.clone(), *rank))
-        .collect();
-    let meta_map = scored
-        .into_iter()
-        .map(|(_, session)| (session.session_id.clone(), session))
-        .collect();
     RankedSessions {
-        ranked,
-        meta_map,
+        sessions: scored.into_iter().map(|(_, session)| session).collect(),
         limit_rank,
     }
 }
@@ -586,11 +572,10 @@ fn best_matching_messages(
 fn fetch_chunks(
     conn: &Connection,
     fts_query: Option<&str>,
-    ranked: Vec<(String, f64)>,
-    meta_map: &mut HashMap<String, SessionData>,
+    sessions: Vec<SessionData>,
     vec_chunks: &HashMap<String, i64>,
-) -> Result<Vec<(f64, SearchResult)>> {
-    let session_ids: Vec<&str> = ranked.iter().map(|(sid, _)| sid.as_str()).collect();
+) -> Result<Vec<SearchResult>> {
+    let session_ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
     let (best_hits, first_hits) = match fts_query {
         Some(q) => (
             best_matching_messages(conn, q, &session_ids)?,
@@ -614,7 +599,7 @@ fn fetch_chunks(
     let mut snippet_stmt = conn.prepare(snippet_sql)?;
     let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
-    Ok(build_candidates(ranked, meta_map, |sid| {
+    Ok(build_candidates(sessions, |sid| {
         if let Some(rowid) = best_hits.get(sid) {
             if let Some((chunk_id, content)) = row_or_default(
                 rowid_match_stmt.query_row(rusqlite::params![sid, rowid], |row| {
@@ -1105,9 +1090,12 @@ pub fn search_with_embedder<'q>(
     let incomplete = incomplete || left_out_session_could_rank(pruned_best, limit_score);
     merged.truncate(opts.limit);
 
-    let candidates = fetch_chunks(conn, fts_query, merged, &mut meta_map, &vec_chunks)?;
+    let sessions = merged
+        .into_iter()
+        .filter_map(|(sid, _)| meta_map.remove(&sid))
+        .collect();
     Ok(SearchOutcome {
-        results: candidates.into_iter().map(|(_, r)| r).collect(),
+        results: fetch_chunks(conn, fts_query, sessions, &vec_chunks)?,
         vec_degraded,
         results_incomplete: incomplete,
     })
@@ -1128,7 +1116,7 @@ fn keyword_only_outcome(
         });
     };
     let found = find_keyword_sessions(conn, opts, q, now_ms)?;
-    let mut ranking = rank_sessions(found.ranked, now_ms, opts.limit);
+    let ranking = rank_sessions(found.ranked, now_ms, opts.limit);
     // bm25 ranks are negative and lower ranks first, so they are negated into
     // scores that rank higher first.
     let results_incomplete = found.unreadable_rows
@@ -1136,22 +1124,15 @@ fn keyword_only_outcome(
             found.skipped.iter().map(|s| -(s.rank * s.best_factor)),
             ranking.limit_rank.map(|r| -r),
         );
-    if ranking.ranked.is_empty() {
+    if ranking.sessions.is_empty() {
         return Ok(SearchOutcome {
             results: Vec::new(),
             vec_degraded,
             results_incomplete,
         });
     }
-    let candidates = fetch_chunks(
-        conn,
-        fts_query,
-        ranking.ranked,
-        &mut ranking.meta_map,
-        &HashMap::new(),
-    )?;
     Ok(SearchOutcome {
-        results: candidates.into_iter().map(|(_, r)| r).collect(),
+        results: fetch_chunks(conn, fts_query, ranking.sessions, &HashMap::new())?,
         vec_degraded,
         results_incomplete,
     })
