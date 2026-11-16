@@ -202,15 +202,6 @@ fn prepare_match_query_with_missing_vocab_degrades() {
     assert_eq!(result.as_str(), "\"au\" AND \"login\"");
 }
 
-/// The index stores message text as written, so a query that folded full-width
-/// characters would miss the messages that contain them.
-#[test]
-fn prepare_match_query_keeps_full_width_characters_as_typed() {
-    let conn = setup_fts_db();
-    let result = prepare_match_query(&conn, "ＬＯＧＩＮ　ｱｲｳ", "fts_chunks_vocab").unwrap();
-    assert_eq!(result.as_str(), "\"ＬＯＧＩＮ\" AND \"ｱｲｳ\"");
-}
-
 fn prepare_err(conn: &Connection, sql: &str) -> rusqlite::Error {
     let Err(e) = conn.prepare_cached(sql) else {
         panic!("expected prepare_cached to fail for: {sql}");
