@@ -66,7 +66,6 @@ fn tied_ranks<'a>(hits: &[(&'a str, f64)]) -> impl Iterator<Item = (&'a str, f64
         "hits must be listed best first"
     );
     let mut ranks = Vec::with_capacity(hits.len());
-    // Only exactly equal scores tie; a near-tie keeps distinct ranks.
     for tie in hits.chunk_by(|a, b| a.1 == b.1) {
         let rank = ranks.len() as f64 + (tie.len() - 1) as f64 / 2.0;
         ranks.extend(tie.iter().map(|&(sid, _)| (sid, rank)));

@@ -874,11 +874,12 @@ fn recency_lifts_a_new_session_over_a_somewhat_better_older_match_in_hybrid_sear
     assert_eq!(ids(&results), ["new", "old"]);
 }
 
-/// Three year-old sessions and one new one match "authentication" by text, in
-/// the order old-a, old-b, old-c, new (the new one matches slightly worse). A
-/// year-old session found only by vector search keeps the vector leg active.
-/// After fusion the new session scores 5% below the best old one, and the 20%
-/// that recency adds to a same-day session lifts it to the front.
+/// Three year-old sessions and one new one match "authentication" by text. The
+/// old ones tie and share rank 1, and the new one, which matches slightly
+/// worse, takes rank 3. A year-old session found only by vector search keeps the
+/// vector leg active. After fusion the new session scores 5% below that vector
+/// match and 3% below the old text matches, and the 20% that recency adds to a
+/// same-day session lifts it to the front.
 fn seed_new_session_ranked_fourth_by_text(conn: &Connection) {
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     for sid in ["old-a", "old-b", "old-c"] {
