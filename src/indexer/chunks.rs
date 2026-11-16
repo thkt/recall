@@ -5,7 +5,7 @@ use anyhow::Result;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 use tracing::{debug, info};
 
-use super::INDEX_RULES_VERSION;
+use super::chunk_state::{self, chunks_pending};
 use crate::chunker;
 use crate::index_observer::Observer;
 use crate::parser::{Message, Role};
@@ -28,11 +28,13 @@ pub(super) const CREATE_CHUNK_MESSAGE_ROWS: &str = "CREATE TEMP TABLE chunk_mess
          text_bytes INTEGER NOT NULL,
          PRIMARY KEY (session_id, message_rowid)
      ) WITHOUT ROWID;";
-pub(super) const STAGE_CHUNK_MESSAGES: &str =
+pub(super) const STAGE_CHUNK_MESSAGES: &str = concat!(
     "INSERT INTO chunk_message_rows (session_id, message_rowid, text_bytes)
      SELECT m.session_id, m.rowid, length(CAST(m.text AS BLOB))
      FROM messages m CROSS JOIN sessions s ON s.session_id = m.session_id
-     WHERE s.chunks_indexed IS NULL OR s.chunks_indexed < 0";
+     WHERE ",
+    chunks_pending!()
+);
 pub(super) const READ_CHUNK_BATCH: &str = "SELECT r.session_id, m.rowid, m.role, m.text
      FROM chunk_message_rows r CROSS JOIN messages m ON m.rowid = r.message_rowid
      WHERE r.session_id >= ?1 AND r.session_id <= ?2
@@ -67,7 +69,11 @@ pub(super) fn index_chunks_observed(
     observer.count("chunks_created_committed", 0);
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let pending: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE chunks_indexed IS NULL OR chunks_indexed < 0)",
+        concat!(
+            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE ",
+            chunks_pending!(),
+            ")"
+        ),
         [],
         |row| row.get(0),
     )?;
@@ -128,12 +134,13 @@ fn stage_pending_sessions(tx: &Transaction) -> Result<Vec<PendingChunkSession>> 
     tx.execute_batch(CREATE_CHUNK_MESSAGE_ROWS)?;
     tx.execute(STAGE_CHUNK_MESSAGES, [])?;
     let sessions: Vec<PendingChunkSession> = {
-        let mut stmt = tx.prepare(
+        let mut stmt = tx.prepare(concat!(
             "SELECT s.session_id, s.timestamp, COALESCE(SUM(r.text_bytes), 0)
              FROM sessions s LEFT JOIN chunk_message_rows r ON r.session_id = s.session_id
-             WHERE s.chunks_indexed IS NULL OR s.chunks_indexed < 0
-             GROUP BY s.session_id ORDER BY s.session_id",
-        )?;
+             WHERE ",
+            chunks_pending!(),
+            " GROUP BY s.session_id ORDER BY s.session_id"
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<StdResult<_, _>>()?
     };
@@ -188,9 +195,5 @@ fn store_session_chunks(
         )?;
         stats.chunks_created += 1;
     }
-    tx.execute(
-        "UPDATE sessions SET chunks_indexed = CASE WHEN chunks_indexed = -?1 THEN ?1 ELSE 0 END WHERE session_id = ?2",
-        rusqlite::params![INDEX_RULES_VERSION, session_id],
-    )?;
-    Ok(())
+    chunk_state::record_chunked(tx, session_id)
 }

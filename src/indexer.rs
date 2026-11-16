@@ -1,4 +1,5 @@
 mod backfill;
+mod chunk_state;
 mod chunks;
 mod diagnostics;
 mod scan;
@@ -36,8 +37,6 @@ use crate::chunker;
 use crate::classify::classify_session;
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
-
-const INDEX_RULES_VERSION: i64 = 2;
 
 struct SessionEntry {
     session_id: String,
@@ -195,12 +194,7 @@ fn upsert_session(
 ) -> Result<ReuseStats> {
     let cached = ctx.existing.get(fpath_str);
     let session_id = &parsed.metadata.session_id;
-    let reuse = !ctx.force
-        && ctx.tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND chunks_indexed = ?2 AND EXISTS(SELECT 1 FROM qa_chunks WHERE session_id = ?1))",
-            rusqlite::params![session_id, INDEX_RULES_VERSION],
-            |r| r.get::<_, bool>(0),
-        )?;
+    let reuse = !ctx.force && chunk_state::has_current_chunks(ctx.tx, session_id)?;
     if let Some(entry) = cached
         && entry.session_id != *session_id
     {
@@ -245,7 +239,7 @@ fn upsert_session(
             session_type,
             1,
             stamp.and_then(|s| i64::try_from(s.size).ok()),
-            -INDEX_RULES_VERSION,
+            chunk_state::PARSED,
         ],
     )?;
 
@@ -338,10 +332,7 @@ fn reconcile_chunks(
         )?;
     }
 
-    tx.execute(
-        "UPDATE sessions SET chunks_indexed = ?1 WHERE session_id = ?2",
-        rusqlite::params![INDEX_RULES_VERSION, session_id],
-    )?;
+    chunk_state::record_reconciled(tx, session_id)?;
     stats.seconds = start.elapsed().as_secs_f64();
     Ok(stats)
 }
@@ -351,7 +342,7 @@ fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result
         && let Some(new_mt) = stamp.mtime_secs()
         && let Some(entry) = ctx.existing.get(fpath_str)
         && let Some(old_mt) = entry.mtime
-        && entry.rules_version == Some(INDEX_RULES_VERSION)
+        && chunk_state::is_current(entry.rules_version)
         && entry.file_size == Some(stamp.size)
         && (old_mt - new_mt).abs() < 0.001
         && !ctx.tx.prepare_cached(
