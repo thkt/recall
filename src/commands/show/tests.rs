@@ -1,7 +1,7 @@
 use std::process::ExitCode;
 
-use crate::open_or_create_db;
 use crate::tests::{bare_empty_db, printed_envelope, reported};
+use crate::{db, open_or_create_db};
 
 use super::*;
 

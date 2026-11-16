@@ -10,8 +10,8 @@ use crate::commands::{ReadIndex, build_markdown};
 use crate::compat::filter::escape_like;
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
+use crate::parser;
 use crate::parser::Source;
-use crate::{db, parser};
 use crate::{format_timestamp, resolve_db_path};
 
 fn write_show_header(
@@ -301,16 +301,14 @@ pub(crate) fn run_show(
     }
 
     let index = ReadIndex::open(&path)?;
-    let shown = match index.schema()? {
-        db::SchemaState::Empty => Err(RecallError::Usage(
-            "Database not found. Run `recall index` first.".to_owned(),
-        )
-        .into()),
-        _ => show_session_windowed(&index.conn, session_id, verbose, chunk, window),
+    let shown = if index.is_never_indexed()? {
+        Err(RecallError::Usage("Database not found. Run `recall index` first.".to_owned()).into())
+    } else {
+        show_session_windowed(&index.conn, session_id, verbose, chunk, window)
     };
     match shown {
-        Ok(out) => Ok(index.finish(out)),
-        Err(e) => Err(index.fail(e)),
+        Ok(out) => Ok(index.snapshot.finish(out)),
+        Err(e) => Err(index.snapshot.fail(e)),
     }
 }
 

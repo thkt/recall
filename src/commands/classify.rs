@@ -295,7 +295,7 @@ pub(crate) fn run_classify(
     let outcomes = if dry_run {
         if path.try_exists()? {
             let mut index = ReadIndex::open(&path)?;
-            index.refuse_stale_snapshot()?;
+            index.snapshot.refuse()?;
             reclassify_sessions(&mut index.conn, all, true)?
         } else {
             Vec::new()

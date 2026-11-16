@@ -6,7 +6,7 @@ use crate::tests::{
     bare_empty_db, mock_loader, payload_keys, printed_envelope, search_command, seed_healthy_index,
     vec_chunk_count,
 };
-use crate::{embedder, open_or_create_db};
+use crate::{db, embedder, open_or_create_db};
 
 use super::*;
 

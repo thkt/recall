@@ -1,5 +1,5 @@
 use crate::tests::{bare_empty_db, payload_keys, printed_envelope};
-use crate::{embedder, open_or_create_db};
+use crate::{db, embedder, open_or_create_db};
 
 use super::*;
 

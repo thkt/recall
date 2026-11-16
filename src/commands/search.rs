@@ -13,7 +13,7 @@ use crate::error::RecallError;
 use crate::model::{self, DegradedReason, EmbedderDegraded};
 use crate::parser::Source;
 use crate::runtime::{done, warning};
-use crate::{ansi, db, search};
+use crate::{ansi, search};
 use crate::{format_timestamp, resolve_db_path, try_load_embedder_cached_with};
 
 #[derive(Debug, Args)]
@@ -178,14 +178,14 @@ where
     }
 
     let index = ReadIndex::open(&path)?;
-    if index.schema()? == db::SchemaState::Empty {
-        return Ok(index.finish(search_idle_output()));
+    if index.is_never_indexed()? {
+        return Ok(index.snapshot.finish(search_idle_output()));
     }
     let conn = &index.conn;
 
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     if session_count == 0 {
-        return Ok(index.finish(search_idle_output()));
+        return Ok(index.snapshot.finish(search_idle_output()));
     }
 
     let identity_error = if query.is_some() {
@@ -249,7 +249,9 @@ where
         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
     });
 
-    Ok(index.finish(CommandOutput::with_notes(markdown, data, degraded, notes)))
+    Ok(index
+        .snapshot
+        .finish(CommandOutput::with_notes(markdown, data, degraded, notes)))
 }
 
 fn extract_parent_session(file_path: &str) -> Option<&str> {

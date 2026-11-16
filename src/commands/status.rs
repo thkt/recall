@@ -6,8 +6,8 @@ use anyhow::Result;
 use crate::commands::{ReadIndex, build_markdown};
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, cached_artifacts};
+use crate::resolve_db_path;
 use crate::runtime::info as cli_info;
-use crate::{db, resolve_db_path};
 
 pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
     run_status_with(verbose, db_path, || {
@@ -42,18 +42,16 @@ pub(crate) fn run_status_with(
     let index = ReadIndex::open(&path)?;
     let conn = &index.conn;
 
-    let (sessions, chunks, embedded) = match index.schema()? {
-        db::SchemaState::Empty => (0, 0, 0),
-        _ => {
-            let sessions: i64 =
-                conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
-            let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
-            let embedded: i64 =
-                conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
-                    r.get(0)
-                })?;
-            (sessions, chunks, embedded)
-        }
+    let (sessions, chunks, embedded) = if index.is_never_indexed()? {
+        (0, 0, 0)
+    } else {
+        let sessions: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        let chunks: i64 = conn.query_row("SELECT COUNT(*) FROM qa_chunks", [], |r| r.get(0))?;
+        let embedded: i64 =
+            conn.query_row("SELECT COUNT(DISTINCT chunk_id) FROM vec_chunks", [], |r| {
+                r.get(0)
+            })?;
+        (sessions, chunks, embedded)
     };
 
     let markdown = build_markdown(|buf| {
@@ -82,7 +80,7 @@ pub(crate) fn run_status_with(
     });
 
     // The stale-snapshot note comes before the identity note.
-    let mut out = index.finish(CommandOutput::ok(markdown, data));
+    let mut out = index.snapshot.finish(CommandOutput::ok(markdown, data));
     if let Err(error) = model::check_index(conn, model::selected()) {
         out.degraded = true;
         out.notes.push(Note::new(format!(

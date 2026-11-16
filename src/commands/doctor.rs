@@ -269,8 +269,9 @@ where
     }
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
-    let index = ReadIndex::open(&path);
-    let (mut checks, identity) = match &index {
+    // The read connection closes once the checks have read the index, before the
+    // model probe and any download.
+    let (mut checks, identity, snapshot) = match ReadIndex::open(&path) {
         Ok(index) => {
             let conn = &index.conn;
             let identity = model::check_index(conn, model::selected());
@@ -297,9 +298,9 @@ where
                 Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
             };
-            (checks, Some(identity))
+            (checks, Some(identity), Some(index.snapshot))
         }
-        Err(e) => (open_failure_checks(e), None),
+        Err(e) => (open_failure_checks(e), None, None),
     };
     // Installing the selected model cannot make an index built for another model usable.
     let refuses_model = matches!(&identity, Some(Err(e)) if e.refuses_model());
@@ -309,9 +310,9 @@ where
     checks.push(model_check);
 
     let output = render_doctor_report(verbose, &path, &checks, &repairs, &model_recovery);
-    Ok(match &index {
-        Ok(index) => index.finish(output),
-        Err(_) => output,
+    Ok(match snapshot {
+        Some(snapshot) => snapshot.finish(output),
+        None => output,
     })
 }
 
