@@ -37,7 +37,7 @@ pub(super) fn read_session_messages(
     Ok(msgs)
 }
 
-pub(crate) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
+pub(super) fn backfill_rowid_ranges(conn: &mut Connection) -> Result<usize> {
     let sessions: Vec<(String, Option<i64>)> = {
         let null_row_sessions_sql = "SELECT DISTINCT s.session_id, s.timestamp FROM sessions s \
              JOIN qa_chunks c ON c.session_id = s.session_id \
@@ -125,7 +125,7 @@ fn reread_scanned_files(
 
 /// Reads again only the logs in `source_logs`, the ones the index pass reads this run. A session
 /// whose log this run did not find, such as one under a missing root, waits for a run that finds it.
-pub(crate) fn backfill_session_files(
+pub(super) fn backfill_session_files(
     conn: &mut Connection,
     source_logs: &HashSet<PathBuf>,
     on_progress: Option<&dyn Fn(usize, usize)>,

@@ -1,11 +1,8 @@
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
-use tracing::debug;
 
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::Embed;
@@ -91,7 +88,7 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         outcome.degraded_note.is_none() || outcome.failed_count == 0,
         "model-absent and embed-stop degradation are mutually exclusive"
     );
-    // index_and_report, report_indexed_sessions and run_legacy_backfill print every note but the
+    // index_and_report and report_indexed_sessions print every note but the
     // embed failure, which reaches stderr only as a tracing log line without the remedy.
     let mut notes = Vec::new();
     if let Some(note) = &outcome.degraded_note {
@@ -198,15 +195,22 @@ where
     let stats = indexer::index_from_dirs_observed(&mut conn, opts, embed_capable, observer)?;
     observer.count("sessions_stored", stats.total_sessions);
     report_indexed_sessions(&stats);
-    let skipped_roots = stats.skipped_roots;
 
-    let chunk_stats = indexer::index_chunks_observed(&mut conn, observer)?;
-    let parse_diagnostics = run_legacy_backfill(&mut conn, &stats.source_logs, observer)?;
-    if chunk_stats.chunks_created > 0 {
-        done(&format!("Created {} chunks", chunk_stats.chunks_created));
+    let settled = indexer::settle(&mut conn, &stats, observer)?;
+    for note in settled
+        .parse_diagnostics
+        .iter()
+        .flat_map(indexer::FileParseDiagnostics::notes)
+    {
+        warning(&note);
+    }
+    if settled.chunks_created > 0 {
+        done(&format!("Created {} chunks", settled.chunks_created));
     } else {
         done("Chunks up to date");
     }
+    let skipped_roots = stats.skipped_roots;
+    let parse_diagnostics = settled.parse_diagnostics;
 
     if opts.force {
         fix_orphan_embeddings(&conn)?;
@@ -297,41 +301,6 @@ fn report_indexed_sessions(stats: &indexer::IndexStats) {
     for skipped in &stats.skipped_roots {
         warning(&skipped.note());
     }
-}
-
-fn run_legacy_backfill(
-    conn: &mut Connection,
-    source_logs: &HashSet<PathBuf>,
-    observer: &index_observer::Observer,
-) -> Result<Vec<indexer::FileParseDiagnostics>> {
-    let backfill = observer.stage("legacy_backfill");
-    let backfilled = indexer::backfill_rowid_ranges(conn)?;
-    if backfilled > 0 {
-        debug!(
-            sessions = backfilled,
-            "linked legacy chunks to rowid ranges"
-        );
-    }
-    let on_backfill_progress = |done: usize, total: usize| {
-        backfill.progress(done.saturating_sub(1), total, 0);
-    };
-    let scanned_backfilled =
-        indexer::backfill_session_files(conn, source_logs, Some(&on_backfill_progress))?;
-    let parse_diagnostics = indexer::load_parse_diagnostics(conn)?;
-    for note in parse_diagnostics
-        .iter()
-        .flat_map(indexer::FileParseDiagnostics::notes)
-    {
-        warning(&note);
-    }
-    if scanned_backfilled > 0 {
-        debug!(
-            sessions = scanned_backfilled,
-            "recorded scanned files for legacy sessions"
-        );
-    }
-    backfill.finish("committed");
-    Ok(parse_diagnostics)
 }
 
 #[cfg(test)]

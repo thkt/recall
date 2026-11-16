@@ -1945,6 +1945,20 @@ fn index_stderr_summarizes_new_and_unchanged_runs_in_order() {
 }
 
 #[test]
+fn index_stderr_summarizes_the_scan_before_chunking_starts() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = write_session(dir.path(), SESSION_LINE);
+
+    let stderr = index_stderr(dir.path(), &claude_dir);
+
+    assert_in_order(
+        &stderr,
+        "\nIndexed 1 sessions in ",
+        "\nindex: chunking: started",
+    );
+}
+
+#[test]
 fn index_stderr_summarizes_files_with_unresolved_parse_diagnostics() {
     let dir = TempDir::new().unwrap();
     let claude_dir = write_session(dir.path(), &format!("{SESSION_LINE}\nnot json\n"));

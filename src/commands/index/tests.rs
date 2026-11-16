@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use rusqlite::Connection;
+
 use crate::db::collect_strings;
 use crate::envelope::{render_json_success, render_text_notes};
 use crate::model::tests::FakeHost;

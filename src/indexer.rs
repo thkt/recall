@@ -3,15 +3,16 @@ mod chunks;
 mod diagnostics;
 mod scan;
 
-pub(crate) use backfill::{backfill_rowid_ranges, backfill_session_files};
+use backfill::{backfill_rowid_ranges, backfill_session_files};
 #[cfg(test)]
 pub(crate) use chunks::index_chunks;
-pub(crate) use chunks::index_chunks_observed;
+use chunks::index_chunks_observed;
 #[cfg(test)]
 use chunks::{CREATE_CHUNK_MESSAGE_ROWS, READ_CHUNK_BATCH, STAGE_CHUNK_MESSAGES, chunk_batch_len};
 pub use diagnostics::FileParseDiagnostics;
-pub(crate) use diagnostics::load_parse_diagnostics;
-use diagnostics::{LogRead, cleanup_parse_diagnostics, read_log, save_read_error};
+use diagnostics::{
+    LogRead, cleanup_parse_diagnostics, load_parse_diagnostics, read_log, save_read_error,
+};
 use scan::{RemovalGate, collect_sources};
 #[cfg(test)]
 use scan::{
@@ -28,7 +29,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, Transaction, TransactionBehavior};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::chunker;
 
@@ -603,6 +604,50 @@ pub(crate) fn index_from_dirs_observed(
         ),
         preserved_embedded: totals.preserved_embedded,
         source_logs: scan.sources.into_iter().map(|(path, _)| path).collect(),
+    })
+}
+
+/// The rows that follow from the scan, once [`settle`] brought them up to date.
+pub(crate) struct Settled {
+    pub(crate) chunks_created: usize,
+    /// Every unresolved parse diagnostic, read back after the backfill recorded its own.
+    pub(crate) parse_diagnostics: Vec<FileParseDiagnostics>,
+}
+
+/// Chunks the sessions the scan stored, then fills in what an index from an older version lacks.
+/// The backfill reads again only the logs the scan took this run.
+pub(crate) fn settle(
+    conn: &mut Connection,
+    scanned: &IndexStats,
+    observer: &Observer,
+) -> Result<Settled> {
+    let chunk_stats = index_chunks_observed(conn, observer)?;
+
+    let backfill = observer.stage("legacy_backfill");
+    let backfilled = backfill_rowid_ranges(conn)?;
+    if backfilled > 0 {
+        debug!(
+            sessions = backfilled,
+            "linked legacy chunks to rowid ranges"
+        );
+    }
+    let on_backfill_progress = |done: usize, total: usize| {
+        backfill.progress(done.saturating_sub(1), total, 0);
+    };
+    let scanned_backfilled =
+        backfill_session_files(conn, &scanned.source_logs, Some(&on_backfill_progress))?;
+    let parse_diagnostics = load_parse_diagnostics(conn)?;
+    if scanned_backfilled > 0 {
+        debug!(
+            sessions = scanned_backfilled,
+            "recorded scanned files for legacy sessions"
+        );
+    }
+    backfill.finish("committed");
+
+    Ok(Settled {
+        chunks_created: chunk_stats.chunks_created,
+        parse_diagnostics,
     })
 }
 

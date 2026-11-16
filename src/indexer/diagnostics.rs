@@ -127,7 +127,7 @@ pub(super) fn read_log(
     }
 }
 
-pub(crate) fn load_parse_diagnostics(conn: &Connection) -> Result<Vec<FileParseDiagnostics>> {
+pub(super) fn load_parse_diagnostics(conn: &Connection) -> Result<Vec<FileParseDiagnostics>> {
     let mut stmt = conn.prepare(
         "SELECT CAST(file_path AS BLOB), source, invalid_json_lines, invalid_utf8_lines,
                 incomplete_tail_lines, read_error FROM parse_diagnostics ORDER BY file_path",
