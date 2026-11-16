@@ -87,7 +87,7 @@ impl RemovalGate {
         }
     }
 
-    pub(super) fn is_fully_read(&self, source: Source) -> bool {
+    fn is_fully_read(&self, source: Source) -> bool {
         self.fully_read.contains(&source)
     }
 

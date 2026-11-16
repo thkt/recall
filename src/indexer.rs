@@ -67,23 +67,9 @@ pub struct SkippedRoot {
 
 impl SkippedRoot {
     pub(crate) fn note(&self) -> String {
-        self.reason
-            .note(self.source.as_str(), self.preserved_sessions)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkippedReason {
-    MissingRoot {
-        /// The source's other roots were read in full, so their deleted sessions were removed.
-        others_reconciled: bool,
-    },
-    IncompleteEnumeration,
-}
-
-impl SkippedReason {
-    pub(crate) fn note(self, source: &str, preserved: usize) -> String {
-        match self {
+        let source = self.source.as_str();
+        let preserved = self.preserved_sessions;
+        match self.reason {
             SkippedReason::MissingRoot {
                 others_reconciled: true,
             } => format!(
@@ -102,7 +88,19 @@ impl SkippedReason {
             ),
         }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedReason {
+    MissingRoot {
+        /// `true` when the source's other roots were read in full, so their deleted sessions were
+        /// removed. `false` when every root of the source was missing, as Claude's one root can be.
+        others_reconciled: bool,
+    },
+    IncompleteEnumeration,
+}
+
+impl SkippedReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             SkippedReason::MissingRoot { .. } => "missing_root",
