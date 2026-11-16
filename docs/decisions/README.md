@@ -1,25 +1,25 @@
-# Architecture Decision Records
+# Decision Records
 
-This directory contains important decisions about the project's architecture.
+This directory contains important decisions about the project.
 
-## ADR List
+## DR List
 
-| Number                                                                                   | Title                                                                    | Status   | Date       |
-| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ | -------- | ---------- |
-| [0001](0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md)            | Freeze the --json Output Envelope as a Stable Consumer Contract          | accepted | 2026-06-15 |
-| [0002](0002-treat-persisted-and-emitted-string-tokens-as-a-stable-contract.md)           | Treat Persisted and Emitted String Tokens as a Stable Contract           | accepted | 2026-06-15 |
-| [0003](0003-enforce-owner-only-0600-permission-on-index-database.md)                     | Enforce Owner-Only 0600 Permission on the Index Database                 | accepted | 2026-06-15 |
-| [0004](0004-forbid-blanket-deletion-in-the-index-rebuild-path.md)                        | Forbid Blanket Deletion in the Index Rebuild Path                        | accepted | 2026-06-17 |
-| [0005](0005-resolve-fts-hits-to-chunks-by-source-message-rowid-range.md)                 | Resolve FTS Hits to Chunks by Source-Message Rowid Range                 | accepted | 2026-06-17 |
+| Number | Title | Status | Date |
+|--------|-------|--------|------|
+| [0001](0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md) | Freeze the --json Output Envelope as a Stable Consumer Contract | accepted | 2026-06-15 |
+| [0002](0002-treat-persisted-and-emitted-string-tokens-as-a-stable-contract.md) | Treat Persisted and Emitted String Tokens as a Stable Contract | accepted | 2026-06-15 |
+| [0003](0003-enforce-owner-only-0600-permission-on-index-database.md) | Enforce Owner-Only 0600 Permission on the Index Database | accepted | 2026-06-15 |
+| [0004](0004-forbid-blanket-deletion-in-the-index-rebuild-path.md) | Forbid Blanket Deletion in the Index Rebuild Path | accepted | 2026-06-17 |
+| [0005](0005-resolve-fts-hits-to-chunks-by-source-message-rowid-range.md) | Resolve FTS Hits to Chunks by Source-Message Rowid Range | accepted | 2026-06-17 |
 | [0006](0006-adopt-recall-specific-exit-code-routing-extending-scout-adr-0066-group-2.md) | Adopt Recall-Specific Exit Code Routing Extending Scout ADR-0066 Group 2 | accepted | 2026-06-24 |
-| [0007](0007-evolve-the-index-schema-without-a-version-table.md)                          | Evolve the Index Schema Without a Version Table                          | accepted | 2026-06-24 |
-| [0008](0008-classify-session-type-by-first-turn-heuristic-with-fail-open-default.md)     | Classify Session Type by First-Turn Heuristic with a Fail-Open Default   | accepted | 2026-06-24 |
-| [0009](0009-preserve-the-recency-blend-sign-invariant-across-ranking-paths.md)           | Preserve the Recency-Blend Sign Invariant Across Ranking Paths           | accepted | 2026-06-24 |
-| [0010](0010-segment-cjk-queries-at-script-boundaries-with-a-min-anchor-gate.md)          | Segment CJK Queries at Script Boundaries With a Min-Anchor Gate          | accepted | 2026-06-24 |
-| [0011](0011-never-skip-a-directory-by-its-mtime-in-incremental-indexing.md)              | Never Skip a Directory by Its mtime in Incremental Indexing              | accepted | 2026-06-24 |
-| [0012](0012-adopt-no-prefix-descriptive-test-names-repo-wide.md)                         | Adopt No-Prefix Descriptive Test Names Repo-Wide                         | accepted | 2026-07-19 |
-| [0013](0013-skip-the-isolated-model-probe-on-search-in-a-verified-environment.md)      | Skip the Isolated Model Probe on Search in a Verified Environment        | accepted | 2026-11-02 |
-| [0014](0014-apply-upstream-llama-cpp-fixes-as-build-time-patches-on-the-pinned-submodule.md)| Apply Upstream llama.cpp Fixes as Build-Time Patches on the Pinned Submodule| accepted | 2026-11-03 |
+| [0007](0007-evolve-the-index-schema-without-a-version-table.md) | Evolve the Index Schema Without a Version Table | accepted | 2026-06-24 |
+| [0008](0008-classify-session-type-by-first-turn-heuristic-with-fail-open-default.md) | Classify Session Type by First-Turn Heuristic with a Fail-Open Default | accepted | 2026-06-24 |
+| [0009](0009-preserve-the-recency-blend-sign-invariant-across-ranking-paths.md) | Preserve the Recency-Blend Sign Invariant Across Ranking Paths | accepted | 2026-06-24 |
+| [0010](0010-segment-cjk-queries-at-script-boundaries-with-a-min-anchor-gate.md) | Segment CJK Queries at Script Boundaries With a Min-Anchor Gate | accepted | 2026-06-24 |
+| [0011](0011-never-skip-a-directory-by-its-mtime-in-incremental-indexing.md) | Never Skip a Directory by Its mtime in Incremental Indexing | accepted | 2026-06-24 |
+| [0012](0012-adopt-no-prefix-descriptive-test-names-repo-wide.md) | Adopt No-Prefix Descriptive Test Names Repo-Wide | accepted | 2026-07-19 |
+| [0013](0013-skip-the-isolated-model-probe-on-search-in-a-verified-environment.md) | Skip the Isolated Model Probe on Search in a Verified Environment | accepted | 2026-11-02 |
+| [0014](0014-apply-upstream-llama-cpp-fixes-as-build-time-patches-on-the-pinned-submodule.md) | Apply Upstream llama.cpp Fixes as Build-Time Patches on the Pinned Submodule | accepted | 2026-11-03 |
 | [0015](0015-search-uppercase-fts5-operators-on-a-separate-path.md) | Search Uppercase FTS5 Operators on a Separate Path | accepted | 2026-11-10 |
 | [0016](0016-rank-every-match-before-cutting-search-results-to-the-limit.md) | Rank Every Match Before Cutting Search Results to the Limit | accepted | 2026-11-11 |
 | [0017](0017-keep-session-rows-when-migrating-the-fts-tokenizer.md) | Keep Session Rows When Migrating the FTS Tokenizer | accepted | 2026-11-13 |
@@ -50,10 +50,10 @@ This directory contains important decisions about the project's architecture.
 
 This project uses [MADR (Markdown Any Decision Records)](https://adr.github.io/madr/) format, v4.
 
-### How to Create an ADR
+### How to Create a Decision Record
 
 ```bash
-/adr "Decision Title"
+/dr "Decision Title"
 ```
 
 ### Status Meanings
@@ -61,10 +61,10 @@ This project uses [MADR (Markdown Any Decision Records)](https://adr.github.io/m
 - **Proposed**: Awaiting review
 - **Accepted**: Approved, implementing or completed
 - **Rejected**: Considered but not adopted
-- **Deprecated**: Retired without a replacement ADR
-- **Superseded**: Replaced by another ADR (e.g. `superseded by ADR-NNNN`)
+- **Deprecated**: Retired without a replacement DR
+- **Superseded**: Replaced by another DR (e.g. `superseded by DR-NNNN`)
 
 ---
 
-_Last updated: 2026-11-03_
-_Auto-generated by: update-index.py_
+*Last updated: 2026-11-16*
+*Auto-generated by: update-index.ts*
