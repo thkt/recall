@@ -43,7 +43,7 @@ struct SessionEntry {
     source: Option<Source>,
     mtime: Option<f64>,
     file_size: Option<u64>,
-    rules_version: Option<i64>,
+    chunks_indexed: Option<i64>,
 }
 
 pub struct IndexStats {
@@ -342,7 +342,7 @@ fn is_unchanged(ctx: &IndexContext, fpath_str: &str, stamp: FileStamp) -> Result
         && let Some(new_mt) = stamp.mtime_secs()
         && let Some(entry) = ctx.existing.get(fpath_str)
         && let Some(old_mt) = entry.mtime
-        && chunk_state::is_current(entry.rules_version)
+        && chunk_state::is_current(entry.chunks_indexed)
         && entry.file_size == Some(stamp.size)
         && (old_mt - new_mt).abs() < 0.001
         && !ctx.tx.prepare_cached(
@@ -711,7 +711,7 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEn
     })?;
     let mut map = HashMap::new();
     for row in rows {
-        let (fp, sid, src, mt, size, rules_version) = row?;
+        let (fp, sid, src, mt, size, chunks_indexed) = row?;
         map.insert(
             fp,
             SessionEntry {
@@ -719,7 +719,7 @@ fn load_existing_sessions(conn: &Connection) -> Result<HashMap<String, SessionEn
                 source: Source::from_db(&src),
                 mtime: mt,
                 file_size: size.and_then(|size| u64::try_from(size).ok()),
-                rules_version,
+                chunks_indexed,
             },
         );
     }
