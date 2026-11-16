@@ -11,7 +11,7 @@ use rusqlite::{Connection, Transaction};
 use super::scan::RemovalGate;
 use crate::ansi;
 use crate::parser::LineDiagnostics;
-use crate::parser::Source;
+use crate::parser::{ParseResult, Source};
 
 #[derive(Debug)]
 pub struct FileParseDiagnostics {
@@ -61,7 +61,7 @@ fn path_key(path: &Path) -> Value {
     }
 }
 
-pub(super) fn save_parse_diagnostics(
+fn save_parse_diagnostics(
     tx: &Transaction,
     path: &str,
     source: Source,
@@ -93,6 +93,36 @@ pub(super) fn save_read_error(tx: &Transaction, path: &Path, source: Source) -> 
         rusqlite::params![path_key(path), source.as_str()],
     )?;
     Ok(())
+}
+
+/// What reading a log found.
+pub(super) enum LogRead {
+    Parsed(ParseResult),
+    /// The log holds no session record.
+    Empty,
+    Unreadable,
+}
+
+/// Parses the log at `path` with `parse` and records what the read found: the
+/// parse diagnostics of a parsed log, or a read error. Every read of a log goes
+/// through here, so a read that succeeds also clears an earlier read error.
+pub(super) fn read_log(
+    tx: &Transaction,
+    path: &Path,
+    source: Source,
+    parse: impl FnOnce(&Path, Source) -> Result<Option<ParseResult>>,
+) -> Result<LogRead> {
+    match parse(path, source) {
+        Ok(Some(parsed)) => {
+            save_parse_diagnostics(tx, &path.to_string_lossy(), source, parsed.diagnostics)?;
+            Ok(LogRead::Parsed(parsed))
+        }
+        Ok(None) => Ok(LogRead::Empty),
+        Err(_) => {
+            save_read_error(tx, path, source)?;
+            Ok(LogRead::Unreadable)
+        }
+    }
 }
 
 pub(crate) fn load_parse_diagnostics(conn: &Connection) -> Result<Vec<FileParseDiagnostics>> {

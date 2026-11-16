@@ -11,7 +11,7 @@ pub(crate) use chunks::index_chunks_observed;
 use chunks::{CREATE_CHUNK_MESSAGE_ROWS, READ_CHUNK_BATCH, STAGE_CHUNK_MESSAGES, chunk_batch_len};
 pub use diagnostics::FileParseDiagnostics;
 pub(crate) use diagnostics::load_parse_diagnostics;
-use diagnostics::{cleanup_parse_diagnostics, save_parse_diagnostics, save_read_error};
+use diagnostics::{LogRead, cleanup_parse_diagnostics, read_log, save_read_error};
 use scan::{RemovalGate, collect_sources};
 #[cfg(test)]
 use scan::{
@@ -384,16 +384,11 @@ fn index_file_with_parser(
         return Ok(IndexOutcome::Preserved(entry.session_id.clone()));
     }
 
-    let mut parsed = match parse(fpath, *source) {
-        Ok(Some(p)) => p,
-        Ok(None) => return Ok(IndexOutcome::Empty),
-        Err(_) => {
-            save_read_error(ctx.tx, fpath, *source)?;
-            return Ok(IndexOutcome::Failed);
-        }
+    let mut parsed = match read_log(ctx.tx, fpath, *source, parse)? {
+        LogRead::Parsed(parsed) => parsed,
+        LogRead::Empty => return Ok(IndexOutcome::Empty),
+        LogRead::Unreadable => return Ok(IndexOutcome::Failed),
     };
-
-    save_parse_diagnostics(ctx.tx, fpath_str, *source, parsed.diagnostics)?;
 
     if parsed.messages.is_empty() {
         let Some(entry) = ctx.existing.get(fpath_str) else {
