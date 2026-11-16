@@ -409,25 +409,8 @@ fn fetch_session_metadata(conn: &Connection, session_ids: &[&str]) -> Result<Ses
     Ok(found)
 }
 
-fn build_candidates(
-    sessions: Vec<SessionData>,
-    mut get_excerpt: impl FnMut(&str) -> (String, Option<i64>),
-) -> Vec<SearchResult> {
-    sessions
-        .into_iter()
-        .map(|session| {
-            let (excerpt, chunk_id) = get_excerpt(&session.session_id);
-            SearchResult {
-                session,
-                excerpt,
-                chunk_id,
-            }
-        })
-        .collect()
-}
-
 struct RankedSessions {
-    /// The sessions that rank highest first, cut to `limit`.
+    /// Ranked sessions, best first, cut to `limit`.
     sessions: Vec<SessionData>,
     /// Blended rank of the `limit`-th session, or `None` when fewer than
     /// `limit` sessions were ranked.
@@ -599,7 +582,7 @@ fn fetch_chunks(
     let mut snippet_stmt = conn.prepare(snippet_sql)?;
     let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
-    Ok(build_candidates(sessions, |sid| {
+    let mut excerpt_of = |sid: &str| -> (String, Option<i64>) {
         if let Some(rowid) = best_hits.get(sid) {
             if let Some((chunk_id, content)) = row_or_default(
                 rowid_match_stmt.query_row(rusqlite::params![sid, rowid], |row| {
@@ -633,7 +616,18 @@ fn fetch_chunks(
             return (content, Some(chunk_id));
         }
         (String::new(), None)
-    }))
+    };
+    Ok(sessions
+        .into_iter()
+        .map(|session| {
+            let (excerpt, chunk_id) = excerpt_of(&session.session_id);
+            SearchResult {
+                session,
+                excerpt,
+                chunk_id,
+            }
+        })
+        .collect())
 }
 
 fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
@@ -1090,7 +1084,7 @@ pub fn search_with_embedder<'q>(
     let incomplete = incomplete || left_out_session_could_rank(pruned_best, limit_score);
     merged.truncate(opts.limit);
 
-    let sessions = merged
+    let sessions: Vec<SessionData> = merged
         .into_iter()
         .filter_map(|(sid, _)| meta_map.remove(&sid))
         .collect();
