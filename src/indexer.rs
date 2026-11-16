@@ -607,7 +607,7 @@ pub(crate) fn index_from_dirs_observed(
     })
 }
 
-/// The rows that follow from the scan, once [`settle`] brought them up to date.
+/// What [`settle`] reports once the chunks and the legacy backfill are up to date.
 pub(crate) struct Settled {
     pub(crate) chunks_created: usize,
     /// Every unresolved parse diagnostic, read back after the backfill recorded its own.

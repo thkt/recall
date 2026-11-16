@@ -1959,6 +1959,21 @@ fn index_stderr_summarizes_the_scan_before_chunking_starts() {
 }
 
 #[test]
+fn index_stderr_warns_about_parse_diagnostics_after_the_backfill_and_before_the_chunk_summary() {
+    let dir = TempDir::new().unwrap();
+    let claude_dir = write_session(dir.path(), &format!("{SESSION_LINE}\nnot json\n"));
+
+    let stderr = index_stderr(dir.path(), &claude_dir);
+
+    assert_in_order(
+        &stderr,
+        "\nindex: legacy_backfill: committed",
+        "\nwarning: ",
+    );
+    assert_in_order(&stderr, "\nwarning: ", "\nCreated 1 chunks\n");
+}
+
+#[test]
 fn index_stderr_summarizes_files_with_unresolved_parse_diagnostics() {
     let dir = TempDir::new().unwrap();
     let claude_dir = write_session(dir.path(), &format!("{SESSION_LINE}\nnot json\n"));
