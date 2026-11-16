@@ -11,7 +11,8 @@
 //! | another positive value | parsed and chunked under other rules, such as `1` from the migration that added the column |
 //!
 //! Only a session chunked under the current rules counts as unchanged. The scan parses every
-//! other session again when its log is found.
+//! other session again when its log is found, except that it keeps a session with stored vectors
+//! unparsed while the model cannot embed.
 
 use anyhow::Result;
 use rusqlite::Transaction;
@@ -47,8 +48,8 @@ pub(super) fn has_current_chunks(tx: &Transaction, session_id: &str) -> Result<b
     )?)
 }
 
-/// Records that the session's chunks were made or matched to its messages. A session whose
-/// messages were parsed under other rules gets `0`, so the scan still parses it again.
+/// Records that the session's chunks were made or matched to its messages. A session whose rules
+/// version was unknown or other gets `0`, so the scan still parses it again.
 pub(super) fn record_chunked(tx: &Transaction, session_id: &str) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET chunks_indexed = CASE WHEN chunks_indexed = ?1 THEN ?2 ELSE 0 END \
