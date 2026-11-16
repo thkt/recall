@@ -70,7 +70,7 @@ pub(super) fn index_chunks_observed(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let pending: bool = tx.query_row(
         concat!(
-            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE ",
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE ",
             chunks_pending!(),
             ")"
         ),

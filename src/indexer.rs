@@ -332,7 +332,7 @@ fn reconcile_chunks(
         )?;
     }
 
-    chunk_state::record_reconciled(tx, session_id)?;
+    chunk_state::record_chunked(tx, session_id)?;
     stats.seconds = start.elapsed().as_secs_f64();
     Ok(stats)
 }
