@@ -1784,7 +1784,6 @@ fn freeze_index_payload_key_set() {
             source: parser::Source::Codex,
             preserved_sessions: 2,
             reason: indexer::SkippedReason::IncompleteEnumeration,
-            other_roots_reconciled: false,
         }],
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1845,7 +1844,6 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
             source: parser::Source::Codex,
             preserved_sessions: 2,
             reason: indexer::SkippedReason::IncompleteEnumeration,
-            other_roots_reconciled: false,
         }],
         preserved_embedded: 1,
         parse_diagnostics: vec![indexer::FileParseDiagnostics {
