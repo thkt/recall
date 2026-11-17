@@ -87,7 +87,7 @@ impl RemovalGate {
         }
     }
 
-    pub(super) fn is_fully_read(&self, source: Source) -> bool {
+    fn is_fully_read(&self, source: Source) -> bool {
         self.fully_read.contains(&source)
     }
 
@@ -179,10 +179,20 @@ fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
     } else if any_present {
         out.removal.fully_read.insert(source);
         if out.removal.missing_roots.iter().any(|(s, _)| *s == source) {
-            out.skipped.insert(source, SkippedReason::MissingRoot);
+            out.skipped.insert(
+                source,
+                SkippedReason::MissingRoot {
+                    others_reconciled: true,
+                },
+            );
         }
     } else {
-        out.skipped.insert(source, SkippedReason::MissingRoot);
+        out.skipped.insert(
+            source,
+            SkippedReason::MissingRoot {
+                others_reconciled: false,
+            },
+        );
     }
 }
 

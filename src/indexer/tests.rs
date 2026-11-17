@@ -876,6 +876,15 @@ fn seed_claude_and_codex(conn: &mut Connection) -> (TempDir, PathBuf, PathBuf) {
     (tmp, claude_dir, codex_dir)
 }
 
+/// Every root of the source was missing.
+const ALL_ROOTS_MISSING: SkippedReason = SkippedReason::MissingRoot {
+    others_reconciled: false,
+};
+/// One root of the source was missing, and its other roots were read in full.
+const ONE_ROOT_MISSING: SkippedReason = SkippedReason::MissingRoot {
+    others_reconciled: true,
+};
+
 /// The (source, reason, preserved_sessions) of each root an index run reports as skipped.
 fn skipped_roots(stats: &IndexStats) -> Vec<(Source, SkippedReason, usize)> {
     stats
@@ -911,7 +920,7 @@ fn deleted_claude_log_is_removed_while_sessions_under_a_missing_codex_root_are_k
     );
     assert_eq!(
         skipped_roots(&stats),
-        [(Source::Codex, SkippedReason::MissingRoot, 1)]
+        [(Source::Codex, ALL_ROOTS_MISSING, 1)]
     );
 }
 
@@ -1099,8 +1108,7 @@ fn missing_root_note_says_nothing_was_deleted_and_to_rerun_once_the_root_is_back
     let skipped = SkippedRoot {
         source: Source::Codex,
         preserved_sessions: 3,
-        reason: SkippedReason::MissingRoot,
-        other_roots_reconciled: false,
+        reason: ALL_ROOTS_MISSING,
     };
 
     assert_eq!(
@@ -1111,7 +1119,12 @@ fn missing_root_note_says_nothing_was_deleted_and_to_rerun_once_the_root_is_back
 
 #[test]
 fn skipped_root_reasons_are_reported_as_missing_root_and_incomplete_enumeration() {
-    assert_eq!(SkippedReason::MissingRoot.as_str(), "missing_root");
+    for others_reconciled in [false, true] {
+        assert_eq!(
+            SkippedReason::MissingRoot { others_reconciled }.as_str(),
+            "missing_root"
+        );
+    }
     assert_eq!(
         SkippedReason::IncompleteEnumeration.as_str(),
         "incomplete_enumeration"
@@ -1124,7 +1137,6 @@ fn incomplete_root_note_without_preserved_sessions_warns_that_sessions_may_be_mi
         source: Source::Claude,
         preserved_sessions: 0,
         reason: SkippedReason::IncompleteEnumeration,
-        other_roots_reconciled: false,
     };
 
     assert_eq!(
@@ -1139,7 +1151,6 @@ fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_
         source: Source::Claude,
         preserved_sessions: 2,
         reason: SkippedReason::IncompleteEnumeration,
-        other_roots_reconciled: false,
     };
 
     assert_eq!(
@@ -1459,7 +1470,7 @@ fn rebuild_with_a_missing_codex_root_keeps_its_session_and_embeddings_and_report
     );
     assert_eq!(
         skipped_roots(&stats),
-        [(Source::Codex, SkippedReason::MissingRoot, 1)],
+        [(Source::Codex, ALL_ROOTS_MISSING, 1)],
         "the missing codex root must be reported as preserved"
     );
 }
@@ -1505,8 +1516,8 @@ fn rebuild_with_every_root_missing_keeps_all_sessions_and_embeddings() {
     assert_eq!(
         skipped_roots(&stats),
         [
-            (Source::Claude, SkippedReason::MissingRoot, 1),
-            (Source::Codex, SkippedReason::MissingRoot, 1)
+            (Source::Claude, ALL_ROOTS_MISSING, 1),
+            (Source::Codex, ALL_ROOTS_MISSING, 1)
         ],
         "both missing roots must be reported as preserved"
     );
@@ -2901,7 +2912,7 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     index_chunks(&mut conn).unwrap();
     assert_eq!(
         skipped_roots(&stats),
-        [(Source::Claude, SkippedReason::MissingRoot, 1)]
+        [(Source::Claude, ALL_ROOTS_MISSING, 1)]
     );
     assert_reported_diagnostics(&stats.parse_diagnostics, &conn, &partial);
     fs::rename(&hidden, &claude_dir).unwrap();
@@ -3981,7 +3992,7 @@ fn assert_session_chunked_from_stored_text_is_reread_once_its_root_returns(marke
     assert_eq!((missing.indexed, missing.total_sessions), (0, 1));
     assert_eq!(
         skipped_roots(&missing),
-        [(Source::Claude, SkippedReason::MissingRoot, 1)]
+        [(Source::Claude, ALL_ROOTS_MISSING, 1)]
     );
     assert_eq!(index_chunks(&mut conn).unwrap().chunks_created, 3);
     assert_eq!(
@@ -4683,7 +4694,7 @@ fn missing_archived_root_keeps_its_sessions_and_still_removes_sessions_deleted_e
     );
     assert_eq!(
         skipped_roots(&stats),
-        [(Source::Codex, SkippedReason::MissingRoot, 1)]
+        [(Source::Codex, ONE_ROOT_MISSING, 1)]
     );
     assert_eq!(
         stats.skipped_roots[0].note(),

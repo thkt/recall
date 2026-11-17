@@ -63,33 +63,21 @@ pub struct SkippedRoot {
     pub source: Source,
     pub preserved_sessions: usize,
     pub reason: SkippedReason,
-    /// Another root of the same source was read in full, so its deleted sessions were removed.
-    pub other_roots_reconciled: bool,
 }
 
 impl SkippedRoot {
     pub(crate) fn note(&self) -> String {
         let source = self.source.as_str();
-        if self.other_roots_reconciled && self.reason == SkippedReason::MissingRoot {
-            return format!(
-                "a {source} root is unavailable — preserved {preserved} existing session(s) under it and reconciled the rest; re-run `recall index` once the root is back so a full scan can reconcile them",
-                preserved = self.preserved_sessions,
-            );
-        }
-        self.reason.note(source, self.preserved_sessions)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkippedReason {
-    MissingRoot,
-    IncompleteEnumeration,
-}
-
-impl SkippedReason {
-    pub(crate) fn note(self, source: &str, preserved: usize) -> String {
-        match self {
-            SkippedReason::MissingRoot => format!(
+        let preserved = self.preserved_sessions;
+        match self.reason {
+            SkippedReason::MissingRoot {
+                others_reconciled: true,
+            } => format!(
+                "a {source} root is unavailable — preserved {preserved} existing session(s) under it and reconciled the rest; re-run `recall index` once the root is back so a full scan can reconcile them"
+            ),
+            SkippedReason::MissingRoot {
+                others_reconciled: false,
+            } => format!(
                 "{source} root unavailable — preserved {preserved} existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions"
             ),
             SkippedReason::IncompleteEnumeration if preserved == 0 => format!(
@@ -100,10 +88,22 @@ impl SkippedReason {
             ),
         }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedReason {
+    MissingRoot {
+        /// `true` when the source's other roots were read in full, so their deleted sessions were
+        /// removed. `false` when every root of the source was missing, as Claude's one root can be.
+        others_reconciled: bool,
+    },
+    IncompleteEnumeration,
+}
+
+impl SkippedReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            SkippedReason::MissingRoot => "missing_root",
+            SkippedReason::MissingRoot { .. } => "missing_root",
             SkippedReason::IncompleteEnumeration => "incomplete_enumeration",
         }
     }
@@ -682,14 +682,13 @@ fn summarize_skipped_roots(
                 })
                 .count();
             let emit = match reason {
-                SkippedReason::MissingRoot => preserved_sessions > 0,
+                SkippedReason::MissingRoot { .. } => preserved_sessions > 0,
                 SkippedReason::IncompleteEnumeration => true,
             };
             emit.then_some(SkippedRoot {
                 source,
                 preserved_sessions,
                 reason,
-                other_roots_reconciled: removal.is_fully_read(source),
             })
         })
         .collect()
