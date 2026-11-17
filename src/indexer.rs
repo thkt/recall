@@ -29,12 +29,13 @@ use std::result::Result as StdResult;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use tracing::{debug, info};
 
 use crate::chunker;
 
 use crate::classify::classify_session;
+use crate::db::EMPTY_MESSAGE_RANGE;
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
@@ -163,8 +164,42 @@ fn resolve_file_stamp(fpath: &Path) -> Option<FileStamp> {
     })
 }
 
+/// Deletes the messages of `session_id` through the rowid range its session row stores.
+///
+/// `messages.session_id` is UNINDEXED, so a delete by it reads every message of the index (DR
+/// 0019). The range covers every message of the session, and the `session_id` test keeps the
+/// rows of any other session inside it. Call this before deleting the session row.
+fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
+    let stored = tx
+        .prepare_cached(
+            "SELECT message_rowid_lo, message_rowid_hi FROM sessions WHERE session_id = ?1",
+        )?
+        .query_row([session_id], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?))
+        })
+        .optional()?;
+    match stored {
+        // No messages outlive their session row; the schema upgrade removed the ones that did.
+        None => {}
+        Some((Some(lo), Some(hi))) => {
+            tx.prepare_cached(
+                "DELETE FROM messages WHERE rowid BETWEEN ?1 AND ?2 AND session_id = ?3",
+            )?
+            .execute(rusqlite::params![lo, hi, session_id])?;
+        }
+        // A row that an older recall wrote holds no range.
+        Some(_) => {
+            tx.prepare_cached("DELETE FROM messages WHERE session_id = ?1")?
+                .execute([session_id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes everything stored for `session_id` except its session row. Call this before deleting
+/// the session row.
 fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
-    tx.execute("DELETE FROM messages WHERE session_id = ?", [session_id])?;
+    delete_session_messages(tx, session_id)?;
     tx.execute(
         "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)",
         [session_id],
@@ -198,15 +233,14 @@ fn upsert_session(
     if let Some(entry) = cached
         && entry.session_id != *session_id
     {
+        delete_session_dependents(ctx.tx, &entry.session_id)?;
         ctx.tx.execute(
             "DELETE FROM sessions WHERE session_id = ?",
             [&entry.session_id],
         )?;
-        delete_session_dependents(ctx.tx, &entry.session_id)?;
     }
     if reuse {
-        ctx.tx
-            .execute("DELETE FROM messages WHERE session_id = ?", [session_id])?;
+        delete_session_messages(ctx.tx, session_id)?;
         ctx.tx.execute(
             "DELETE FROM session_files WHERE session_id = ?",
             [session_id],
@@ -247,16 +281,25 @@ fn upsert_session(
         .tx
         .prepare_cached("INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)")?;
     let mut messages = Vec::new();
+    let mut rowids: Option<(i64, i64)> = None;
     for msg in parsed.messages {
         msg_stmt.execute(rusqlite::params![
             parsed.metadata.session_id,
             msg.role.as_str(),
             msg.text
         ])?;
+        let rowid = ctx.tx.last_insert_rowid();
+        rowids = Some(rowids.map_or((rowid, rowid), |(lo, hi)| (lo.min(rowid), hi.max(rowid))));
         if reuse {
-            messages.push((ctx.tx.last_insert_rowid(), msg));
+            messages.push((rowid, msg));
         }
     }
+    let (lo, hi) = rowids.unwrap_or(EMPTY_MESSAGE_RANGE);
+    ctx.tx
+        .prepare_cached(
+            "UPDATE sessions SET message_rowid_lo = ?1, message_rowid_hi = ?2 WHERE session_id = ?3",
+        )?
+        .execute(rusqlite::params![lo, hi, session_id])?;
     let stats = if reuse {
         reconcile_chunks(
             ctx.tx,
@@ -743,12 +786,18 @@ fn cleanup_orphans(
             continue;
         }
         if !source_paths.contains(Path::new(fp.as_str())) {
-            let deleted = tx.execute(
-                "DELETE FROM sessions WHERE session_id = ? AND file_path = ?",
+            // A log read this run may have taken the session over; its row then names that log.
+            let still_this_log: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ? AND file_path = ?)",
                 rusqlite::params![entry.session_id, fp],
+                |r| r.get(0),
             )?;
-            if deleted > 0 {
+            if still_this_log {
                 delete_session_dependents(tx, &entry.session_id)?;
+                tx.execute(
+                    "DELETE FROM sessions WHERE session_id = ?",
+                    [&entry.session_id],
+                )?;
             }
         }
     }

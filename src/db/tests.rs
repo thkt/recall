@@ -202,6 +202,41 @@ const SESSION_ROWS: &str = "SELECT json_array(session_id, source, file_path, pro
      timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions \
      ORDER BY session_id";
 
+#[test]
+fn upgrading_an_index_without_message_ranges_stores_each_range_and_drops_messages_without_a_session()
+ {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    conn.execute_batch(
+        "INSERT INTO sessions (session_id) VALUES ('a'), ('b'), ('quiet');
+         INSERT INTO messages (rowid, session_id, role, text) VALUES
+             (1, 'a', 'user', 'a first'), (2, 'b', 'user', 'b only'),
+             (3, 'gone', 'user', 'no session'), (4, 'a', 'assistant', 'a last');
+         ALTER TABLE sessions DROP COLUMN message_rowid_lo;
+         ALTER TABLE sessions DROP COLUMN message_rowid_hi;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, message_rowid_lo, message_rowid_hi) FROM sessions \
+             ORDER BY session_id"
+        ),
+        [r#"["a",1,4]"#, r#"["b",2,2]"#, r#"["quiet",1,0]"#]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT text FROM messages ORDER BY rowid"),
+        ["a first", "b only", "a last"]
+    );
+    let upgraded = schema_snapshot(&conn);
+    drop(conn);
+    assert_eq!(schema_snapshot(&open_db(tmp.path()).unwrap()), upgraded);
+}
+
 /// The schema version with every schema object, so a test can show that an open changed nothing.
 fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
     (

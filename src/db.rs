@@ -213,7 +213,9 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             file_size INTEGER,
             session_type TEXT,
             files_scanned INTEGER,
-            chunks_indexed INTEGER
+            chunks_indexed INTEGER,
+            message_rowid_lo INTEGER,
+            message_rowid_hi INTEGER
         );",
     )?;
 
@@ -270,6 +272,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(MESSAGES_VOCAB_SQL)?;
 
     migrate_chunks_indexed_if_needed(conn)?;
+    migrate_message_rowid_range_if_needed(conn)?;
 
     Ok(())
 }
@@ -437,6 +440,33 @@ fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
              UPDATE sessions SET chunks_indexed = 1
              WHERE EXISTS (SELECT 1 FROM qa_chunks c WHERE c.session_id = sessions.session_id);",
         )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// The message rowid range stored for a session without messages. It holds no rowid.
+pub(crate) const EMPTY_MESSAGE_RANGE: (i64, i64) = (1, 0);
+
+/// Stores in each session row the rowid range of its messages, which the indexer deletes them
+/// by (DR 0019). The upgrade first removes the messages whose session row is gone, so that a
+/// session without a row has no messages.
+fn migrate_message_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("message_rowid_lo")) {
+        let (empty_lo, empty_hi) = EMPTY_MESSAGE_RANGE;
+        tx.execute_batch(&format!(
+            "ALTER TABLE sessions ADD COLUMN message_rowid_lo INTEGER;
+             ALTER TABLE sessions ADD COLUMN message_rowid_hi INTEGER;
+             DELETE FROM messages WHERE NOT EXISTS
+                 (SELECT 1 FROM sessions s WHERE s.session_id = messages.session_id);
+             UPDATE sessions SET message_rowid_lo = r.lo, message_rowid_hi = r.hi
+                 FROM (SELECT session_id, min(rowid) AS lo, max(rowid) AS hi
+                       FROM messages GROUP BY session_id) AS r
+                 WHERE r.session_id = sessions.session_id;
+             UPDATE sessions SET message_rowid_lo = {empty_lo}, message_rowid_hi = {empty_hi}
+                 WHERE message_rowid_lo IS NULL;"
+        ))?;
     }
     tx.commit()?;
     Ok(())
