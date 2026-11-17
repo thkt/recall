@@ -99,6 +99,54 @@ fn expand_single_char_term() {
     assert!(result.as_str().contains("\"audit\"") || result.as_str() == "\"a\"");
 }
 
+/// A table with the `messages` tokenizer and its vocabulary, holding one row per text.
+fn trigram_vocab_db(texts: &[&str]) -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE VIRTUAL TABLE docs USING fts5(text, tokenize='trigram');
+         CREATE VIRTUAL TABLE docs_vocab USING fts5vocab(docs, row);",
+    )
+    .unwrap();
+    for text in texts {
+        conn.execute("INSERT INTO docs(text) VALUES (?1)", [text])
+            .unwrap();
+    }
+    conn
+}
+
+fn expand_in(conn: &Connection, query: &str) -> String {
+    fts_expand_short_terms(conn, &sanitized(query), "docs_vocab")
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
+#[test]
+fn a_short_word_expands_only_to_the_terms_that_start_with_it() {
+    let conn = trigram_vocab_db(&["xaby", "xabz", "xacq", "xaaq"]);
+    assert_eq!(expand_in(&conn, "ab"), r#"("aby" OR "abz")"#);
+}
+
+#[test]
+fn an_upper_case_short_word_expands_to_the_terms_of_its_lower_case_form() {
+    let conn = trigram_vocab_db(&["Abc", "abd"]);
+    assert_eq!(expand_in(&conn, "AB"), r#"("abc" OR "abd")"#);
+}
+
+#[test]
+fn a_short_word_with_like_wildcards_expands_only_to_the_terms_that_hold_them_as_written() {
+    let conn = trigram_vocab_db(&["5%x", "5_y", "5zz", "5\\w"]);
+    assert_eq!(expand_in(&conn, "5%"), r#"("5%x")"#);
+    assert_eq!(expand_in(&conn, "5_"), r#"("5_y")"#);
+    assert_eq!(expand_in(&conn, "5\\"), r#"("5\w")"#);
+}
+
+#[test]
+fn a_two_character_cjk_word_expands_to_the_trigrams_that_start_with_it() {
+    let conn = trigram_vocab_db(&["設定を変更", "設計"]);
+    assert_eq!(expand_in(&conn, "設定"), r#"("設定を")"#);
+}
+
 fn no_norm() -> QueryNormalizationConfig {
     QueryNormalizationConfig::disabled()
 }
