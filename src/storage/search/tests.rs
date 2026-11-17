@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::setup_test_db;
 
 #[test]
 fn fts_quote_simple() {
@@ -75,28 +76,82 @@ fn expand_operator_like_terms_are_quoted_not_expanded() {
 }
 
 #[test]
-fn expand_special_chars_escaped() {
-    let conn = setup_fts_db();
-    let result = fts_expand_short_terms(&conn, &sanitized("a%"), "fts_chunks_vocab").unwrap();
-    assert!(
-        result.as_str().contains("\"audit\"") || result.as_str() == "\"a%\"",
-        "{}",
-        result.as_str()
-    );
-}
-
-#[test]
 fn expand_without_vocab_table_degrades() {
     let conn = Connection::open_in_memory().unwrap();
     let result = fts_expand_short_terms(&conn, &sanitized("au login"), "fts_chunks_vocab").unwrap();
     assert_eq!(result.as_str(), "\"au\" AND \"login\"");
 }
 
+/// An index with the production schema, holding one message per text.
+fn index_with_messages(texts: &[&str]) -> (tempfile::TempDir, Connection) {
+    let (dir, conn) = setup_test_db();
+    for text in texts {
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES ('s', 'user', ?1)",
+            [text],
+        )
+        .unwrap();
+    }
+    (dir, conn)
+}
+
+fn expand_in(conn: &Connection, query: &str) -> String {
+    fts_expand_short_terms(conn, &sanitized(query), "messages_vocab")
+        .unwrap()
+        .as_str()
+        .to_owned()
+}
+
 #[test]
-fn expand_single_char_term() {
-    let conn = setup_fts_db();
-    let result = fts_expand_short_terms(&conn, &sanitized("a"), "fts_chunks_vocab").unwrap();
-    assert!(result.as_str().contains("\"audit\"") || result.as_str() == "\"a\"");
+fn a_short_word_expands_only_to_the_terms_that_start_with_it() {
+    let (_dir, conn) = index_with_messages(&["xaby", "xabz", "xab😀", "xacq", "xaaq"]);
+    assert_eq!(expand_in(&conn, "ab"), r#"("aby" OR "abz" OR "ab😀")"#);
+}
+
+#[test]
+fn a_one_character_word_expands_to_the_terms_that_start_with_it() {
+    let (_dir, conn) = index_with_messages(&["abc", "bcd"]);
+    assert_eq!(expand_in(&conn, "a"), r#"("abc")"#);
+}
+
+#[test]
+fn an_upper_case_short_word_expands_to_the_terms_of_its_lower_case_form() {
+    let (_dir, conn) = index_with_messages(&["Abc", "abd"]);
+    assert_eq!(expand_in(&conn, "AB"), r#"("abc" OR "abd")"#);
+}
+
+#[test]
+fn a_short_word_with_like_wildcards_expands_only_to_the_terms_that_hold_them_as_written() {
+    let (_dir, conn) = index_with_messages(&["5%x", "5_y", "5zz", "5\\w"]);
+    assert_eq!(expand_in(&conn, "5%"), r#"("5%x")"#);
+    assert_eq!(expand_in(&conn, "5_"), r#"("5_y")"#);
+    assert_eq!(expand_in(&conn, "5\\"), r#"("5\w")"#);
+}
+
+#[test]
+fn a_two_character_cjk_word_expands_to_the_trigrams_that_start_with_it() {
+    let (_dir, conn) = index_with_messages(&["設定を変更", "設計書"]);
+    assert_eq!(expand_in(&conn, "設定"), r#"("設定を")"#);
+}
+
+#[test]
+fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table() {
+    let (_dir, conn) = setup_test_db();
+    let plan: String = conn
+        .query_row(
+            &format!("EXPLAIN QUERY PLAN {}", vocab_lookup_sql("messages_vocab")),
+            ["ab", "ac"],
+            |row| row.get(3),
+        )
+        .unwrap();
+    let idx_num: u32 = plan
+        .split_once("VIRTUAL TABLE INDEX ")
+        .and_then(|(_, rest)| rest.split(':').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no index number in the plan: {plan}"));
+    // FTS5_VOCAB_TERM_GE and FTS5_VOCAB_TERM_LE in SQLite's fts5_vocab.c. Without them,
+    // fts5vocab reads every term of the index.
+    assert_eq!(idx_num & 0x600, 0x600, "{plan}");
 }
 
 #[test]
