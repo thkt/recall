@@ -140,7 +140,7 @@ Overlapping `index` or `rebuild` runs save an embedding only if the chunk still 
 
 An otherwise compatible index without generation tracking remains readable by `search`, `status`, and `show`, without migration or a rebuild. Opening it for writing adds generation tracking while preserving existing chunks and embeddings.
 
-The first `index`, `rebuild` or `classify` that opens an index from an earlier release records where each session's messages are stored, so later runs delete a session's old messages without reading every message. It prints a one-line notice, reads every stored message once, and deletes the messages that belong to no session. Search never shows those messages. `search`, `status` and `show` read the index without this step.
+The first `index`, `rebuild` or `classify` that opens an index from an earlier release records where each session's messages are stored, so later runs delete a session's old messages without reading every message. It prints a one-line notice, reads all stored messages, and deletes the messages that belong to no session. Search never shows those messages. `search`, `status` and `show` read the index without this step.
 
 Pending embedding bodies are loaded in pages of at most 1,024 chunks and 8 MiB, then released before the next page. A single chunk larger than 8 MiB is processed alone without truncation. The ID/generation/length worklist still grows with pending chunk count; model and other indexing memory are separate. Failed inference or save batches remain retryable while later batches continue; save errors are returned after processing the worklist. See [bounds and host comparison](docs/index-observability.md#未処理本文の有限ページと比較計測) for memory accounting and measurements.
 

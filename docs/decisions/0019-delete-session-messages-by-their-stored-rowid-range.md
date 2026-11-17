@@ -46,6 +46,7 @@ Every caller deletes the messages before the session row. `cleanup_orphans` and 
 - Good, because an older recall can still write the index: the NULL ranges it leaves fall back to the full-read delete
 - Bad, because correctness now rests on two invariants that no constraint enforces: every message has a session row, and the stored range covers every message of its session. A new path that inserts messages without recording the range, or deletes a session row before its messages, breaks them and no query fails
 - Bad, because the upgrade reads the whole `messages` table twice (the delete of messages without a session row, then the `GROUP BY`) while it holds the write lock. On the synthetic index the upgrade took 2.4 s. The first, cold read took 1.6 s of it, and the second read 46 to 64 ms, so one read would save little
+- Bad, because deleting a session still deletes its embeddings with `DELETE FROM vec_chunks WHERE chunk_id IN (...)`, which reads every embedding: sqlite-vec 0.1.9 keeps no index on the auxiliary `chunk_id` column. With 29,322 embeddings on the synthetic index, that delete took 35 ms per session, so a rebuild of an index with embeddings keeps that part of its cost
 - Neutral, because a backfilled range spans the rows of other sessions when an older recall wrote the messages of one session in separate runs. The delete then reads more rows than the session holds, and the `session_id` test still keeps the other rows
 
 ### Confirmation
