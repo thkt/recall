@@ -329,6 +329,37 @@ fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_it
     assert_emptied_log_loses_its_stored_messages("codex", CODEX_QUESTION, CODEX_METADATA_ONLY);
 }
 
+const MESSAGES_BY_SESSION: &str =
+    "SELECT json_array(session_id, text) FROM messages ORDER BY session_id, rowid";
+#[test]
+fn a_log_rewritten_under_another_session_id_loses_the_messages_of_the_session_it_held() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("codex", "rollout-test.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, SESSION_A_LOG, t0);
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    rewrite_with_mtime(
+        &log.file,
+        concat!(
+            r#"{"type":"session_meta","payload":{"id":"session-b","source":"exec"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"role":"user","content":"other question"}}"#,
+        ),
+        t0 + Duration::from_secs(10),
+    );
+
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, MESSAGES_BY_SESSION),
+        [r#"["session-b","other question"]"#]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["session-b"]
+    );
+}
+
 const SESSION_A_LOG: &str = concat!(
     r#"{"type":"session_meta","payload":{"id":"session-a","source":"exec"}}"#,
     "\n",
