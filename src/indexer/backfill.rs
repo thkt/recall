@@ -6,7 +6,7 @@ use anyhow::Result;
 use rusqlite::{Connection, Transaction};
 use tracing::debug;
 
-use super::diagnostics::{save_parse_diagnostics, save_read_error};
+use super::diagnostics::{LogRead, read_log};
 use super::insert_session_files;
 use crate::chunker;
 use crate::parser::{Message, Role, Source, parse_session_including_empty};
@@ -114,17 +114,13 @@ fn reread_scanned_files(
     if !source_logs.contains(fpath) {
         return Ok(RereadOutcome::Unavailable);
     }
-    match parse_session_including_empty(fpath, source) {
-        Ok(Some(parsed)) => {
-            save_parse_diagnostics(tx, &fpath.to_string_lossy(), source, parsed.diagnostics)?;
-            Ok(RereadOutcome::Paths(parsed.scanned_files))
-        }
-        Ok(None) => Ok(RereadOutcome::Paths(Vec::new())),
-        Err(_) => {
-            save_read_error(tx, fpath, source)?;
-            Ok(RereadOutcome::Unavailable)
-        }
-    }
+    Ok(
+        match read_log(tx, fpath, source, parse_session_including_empty)? {
+            LogRead::Parsed(parsed) => RereadOutcome::Paths(parsed.scanned_files),
+            LogRead::Empty => RereadOutcome::Paths(Vec::new()),
+            LogRead::Unreadable => RereadOutcome::Unavailable,
+        },
+    )
 }
 
 /// Reads again only the logs in `source_logs`, the ones the index pass reads this run. A session
