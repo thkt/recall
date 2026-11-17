@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::Path;
 
+use rusqlite::Connection;
+
 use crate::db::collect_strings;
 use crate::envelope::{render_json_success, render_text_notes};
 use crate::model::tests::FakeHost;
@@ -427,6 +429,58 @@ fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_me
             "/proj/marker_b.rs".to_owned(),
         ],
         "the backfill must fill session_files from the write-target tool_use paths"
+    );
+}
+
+#[test]
+fn an_index_run_that_backfills_a_legacy_index_logs_how_many_sessions_each_backfill_updated() {
+    use std::sync::Mutex;
+    use tracing::subscriber::with_default;
+
+    let src = tempfile::TempDir::new().unwrap();
+    let claude_dir = src.path().join("claude");
+    let (_, codex_dir) = absent_source_dirs(src.path());
+    write_backfill_session(&claude_dir, "a.jsonl", "session a probe", "/proj/a.rs");
+    write_backfill_session(&claude_dir, "b.jsonl", "session b probe", "/proj/b.rs");
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let opts = indexer::IndexOptions {
+        force: false,
+        claude_dir: &claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    {
+        let conn = open_or_create_db(&db_path).unwrap();
+        reset_to_legacy_state(&conn);
+        conn.execute(
+            "UPDATE qa_chunks SET src_rowid_lo = NULL, src_rowid_hi = NULL",
+            [],
+        )
+        .unwrap();
+    }
+    let log = db_dir.path().join("log");
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("recall::indexer=debug")
+        .with_writer(Mutex::new(fs::File::create(&log).unwrap()))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+
+    with_default(subscriber, || {
+        index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
+    });
+
+    let log = fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("legacy"))
+            .collect::<Vec<_>>(),
+        [
+            "DEBUG recall::indexer: linked legacy chunks to rowid ranges sessions=2",
+            "DEBUG recall::indexer: recorded scanned files for legacy sessions sessions=2",
+        ]
     );
 }
 

@@ -24,7 +24,7 @@ Gemma移行後の現行pipelineはversion 2です。以下の過去の時間・�
 | `fts_finalize` | transaction commit後のFTS optimize/automerge設定 |
 | `chunk_reconciliation` | 再利用対象の会話の旧チャンク取得・新チャンク生成・照合・rowid更新・不要vector削除・再利用件数取得。`parse_fts` と `fts_transaction` に含まれる。対象なしは0 |
 | `chunking` | 未完了セッション選択、本文取得、チャンク作成、DB書込み、段階全体のcommit |
-| `legacy_backfill` | 既存チャンクのrowidリンクと旧セッションの編集先パス再読込み、解析診断の取得/表示 |
+| `legacy_backfill` | 既存チャンクのrowidリンクと旧セッションの編集先パス再読込み、解析診断の取得。診断の表示はこの段階の後 |
 | `pending_extraction` | 埋め込み未処理のID・世代・byte長の一回の照合とソート、および各ページの本文取得の累積。利用不可時はIDだけで件数を取得 |
 | `inference` | 全バッチの推論時間の累積。tokenize、分割、指定したforward pauseを含む |
 | `embedding_db_save` | 全バッチの保存時間の累積。writer lock待ち、世代/本文照合、書込み、commitを含む |

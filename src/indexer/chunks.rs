@@ -58,7 +58,7 @@ pub(crate) fn index_chunks(conn: &mut Connection) -> Result<ChunkStats> {
     index_chunks_observed(conn, &Observer::default())
 }
 
-pub(crate) fn index_chunks_observed(
+pub(super) fn index_chunks_observed(
     conn: &mut Connection,
     observer: &Observer,
 ) -> Result<ChunkStats> {
