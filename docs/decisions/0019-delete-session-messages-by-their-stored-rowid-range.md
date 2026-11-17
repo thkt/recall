@@ -36,16 +36,16 @@ Chosen option: "Store each session's message rowid range", because it is the onl
 - A range: it runs `DELETE FROM messages WHERE rowid BETWEEN lo AND hi AND session_id = ?`. FTS5 reads only the rows of that rowid range, and the `session_id` test keeps the rows of any other session inside it
 - A NULL range: it runs the full-read delete. A recall that predates the columns writes such a row, because its `INSERT OR REPLACE` leaves the two columns NULL
 
-Every caller deletes the messages before the session row. `cleanup_orphans` and the branch for a log that now names another session id used to delete the session row first, and now delete in that order.
+Every caller deletes the messages before the session row. `cleanup_orphans` and the branch for a log that now names another session id used to delete the session row first. Both now call `delete_session`, which deletes the messages first and then the row.
 
-`migrate_message_rowid_range_if_needed` (src/db.rs) adds the two columns inside an immediate transaction. In the same transaction it deletes the messages whose session row is gone, then fills each range with one `GROUP BY session_id` read; a session without messages gets the empty range. Search never shows those messages: it skips a match that has no session row and counts it as missing. `schema_state` does not check the columns, because only the writer reads them and the writer upgrades the index when it opens it.
+`migrate_message_rowid_range_if_needed` (src/db.rs) prints a one-line notice and adds the two columns inside an immediate transaction. In the same transaction it deletes the messages whose session row is gone, then fills each range with one `GROUP BY session_id` read; a session without messages gets the empty range. Search never shows those messages: it skips a match that has no session row and counts it as missing. `schema_state` does not check the columns, because only the writer reads them and the writer upgrades the index when it opens it.
 
 ### Consequences
 
 - Good, because a session that a run writes for the first time no longer reads the table, and a changed session reads only its own rowid range. On the synthetic index, deleting one session's messages by its range took 0.2 ms against 25 ms by `session_id`
 - Good, because an older recall can still write the index: the NULL ranges it leaves fall back to the full-read delete
 - Bad, because correctness now rests on two invariants that no constraint enforces: every message has a session row, and the stored range covers every message of its session. A new path that inserts messages without recording the range, or deletes a session row before its messages, breaks them and no query fails
-- Bad, because the upgrade reads the whole `messages` table twice (the delete of messages without a session row, then the `GROUP BY`) while it holds the write lock
+- Bad, because the upgrade reads the whole `messages` table twice (the delete of messages without a session row, then the `GROUP BY`) while it holds the write lock. On the synthetic index the upgrade took 2.4 s. The first, cold read took 1.6 s of it, and the second read 46 to 64 ms, so one read would save little
 - Neutral, because a backfilled range spans the rows of other sessions when an older recall wrote the messages of one session in separate runs. The delete then reads more rows than the session holds, and the `session_id` test still keeps the other rows
 
 ### Confirmation
@@ -53,9 +53,10 @@ Every caller deletes the messages before the session row. `cleanup_orphans` and 
 - `upgrading_an_index_without_message_ranges_stores_each_range_and_drops_messages_without_a_session` (src/db/tests.rs) checks the upgrade, its empty range, and that a second open changes nothing
 - `a_changed_log_loses_only_its_own_messages_inside_the_rowid_range_its_session_stores` (src/indexer/tests.rs) fails when the range delete drops its `session_id` test
 - `a_changed_log_whose_session_row_has_no_rowid_range_still_loses_its_old_messages` (src/indexer/tests.rs) fails when a NULL range deletes nothing
-- `a_log_rewritten_under_another_session_id_loses_the_messages_of_the_session_it_held` and `deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_embeddings_and_touched_files` (src/indexer/tests.rs) fail when a caller deletes the session row before its messages
+- `a_log_reduced_to_metadata_stores_an_empty_message_range` (src/indexer/tests.rs) fails when a session without messages gets any range but the empty one
+- `a_log_rewritten_under_another_session_id_loses_the_messages_of_the_session_it_held` and `deleting_a_log_under_a_fully_read_root_removes_its_session_messages_chunks_embeddings_and_touched_files` (src/indexer/tests.rs) fail when `delete_session` deletes the session row before its messages
 
-Code review checks that a new `INSERT INTO messages` records the range and that a new `DELETE FROM sessions` runs after `delete_session_dependents`.
+Code review checks that a new `INSERT INTO messages` records the range and that a new delete of a session row goes through `delete_session`.
 
 ## Pros and Cons of the Options
 
@@ -94,7 +95,7 @@ Collect the changed session ids during the run and delete their old messages in 
 
 The measurements in Context come from a synthetic index generated in scratch space, with a release build and no model. The pull request on branch `perf/session-message-range` records the before and after runs.
 
-This record does not make an exception to DR 0004. The upgrade deletes only messages that no session row owns, never a session row, and the removal gate of `cleanup_orphans` is unchanged. DR 0017's tokenizer copy already leaves such messages behind.
+This record does not make an exception to DR 0004. The upgrade deletes only messages that no session row owns, never a session row, and the removal gate of `cleanup_orphans` is unchanged. DR 0017's tokenizer copy already drops such messages: it copies only the messages that belong to a session row.
 
 For DR 0005, the range comes from the rowids that each insert returned. FTS5 gives a new row the largest rowid plus one, so a session whose messages were last in the table can receive the rowids it has just freed. The recorded range follows the rowids the session actually received.
 

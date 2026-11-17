@@ -212,6 +212,14 @@ fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deletes `session_id` and everything stored for it. The messages go first, because their
+/// delete reads the range from the session row.
+fn delete_session(tx: &Transaction, session_id: &str) -> Result<()> {
+    delete_session_dependents(tx, session_id)?;
+    tx.execute("DELETE FROM sessions WHERE session_id = ?", [session_id])?;
+    Ok(())
+}
+
 fn insert_session_files(tx: &Transaction, session_id: &str, paths: &[String]) -> Result<()> {
     let mut stmt =
         tx.prepare_cached("INSERT INTO session_files (session_id, path) VALUES (?1, ?2)")?;
@@ -233,11 +241,7 @@ fn upsert_session(
     if let Some(entry) = cached
         && entry.session_id != *session_id
     {
-        delete_session_dependents(ctx.tx, &entry.session_id)?;
-        ctx.tx.execute(
-            "DELETE FROM sessions WHERE session_id = ?",
-            [&entry.session_id],
-        )?;
+        delete_session(ctx.tx, &entry.session_id)?;
     }
     if reuse {
         delete_session_messages(ctx.tx, session_id)?;
@@ -793,11 +797,7 @@ fn cleanup_orphans(
                 |r| r.get(0),
             )?;
             if still_this_log {
-                delete_session_dependents(tx, &entry.session_id)?;
-                tx.execute(
-                    "DELETE FROM sessions WHERE session_id = ?",
-                    [&entry.session_id],
-                )?;
+                delete_session(tx, &entry.session_id)?;
             }
         }
     }

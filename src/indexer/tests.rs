@@ -331,9 +331,10 @@ fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_it
 
 const MESSAGES_BY_SESSION: &str =
     "SELECT json_array(session_id, text) FROM messages ORDER BY session_id, rowid";
-/// Each session's stored rowid range next to the smallest and largest rowid of its messages.
-const RANGES_AND_ROWIDS: &str = "SELECT json_array(s.session_id, s.message_rowid_lo, \
-     s.message_rowid_hi, min(m.rowid), max(m.rowid)) FROM sessions s \
+/// Each session that holds messages, and whether its stored range runs from the smallest to the
+/// largest rowid of those messages.
+const RANGE_MATCHES_ROWIDS: &str = "SELECT json_array(s.session_id, \
+     s.message_rowid_lo = min(m.rowid) AND s.message_rowid_hi = max(m.rowid)) FROM sessions s \
      JOIN messages m ON m.session_id = s.session_id GROUP BY s.session_id ORDER BY s.session_id";
 
 #[test]
@@ -379,8 +380,8 @@ fn a_changed_log_loses_only_its_own_messages_inside_the_rowid_range_its_session_
         ]
     );
     assert_eq!(
-        collect_strings(&conn, RANGES_AND_ROWIDS),
-        [r#"["s",2,3,2,3]"#, r#"["t",1,1,1,1]"#]
+        collect_strings(&conn, RANGE_MATCHES_ROWIDS),
+        [r#"["s",1]"#, r#"["t",1]"#]
     );
 }
 
@@ -406,9 +407,31 @@ fn a_changed_log_whose_session_row_has_no_rowid_range_still_loses_its_old_messag
         collect_strings(&conn, MESSAGES_BY_SESSION),
         [r#"["s","original question"]"#, r#"["s","appended answer"]"#]
     );
+    assert_eq!(collect_strings(&conn, RANGE_MATCHES_ROWIDS), [r#"["s",1]"#]);
+}
+
+#[test]
+fn a_log_reduced_to_metadata_stores_an_empty_message_range() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, FRESHNESS_QUESTION, t0);
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    rewrite_with_mtime(
+        &log.file,
+        CLAUDE_METADATA_ONLY,
+        t0 + Duration::from_secs(10),
+    );
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
     assert_eq!(
-        collect_strings(&conn, RANGES_AND_ROWIDS),
-        [r#"["s",1,2,1,2]"#]
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, message_rowid_lo, message_rowid_hi) FROM sessions"
+        ),
+        [r#"["s",1,0]"#]
     );
 }
 

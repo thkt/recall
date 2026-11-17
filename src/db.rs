@@ -454,6 +454,7 @@ pub(crate) const EMPTY_MESSAGE_RANGE: (i64, i64) = (1, 0);
 fn migrate_message_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("message_rowid_lo")) {
+        info("recall: recording where each session's messages are stored; this runs once");
         let (empty_lo, empty_hi) = EMPTY_MESSAGE_RANGE;
         tx.execute_batch(&format!(
             "ALTER TABLE sessions ADD COLUMN message_rowid_lo INTEGER;
