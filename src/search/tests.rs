@@ -1424,6 +1424,21 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
     assert_eq!(ids(&results), ["s1"]);
 }
 
+/// The index stores message text as written, so folding the query alone would
+/// turn ＬＯＧＩＮ into login and miss the message that holds ＬＯＧＩＮ.
+#[test]
+fn a_full_width_query_finds_the_session_that_holds_it_as_typed() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "full", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "full", "user", "ＬＯＧＩＮ ボタンを押す");
+    insert_session(&conn, "other", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "other", "user", "quicksort を実装する");
+
+    let results = search(&conn, "ＬＯＧＩＮ", &at_now()).unwrap();
+
+    assert_eq!(ids(&results), ["full"]);
+}
+
 /// Writes two Claude logs: "sess-alpha" in /home/me/alpha asks about
 /// authentication, and "sess-beta" in /home/me/beta asks about quicksort.
 fn write_two_claude_logs(claude_dir: &Path) {

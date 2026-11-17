@@ -8,8 +8,7 @@ use crate::compat::filter::{
 use crate::compat::{anon_placeholders, clean_for_trigram};
 use crate::embedding::Embed;
 use crate::storage::{
-    MIN_TRIGRAM_TERM_CHARS, QueryNormalizationConfig, SanitizeError, prepare_match_query,
-    prepare_operator_query,
+    MIN_TRIGRAM_TERM_CHARS, SanitizeError, prepare_match_query, prepare_operator_query,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -825,12 +824,7 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
     } else {
         query.to_owned()
     };
-    match prepare_match_query(
-        conn,
-        &fts_input,
-        "messages_vocab",
-        &QueryNormalizationConfig::disabled(),
-    ) {
+    match prepare_match_query(conn, &fts_input, "messages_vocab") {
         Ok(m) => Ok(Some(KeywordQuery {
             fts: clean_for_trigram(&m),
             not_operands: Vec::new(),
