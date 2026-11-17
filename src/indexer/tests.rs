@@ -329,6 +329,141 @@ fn codex_log_emptied_or_reduced_to_session_meta_with_an_unchanged_mtime_loses_it
     assert_emptied_log_loses_its_stored_messages("codex", CODEX_QUESTION, CODEX_METADATA_ONLY);
 }
 
+const MESSAGES_BY_SESSION: &str =
+    "SELECT json_array(session_id, text) FROM messages ORDER BY session_id, rowid";
+/// Each session that holds messages, and whether its stored range runs from the smallest to the
+/// largest rowid of those messages.
+const RANGE_MATCHES_ROWIDS: &str = "SELECT json_array(s.session_id, \
+     s.message_rowid_lo = min(m.rowid) AND s.message_rowid_hi = max(m.rowid)) FROM sessions s \
+     JOIN messages m ON m.session_id = s.session_id GROUP BY s.session_id ORDER BY s.session_id";
+
+#[test]
+fn a_changed_log_loses_only_its_own_messages_inside_the_rowid_range_its_session_stores() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    let other = log.file.with_file_name("t.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, FRESHNESS_QUESTION, t0);
+    rewrite_with_mtime(
+        &other,
+        r#"{"type":"user","cwd":"/proj","message":{"role":"user","content":"other question"}}"#,
+        t0,
+    );
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    index_chunks(&mut conn).unwrap();
+    // The range of `s` now spans the message of `t` too, as the range the schema upgrade stores
+    // for a session whose messages an older recall did not write in one run.
+    conn.execute_batch(
+        "UPDATE sessions SET message_rowid_lo = (SELECT min(rowid) FROM messages),
+             message_rowid_hi = (SELECT max(rowid) FROM messages) WHERE session_id = 's'",
+    )
+    .unwrap();
+
+    rewrite_with_mtime(
+        &log.file,
+        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+        t0 + Duration::from_secs(10),
+    );
+    assert_eq!(
+        index_from_dirs(&mut conn, &log.opts(), true)
+            .unwrap()
+            .indexed,
+        1
+    );
+
+    assert_eq!(
+        collect_strings(&conn, MESSAGES_BY_SESSION),
+        [
+            r#"["s","original question"]"#,
+            r#"["s","appended answer"]"#,
+            r#"["t","other question"]"#
+        ]
+    );
+    assert_eq!(
+        collect_strings(&conn, RANGE_MATCHES_ROWIDS),
+        [r#"["s",1]"#, r#"["t",1]"#]
+    );
+}
+
+#[test]
+fn a_changed_log_whose_session_row_has_no_rowid_range_still_loses_its_old_messages() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, FRESHNESS_QUESTION, t0);
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    // An older recall rewrites a session row without the range.
+    conn.execute_batch("UPDATE sessions SET message_rowid_lo = NULL, message_rowid_hi = NULL")
+        .unwrap();
+
+    rewrite_with_mtime(
+        &log.file,
+        &format!("{FRESHNESS_QUESTION}{FRESHNESS_ANSWER}"),
+        t0 + Duration::from_secs(10),
+    );
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, MESSAGES_BY_SESSION),
+        [r#"["s","original question"]"#, r#"["s","appended answer"]"#]
+    );
+    assert_eq!(collect_strings(&conn, RANGE_MATCHES_ROWIDS), [r#"["s",1]"#]);
+}
+
+#[test]
+fn a_log_reduced_to_metadata_stores_an_empty_message_range() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("claude", "s.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, FRESHNESS_QUESTION, t0);
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    rewrite_with_mtime(
+        &log.file,
+        CLAUDE_METADATA_ONLY,
+        t0 + Duration::from_secs(10),
+    );
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert!(collect_strings(&conn, "SELECT text FROM messages").is_empty());
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(session_id, message_rowid_lo, message_rowid_hi) FROM sessions"
+        ),
+        [r#"["s",1,0]"#]
+    );
+}
+
+#[test]
+fn a_log_rewritten_under_another_session_id_loses_the_messages_of_the_session_it_held() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = OneLog::new("codex", "rollout-test.jsonl");
+    let t0 = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    rewrite_with_mtime(&log.file, SESSION_A_LOG, t0);
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+    rewrite_with_mtime(
+        &log.file,
+        concat!(
+            r#"{"type":"session_meta","payload":{"id":"session-b","source":"exec"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"role":"user","content":"other question"}}"#,
+        ),
+        t0 + Duration::from_secs(10),
+    );
+
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, MESSAGES_BY_SESSION),
+        [r#"["session-b","other question"]"#]
+    );
+    assert_eq!(
+        collect_strings(&conn, "SELECT session_id FROM sessions"),
+        ["session-b"]
+    );
+}
+
 const SESSION_A_LOG: &str = concat!(
     r#"{"type":"session_meta","payload":{"id":"session-a","source":"exec"}}"#,
     "\n",
