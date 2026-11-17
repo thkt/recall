@@ -541,6 +541,16 @@ fn is_valid_sql_identifier(value: &str) -> bool {
     head_ok && tail_ok
 }
 
+/// Selects the 25 most frequent terms from `?1` up to, not including, `?2`.
+fn vocab_lookup_sql(vocab_table: &str) -> String {
+    // fts5vocab narrows its scan by a range on `term`. A LIKE prefix reads every term instead.
+    format!(
+        "SELECT term FROM {vocab_table} \
+         WHERE term >= ?1 AND term < ?2 \
+         ORDER BY cnt DESC, term LIMIT 25"
+    )
+}
+
 pub(crate) fn fts_expand_short_terms(
     conn: &Connection,
     query: &SanitizedFtsQuery,
@@ -549,13 +559,7 @@ pub(crate) fn fts_expand_short_terms(
     if !is_valid_sql_identifier(vocab_table) {
         return Err(SanitizeError::InvalidVocabTable(vocab_table.to_owned()));
     }
-    // fts5vocab narrows its scan by a range on `term`. A LIKE prefix reads every term instead.
-    let sql = format!(
-        "SELECT term FROM {vocab_table} \
-         WHERE term >= ?1 AND term < ?2 \
-         ORDER BY cnt DESC, term LIMIT 25"
-    );
-    let mut stmt = match conn.prepare_cached(&sql) {
+    let mut stmt = match conn.prepare_cached(&vocab_lookup_sql(vocab_table)) {
         Ok(s) => Some(s),
         Err(e) if is_missing_table_error(&e) => None,
         Err(e) => return Err(SanitizeError::VocabLookupFailed(e.to_string())),
