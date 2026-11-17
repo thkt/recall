@@ -9,7 +9,7 @@ scope: "How the indexer deletes a session's rows in the messages FTS5 table (src
 
 ## Context and Problem Statement
 
-`messages` is an FTS5 table, and its `session_id` column is UNINDEXED: FTS5 keeps no index on it, so `DELETE FROM messages WHERE session_id = ?` reads every row (`SCAN messages VIRTUAL TABLE INDEX 0:`). The indexer ran that delete for every session it wrote. On a synthetic index of 6,000 sessions and 58,602 messages (73 MB of text, the coverage scale in `.claude/OUTCOME.md`), one delete took about 25 ms with a warm page cache and about 600 ms cold. The first `recall index` spent 81 s of its 83 s in the full-text transaction, and `recall rebuild`, which writes every present session again, spent 205 s of 208 s. How should the indexer find the messages of one session without reading the whole table?
+`messages` is an FTS5 table, and its `session_id` column is UNINDEXED: FTS5 keeps no index on it, so `DELETE FROM messages WHERE session_id = ?` reads every row (`SCAN messages VIRTUAL TABLE INDEX 0:`). The indexer ran that delete for every session it wrote. On a synthetic index of 6,000 sessions and 58,602 messages without embeddings (73 MB of text, the coverage scale in `.claude/OUTCOME.md`), one delete took about 25 ms with a warm page cache and about 600 ms cold. The first `recall index` spent 81 s of its 83 s in the full-text transaction, and `recall rebuild`, which writes every present session again, spent 205 s of 208 s. How should the indexer find the messages of one session without reading the whole table?
 
 ## Decision Drivers
 
@@ -32,7 +32,7 @@ Chosen option: "Store each session's message rowid range", because it is the onl
 
 `sessions` gains `message_rowid_lo` and `message_rowid_hi`. `upsert_session` records the smallest and the largest rowid it inserted for the session, or the empty range `(1, 0)` (`EMPTY_MESSAGE_RANGE`) for a session without messages. `delete_session_messages` (src/indexer.rs) reads the session row first:
 
-- No row: it deletes nothing. Every message belongs to a session row, as the next paragraph explains
+- No row: it deletes nothing, because no message outlives its session row. The upgrade deletes the messages that did, and every caller deletes the messages before the row
 - A range: it runs `DELETE FROM messages WHERE rowid BETWEEN lo AND hi AND session_id = ?`. FTS5 reads only the rows of that rowid range, and the `session_id` test keeps the rows of any other session inside it
 - A NULL range: it runs the full-read delete. A recall that predates the columns writes such a row, because its `INSERT OR REPLACE` leaves the two columns NULL
 
@@ -92,8 +92,6 @@ Collect the changed session ids during the run and delete their old messages in 
 - Bad, because the delete has to spare the rows the run just inserted for the same sessions, which needs a rowid bound taken before the run, and it moves every delete out of the per-session write
 
 ## More Information
-
-The measurements in Context come from a synthetic index generated in scratch space, with a release build and no model. The pull request on branch `perf/session-message-range` records the before and after runs.
 
 This record does not make an exception to DR 0004. The upgrade deletes only messages that no session row owns, never a session row, and the removal gate of `cleanup_orphans` is unchanged. DR 0017's tokenizer copy already drops such messages: it copies only the messages that belong to a session row.
 
