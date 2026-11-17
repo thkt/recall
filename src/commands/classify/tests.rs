@@ -1,5 +1,6 @@
 use std::fs;
 
+use crate::db;
 use crate::tests::printed_envelope;
 
 use super::*;

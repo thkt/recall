@@ -1604,6 +1604,44 @@ fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_th
     assert_eq!(outcome(recall(dir.path()).arg("status")), error);
 }
 
+#[cfg(unix)]
+#[test]
+fn status_of_a_stale_snapshot_built_for_another_model_lists_the_snapshot_note_before_the_identity_note()
+ {
+    let dir = TempDir::new().unwrap();
+    seed_indexed_session(dir.path());
+    let db = dir.path().join("recall.db");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE embedding_identity SET fingerprint = 'another model'",
+            [],
+        )
+        .unwrap();
+    let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
+    fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+    let _read_only = ReadOnlyDir::new(dir.path());
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    assert_eq!(
+        json_outcome(recall(dir.path()).args(["status", "--json"])),
+        (
+            Some(0),
+            serde_json::json!({
+                "data": status_of_one_session(),
+                "degraded": true,
+                "notes": [
+                    READ_ONLY_DIR_NOTE,
+                    "semantic search unavailable: index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest; results are text-only",
+                ],
+            }),
+            String::new()
+        )
+    );
+}
+
 #[test]
 fn text_search_and_status_print_the_notes_they_add_on_stderr() {
     let automated = TempDir::new().unwrap();

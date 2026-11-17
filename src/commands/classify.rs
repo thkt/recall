@@ -7,10 +7,11 @@ use std::time::SystemTime;
 use anyhow::Result;
 use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 
+use crate::commands::ReadIndex;
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser::Source;
-use crate::{ansi, classify, db, open_or_create_db, parser, resolve_db_path};
+use crate::{ansi, classify, open_or_create_db, parser, resolve_db_path};
 
 pub(crate) struct ClassifyOutcome {
     session_id: String,
@@ -293,11 +294,9 @@ pub(crate) fn run_classify(
     let path = resolve_db_path(db_path)?;
     let outcomes = if dry_run {
         if path.try_exists()? {
-            let (mut conn, tier) = db::open_db_readonly(&path)?;
-            if let Some(note) = db::stale_wal_note(&path, tier) {
-                return Err(RecallError::DatabaseRead(note).into());
-            }
-            reclassify_sessions(&mut conn, all, true)?
+            let mut index = ReadIndex::open(&path)?;
+            index.snapshot.refuse()?;
+            reclassify_sessions(&mut index.conn, all, true)?
         } else {
             Vec::new()
         }

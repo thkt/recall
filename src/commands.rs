@@ -3,9 +3,12 @@ use std::fmt;
 pub(crate) mod classify;
 pub(crate) mod doctor;
 pub(crate) mod index;
+mod read_index;
 pub(crate) mod search;
 pub(crate) mod show;
 pub(crate) mod status;
+
+pub(crate) use read_index::ReadIndex;
 
 /// `String` never fails a write, and the values formatted here only propagate
 /// the writer's error, so an `Err` would be a bug.

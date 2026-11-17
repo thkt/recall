@@ -6,18 +6,15 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Args;
 
-use crate::commands::build_markdown;
+use crate::commands::{ReadIndex, build_markdown};
 use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
 use crate::error::RecallError;
 use crate::model::{self, DegradedReason, EmbedderDegraded};
 use crate::parser::Source;
 use crate::runtime::{done, warning};
-use crate::{ansi, db, search};
-use crate::{
-    format_timestamp, require_current_schema_in_snapshot, resolve_db_path,
-    try_load_embedder_cached_with,
-};
+use crate::{ansi, search};
+use crate::{format_timestamp, resolve_db_path, try_load_embedder_cached_with};
 
 #[derive(Debug, Args)]
 pub(crate) struct SearchArgs {
@@ -88,16 +85,9 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
     }
 }
 
-/// `wal_note` says the sessions may sit in a write-ahead log this snapshot cannot read.
-fn search_idle_output(wal_note: Option<String>) -> CommandOutput {
+fn search_idle_output() -> CommandOutput {
     done("No sessions indexed. Run `recall index` first.");
-    let notes: Vec<Note> = wal_note.into_iter().map(Note::new).collect();
-    CommandOutput::with_notes(
-        String::new(),
-        serde_json::json!({ "results": [] }),
-        !notes.is_empty(),
-        notes,
-    )
+    CommandOutput::ok(String::new(), serde_json::json!({ "results": [] }))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -184,23 +174,22 @@ where
     let path = resolve_db_path(db_path)?;
 
     if !path.exists() {
-        return Ok(search_idle_output(None));
+        return Ok(search_idle_output());
     }
 
-    let (conn, tier) = db::open_db_readonly(&path)?;
-    let wal_note = db::stale_wal_note(&path, tier);
-    match db::schema_state(&conn)? {
-        db::SchemaState::Empty => return Ok(search_idle_output(wal_note)),
-        state => require_current_schema_in_snapshot(state, wal_note.as_deref())?,
+    let index = ReadIndex::open(&path)?;
+    if index.is_never_indexed()? {
+        return Ok(index.snapshot.finish(search_idle_output()));
     }
+    let conn = &index.conn;
 
     let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
     if session_count == 0 {
-        return Ok(search_idle_output(wal_note));
+        return Ok(index.snapshot.finish(search_idle_output()));
     }
 
     let identity_error = if query.is_some() {
-        model::check_index(&conn, model::selected()).err()
+        model::check_index(conn, model::selected()).err()
     } else {
         None
     };
@@ -231,7 +220,7 @@ where
         now_ms: None,
     };
     let outcome =
-        search::search_with_embedder(&conn, query.as_deref(), &options, embedder.as_deref())?;
+        search::search_with_embedder(conn, query.as_deref(), &options, embedder.as_deref())?;
     let results = outcome.results;
 
     if outcome.vec_degraded {
@@ -248,8 +237,7 @@ where
         ));
     }
 
-    let automated =
-        search::count_excluded_automated(&conn, query.as_deref(), &options).unwrap_or(0);
+    let automated = search::count_excluded_automated(conn, query.as_deref(), &options).unwrap_or(0);
     if automated > 0 {
         notes.push(Note::new(format!(
             "{automated} automated session(s) matching this search were excluded by default; use --include-automated to include them"
@@ -261,12 +249,9 @@ where
         "results": results.iter().map(result_to_json).collect::<Vec<_>>(),
     });
 
-    if let Some(note) = wal_note {
-        degraded = true;
-        notes.push(Note::new(note));
-    }
-
-    Ok(CommandOutput::with_notes(markdown, data, degraded, notes))
+    Ok(index
+        .snapshot
+        .finish(CommandOutput::with_notes(markdown, data, degraded, notes)))
 }
 
 fn extract_parent_session(file_path: &str) -> Option<&str> {
