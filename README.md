@@ -222,7 +222,7 @@ Claude message `sessionId` values must agree with the file's session ID or the p
 
 Automated sessions are excluded from ordinary search; `--include-automated` includes them. Classification does not delete messages, exclude files from indexing, or reduce embedding work. See the [provenance evidence and format limits](docs/research/session-provenance-classification.md).
 
-When reindexing a metadata-only log, records resolving to a different session ID leave the stored session unchanged and pending retry. Metadata for the same ID can update its classification; an empty log without session records still follows the existing empty-body indexing behavior.
+When reindexing a metadata-only log, records resolving to a different session ID leave the stored session unchanged and pending retry. Metadata for the same ID can update its classification; an empty log without session records still follows the existing empty-body indexing behavior. If another log took over a session ID earlier in the same run, the session stays with that log: a log rewritten under a new session ID and a log left without messages neither delete nor rewrite it, and the log left without messages counts as empty.
 
 For an existing index, preview with `recall classify --all --dry-run`, then apply with `recall classify --all`. Both dry-run modes open the DB read-only: they do not create the DB or parent directories, migrate the schema, or change stored data or existing file permissions. A missing DB returns zero classifications in the usual JSON envelope when `--json` is set.
 
