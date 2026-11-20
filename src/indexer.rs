@@ -212,9 +212,22 @@ fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletes `session_id` and everything stored for it. The messages go first, because their
-/// delete reads the range from the session row.
-fn delete_session(tx: &Transaction, session_id: &str) -> Result<()> {
+fn session_row_names_log(tx: &Transaction, session_id: &str, log: &str) -> Result<bool> {
+    tx.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND file_path = ?2)",
+    )?
+    .query_row([session_id, log], |r| r.get(0))
+    .map_err(Into::into)
+}
+
+/// Deletes `session_id` and everything stored for it while its session row still names
+/// `owner_log`. A log read earlier in the same run may have taken the session over, and its row
+/// then names that log. The messages go first, because their delete reads the range from the
+/// session row.
+fn delete_session(tx: &Transaction, session_id: &str, owner_log: &str) -> Result<()> {
+    if !session_row_names_log(tx, session_id, owner_log)? {
+        return Ok(());
+    }
     delete_session_dependents(tx, session_id)?;
     tx.execute("DELETE FROM sessions WHERE session_id = ?", [session_id])?;
     Ok(())
@@ -241,7 +254,7 @@ fn upsert_session(
     if let Some(entry) = cached
         && entry.session_id != *session_id
     {
-        delete_session(ctx.tx, &entry.session_id)?;
+        delete_session(ctx.tx, &entry.session_id, fpath_str)?;
     }
     if reuse {
         delete_session_messages(ctx.tx, session_id)?;
@@ -442,6 +455,9 @@ fn index_file_with_parser(
         }
         if parsed.origin.has_records && parsed.metadata.session_id != entry.session_id {
             return Ok(IndexOutcome::Failed);
+        }
+        if !session_row_names_log(ctx.tx, &entry.session_id, fpath_str)? {
+            return Ok(IndexOutcome::Empty);
         }
         parsed.metadata.session_id.clone_from(&entry.session_id);
     }
@@ -790,15 +806,7 @@ fn cleanup_orphans(
             continue;
         }
         if !source_paths.contains(Path::new(fp.as_str())) {
-            // A log read this run may have taken the session over; its row then names that log.
-            let still_this_log: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ? AND file_path = ?)",
-                rusqlite::params![entry.session_id, fp],
-                |r| r.get(0),
-            )?;
-            if still_this_log {
-                delete_session(tx, &entry.session_id)?;
-            }
+            delete_session(tx, &entry.session_id, fp)?;
         }
     }
     Ok(())

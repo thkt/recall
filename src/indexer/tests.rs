@@ -4962,6 +4962,84 @@ fn archived_root_whose_parent_cannot_be_searched_keeps_every_codex_session() {
     );
 }
 
+const SESSION_LOGS: &str =
+    "SELECT json_array(session_id, file_path) FROM sessions ORDER BY session_id";
+
+fn session_log(session_id: u8, log: &Path) -> String {
+    serde_json::json!([
+        format!("01900000-0000-7000-8000-0000000000{session_id:02}"),
+        log.to_str().unwrap()
+    ])
+    .to_string()
+}
+
+fn session_message(session_id: u8, text: &str) -> String {
+    serde_json::json!([
+        format!("01900000-0000-7000-8000-0000000000{session_id:02}"),
+        text
+    ])
+    .to_string()
+}
+
+#[test]
+fn a_log_rewritten_under_a_new_session_id_keeps_the_session_another_log_took_over_in_the_same_run()
+{
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let renamed = roots.archived.join("rollout-a.jsonl");
+    fs::write(&renamed, rollout_body(1, "first")).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    fs::write(&renamed, rollout_body(2, "renamed")).unwrap();
+    let heir = roots.day.join("rollout-b.jsonl");
+    fs::write(&heir, rollout_body(1, "inherited")).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, SESSION_LOGS),
+        [session_log(1, &heir), session_log(2, &renamed)]
+    );
+    assert_eq!(
+        collect_strings(&conn, MESSAGES_BY_SESSION),
+        [
+            session_message(1, "inherited question"),
+            session_message(2, "renamed question")
+        ]
+    );
+}
+
+#[test]
+fn a_log_reduced_to_metadata_counts_as_empty_and_keeps_the_session_another_log_took_over_in_the_same_run()
+ {
+    let (_db, mut conn) = setup_test_db();
+    let roots = CodexRoots::new();
+    let emptied = roots.archived.join("rollout-a.jsonl");
+    fs::write(&emptied, rollout_body(1, "first")).unwrap();
+    index_from_dirs(&mut conn, &roots.opts(), true).unwrap();
+
+    fs::write(&emptied, ROLLOUT_META).unwrap();
+    let heir = roots.day.join("rollout-b.jsonl");
+    fs::write(&heir, rollout_body(1, "inherited")).unwrap();
+    let observer = Observer::default();
+    let stats = index_from_dirs_observed(&mut conn, &roots.opts(), true, &observer).unwrap();
+
+    assert_eq!(
+        (
+            stats.indexed,
+            observer.snapshot()["counts"]["files_empty"].clone()
+        ),
+        (1, serde_json::json!(1))
+    );
+    assert_eq!(
+        collect_strings(&conn, SESSION_LOGS),
+        [session_log(1, &heir)]
+    );
+    assert_eq!(
+        collect_strings(&conn, MESSAGES_BY_SESSION),
+        [session_message(1, "inherited question")]
+    );
+}
+
 fn archived_dir_for(vars: &[(&str, &str)]) -> Option<PathBuf> {
     resolve_codex_archived_dir_with(Path::new("/fake/home"), |key| {
         vars.iter()
