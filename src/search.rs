@@ -958,29 +958,29 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
+    let found = match fts_query {
+        Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
+        None => KeywordSessions::default(),
+    };
 
     let run_hybrid = match embedder {
         Some(_) => match has_vec_data(conn) {
             Ok(has_data) => has_data,
             Err(e) => {
                 warn!(error = %e, "vec_chunks probe failed, using text search only");
-                return keyword_only_outcome(conn, fts_query, opts, now_ms, true);
+                return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
             }
         },
         None => false,
     };
 
     let Some(embedder) = embedder.filter(|_| run_hybrid) else {
-        return keyword_only_outcome(conn, fts_query, opts, now_ms, false);
+        return keyword_only_outcome(conn, fts_query, found, opts, now_ms, false);
     };
 
-    let found = match fts_query {
-        Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
-        None => KeywordSessions::default(),
-    };
     let incomplete = found.unreadable_rows;
 
-    let (vec_hits, vec_degraded) = match vec_search(
+    let vec_hits = match vec_search(
         conn,
         embedder,
         keyword.embed_text.as_deref().unwrap_or(query),
@@ -988,10 +988,10 @@ pub fn search_with_embedder<'q>(
         opts,
         now_ms,
     ) {
-        Ok(hits) => (hits, false),
+        Ok(hits) => hits,
         Err(e) => {
             warn!(error = %e, "vector search failed, using text search only");
-            (Vec::new(), true)
+            return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
         }
     };
 
@@ -1006,9 +1006,8 @@ pub fn search_with_embedder<'q>(
             .map(|hit| (hit.session_id.as_str(), hit.distance)),
     );
     let fts_ids: HashSet<&str> = found.order.iter().map(|(sid, _)| sid.as_str()).collect();
-    let not_filter_failed =
+    let vec_degraded =
         drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
-    let vec_degraded = vec_degraded || not_filter_failed;
 
     if merged.is_empty() {
         return Ok(SearchOutcome {
@@ -1092,18 +1091,11 @@ pub fn search_with_embedder<'q>(
 fn keyword_only_outcome(
     conn: &Connection,
     fts_query: Option<&str>,
+    found: KeywordSessions,
     opts: &SearchOptions,
     now_ms: i64,
     vec_degraded: bool,
 ) -> Result<SearchOutcome> {
-    let Some(q) = fts_query else {
-        return Ok(SearchOutcome {
-            results: Vec::new(),
-            vec_degraded,
-            results_incomplete: false,
-        });
-    };
-    let found = find_keyword_sessions(conn, opts, q, now_ms)?;
     let ranking = rank_sessions(found.ranked, now_ms, opts.limit);
     // bm25 ranks are negative and lower ranks first, so they are negated into
     // scores that rank higher first.
