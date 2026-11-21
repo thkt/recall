@@ -100,9 +100,9 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     )
     .unwrap();
     let counts = observer.snapshot()["counts"].clone();
-    assert_eq!(counts["chunks_saved"], 897);
-    assert_eq!(counts["chunks_failed"], 128);
-    assert_eq!(counts["chunks_remaining_snapshot"], 128);
+    assert_eq!(counts["chunks_saved"], 1024);
+    assert_eq!(counts["chunks_failed"], 1);
+    assert_eq!(counts["chunks_remaining_snapshot"], 1);
     assert_eq!(counts["chunks_unattempted"], 0);
     assert_eq!(counts["chunks_stale"], 0);
     assert!(
@@ -117,14 +117,14 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
             .iter()
             .filter(|line| line.contains("embedding_db_save: committed"))
             .count(),
-        8
+        15
     );
     assert_eq!(
-        first.embedded, 897,
-        "later batches and the next page still commit"
+        first.embedded, 1024,
+        "every chunk except the poison one commits, including its batch neighbours"
     );
 
-    assert_eq!(first.failed_count, 128);
+    assert_eq!(first.failed_count, 1);
     assert!(
         first
             .first_error
@@ -135,12 +135,12 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     let stored: i64 = conn
         .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(stored, 897, "a failed batch must not partially commit");
-    assert_eq!(pending_chunks(&conn, usize::MAX).unwrap().len(), 128);
+    assert_eq!(stored, 1024, "only the poison chunk is left unembedded");
+    assert_eq!(pending_chunks(&conn, usize::MAX).unwrap().len(), 1);
 
     assert_eq!(counts["pending_pages"], 2);
-    assert_eq!(counts["inference_chunks"], 1025);
-    assert_eq!(counts["inference_batches"], 9);
+    assert_eq!(counts["inference_chunks"], 1279);
+    assert_eq!(counts["inference_batches"], 23);
     let healthy = MockEmbedder::new();
     let second = embed_pending_observed(
         &mut conn,
@@ -151,8 +151,8 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     )
     .unwrap();
     assert_eq!(
-        second.embedded, 128,
-        "the previously failed batch embeds on the retry run"
+        second.embedded, 1,
+        "the previously failed chunk embeds on the retry run"
     );
     assert_eq!(second.failed_count, 0, "nothing fails on the healthy retry");
     let pending: i64 = conn
@@ -164,6 +164,59 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
         )
         .unwrap();
     assert_eq!(pending, 0, "no chunk is left behind after the retry");
+}
+
+fn vec_chunk_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn poison_chunks_in_both_halves_leave_the_whole_batch_failed_after_three_inferences() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
+
+    let poisoned = MockEmbedder::failing_on_texts(&["content_0001", "content_0128"]);
+    let (observer, _lines) = recording();
+    let result = embed_pending_observed(
+        &mut conn,
+        &poisoned,
+        None,
+        &EmbedOptions::default(),
+        &observer,
+    )
+    .unwrap();
+
+    assert_eq!(observer.snapshot()["counts"]["inference_batches"], 3);
+    assert_eq!(result.embedded, 0);
+    assert_eq!(result.failed_count, 128);
+    assert_eq!(vec_chunk_count(&conn), 0);
+}
+
+#[test]
+fn a_model_failing_every_inference_gives_up_on_a_full_batch_after_three_inferences() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 128, |id| format!("content_{id:04}"));
+
+    let broken = MockEmbedder::failing_after(0);
+    let (observer, _lines) = recording();
+    let result = embed_pending_observed(
+        &mut conn,
+        &broken,
+        None,
+        &EmbedOptions::default(),
+        &observer,
+    )
+    .unwrap();
+
+    assert_eq!(observer.snapshot()["counts"]["inference_batches"], 3);
+    assert_eq!(result.embedded, 0);
+    assert_eq!(result.failed_count, 128);
+    assert_eq!(
+        result.first_error.as_deref(),
+        Some("batch inference failed")
+    );
+    assert_eq!(vec_chunk_count(&conn), 0);
 }
 
 struct InterruptedEmbedder<F>(F);

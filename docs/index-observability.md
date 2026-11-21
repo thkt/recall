@@ -77,7 +77,7 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-
 - `chunks_matched_committed`：FTS更新で本文一致として維持したチャンク数。embedding未作成の一致チャンクも含む。
 - `embeddings_reused_committed`：上記のうち既存vectorを持つチャンク数。vectorのsub-chunk行数ではない。変更会話の照合だけを数え、無変更ファイル全体のembedding数は含めない。
 - `chunks_reconciled_created_committed` / `chunks_removed_committed`：照合で作成／除去したチャンク数。新規会話等の `chunks_created_committed` とは別の処理分である。強制再生成やorphan cleanupによる除去は含まない。これら4値はFTS commit後に確定し、失敗時には出さない。
-- `inference_batches` / `inference_chunks`：本番バッチ推論の呼出し回数／渡したチャンク数。失敗した呼出しも含み、モデルprobeは除く。内部のGPU forward数やtoken分割数ではない。
+- `inference_batches` / `inference_chunks`：本番バッチ推論の呼出し回数／渡したチャンク数。失敗した呼出しも含み、モデルprobeは除く。推論に失敗したバッチを半分に分けて推論し直した呼出しと、そこで渡したチャンクも含む。内部のGPU forward数やtoken分割数ではない。
 
 FTS commit後に停止しても、一致したベクトルと新しいrowid対応は残る。未処理部分は次のindexのpending抽出で再選択する。推論中の同時更新は #319 の本文・世代照合で保存を拒否する。一致するチャンクは世代を変えないため、その入力に対する進行中の推論結果は保存できる。正常終了の残件は `chunks_remaining_snapshot`、途中停止は最後のcommit通知と再開時の抽出で確認する。モデル不在・probe失敗時は #215 の保護を優先する。同時実行の保証には、全writerがこれらの保護を持つ版であることが必要である。
 

@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::compat::anon_placeholders;
-use crate::embedding::Embed;
 #[cfg(test)]
-use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS, EmbedError};
+use crate::embedding::EMBEDDING_DIMS;
+use crate::embedding::{ChunkedEmbedding, Embed, EmbedError};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Row, TransactionBehavior};
 use tracing::warn;
@@ -132,104 +132,163 @@ fn embed_page(
     observer: &Observer,
     progress: &mut EmbeddingProgress,
 ) {
+    let mut batch_embedder = BatchEmbedder {
+        conn,
+        embedder,
+        on_progress,
+        options,
+        observer,
+        progress,
+    };
     for batch in chunks.chunks(EMBED_BATCH_SIZE) {
+        let inferred = batch_embedder.infer(batch);
+        batch_embedder.progress.attempted += batch.len();
+        observer.count(
+            "chunks_unattempted",
+            batch_embedder.progress.total - batch_embedder.progress.attempted,
+        );
+        match inferred {
+            Ok(embeddings) => batch_embedder.save(batch, &embeddings),
+            Err(_) => batch_embedder.retry_halves(batch),
+        }
+        observer.embedding_progress();
+    }
+}
+
+struct BatchEmbedder<'a, 'p> {
+    conn: &'a mut Connection,
+    embedder: &'a dyn Embed,
+    on_progress: Option<&'a dyn Fn(usize, usize)>,
+    options: &'a EmbedOptions,
+    observer: &'a Observer,
+    progress: &'p mut EmbeddingProgress,
+}
+
+impl BatchEmbedder<'_, '_> {
+    fn infer(&mut self, batch: &[PendingChunk]) -> StdResult<Vec<ChunkedEmbedding>, EmbedError> {
         let texts: Vec<&str> = batch.iter().map(|chunk| chunk.content.as_str()).collect();
-        progress.batches += 1;
-        progress.inferred += batch.len();
-        observer.count("inference_batches", progress.batches);
-        observer.count("inference_chunks", progress.inferred);
-        let inference = observer.stage("inference");
-        let result = embedder.embed_documents_batch_with_options(&texts, options);
+        self.progress.batches += 1;
+        self.progress.inferred += batch.len();
+        self.observer
+            .count("inference_batches", self.progress.batches);
+        self.observer
+            .count("inference_chunks", self.progress.inferred);
+        let inference = self.observer.stage("inference");
+        let result = self
+            .embedder
+            .embed_documents_batch_with_options(&texts, self.options);
         inference.finish(if result.is_ok() {
             "complete; not saved"
         } else {
             "failed; not saved"
         });
-        progress.attempted += batch.len();
-        observer.count("chunks_unattempted", progress.total - progress.attempted);
-        match result {
-            Ok(embeddings) => {
-                // Inference ran without a write lock; validate generations before saving.
-                let save = observer.stage("embedding_db_save");
-                let saved: Result<usize> = (|| {
-                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    let mut current = Vec::new();
-                    {
-                        let mut check = tx.prepare_cached(
-                            "SELECT EXISTS(SELECT 1 FROM qa_chunks \
-                         WHERE id = ?1 AND content = ?2 AND generation = ?3)",
-                        )?;
-                        for (chunked, chunk) in embeddings.iter().zip(batch) {
-                            if check.query_row(
-                                rusqlite::params![chunk.id, chunk.content, chunk.generation],
-                                |row| row.get::<_, bool>(0),
-                            )? {
-                                current.push((chunked, chunk.id));
-                            }
-                        }
-                    }
-                    if current.is_empty() {
-                        return Ok(0);
-                    }
-                    let placeholders = anon_placeholders(current.len());
-                    tx.execute(
-                        &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
-                        rusqlite::params_from_iter(current.iter().map(|(_, id)| id)),
-                    )?;
-                    for (chunked, id) in &current {
-                        for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
-                            let embedding_bytes = f32_as_bytes(sub_emb);
-                            tx.execute(
-                                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
-                             VALUES (?1, ?2, ?3)",
-                                rusqlite::params![embedding_bytes, id, sub_idx as i64],
-                            )?;
-                        }
-                    }
-                    tx.commit()?;
-                    Ok(current.len())
-                })();
-                let saved = match saved {
-                    Ok(saved) => saved,
-                    Err(error) => {
-                        progress.save_failed += batch.len();
-                        observer.count("chunks_save_failed", progress.save_failed);
-                        if progress.first_save_error.is_none() {
-                            progress.first_save_error = Some(error);
-                        }
-                        save.finish("failed; batch rolled back");
-                        observer.embedding_progress();
-                        continue;
-                    }
-                };
-                progress.stale += batch.len() - saved;
-                progress.result.embedded += saved;
-                observer.count("chunks_stale", progress.stale);
-                observer.count("chunks_saved", progress.result.embedded);
-                observer.count(
-                    "chunks_remaining_snapshot",
-                    progress.total - progress.result.embedded,
-                );
-                save.finish(if saved == 0 {
-                    "no current results to save"
-                } else {
-                    "committed"
-                });
-                if saved > 0
-                    && let Some(cb) = &on_progress
-                {
-                    cb(progress.result.embedded, progress.total);
-                }
-            }
-            Err(_) => {
-                progress.result.failed_count += batch.len();
-                observer.count("chunks_failed", progress.result.failed_count);
-                if progress.result.first_error.is_none() {
-                    progress.result.first_error = Some("batch inference failed".to_owned());
-                }
+        result
+    }
+
+    fn retry_halves(&mut self, failed: &[PendingChunk]) {
+        if failed.len() < 2 {
+            self.record_failed(failed.len());
+            return;
+        }
+        let (front, back) = failed.split_at(failed.len() / 2);
+        let mut still_failing = Vec::new();
+        for half in [front, back] {
+            match self.infer(half) {
+                Ok(embeddings) => self.save(half, &embeddings),
+                Err(_) => still_failing.push(half),
             }
         }
-        observer.embedding_progress();
+        match still_failing.as_slice() {
+            [] => {}
+            [half] => self.retry_halves(half),
+            _ => self.record_failed(failed.len()),
+        }
+    }
+
+    fn record_failed(&mut self, count: usize) {
+        let result = &mut self.progress.result;
+        result.failed_count += count;
+        self.observer.count("chunks_failed", result.failed_count);
+        if result.first_error.is_none() {
+            result.first_error = Some("batch inference failed".to_owned());
+        }
+    }
+
+    fn save(&mut self, batch: &[PendingChunk], embeddings: &[ChunkedEmbedding]) {
+        let observer = self.observer;
+        let progress = &mut *self.progress;
+        // Inference ran without a write lock; validate generations before saving.
+        let save = observer.stage("embedding_db_save");
+        let saved: Result<usize> = (|| {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut current = Vec::new();
+            {
+                let mut check = tx.prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM qa_chunks \
+                 WHERE id = ?1 AND content = ?2 AND generation = ?3)",
+                )?;
+                for (chunked, chunk) in embeddings.iter().zip(batch) {
+                    if check.query_row(
+                        rusqlite::params![chunk.id, chunk.content, chunk.generation],
+                        |row| row.get::<_, bool>(0),
+                    )? {
+                        current.push((chunked, chunk.id));
+                    }
+                }
+            }
+            if current.is_empty() {
+                return Ok(0);
+            }
+            let placeholders = anon_placeholders(current.len());
+            tx.execute(
+                &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
+                rusqlite::params_from_iter(current.iter().map(|(_, id)| id)),
+            )?;
+            for (chunked, id) in &current {
+                for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
+                    let embedding_bytes = f32_as_bytes(sub_emb);
+                    tx.execute(
+                        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
+                     VALUES (?1, ?2, ?3)",
+                        rusqlite::params![embedding_bytes, id, sub_idx as i64],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(current.len())
+        })();
+        let saved = match saved {
+            Ok(saved) => saved,
+            Err(error) => {
+                progress.save_failed += batch.len();
+                observer.count("chunks_save_failed", progress.save_failed);
+                if progress.first_save_error.is_none() {
+                    progress.first_save_error = Some(error);
+                }
+                save.finish("failed; batch rolled back");
+                return;
+            }
+        };
+        progress.stale += batch.len() - saved;
+        progress.result.embedded += saved;
+        observer.count("chunks_stale", progress.stale);
+        observer.count("chunks_saved", progress.result.embedded);
+        observer.count(
+            "chunks_remaining_snapshot",
+            progress.total - progress.result.embedded,
+        );
+        save.finish(if saved == 0 {
+            "no current results to save"
+        } else {
+            "committed"
+        });
+        if saved > 0
+            && let Some(cb) = &self.on_progress
+        {
+            cb(progress.result.embedded, progress.total);
+        }
     }
 }
 
@@ -397,7 +456,7 @@ pub(crate) fn embed_recent_chunks(
 pub(crate) struct MockEmbedder {
     call_count: AtomicUsize,
     fail_after: Option<usize>,
-    fail_on_text: Option<String>,
+    fail_on_texts: Vec<String>,
     captured_options: Mutex<Vec<EmbedOptions>>,
 }
 
@@ -407,7 +466,7 @@ impl MockEmbedder {
         Self {
             call_count: AtomicUsize::new(0),
             fail_after: None,
-            fail_on_text: None,
+            fail_on_texts: Vec::new(),
             captured_options: Mutex::new(Vec::new()),
         }
     }
@@ -416,16 +475,20 @@ impl MockEmbedder {
         Self {
             call_count: AtomicUsize::new(0),
             fail_after: Some(n),
-            fail_on_text: None,
+            fail_on_texts: Vec::new(),
             captured_options: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn failing_on_text(text: &str) -> Self {
+        Self::failing_on_texts(&[text])
+    }
+
+    pub(crate) fn failing_on_texts(texts: &[&str]) -> Self {
         Self {
             call_count: AtomicUsize::new(0),
             fail_after: None,
-            fail_on_text: Some(text.to_owned()),
+            fail_on_texts: texts.iter().map(|text| (*text).to_owned()).collect(),
             captured_options: Mutex::new(Vec::new()),
         }
     }
@@ -488,8 +551,10 @@ impl Embed for MockEmbedder {
     }
 
     fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        if let Some(poison) = self.fail_on_text.as_deref()
-            && texts.contains(&poison)
+        if let Some(poison) = self
+            .fail_on_texts
+            .iter()
+            .find(|poison| texts.contains(&poison.as_str()))
         {
             return Err(Self::inference_error(format!("poison text: {poison}")));
         }
