@@ -2,7 +2,7 @@
   "repository": "thkt/recall",
   "remote": "origin",
   "baseBranch": "main",
-  "setup": [["cargo", "fetch", "--locked"]],
+  "setup": [["git", "submodule", "update", "--init", "--recursive"], ["cargo", "fetch", "--locked"]],
   "check": [
     "sh",
     "-ec",
