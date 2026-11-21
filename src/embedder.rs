@@ -5,11 +5,11 @@ use std::sync::Mutex;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::compat::anon_placeholders;
+use crate::db::{delete_chunk_vectors, is_contiguous_range};
 #[cfg(test)]
 use crate::embedding::EMBEDDING_DIMS;
 use crate::embedding::{ChunkedEmbedding, Embed, EmbedError};
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Row, TransactionBehavior};
 use tracing::warn;
 
@@ -226,36 +226,53 @@ impl BatchEmbedder<'_, '_> {
             let mut current = Vec::new();
             {
                 let mut check = tx.prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM qa_chunks \
-                 WHERE id = ?1 AND content = ?2 AND generation = ?3)",
+                    "SELECT vec_rowid_lo, vec_rowid_hi FROM qa_chunks \
+                 WHERE id = ?1 AND content = ?2 AND generation = ?3",
                 )?;
                 for (chunked, chunk) in embeddings.iter().zip(batch) {
-                    if check.query_row(
-                        rusqlite::params![chunk.id, chunk.content, chunk.generation],
-                        |row| row.get::<_, bool>(0),
-                    )? {
-                        current.push((chunked, chunk.id));
+                    if let Some(recorded) = check
+                        .query_row(
+                            rusqlite::params![chunk.id, chunk.content, chunk.generation],
+                            |row| {
+                                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?))
+                            },
+                        )
+                        .optional()?
+                    {
+                        current.push((chunked, chunk.id, recorded));
                     }
                 }
             }
             if current.is_empty() {
                 return Ok(0);
             }
-            let placeholders = anon_placeholders(current.len());
-            tx.execute(
-                &format!("DELETE FROM vec_chunks WHERE chunk_id IN ({placeholders})"),
-                rusqlite::params_from_iter(current.iter().map(|(_, id)| id)),
-            )?;
-            for (chunked, id) in &current {
-                for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
-                    let embedding_bytes = f32_as_bytes(sub_emb);
-                    tx.execute(
-                        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) \
-                     VALUES (?1, ?2, ?3)",
-                        rusqlite::params![embedding_bytes, id, sub_idx as i64],
-                    )?;
+            for (_, id, recorded) in &current {
+                if let (Some(lo), Some(hi)) = *recorded {
+                    delete_chunk_vectors(&tx, *id, lo, hi)?;
                 }
             }
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut record = tx.prepare_cached(
+                "UPDATE qa_chunks SET vec_rowid_lo = ?1, vec_rowid_hi = ?2 WHERE id = ?3",
+            )?;
+            for (chunked, id, _) in &current {
+                let mut range: Option<(i64, i64)> = None;
+                for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
+                    insert.execute(rusqlite::params![f32_as_bytes(sub_emb), id, sub_idx as i64])?;
+                    let rowid = tx.last_insert_rowid();
+                    range = Some(range.map_or((rowid, rowid), |(lo, _)| (lo, rowid)));
+                }
+                let Some((lo, hi)) = range else { continue };
+                ensure!(
+                    is_contiguous_range(lo, hi, chunked.chunks().len()),
+                    "embeddings of chunk {id} received rowids {lo}..={hi} that are not consecutive"
+                );
+                record.execute(rusqlite::params![lo, hi, id])?;
+            }
+            drop(insert);
+            drop(record);
             tx.commit()?;
             Ok(current.len())
         })();
@@ -458,6 +475,7 @@ pub(crate) struct MockEmbedder {
     fail_after: Option<usize>,
     fail_on_texts: Vec<String>,
     captured_options: Mutex<Vec<EmbedOptions>>,
+    vectors_per_text: usize,
 }
 
 #[cfg(test)]
@@ -468,6 +486,7 @@ impl MockEmbedder {
             fail_after: None,
             fail_on_texts: Vec::new(),
             captured_options: Mutex::new(Vec::new()),
+            vectors_per_text: 1,
         }
     }
 
@@ -477,6 +496,7 @@ impl MockEmbedder {
             fail_after: Some(n),
             fail_on_texts: Vec::new(),
             captured_options: Mutex::new(Vec::new()),
+            vectors_per_text: 1,
         }
     }
 
@@ -490,11 +510,19 @@ impl MockEmbedder {
             fail_after: None,
             fail_on_texts: texts.iter().map(|text| (*text).to_owned()).collect(),
             captured_options: Mutex::new(Vec::new()),
+            vectors_per_text: 1,
         }
     }
 
     pub(crate) fn capturing_options() -> Self {
         Self::new()
+    }
+
+    pub(crate) fn with_vectors_per_text(vectors_per_text: usize) -> Self {
+        Self {
+            vectors_per_text,
+            ..Self::new()
+        }
     }
 
     pub(crate) fn calls(&self) -> usize {
@@ -547,7 +575,14 @@ impl Embed for MockEmbedder {
         if self.fail_after.is_some_and(|limit| count >= limit) {
             return Err(Self::inference_error("mock failure".to_owned()));
         }
-        ChunkedEmbedding::try_new(vec![Self::deterministic_vector(text)])
+        ChunkedEmbedding::try_new(
+            (0..self.vectors_per_text)
+                .map(|sub_idx| match sub_idx {
+                    0 => Self::deterministic_vector(text),
+                    _ => Self::deterministic_vector(&format!("{text}#{sub_idx}")),
+                })
+                .collect(),
+        )
     }
 
     fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {

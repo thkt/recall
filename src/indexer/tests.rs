@@ -3,7 +3,9 @@ use std::time::{Duration, SystemTime};
 
 use super::*;
 use crate::commands::classify::reclassify_sessions;
-use crate::db::{collect_strings, open_db, seed_session, seed_session_file, setup_test_db};
+use crate::db::{
+    collect_strings, open_db, seed_chunk_vector, seed_session, seed_session_file, setup_test_db,
+};
 use crate::embedder::{
     EmbedOptions, MockEmbedder, embed_pending_observed, embed_recent_chunks, f32_as_bytes,
 };
@@ -2282,11 +2284,7 @@ fn seed_legacy_chunk(conn: &Connection, id: i64, content: &str) {
     )
     .unwrap();
     let embedding = MockEmbedder::deterministic_vector(content);
-    conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-        rusqlite::params![id, f32_as_bytes(&embedding)],
-    )
-    .unwrap();
+    seed_chunk_vector(conn, id, 0, f32_as_bytes(&embedding));
 }
 
 #[test]
@@ -4006,9 +4004,10 @@ fn truncating_a_log_keeps_the_vector_of_the_remaining_chunk_and_infers_nothing()
 fn truncating_to_a_duplicated_turn_keeps_the_copy_that_has_a_vector() {
     let (_db_dir, mut conn) = setup_test_db();
     let log = embedded_reuse_conversation(&mut conn);
-    conn.execute(
-        "DELETE FROM vec_chunks WHERE chunk_id = (SELECT min(id) FROM qa_chunks)",
-        [],
+    conn.execute_batch(
+        "DELETE FROM vec_chunks WHERE chunk_id = (SELECT min(id) FROM qa_chunks);
+         UPDATE qa_chunks SET vec_rowid_lo = NULL, vec_rowid_hi = NULL
+         WHERE id = (SELECT min(id) FROM qa_chunks);",
     )
     .unwrap();
     let before = vector_rows(&conn);
@@ -4347,11 +4346,7 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
         )
         .unwrap();
     let bytes = f32_as_bytes(&MockEmbedder::deterministic_vector("stable\nanswer")).to_vec();
-    conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (?1, 0, ?2)",
-        rusqlite::params![stable, bytes],
-    )
-    .unwrap();
+    seed_chunk_vector(&conn, stable, 0, &bytes);
     let before = chunk_vectors(&conn);
     write_reuse_conversation(
         &path,
@@ -5072,5 +5067,78 @@ fn codex_archived_dir_defaults_under_home_unless_only_the_sessions_dir_is_overri
     assert_eq!(
         resolve(&[("RECALL_CODEX_ARCHIVED_DIR", "/tmp/archived")]),
         Some(PathBuf::from("/tmp/archived"))
+    );
+}
+
+const SESSION_VECTORS: &str = "SELECT json_array(c.session_id, c.id, c.vec_rowid_lo, c.vec_rowid_hi, v.rowid, v.sub_idx) \
+     FROM vec_chunks v LEFT JOIN qa_chunks c ON c.id = v.chunk_id ORDER BY v.rowid";
+
+fn session_vectors(conn: &Connection, session_id: &str) -> Vec<String> {
+    collect_strings(conn, SESSION_VECTORS)
+        .into_iter()
+        .filter(|row| row.starts_with(&format!("[\"{session_id}\",")))
+        .collect()
+}
+
+fn two_logs_with_two_vectors_per_chunk(conn: &mut Connection) -> OneLog {
+    let log = OneLog::new("claude", "a.jsonl");
+    write_reuse_conversation(
+        &log.file,
+        &[("user", "a question"), ("assistant", "a answer")],
+    );
+    write_reuse_conversation(
+        &log.claude.join("b.jsonl"),
+        &[
+            ("user", "b question"),
+            ("assistant", "b answer"),
+            ("user", "b follow-up"),
+            ("assistant", "b second answer"),
+        ],
+    );
+    assert_eq!(index_from_dirs(conn, &log.opts(), true).unwrap().indexed, 2);
+    index_chunks(conn).unwrap();
+    assert_eq!(
+        embed_recent_chunks(conn, &MockEmbedder::with_vectors_per_text(2), 100, None)
+            .unwrap()
+            .embedded,
+        3
+    );
+    log
+}
+
+#[test]
+fn deleting_a_session_removes_every_vector_of_its_chunks_and_keeps_the_other_sessions_vectors() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = two_logs_with_two_vectors_per_chunk(&mut conn);
+    assert_eq!(session_vectors(&conn, "a").len(), 2);
+    let b_before = session_vectors(&conn, "b");
+    assert_eq!(b_before.len(), 4);
+
+    fs::remove_file(&log.file).unwrap();
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert_eq!(collect_strings(&conn, SESSION_VECTORS), b_before);
+}
+
+#[test]
+fn deleting_a_session_whose_chunk_records_another_chunks_vector_range_keeps_that_vector() {
+    let (_db_dir, mut conn) = setup_test_db();
+    let log = two_logs_with_two_vectors_per_chunk(&mut conn);
+    conn.execute(
+        "UPDATE qa_chunks SET (vec_rowid_lo, vec_rowid_hi) = \
+         (SELECT min(vec_rowid_lo), max(vec_rowid_hi) FROM qa_chunks WHERE session_id = 'b') \
+         WHERE session_id = 'a'",
+        [],
+    )
+    .unwrap();
+    let b_before = session_vectors(&conn, "b");
+
+    fs::remove_file(&log.file).unwrap();
+    index_from_dirs(&mut conn, &log.opts(), true).unwrap();
+
+    assert_eq!(session_vectors(&conn, "b"), b_before);
+    assert_eq!(
+        collect_strings(&conn, "SELECT DISTINCT session_id FROM qa_chunks"),
+        ["b"]
     );
 }

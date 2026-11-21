@@ -1,5 +1,5 @@
 use super::*;
-use crate::embedder::f32_as_bytes;
+use crate::embedder::{f32_as_bytes, pending_count};
 use tempfile::NamedTempFile;
 
 #[path = "../../tests/support/stale_snapshot_note.rs"]
@@ -445,6 +445,8 @@ fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
             "src_rowid_lo",
             "src_rowid_hi",
             "generation",
+            "vec_rowid_lo",
+            "vec_rowid_hi",
         ]
     );
     assert_eq!(chunks, [r#"[1,"s1","q\na",0,null,null,0]"#]);
@@ -1138,5 +1140,124 @@ fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
             vec![r#"["s","claude","/f","/p","slug",0,456.0,42,null,null,null]"#.to_owned()],
             vec![r#"["/s.jsonl","claude",2,0,0,0]"#.to_owned()]
         )
+    );
+}
+
+#[test]
+fn deleting_one_chunk_vector_reads_only_the_row_with_that_rowid() {
+    let (_dir, conn) = setup_test_db();
+
+    let plan: Vec<String> = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {DELETE_CHUNK_VECTOR}"))
+        .unwrap()
+        .query_map([1, 1], |r| r.get("detail"))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert!(
+        plan.iter()
+            .any(|d| d.contains("vec_chunks VIRTUAL TABLE INDEX")),
+        "{plan:?}"
+    );
+    assert!(!plan.iter().any(|d| d.contains("INDEX 0:")), "{plan:?}");
+}
+
+const VECTOR_RANGES: &str =
+    "SELECT json_array(id, vec_rowid_lo, vec_rowid_hi) FROM qa_chunks ORDER BY id";
+
+#[test]
+fn upgrading_an_index_without_vector_ranges_stores_each_range_and_returns_gapped_chunks_to_inference()
+ {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    seed_session(&conn, "s1");
+    for (id, content) in [
+        (1, "two vectors"),
+        (2, "split vectors"),
+        (3, "between"),
+        (4, "inside the orphan"),
+    ] {
+        seed_chunk(&conn, id, content);
+    }
+    let emb = f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec();
+    for (rowid, chunk_id, sub_idx) in [
+        (1, 1, 0),
+        (2, 1, 1),
+        (3, 2, 0),
+        (4, 3, 0),
+        (5, 2, 1),
+        (6, 99, 0),
+        (7, 4, 0),
+        (8, 99, 1),
+    ] {
+        conn.execute(
+            "INSERT INTO vec_chunks (rowid, chunk_id, sub_idx, embedding) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![rowid, chunk_id, sub_idx, emb],
+        )
+        .unwrap();
+    }
+    conn.execute_batch(
+        "ALTER TABLE qa_chunks DROP COLUMN vec_rowid_lo;
+         ALTER TABLE qa_chunks DROP COLUMN vec_rowid_hi;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, VECTOR_RANGES),
+        ["[1,1,2]", "[2,null,null]", "[3,4,4]", "[4,7,7]"]
+    );
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT json_array(rowid, chunk_id) FROM vec_chunks ORDER BY rowid"
+        ),
+        ["[1,1]", "[2,1]", "[4,3]", "[6,99]", "[7,4]", "[8,99]"]
+    );
+    assert_eq!(pending_count(&conn).unwrap(), 1);
+    let (schema, ranges, vectors) = (
+        schema_snapshot(&conn),
+        collect_strings(&conn, VECTOR_RANGES),
+        embeddings(&conn),
+    );
+    drop(conn);
+
+    let reopened = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        (
+            schema_snapshot(&reopened),
+            collect_strings(&reopened, VECTOR_RANGES),
+            embeddings(&reopened)
+        ),
+        (schema, ranges, vectors)
+    );
+}
+
+#[test]
+fn rebuilding_the_vector_table_without_a_sub_index_clears_every_stored_vector_range() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    seed_session(&conn, "s1");
+    seed_chunk(&conn, 1, "embedded before");
+    seed_chunk(&conn, 2, "also embedded");
+    conn.execute_batch(&format!(
+        "UPDATE qa_chunks SET vec_rowid_lo = id, vec_rowid_hi = id;
+         DROP TABLE vec_chunks;
+         CREATE VIRTUAL TABLE vec_chunks USING vec0(
+             embedding FLOAT[{EMBEDDING_DIMS}], {VEC_NO_SUB}
+         );"
+    ))
+    .unwrap();
+    drop(conn);
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, VECTOR_RANGES),
+        ["[1,null,null]", "[2,null,null]"]
     );
 }

@@ -35,7 +35,7 @@ use tracing::{debug, info};
 use crate::chunker;
 
 use crate::classify::classify_session;
-use crate::db::EMPTY_MESSAGE_RANGE;
+use crate::db::{EMPTY_MESSAGE_RANGE, delete_recorded_vectors};
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
@@ -200,10 +200,7 @@ fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
 /// the session row.
 fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     delete_session_messages(tx, session_id)?;
-    tx.execute(
-        "DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)",
-        [session_id],
-    )?;
+    delete_recorded_vectors(tx, session_id, "")?;
     tx.execute("DELETE FROM qa_chunks WHERE session_id = ?", [session_id])?;
     tx.execute(
         "DELETE FROM session_files WHERE session_id = ?",
@@ -345,7 +342,9 @@ fn reconcile_chunks(
     let embedded: HashSet<i64> = if known_unembedded {
         HashSet::new()
     } else {
-        let mut stmt = tx.prepare_cached("SELECT DISTINCT chunk_id FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ?)")?;
+        let mut stmt = tx.prepare_cached(
+            "SELECT id FROM qa_chunks WHERE session_id = ? AND vec_rowid_lo IS NOT NULL",
+        )?;
         stmt.query_map([session_id], |r| r.get(0))?
             .collect::<StdResult<_, _>>()?
     };
@@ -384,7 +383,7 @@ fn reconcile_chunks(
     }
     if stored.values().any(|ids| !ids.is_empty()) {
         if stored.values().flatten().any(|id| embedded.contains(id)) {
-            tx.execute("DELETE FROM vec_chunks WHERE chunk_id IN (SELECT id FROM qa_chunks WHERE session_id = ? AND src_rowid_lo IS NULL)", [session_id])?;
+            delete_recorded_vectors(tx, session_id, " AND src_rowid_lo IS NULL")?;
         }
         stats.removed = tx.execute(
             "DELETE FROM qa_chunks WHERE session_id = ? AND src_rowid_lo IS NULL",
