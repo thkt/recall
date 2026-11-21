@@ -1655,6 +1655,34 @@ fn a_failing_vector_leg_falls_back_to_text_matches_and_flags_degraded() {
 }
 
 #[test]
+fn a_failing_vector_leg_ranks_text_matches_as_a_search_without_a_model_does() {
+    let repeated = "authentication authentication authentication";
+    let mentioned_once = "authentication came up once in a long discussion about deployment \
+         pipelines, database migrations, release notes, dashboard layouts, and onboarding \
+         checklists for the next quarter";
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "old", "claude", "/proj", NOW_MS - 365 * MS_PER_DAY);
+    insert_message(&conn, "old", "user", repeated);
+    insert_chunk(&conn, 1, "old", repeated);
+    insert_session(&conn, "new", "claude", "/proj", NOW_MS - MS_PER_DAY);
+    insert_message(&conn, "new", "user", mentioned_once);
+    insert_chunk(&conn, 2, "new", mentioned_once);
+
+    let without_model = search_with_embedder(&conn, "authentication", &at_now(), None).unwrap();
+    let failed_vector_leg = search_with_embedder(
+        &conn,
+        "authentication",
+        &at_now(),
+        Some(&MockEmbedder::failing_after(0)),
+    )
+    .unwrap();
+
+    assert_eq!(ids(&without_model.results), ["old", "new"]);
+    assert_eq!(ids(&failed_vector_leg.results), ids(&without_model.results));
+    assert!(failed_vector_leg.vec_degraded);
+}
+
+#[test]
 fn a_failing_vector_leg_flags_degraded_even_with_no_text_match() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
@@ -1750,6 +1778,26 @@ fn hybrid_search_drops_an_unknown_source_and_flags_incomplete_only() {
     .unwrap();
 
     assert_eq!(ids(&outcome.results), ["s1"]);
+    assert!(!outcome.vec_degraded);
+    assert!(outcome.results_incomplete);
+}
+
+#[test]
+fn hybrid_search_flags_incomplete_when_every_match_is_an_unknown_source() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "weird", "gemini", "/proj", NOW_MS);
+    insert_message(&conn, "weird", "user", "authentication flow design");
+    insert_chunk(&conn, 1, "weird", "authentication flow");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &at_now(),
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), NONE);
     assert!(!outcome.vec_degraded);
     assert!(outcome.results_incomplete);
 }
