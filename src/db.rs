@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -254,7 +255,9 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             timestamp INTEGER,
             src_rowid_lo INTEGER,
             src_rowid_hi INTEGER,
-            generation INTEGER NOT NULL DEFAULT 0
+            generation INTEGER NOT NULL DEFAULT 0,
+            vec_rowid_lo INTEGER,
+            vec_rowid_hi INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);",
     )?;
@@ -273,6 +276,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     migrate_chunks_indexed_if_needed(conn)?;
     migrate_message_rowid_range_if_needed(conn)?;
+    migrate_vector_rowid_range_if_needed(conn)?;
 
     Ok(())
 }
@@ -362,6 +366,12 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
     if !sql.contains("sub_idx") {
         let tx = conn.transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
+        if table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("vec_rowid_lo")) {
+            tx.execute(
+                "UPDATE qa_chunks SET vec_rowid_lo = NULL, vec_rowid_hi = NULL",
+                [],
+            )?;
+        }
         tx.commit()?;
     }
 
@@ -473,6 +483,89 @@ fn migrate_message_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const DELETE_CHUNK_VECTOR: &str =
+    "DELETE FROM vec_chunks WHERE rowid = ?1 AND chunk_id = ?2";
+
+pub(crate) fn delete_chunk_vectors(
+    conn: &Connection,
+    chunk_id: i64,
+    lo: i64,
+    hi: i64,
+) -> Result<()> {
+    let mut delete = conn.prepare_cached(DELETE_CHUNK_VECTOR)?;
+    for rowid in lo..=hi {
+        delete.execute(rusqlite::params![rowid, chunk_id])?;
+    }
+    Ok(())
+}
+
+pub(crate) fn delete_recorded_vectors(
+    conn: &Connection,
+    session_id: &str,
+    filter: &str,
+) -> Result<()> {
+    let ranges: Vec<(i64, i64, i64)> = conn
+        .prepare_cached(&format!(
+            "SELECT id, vec_rowid_lo, vec_rowid_hi FROM qa_chunks \
+             WHERE session_id = ?1 AND vec_rowid_lo IS NOT NULL{filter}"
+        ))?
+        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (chunk_id, lo, hi) in ranges {
+        delete_chunk_vectors(conn, chunk_id, lo, hi)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn is_contiguous_range(lo: i64, hi: i64, count: usize) -> bool {
+    hi.checked_sub(lo)
+        .and_then(|span| span.checked_add(1))
+        .and_then(|len| usize::try_from(len).ok())
+        == Some(count)
+}
+
+fn migrate_vector_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if table_def(&tx, "qa_chunks")?.is_some_and(|sql| !sql.contains("vec_rowid_lo")) {
+        info("recall: recording where each chunk's embeddings are stored; this runs once");
+        tx.execute_batch(
+            "ALTER TABLE qa_chunks ADD COLUMN vec_rowid_lo INTEGER;
+             ALTER TABLE qa_chunks ADD COLUMN vec_rowid_hi INTEGER;",
+        )?;
+        let mut rowids: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        {
+            let mut stmt = tx.prepare("SELECT rowid, chunk_id FROM vec_chunks")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (rowid, chunk_id) = row?;
+                rowids.entry(chunk_id).or_default().push(rowid);
+            }
+        }
+        let mut chunk_exists =
+            tx.prepare("SELECT EXISTS(SELECT 1 FROM qa_chunks WHERE id = ?1)")?;
+        let mut record =
+            tx.prepare("UPDATE qa_chunks SET vec_rowid_lo = ?1, vec_rowid_hi = ?2 WHERE id = ?3")?;
+        let mut delete = tx.prepare(DELETE_CHUNK_VECTOR)?;
+        for (chunk_id, rowids) in rowids {
+            if !chunk_exists.query_row([chunk_id], |r| r.get::<_, bool>(0))? {
+                continue;
+            }
+            let (Some(&lo), Some(&hi)) = (rowids.iter().min(), rowids.iter().max()) else {
+                continue;
+            };
+            if is_contiguous_range(lo, hi, rowids.len()) {
+                record.execute(rusqlite::params![lo, hi, chunk_id])?;
+            } else {
+                for rowid in rowids {
+                    delete.execute(rusqlite::params![rowid, chunk_id])?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Moves a `messages` table built with an older tokenizer onto `FTS_TOKENIZER` by copying every
 /// row, rowid included, into a new table. Sessions, chunks and the chunks' message rowid ranges
 /// (DR 0005) stay, so the sessions of a missing or unreadable root are not lost (DR 0017).
@@ -562,6 +655,21 @@ pub(crate) fn seed_chunk(conn: &Connection, id: i64, content: &str) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, 's1', ?2, 0)",
         rusqlite::params![id, content],
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn seed_chunk_vector(conn: &Connection, chunk_id: i64, sub_idx: i64, embedding: &[u8]) {
+    conn.execute(
+        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (?1, ?2, ?3)",
+        rusqlite::params![chunk_id, sub_idx, embedding],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE qa_chunks SET vec_rowid_lo = coalesce(vec_rowid_lo, ?1), vec_rowid_hi = ?1 \
+         WHERE id = ?2",
+        rusqlite::params![conn.last_insert_rowid(), chunk_id],
     )
     .unwrap();
 }

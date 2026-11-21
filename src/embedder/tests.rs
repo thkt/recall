@@ -781,3 +781,59 @@ fn later_pages_reject_replaced_and_deleted_generations_without_loading_new_bodie
     assert_eq!((rows, distinct), (1027, 1027));
     assert_vectors_match_current_content(&conn);
 }
+
+#[test]
+fn saving_a_changed_chunk_again_replaces_all_its_old_vectors_and_records_the_new_rowids() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_chunks(&conn, 2, |id| format!("content {id}"));
+    let first = pending_chunks(&conn, usize::MAX).unwrap();
+    embed_chunks(
+        &mut conn,
+        &MockEmbedder::with_vectors_per_text(2),
+        &first,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
+    conn.execute("UPDATE qa_chunks SET content = 'changed' WHERE id = 1", [])
+        .unwrap();
+    let changed = conn
+        .query_row(
+            "SELECT id, generation, content FROM qa_chunks WHERE id = 1",
+            [],
+            |r| {
+                Ok(PendingChunk {
+                    id: r.get(0)?,
+                    generation: r.get(1)?,
+                    content: r.get(2)?,
+                })
+            },
+        )
+        .unwrap();
+
+    let saved = embed_chunks(
+        &mut conn,
+        &MockEmbedder::with_vectors_per_text(3),
+        &[changed],
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(saved.embedded, 1);
+    let rows = |sql: &str| -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    assert_eq!(
+        rows("SELECT json_array(rowid, chunk_id, sub_idx) FROM vec_chunks ORDER BY rowid"),
+        ["[3,2,0]", "[4,2,1]", "[5,1,0]", "[6,1,1]", "[7,1,2]"]
+    );
+    assert_eq!(
+        rows("SELECT json_array(id, vec_rowid_lo, vec_rowid_hi) FROM qa_chunks ORDER BY id"),
+        ["[1,5,7]", "[2,3,4]"]
+    );
+}
