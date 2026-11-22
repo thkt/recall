@@ -133,6 +133,12 @@ fn a_two_character_cjk_word_expands_to_the_trigrams_that_start_with_it() {
     assert_eq!(expand_in(&conn, "設定"), r#"("設定を")"#);
 }
 
+#[test]
+fn a_short_word_expands_to_no_term_whose_next_character_is_the_last_unicode_scalar() {
+    let (_dir, conn) = index_with_messages(&["xaby", "xab\u{10FFFF}"]);
+    assert_eq!(expand_in(&conn, "ab"), r#"("aby")"#);
+}
+
 const FTS5_VOCAB_TERM_GE: u32 = 0x0200;
 const FTS5_VOCAB_TERM_LE: u32 = 0x0400;
 
@@ -565,4 +571,25 @@ fn operator_query_renders_a_chain_of_100_000_nots_without_overflowing_the_stack(
     let rendered = operator(&query);
 
     assert_eq!(rendered.not_operands.len(), 100_000);
+}
+
+#[test]
+fn the_sanitizer_the_expansion_and_the_operator_query_all_end_an_unclosed_phrase_at_the_query_end()
+{
+    let conn = setup_fts_db();
+
+    assert_eq!(
+        sanitize_fts_query("alpha \"beta gamma"),
+        ok("alpha \"beta gamma\"")
+    );
+    assert_eq!(
+        prepare_match_query(&conn, "alpha \"beta gamma", "fts_chunks_vocab")
+            .unwrap()
+            .as_str(),
+        "\"alpha\" AND \"beta gamma\""
+    );
+    assert_eq!(
+        operator("alpha AND \"beta gamma").match_query.as_deref(),
+        Some("(\"alpha\" AND \"beta gamma\")")
+    );
 }

@@ -570,8 +570,6 @@ fn search_whose_vector_query_fails_prints_a_text_only_note_to_a_text_reader_with
 
 #[test]
 fn run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results() {
-    // "weird" has an unknown source and a much longer message, so even the
-    // largest recency boost leaves it below "s1" at a limit of one.
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
@@ -615,7 +613,8 @@ fn run_search_is_not_degraded_when_a_skipped_session_could_not_reach_the_results
             "    > **authentication**\n",
             "    inspect: recall show s1\n",
             "\n",
-        )
+        ),
+        "\"weird\" has an unknown source and a much longer message, so even the largest recency boost leaves it below \"s1\""
     );
     assert_eq!(
         printed_envelope(&out),

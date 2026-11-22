@@ -50,9 +50,11 @@ fn lowercase_and_or_not_in_a_query_are_matched_as_ordinary_words() {
 
     assert_eq!(matched_sessions(&conn, "tokio and async"), ["with-and"]);
     assert_eq!(matched_sessions(&conn, "do not panic"), ["with-not"]);
-    // "or" is under 3 characters, so it is dropped like any other short word
-    // and both messages match on the remaining words.
-    assert_eq!(matched_sessions(&conn, "red or blue"), ["no-or", "with-or"]);
+    let or_too_short_for_a_trigram_is_dropped = "red or blue";
+    assert_eq!(
+        matched_sessions(&conn, or_too_short_for_a_trigram_is_dropped),
+        ["no-or", "with-or"]
+    );
 }
 
 #[test]
@@ -108,14 +110,16 @@ fn a_term_with_colons_finds_the_message_containing_it() {
 
 #[test]
 fn a_term_shaped_like_a_column_filter_finds_only_the_message_containing_it() {
-    // Both messages are stored with role "user", so a "role:user" that reached
-    // the full-text index as a column filter would match both.
     let (_dir, conn) = db_with_messages(&[
         ("literal", "set role:user in the config"),
         ("other", "the user asked about roles"),
     ]);
 
-    assert_eq!(matched_sessions(&conn, "role:user"), ["literal"]);
+    assert_eq!(
+        matched_sessions(&conn, "role:user"),
+        ["literal"],
+        "both messages have role user, so a role:user column filter would match both"
+    );
 }
 
 #[test]

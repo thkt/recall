@@ -520,10 +520,6 @@ fn a_limit_of_zero_returns_nothing() {
     assert_eq!(ids(&results), NONE);
 }
 
-/// Three year-old sessions and one new one match "authentication". By text alone
-/// they rank old-short, old-medium, new, old-long, since shorter messages score
-/// higher. "old-short" scores 16% above "new", less than the 20% that recency
-/// adds to a same-day session.
 fn seed_new_session_ranked_third_by_text(conn: &Connection) {
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     insert_session(conn, "old-short", "claude", "/proj", year_ago);
@@ -545,12 +541,28 @@ fn seed_new_session_ranked_third_by_text(conn: &Connection) {
 fn recency_lifts_a_new_session_over_somewhat_better_older_text_matches() {
     let (_dir, conn) = setup_test_db();
     seed_new_session_ranked_third_by_text(&conn);
+    let a_century_later_every_session_is_too_old_for_a_boost = SearchOptions {
+        now_ms: Some(NOW_MS + 100 * 365 * MS_PER_DAY),
+        ..SearchOptions::default()
+    };
 
+    let by_text_alone = search(
+        &conn,
+        "authentication",
+        &a_century_later_every_session_is_too_old_for_a_boost,
+    )
+    .unwrap();
     let results = search(&conn, "authentication", &at_now()).unwrap();
 
     assert_eq!(
+        ids(&by_text_alone),
+        ["old-short", "old-medium", "new", "old-long"],
+        "shorter messages score higher by text"
+    );
+    assert_eq!(
         ids(&results),
-        ["new", "old-short", "old-medium", "old-long"]
+        ["new", "old-short", "old-medium", "old-long"],
+        "old-short scores 16% above new, less than the {RECENCY_BOOST_WEIGHT} that recency adds to a same-day session"
     );
 }
 
@@ -826,8 +838,6 @@ fn a_session_without_a_timestamp_ranks_below_an_equally_matching_dated_one() {
 #[test]
 fn recency_lifts_a_new_session_over_a_somewhat_better_older_match_in_hybrid_search() {
     let (_dir, conn) = setup_test_db();
-    // "old" ranks first in both legs, which puts it 1.7% ahead after fusion.
-    // At 90 days "new" gains 2.5% from recency, enough to pass it; half is not.
     insert_session(&conn, "old", "claude", "/proj", NOW_MS - 365 * MS_PER_DAY);
     insert_message(&conn, "old", "user", "authentication");
     insert_chunk(&conn, 1, "old", "authentication");
@@ -844,15 +854,13 @@ fn recency_lifts_a_new_session_over_a_somewhat_better_older_match_in_hybrid_sear
     .unwrap()
     .results;
 
-    assert_eq!(ids(&results), ["new", "old"]);
+    assert_eq!(
+        ids(&results),
+        ["new", "old"],
+        "old ranks first in both legs, 1.7% ahead after fusion; at 90 days new gains 2.5% from recency, and half that would not pass old"
+    );
 }
 
-/// Three year-old sessions and one new one match "authentication" by text. The
-/// old ones tie and share rank 1, and the new one, which matches slightly
-/// worse, takes rank 3. A year-old session found only by vector search keeps the
-/// vector leg active. After fusion the new session scores 5% below that vector
-/// match and 3% below the old text matches, and the 20% that recency adds to a
-/// same-day session lifts it to the front.
 fn seed_new_session_ranked_fourth_by_text(conn: &Connection) {
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     for sid in ["old-a", "old-b", "old-c"] {
@@ -883,7 +891,11 @@ fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_text
 
     let outcome = hybrid_search_at_limit(&conn, 1);
 
-    assert_eq!(ids(&outcome.results), ["new"]);
+    assert_eq!(
+        ids(&outcome.results),
+        ["new"],
+        "the three old text matches share rank 1 and new takes rank 3; fused, new scores 5% below vec-old and 3% below the old text matches, and the {RECENCY_BOOST_WEIGHT} recency boost of a same-day session lifts it to the front"
+    );
 }
 
 #[test]
@@ -1244,13 +1256,14 @@ fn a_kanji_compound_in_a_query_is_matched_whole() {
     insert_message(&conn, "whole", "user", "Rustで機械学習を試す");
     insert_session(&conn, "apart", "claude", "/proj", NOW_MS);
     insert_message(&conn, "apart", "user", "Rustで機械の学習を試す");
-    // "Rust" is a run of at least three characters, so the query is searched
-    // split at script boundaries. Without it the query would be searched as one
-    // phrase whether or not the kanji run were split.
 
     let results = search(&conn, "Rust機械学習", &at_now()).unwrap();
 
-    assert_eq!(ids(&results), ["whole"]);
+    assert_eq!(
+        ids(&results),
+        ["whole"],
+        "Rust is at least three characters, so the query is split at script boundaries; without it the query is one phrase whether or not the kanji run is split"
+    );
 }
 
 #[test]
@@ -1308,18 +1321,17 @@ fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
-    // With s1, sixteen trigrams start with "校正" and sixteen with "する". Split
-    // into "校正 する", the query would expand to 16 × 16 = 256 combinations.
-    // While MAX_COMBINATIONS (src/compat.rs) is below 256, that split query
-    // overflows and finds nothing. At a cap of 256 or more it also returns only
-    // s1, and this test passes without the gate.
-    // a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone
-    // fails at such a cap.
     seed_fifteen_words_starting_with_kousei_and_suru(&conn);
+    let trigrams_per_prefix_with_s1 = 15 + 1;
+    let split_query_combinations = trigrams_per_prefix_with_s1 * trigrams_per_prefix_with_s1;
 
     let results = search(&conn, "校正する", &at_now()).unwrap();
 
-    assert_eq!(ids(&results), ["s1"]);
+    assert_eq!(
+        ids(&results),
+        ["s1"],
+        "split into 校正 する the query expands to {split_query_combinations} combinations and overflows MAX_COMBINATIONS in src/compat.rs; at a cap of {split_query_combinations} or more this test passes without the gate, and a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone fails"
+    );
 }
 
 #[test]
@@ -1329,17 +1341,19 @@ fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_a
     insert_message(&conn, "both", "user", "Rustで校正する手順");
     insert_session(&conn, "rust-only", "claude", "/proj", NOW_MS);
     insert_message(&conn, "rust-only", "user", "Rustの設定をまとめた");
-    // With "both", sixteen trigrams start with "校正" and sixteen with "する".
-    // "Rust 校正 する" would expand to 16 × 16 = 256 combinations. While
-    // MAX_COMBINATIONS (src/compat.rs) is below 256, that overflows and only
-    // "Rust" is searched.
     seed_fifteen_words_starting_with_kousei_and_suru(&conn);
+    let trigrams_per_prefix_with_both = 15 + 1;
+    let split_query_combinations = trigrams_per_prefix_with_both * trigrams_per_prefix_with_both;
 
     let results = search(&conn, "Rust校正する", &at_now()).unwrap();
 
     let mut matched = ids(&results);
     matched.sort_unstable();
-    assert_eq!(matched, ["both", "rust-only"]);
+    assert_eq!(
+        matched,
+        ["both", "rust-only"],
+        "Rust 校正 する expands to {split_query_combinations} combinations and overflows MAX_COMBINATIONS in src/compat.rs, so only Rust is searched"
+    );
 }
 
 #[test]
@@ -1372,13 +1386,6 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "それはうーんと悩ましい問題だ");
-    // ー is Katakana, so the query splits into three one-character runs. This
-    // message adds five trigrams starting with う, five starting with ー and
-    // four starting with ん, since んじ ends the message. s1 adds one of each,
-    // so the split form would expand to 6 × 6 × 5 = 180 combinations. While
-    // MAX_COMBINATIONS (src/compat.rs) is below 180, it finds nothing. At a cap
-    // of 180 or more it finds this message too. Either way the test fails
-    // without the gate.
     insert_session(&conn, "decoy", "claude", "/proj", NOW_MS);
     insert_message(
         &conn,
@@ -1387,9 +1394,20 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
         "うみ うた うし うま うち ーる ーと ーな ーき ーす んご んぶ んか んぼ んじ",
     );
 
+    let trigrams_starting_with_u = 5 + 1;
+    let trigrams_starting_with_prolonged_mark = 5 + 1;
+    let trigrams_starting_with_n_as_nji_ends_the_decoy = 4 + 1;
+    let split_form_combinations = trigrams_starting_with_u
+        * trigrams_starting_with_prolonged_mark
+        * trigrams_starting_with_n_as_nji_ends_the_decoy;
+
     let results = search(&conn, "うーん", &at_now()).unwrap();
 
-    assert_eq!(ids(&results), ["s1"]);
+    assert_eq!(
+        ids(&results),
+        ["s1"],
+        "ー is Katakana, so the split form has three one-character runs and expands to {split_form_combinations} combinations; under that cap it finds nothing, at or over it it also finds the decoy, so without the gate this fails either way"
+    );
 }
 
 #[test]
@@ -1864,15 +1882,14 @@ fn an_unreadable_message_row_flags_incomplete_and_keeps_the_rest() {
     insert_message(&conn, "s1", "user", "authentication flow");
     insert_null_session_id_message(&conn, "authentication token");
 
-    // With automated sessions excluded, the session-type filter would drop the
-    // NULL row before it is read; including them lets the row reach the reader.
+    let past_the_session_type_filter_that_would_drop_the_null_row = SearchOptions {
+        include_automated: true,
+        ..at_now()
+    };
     let outcome = search_with_embedder(
         &conn,
         "authentication",
-        &SearchOptions {
-            include_automated: true,
-            ..at_now()
-        },
+        &past_the_session_type_filter_that_would_drop_the_null_row,
         None,
     )
     .unwrap();
@@ -2390,6 +2407,25 @@ fn a_file_list_cut_by_the_limit_lists_sessions_of_the_same_time_in_session_id_or
     let outcome = search_with_embedder(&conn, None, &opts, None).unwrap();
 
     assert_eq!(ids(&outcome.results), ["a", "b", "c", "m"]);
+}
+
+#[test]
+fn excluded_automated_count_leaves_out_an_automated_session_only_the_vector_search_finds() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "auto-text", "claude", "/proj", NOW_MS);
+    set_session_type(&conn, "auto-text", "automated");
+    insert_message(&conn, "auto-text", "user", "authentication flow");
+    insert_session(&conn, "auto-vector", "claude", "/proj", NOW_MS);
+    set_session_type(&conn, "auto-vector", "automated");
+    insert_message(&conn, "auto-vector", "user", "unrelated weather topic");
+    insert_chunk(&conn, 1, "auto-vector", "authentication");
+
+    let count = count_excluded_automated(&conn, Some("authentication"), &at_now()).unwrap();
+
+    assert_eq!(
+        count, 1,
+        "the count can fall short of the hybrid results, but never includes a session the text search does not match"
+    );
 }
 
 #[test]

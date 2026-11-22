@@ -813,8 +813,6 @@ fn sessions_matching_any(
         .context("NOT filter query failed")
 }
 
-/// Matches reachable only through the vector leg are not counted, so the count
-/// can fall short but never includes a session that does not match the search.
 pub fn count_excluded_automated(
     conn: &Connection,
     query: Option<&str>,

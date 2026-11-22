@@ -8,9 +8,6 @@ enum Piece<'a> {
     Word(&'a str),
 }
 
-/// The plain sanitizer, the short-term expansion and the operator tokenizer all
-/// read phrases through this function, so they agree on where a phrase starts
-/// and ends.
 fn scan_tokens(query: &str, stands_alone: fn(char) -> bool) -> Vec<Vec<Piece<'_>>> {
     let mut tokens: Vec<Vec<Piece<'_>>> = Vec::new();
     let mut rest = query;
@@ -466,7 +463,6 @@ fn expand_token_via_vocab(
 ) -> Result<Option<String>, SanitizeError> {
     // source: https://www.sqlite.org/fts5.html#the_trigram_tokenizer
     let prefix = token.to_ascii_lowercase();
-    // The bound leaves out only the terms whose next character is U+10FFFF.
     let bound = format!("{prefix}{}", char::MAX);
     match stmt
         .query_map([&prefix, &bound], |row| row.get::<_, String>(0))
