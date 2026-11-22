@@ -135,6 +135,7 @@ fn reuse_artifact(root: &Path, name: &str, expected: &str, legacy: &[PathBuf]) -
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 return Err(error.into());
             }
+            // why-not: no error on a failed hard link; a cache on another filesystem cannot link, so copy
             Err(_) => install_artifact(root, name, expected, &mut fs::File::open(source)?)?,
         }
         return Ok(true);
