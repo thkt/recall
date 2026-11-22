@@ -17,12 +17,10 @@ pub(crate) fn recency_decay(now_ms: i64, ts: Option<i64>) -> f64 {
     }
 }
 
-/// What the recency blend multiplies a score by.
 pub(crate) fn recency_factor(now_ms: i64, ts: Option<i64>) -> f64 {
     1.0 + RECENCY_BOOST_WEIGHT * recency_decay(now_ms, ts)
 }
 
-/// `recency_decay` is at most 1.0, so no score is multiplied by more than this.
 pub(crate) const MAX_RECENCY_FACTOR: f64 = 1.0 + RECENCY_BOOST_WEIGHT;
 
 pub(crate) fn apply_recency_boost(
@@ -38,15 +36,11 @@ pub(crate) fn apply_recency_boost(
     results.sort_by(|a, b| b.1.total_cmp(&a.1));
 }
 
-/// Fuses the sessions each search found, as `(session id, score)` pairs listed
-/// best first. In both searches a lower score ranks higher.
 pub(crate) fn rrf_merge_sessions<'a>(
     fts_hits: impl IntoIterator<Item = (&'a str, f64)>,
     vec_hits: impl IntoIterator<Item = (&'a str, f64)>,
 ) -> Vec<(String, f64)> {
     let mut scores: HashMap<String, f64> = HashMap::new();
-    // Each search is ranked on its own. Its scores only decide which sessions
-    // share a rank.
     let fts_hits: Vec<_> = fts_hits.into_iter().collect();
     let vec_hits: Vec<_> = vec_hits.into_iter().collect();
     for (sid, rank) in tied_ranks(&fts_hits).chain(tied_ranks(&vec_hits)) {
@@ -57,9 +51,6 @@ pub(crate) fn rrf_merge_sessions<'a>(
     result
 }
 
-/// The rank of each hit: its position from 0, or, for hits with the same score,
-/// the mean of the positions they span. The order among tied hits then does not
-/// move the fused score, and a large tie gains no weight over its positions.
 fn tied_ranks<'a>(hits: &[(&'a str, f64)]) -> impl Iterator<Item = (&'a str, f64)> {
     debug_assert!(
         hits.windows(2).all(|pair| pair[0].1 <= pair[1].1),

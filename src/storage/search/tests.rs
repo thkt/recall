@@ -82,7 +82,6 @@ fn expand_without_vocab_table_degrades() {
     assert_eq!(result.as_str(), "\"au\" AND \"login\"");
 }
 
-/// An index with the production schema, holding one message per text.
 fn index_with_messages(texts: &[&str]) -> (tempfile::TempDir, Connection) {
     let (dir, conn) = setup_test_db();
     for text in texts {
@@ -135,6 +134,15 @@ fn a_two_character_cjk_word_expands_to_the_trigrams_that_start_with_it() {
 }
 
 #[test]
+fn a_short_word_expands_to_no_term_whose_next_character_is_the_last_unicode_scalar() {
+    let (_dir, conn) = index_with_messages(&["xaby", "xab\u{10FFFF}"]);
+    assert_eq!(expand_in(&conn, "ab"), r#"("aby")"#);
+}
+
+const FTS5_VOCAB_TERM_GE: u32 = 0x0200;
+const FTS5_VOCAB_TERM_LE: u32 = 0x0400;
+
+#[test]
 fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table() {
     let (_dir, conn) = setup_test_db();
     let plan: String = conn
@@ -149,9 +157,8 @@ fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table(
         .and_then(|(_, rest)| rest.split(':').next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no index number in the plan: {plan}"));
-    // FTS5_VOCAB_TERM_GE and FTS5_VOCAB_TERM_LE in SQLite's fts5_vocab.c. Without them,
-    // fts5vocab reads every term of the index.
-    assert_eq!(idx_num & 0x600, 0x600, "{plan}");
+    let range_on_term = FTS5_VOCAB_TERM_GE | FTS5_VOCAB_TERM_LE;
+    assert_eq!(idx_num & range_on_term, range_on_term, "{plan}");
 }
 
 #[test]
@@ -554,5 +561,35 @@ fn operator_query_ignores_dangling_operators_and_closes_open_parentheses() {
     assert_eq!(
         operator("(alpha OR beta AND gamma").match_query.as_deref(),
         Some("(\"alpha\" OR (\"beta\" AND \"gamma\"))")
+    );
+}
+
+#[test]
+fn operator_query_renders_a_chain_of_100_000_nots_without_overflowing_the_stack() {
+    let query = format!("alpha{}", " NOT beta".repeat(100_000));
+
+    let rendered = operator(&query);
+
+    assert_eq!(rendered.not_operands.len(), 100_000);
+}
+
+#[test]
+fn the_sanitizer_the_expansion_and_the_operator_query_all_end_an_unclosed_phrase_at_the_query_end()
+{
+    let conn = setup_fts_db();
+
+    assert_eq!(
+        sanitize_fts_query("alpha \"beta gamma"),
+        ok("alpha \"beta gamma\"")
+    );
+    assert_eq!(
+        prepare_match_query(&conn, "alpha \"beta gamma", "fts_chunks_vocab")
+            .unwrap()
+            .as_str(),
+        "\"alpha\" AND \"beta gamma\""
+    );
+    assert_eq!(
+        operator("alpha AND \"beta gamma").match_query.as_deref(),
+        Some("(\"alpha\" AND \"beta gamma\")")
     );
 }

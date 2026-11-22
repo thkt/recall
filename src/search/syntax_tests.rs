@@ -1,4 +1,7 @@
+use std::ffi::c_int;
 use std::path::PathBuf;
+
+use rusqlite::ffi::{self, SQLITE_BUSY, SQLITE_CORRUPT_VTAB, SQLITE_ERROR};
 
 use super::*;
 use crate::db::setup_test_db;
@@ -47,9 +50,11 @@ fn lowercase_and_or_not_in_a_query_are_matched_as_ordinary_words() {
 
     assert_eq!(matched_sessions(&conn, "tokio and async"), ["with-and"]);
     assert_eq!(matched_sessions(&conn, "do not panic"), ["with-not"]);
-    // "or" is under 3 characters, so it is dropped like any other short word
-    // and both messages match on the remaining words.
-    assert_eq!(matched_sessions(&conn, "red or blue"), ["no-or", "with-or"]);
+    let or_too_short_for_a_trigram_is_dropped = "red or blue";
+    assert_eq!(
+        matched_sessions(&conn, or_too_short_for_a_trigram_is_dropped),
+        ["no-or", "with-or"]
+    );
 }
 
 #[test]
@@ -105,14 +110,16 @@ fn a_term_with_colons_finds_the_message_containing_it() {
 
 #[test]
 fn a_term_shaped_like_a_column_filter_finds_only_the_message_containing_it() {
-    // Both messages are stored with role "user", so a "role:user" that reached
-    // the full-text index as a column filter would match both.
     let (_dir, conn) = db_with_messages(&[
         ("literal", "set role:user in the config"),
         ("other", "the user asked about roles"),
     ]);
 
-    assert_eq!(matched_sessions(&conn, "role:user"), ["literal"]);
+    assert_eq!(
+        matched_sessions(&conn, "role:user"),
+        ["literal"],
+        "both messages have role user, so a role:user column filter would match both"
+    );
 }
 
 #[test]
@@ -220,8 +227,6 @@ fn parentheses_group_an_or_before_the_and_that_follows_it() {
     );
 }
 
-/// The `RecallError` a rejected query fails with, in its `Debug` form so a test
-/// can compare the variant and the message as one literal.
 fn rejection(conn: &Connection, query: &str) -> String {
     rejection_with(conn, query, &SearchOptions::default())
 }
@@ -292,7 +297,7 @@ fn a_not_with_nothing_before_it_is_rejected_as_a_query_syntax_error() {
 }
 
 #[test]
-fn deeply_nested_parentheses_are_rejected_as_a_query_syntax_error() {
+fn parentheses_nested_too_deep_for_the_parser_stack_are_rejected_as_a_query_syntax_error() {
     let (_dir, conn) = db_with_messages(&[("alpha", "alpha release notes")]);
     let query = format!("{}alpha OR beta", "(".repeat(5000));
 
@@ -419,14 +424,11 @@ fn a_session_found_only_by_the_vector_search_stays_when_it_matches_a_not_nested_
     );
 }
 
-/// Embeds like `MockEmbedder`, but first drops the full-text index data through a
-/// second connection. Every MATCH after the vector search then fails, while the
-/// keyword search that ran before it has its rows.
-struct IndexBreakingEmbedder {
+struct EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
     db_path: PathBuf,
 }
 
-impl Embed for IndexBreakingEmbedder {
+impl Embed for EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         Connection::open(&self.db_path)
             .and_then(|other| other.execute_batch("DROP TABLE messages_data"))
@@ -451,7 +453,7 @@ fn a_failed_not_filter_drops_the_vector_only_sessions_and_marks_the_vector_searc
         ("vec-only", "gamma tag notes"),
     ]);
     add_embedded_chunk(&conn, 1, "vec-only", "gamma tag notes");
-    let embedder = IndexBreakingEmbedder {
+    let embedder = EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
         db_path: dir.path().join("test.db"),
     };
     let opts = SearchOptions {
@@ -517,4 +519,28 @@ fn the_excluded_automated_count_includes_an_automated_session_matching_an_operat
         count, 1,
         "only auto-alpha matches `alpha NOT beta` among the automated sessions"
     );
+}
+
+fn sqlite_failure(code: c_int, message: &str) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(ffi::Error::new(code), Some(message.to_owned()))
+}
+
+#[test]
+fn an_fts5_message_is_a_query_syntax_error_only_under_a_plain_sqlite_error_code() {
+    assert!(is_fts5_query_syntax_error(&sqlite_failure(
+        SQLITE_ERROR,
+        "fts5: syntax error near \"\""
+    )));
+    assert!(is_fts5_query_syntax_error(&sqlite_failure(
+        SQLITE_ERROR,
+        "fts5: parser stack overflow"
+    )));
+    assert!(!is_fts5_query_syntax_error(&sqlite_failure(
+        SQLITE_CORRUPT_VTAB,
+        "fts5: corruption found reading blocks"
+    )));
+    assert!(!is_fts5_query_syntax_error(&sqlite_failure(
+        SQLITE_BUSY,
+        "fts5: database is locked"
+    )));
 }
