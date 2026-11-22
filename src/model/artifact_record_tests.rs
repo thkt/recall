@@ -154,7 +154,7 @@ fn index_doctor_and_status_hash_every_time_and_status_writes_no_record() {
     let host = FakeHost::healthy();
     let mut steps = Vec::new();
     let mut observe =
-        |name: &str| steps.push((name.to_owned(), model.hashes.get(), model.record_count()));
+        |name: &'static str| steps.push((name, model.hashes.get(), model.record_count()));
 
     let status = model
         .serve(&host, |h| run_status_in(false, &db, h))
@@ -186,18 +186,17 @@ fn index_doctor_and_status_hash_every_time_and_status_writes_no_record() {
         .unwrap();
     observe("status with a record");
 
-    let expected: Vec<(String, usize, usize)> = [
-        ("status without a record", 1, 0),
-        ("first search", 2, 1),
-        ("second search", 2, 1),
-        ("index", 3, 1),
-        ("doctor", 4, 1),
-        ("status with a record", 5, 1),
-    ]
-    .into_iter()
-    .map(|(name, hashes, records)| (name.to_owned(), hashes, records))
-    .collect();
-    assert_eq!(steps, expected);
+    assert_eq!(
+        steps,
+        [
+            ("status without a record", 1, 0),
+            ("first search", 2, 1),
+            ("second search", 2, 1),
+            ("index", 3, 1),
+            ("doctor", 4, 1),
+            ("status with a record", 5, 1),
+        ]
+    );
 }
 
 #[test]
