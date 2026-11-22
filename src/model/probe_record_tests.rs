@@ -102,8 +102,8 @@ fn running_marker_whose_lock_is_free_is_reported_as_a_crash_and_disables_skippin
     other.record_success();
     assert!(env.may_skip());
 
-    // Dropping the marker without finishing it is what a crash leaves behind.
-    drop(env.begin_skipped_load().unwrap());
+    let load_that_crashed_before_finishing = env.begin_skipped_load().unwrap();
+    drop(load_that_crashed_before_finishing);
 
     assert!(!env.may_skip(), "a crashed skipped load must stop skipping");
     env.record_success();

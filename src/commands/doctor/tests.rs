@@ -64,8 +64,11 @@ fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
             "  model [ok]\n",
         )
     );
-    // The report already shows its note, so a text run adds no stderr line for it.
-    assert_eq!(render_text_notes(&out), "");
+    assert_eq!(
+        render_text_notes(&out),
+        "",
+        "the report already shows its note, so a text run adds no stderr line for it"
+    );
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({
@@ -1205,7 +1208,6 @@ fn doctor_still_starts_the_probe_after_search_has_recorded_the_environment() {
     assert_eq!(host.probes.get(), 2, "doctor runs the probe every time");
 }
 
-/// The rows `sql` reads from the index at `db_path`, each built by `row`.
 fn stored_rows<T>(
     db_path: &Path,
     sql: &str,
@@ -1380,8 +1382,11 @@ fn doctor_fix_that_cannot_write_the_index_is_degraded_and_says_why() {
             "  model [ok]\n",
         )
     );
-    // The report already shows its note, so a text run adds no stderr line for it.
-    assert_eq!(render_text_notes(&out), "");
+    assert_eq!(
+        render_text_notes(&out),
+        "",
+        "the report already shows its note, so a text run adds no stderr line for it"
+    );
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({

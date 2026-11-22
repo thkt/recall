@@ -4,7 +4,8 @@ use crate::embedder::MockEmbedder;
 use crate::error::classify_exit_code;
 use std::cell::Cell;
 #[test]
-fn checksum_format_and_persisted_identity_survive_digest_updates() {
+fn checksum_format_and_the_persisted_identity_of_the_spec_fields_in_their_order_survive_digest_updates()
+ {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("artifact");
     for (bytes, expected) in [
@@ -314,20 +315,13 @@ fn probe_child_without_a_handed_root_is_an_error() {
     );
 }
 
-/// The model cache as the artifact check reads it (`ModelHost::resolve`).
 #[derive(Clone, Copy)]
 pub(crate) enum CachedArtifacts {
-    /// Every artifact checksum matches.
     Verified,
-    /// Nothing is cached; a load reports `DegradedReason::NotInstalled`.
     NotInstalled,
-    /// A cached artifact fails its checksum; a load reports `DegradedReason::ProbeFailed`.
     Corrupt,
 }
 
-/// Replaces the artifact check, the probe child, the GPU check and the model load; the probe
-/// record is real. `run` hands out only the load steps and ignores `artifacts`; `serve` reads
-/// `artifacts` on every load, so a recover closure can install the model mid-command.
 pub(crate) struct FakeHost {
     pub(crate) artifacts: Cell<CachedArtifacts>,
     pub(crate) probe_result: fn() -> Result<bool>,
@@ -349,7 +343,6 @@ impl FakeHost {
         }
     }
 
-    /// A host with nothing cached, as before the first `recall model download`.
     pub(crate) fn not_installed() -> Self {
         Self {
             artifacts: Cell::new(CachedArtifacts::NotInstalled),
@@ -357,7 +350,6 @@ impl FakeHost {
         }
     }
 
-    /// What a successful `recall model download` leaves in the cache.
     pub(crate) fn install(&self) {
         self.artifacts.set(CachedArtifacts::Verified);
     }
@@ -378,8 +370,6 @@ impl FakeHost {
         })
     }
 
-    /// Hands `f` a model host whose verified artifacts resolve to `root` and whose record store,
-    /// keyed `env`, lives in `records_dir`; commands then pick their loader as in production.
     pub(crate) fn serve<R>(
         &self,
         root: &Path,
@@ -411,7 +401,7 @@ impl FakeHost {
                 ))
             };
             f(&ModelHost {
-                resolve,
+                resolve_when_needed: resolve,
                 probe_records: &probe_records,
                 steps,
             })
@@ -567,7 +557,8 @@ fn default_loader_runs_the_probe_even_when_a_matching_record_exists() {
 }
 
 #[test]
-fn default_loader_records_success_only_after_the_parent_self_check_passes() {
+fn default_loader_records_success_only_after_the_parent_self_check_passes_and_still_returns_a_model_that_fails_it()
+ {
     let not_recorded: [(FakeHost, Option<DegradedReason>); 4] = [
         (
             FakeHost {
@@ -590,7 +581,6 @@ fn default_loader_records_success_only_after_the_parent_self_check_passes() {
             },
             Some(DegradedReason::ProbeFailed),
         ),
-        // A failed parent self-check keeps today's result: the model is returned unrecorded.
         (
             FakeHost {
                 model: failing_self_check,

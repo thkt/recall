@@ -5,8 +5,7 @@ use crate::tests::printed_envelope;
 
 use super::*;
 
-/// Every session's stored label, ordered by session id.
-fn labels(db_path: &Path) -> Vec<(String, Option<String>)> {
+fn stored_labels_by_session_id(db_path: &Path) -> Vec<(String, Option<String>)> {
     db::open_db(db_path)
         .unwrap()
         .prepare("SELECT session_id, session_type FROM sessions ORDER BY session_id")
@@ -17,9 +16,8 @@ fn labels(db_path: &Path) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// An index of two unlabeled sessions whose logs are missing and `tagged`, labeled interactive,
-/// whose readable log names no automated origin. Each is labeled from its first turn.
-fn seed_classify_db() -> (tempfile::TempDir, PathBuf) {
+fn seed_two_logless_unlabeled_sessions_and_one_labeled_interactive() -> (tempfile::TempDir, PathBuf)
+{
     let dir = tempfile::TempDir::new().unwrap();
     let tagged_log = dir.path().join("tagged.jsonl");
     fs::write(&tagged_log, r#"{"type":"user","message":"question"}"#).unwrap();
@@ -46,7 +44,7 @@ fn seed_classify_db() -> (tempfile::TempDir, PathBuf) {
 
 #[test]
 fn classify_all_labels_every_session_from_its_first_turn() {
-    let (_dir, db_path) = seed_classify_db();
+    let (_dir, db_path) = seed_two_logless_unlabeled_sessions_and_one_labeled_interactive();
 
     let out = run_classify(true, false, &Some(db_path.clone())).unwrap();
 
@@ -63,7 +61,7 @@ fn classify_all_labels_every_session_from_its_first_turn() {
         })
     );
     assert_eq!(
-        labels(&db_path),
+        stored_labels_by_session_id(&db_path),
         [
             ("auto".to_owned(), Some("automated".to_owned())),
             ("human".to_owned(), Some("interactive".to_owned())),
@@ -74,7 +72,7 @@ fn classify_all_labels_every_session_from_its_first_turn() {
 
 #[test]
 fn classify_without_all_labels_only_unlabeled_sessions() {
-    let (_dir, db_path) = seed_classify_db();
+    let (_dir, db_path) = seed_two_logless_unlabeled_sessions_and_one_labeled_interactive();
 
     let out = run_classify(false, false, &Some(db_path.clone())).unwrap();
 
@@ -91,7 +89,7 @@ fn classify_without_all_labels_only_unlabeled_sessions() {
         })
     );
     assert_eq!(
-        labels(&db_path),
+        stored_labels_by_session_id(&db_path),
         [
             ("auto".to_owned(), Some("automated".to_owned())),
             ("human".to_owned(), Some("interactive".to_owned())),
@@ -161,7 +159,6 @@ fn classify_dry_run_prints_a_first_turn_with_newlines_on_its_session_line() {
 
 #[test]
 fn classify_dry_run_removes_control_characters_before_keeping_80_characters_of_the_first_turn() {
-    // Cut first, the sequence would straddle the cut and drop the characters after it.
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();

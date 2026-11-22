@@ -13,12 +13,9 @@ pub(crate) struct CommandOutput {
     pub notes: Vec<Note>,
 }
 
-/// A note on a command's result. `--json` carries every note; a text run prints on stderr the
-/// notes the command has not shown already (#403).
 #[derive(Debug)]
 pub(crate) struct Note {
     pub text: String,
-    /// The command already put this in its text output, on stdout or stderr.
     pub shown: bool,
 }
 
@@ -65,23 +62,24 @@ impl CommandOutput {
 
 #[derive(Serialize)]
 struct SuccessEnvelope<'a> {
-    data: Stripped<'a>,
+    data: StringValuesStripped<'a>,
     degraded: bool,
     notes: Vec<Cow<'a, str>>,
 }
 
-/// Serializes a JSON value with control characters removed from every string in it. Object keys
-/// stay as they are, since the commands name them.
-struct Stripped<'a>(&'a serde_json::Value);
+struct StringValuesStripped<'a>(&'a serde_json::Value);
 
-impl Serialize for Stripped<'_> {
+impl Serialize for StringValuesStripped<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0 {
             serde_json::Value::String(s) => serializer.serialize_str(&ansi::strip_control_chars(s)),
-            serde_json::Value::Array(items) => serializer.collect_seq(items.iter().map(Stripped)),
-            serde_json::Value::Object(map) => {
-                serializer.collect_map(map.iter().map(|(key, value)| (key, Stripped(value))))
+            serde_json::Value::Array(items) => {
+                serializer.collect_seq(items.iter().map(StringValuesStripped))
             }
+            serde_json::Value::Object(map) => serializer.collect_map(
+                map.iter()
+                    .map(|(key, value)| (key, StringValuesStripped(value))),
+            ),
             other => other.serialize(serializer),
         }
     }
@@ -103,10 +101,9 @@ pub(crate) struct ErrorPayload {
     pub retryable: bool,
 }
 
-/// Session content reaches these strings, so the envelope strips every one of them (DR 0001).
 pub(crate) fn render_json_success(out: &CommandOutput) -> String {
     let env = SuccessEnvelope {
-        data: Stripped(&out.data),
+        data: StringValuesStripped(&out.data),
         degraded: out.degraded,
         notes: out
             .notes
@@ -117,8 +114,6 @@ pub(crate) fn render_json_success(out: &CommandOutput) -> String {
     serde_json::to_string(&env).expect("SuccessEnvelope is always serializable")
 }
 
-/// The stderr lines a text run adds for the notes its command has not shown: one line each,
-/// control characters removed as in the envelope and a newline turned into a space.
 pub(crate) fn render_text_notes(out: &CommandOutput) -> String {
     out.notes
         .iter()

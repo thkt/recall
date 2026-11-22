@@ -58,7 +58,7 @@ impl DoctorCheck {
 const CORRUPT_DB_REMEDY: &str = "remove the database file and run `recall index`";
 const MODEL_INDEX_REMEDY: &str =
     "select the matching --model-manifest and index, or build this model in a separate --db-path";
-// The index may hold the only copy of a session whose log is gone, so this remedy keeps the file.
+// why-not: this remedy keeps the file; the index may hold the only copy of a session whose log is gone
 const UNREADABLE_IDENTITY_REMEDY: &str = "build this model in a separate --db-path";
 
 fn could_not_run(e: impl Display) -> String {
@@ -234,9 +234,6 @@ pub(crate) fn run_doctor(
     })
 }
 
-/// Diagnoses the index at `db_path` against `host`, always probing the model (DR 0013). Under
-/// `--fix`, `recover_model` stands for the model download; it runs only when the model is missing
-/// or fails its check, and the index was not built for another model or kept as a legacy one.
 pub(crate) fn run_doctor_in<R>(
     verbose: bool,
     fix: bool,
@@ -263,7 +260,6 @@ where
                 "model_recovery_retryable": null,
             }),
             true,
-            // The two lines above already tell a text reader.
             vec![Note::shown("no index: run `recall index`")],
         ));
     }
@@ -277,8 +273,6 @@ where
             let identity = model::check_index(conn, model::selected());
             let checks = match db::schema_state(conn) {
                 Ok(db::SchemaState::Current) => {
-                    // An index built for another model, a legacy one kept for rollback, or one
-                    // whose identity cannot be read stays unwritten.
                     if fix && identity.is_ok() {
                         repairs = Some(vec![RepairOutcome {
                             name: "orphan_embeddings",
@@ -286,8 +280,6 @@ where
                                 .and_then(|writer| fix_orphan_embeddings(&writer)),
                         }]);
                     }
-                    // Each check reads in a new transaction and sees the repair. An index opened
-                    // immutable sits in a read-only directory, where the repair fails instead.
                     db_checks(conn)
                 }
                 Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
@@ -302,7 +294,6 @@ where
         }
         Err(e) => (open_failure_checks(e), None, None),
     };
-    // Installing the selected model cannot make an index built for another model usable.
     let refuses_model = matches!(&identity, Some(Err(e)) if e.refuses_model());
     let (model_check, model_recovery) =
         check_model_with_optional_recovery(fix && !refuses_model, load_embedder, recover_model);
@@ -340,7 +331,6 @@ fn doctor_notes(
     repairs: &Option<Vec<RepairOutcome>>,
     model_recovery: &ModelRecovery,
 ) -> Vec<Note> {
-    // The report on stdout already shows each remedy and failure.
     let mut notes: Vec<Note> = checks
         .iter()
         .filter_map(|c| c.remedy.map(|r| Note::shown(format!("{}: {}", c.name, r))))

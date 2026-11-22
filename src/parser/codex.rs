@@ -167,8 +167,6 @@ fn extract_date_from_path(path: &str) -> Option<String> {
     date_from_rollout_name(path)
 }
 
-/// `archived_sessions/` has no date directories, so archived logs take the date
-/// from their `rollout-YYYY-MM-DDThh-mm-ss-<uuid>` name and keep the same slug.
 fn date_from_rollout_name(path: &str) -> Option<String> {
     let name = path.rsplit(['/', '\\']).next()?;
     let date = name.strip_prefix("rollout-")?.get(..10)?;

@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
 
-/// A CSI sequence holds bytes 0x20–0x3F and ends at a final byte in 0x40–0x7E (ECMA-48 § 5.4).
-/// Any other character breaks the sequence and is kept, so session text after it is not lost.
 fn skip_csi(chars: &mut Peekable<Chars>) {
     while let Some(&next) = chars.peek() {
         if !(' '..='~').contains(&next) {
@@ -16,8 +14,6 @@ fn skip_csi(chars: &mut Peekable<Chars>) {
     }
 }
 
-/// An OSC sequence ends at BEL or ESC \. One left unterminated ends at the end of its line, so it
-/// drops the rest of that line and not the rest of the message.
 fn skip_osc(chars: &mut Peekable<Chars>) {
     while let Some(&next) = chars.peek() {
         if next == '\n' {

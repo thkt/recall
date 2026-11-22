@@ -100,7 +100,7 @@ fn public_model_contract() {
                 assert_eq!(tokens.last(), Some(&model.vocab().eos()));
             }
             if target == 513 {
-                // Full-length inference is measured on M3; avoid quadratic work on CPU CI.
+                // why-not: no inference at the other lengths; it is quadratic on CPU CI, and M3 measures full length
                 unit_vector(
                     &Gemma::encode(&model, &[tokens], &EmbedOptions::default()).unwrap()[0],
                 );

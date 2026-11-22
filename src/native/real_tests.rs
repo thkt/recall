@@ -144,9 +144,7 @@ fn token_ids(tokens: &[LlamaToken]) -> Vec<i32> {
     tokens.iter().map(|t| t.0).collect()
 }
 
-// Writes token ids, every vocabulary piece, and embedding f32 bit patterns for a fixed text set.
-// Run it once per build (with and without the llama.cpp patches) and diff the two output files.
-// Both runs must make the same calls in the same batch composition, so nothing here depends on the build.
+// why-not: nothing here may depend on the build; both dumps must make the same calls in the same batches
 #[test]
 #[ignore = "requires explicitly provided, verified public Gemma artifacts and an output path"]
 fn real_model_bit_dump_for_build_parity() {

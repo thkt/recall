@@ -77,8 +77,6 @@ pub(crate) const DEFAULT_WINDOW: i64 = 5;
 const MAX_WINDOW: i64 = 50;
 const MAX_MSG_CHARS: usize = 4000;
 
-/// A stored message or chunk body as both outputs print it. It is stripped before `cap_message`
-/// cuts it, since an escape sequence cut in half would swallow the `…` that marks the cut.
 fn shown_text(stored: &str) -> String {
     ansi::strip_control_chars(stored).into_owned()
 }

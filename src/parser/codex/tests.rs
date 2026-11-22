@@ -8,8 +8,7 @@ use crate::parser::{assert_classification_matches, write_test_jsonl as write_jso
 const USER_TURN: &str = r#"{"timestamp":"2026-01-18T01:40:00Z","type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"hello"}]}}"#;
 const UUID_NAME: &str = "rollout-2026-01-18T01-37-09-019bccd1-564a-73b3-b3b0-f6b12671ed24.jsonl";
 
-/// Parses with the full reader and checks the classification reader agrees.
-fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
+fn parse_codex_session_checking_classification(path: &Path) -> Result<Option<ParseResult>> {
     let parsed = super::parse_codex_session(path)?;
     if let Some(full) = &parsed {
         assert_classification_matches(path, Source::Codex, full);
@@ -25,17 +24,19 @@ fn turns(parsed: &ParseResult) -> Vec<(Role, &str)> {
         .collect()
 }
 
-/// The slug of a one-turn Codex log stored at `relative` under a fresh directory.
-fn slug_at(relative: &str) -> String {
+fn slug_of_a_one_turn_log_at(relative: &str) -> String {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, USER_TURN).unwrap();
-    parse_codex_session(&path).unwrap().unwrap().metadata.slug
+    parse_codex_session_checking_classification(&path)
+        .unwrap()
+        .unwrap()
+        .metadata
+        .slug
 }
 
-/// Whether a log whose only record is a `session_meta` carrying `payload` reads as automated.
-fn automated_meta(mut payload: Value) -> bool {
+fn only_session_meta_reads_as_automated(mut payload: Value) -> bool {
     payload["id"] = json!("session");
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("rollout-test.jsonl");
@@ -44,7 +45,7 @@ fn automated_meta(mut payload: Value) -> bool {
         json!({"type": "session_meta", "payload": payload}).to_string(),
     )
     .unwrap();
-    parse_codex_session(&path)
+    parse_codex_session_checking_classification(&path)
         .unwrap()
         .unwrap()
         .origin
@@ -60,7 +61,11 @@ fn user_and_assistant_turns_become_messages() {
     ]);
 
     assert_eq!(
-        turns(&parse_codex_session(tmp.path()).unwrap().unwrap()),
+        turns(
+            &parse_codex_session_checking_classification(tmp.path())
+                .unwrap()
+                .unwrap()
+        ),
         [
             (Role::User, "hello from codex"),
             (Role::Assistant, "hi back")
@@ -77,7 +82,11 @@ fn developer_turns_and_injected_instructions_are_not_messages() {
     ]);
 
     assert_eq!(
-        turns(&parse_codex_session(tmp.path()).unwrap().unwrap()),
+        turns(
+            &parse_codex_session_checking_classification(tmp.path())
+                .unwrap()
+                .unwrap()
+        ),
         [(Role::User, "actual question")]
     );
 }
@@ -92,7 +101,10 @@ fn session_meta_sets_the_session_id_and_project() {
     )
     .unwrap();
 
-    let metadata = parse_codex_session(&path).unwrap().unwrap().metadata;
+    let metadata = parse_codex_session_checking_classification(&path)
+        .unwrap()
+        .unwrap()
+        .metadata;
 
     assert_eq!(metadata.session_id, "019bccd3-8798-7e11-b1d1-c61959201d0b");
     assert_eq!(metadata.project, "/home/me/codex-proj");
@@ -107,7 +119,11 @@ fn a_session_without_turns_is_kept_with_no_messages() {
     ]);
 
     assert_eq!(
-        turns(&parse_codex_session(tmp.path()).unwrap().unwrap()),
+        turns(
+            &parse_codex_session_checking_classification(tmp.path())
+                .unwrap()
+                .unwrap()
+        ),
         []
     );
 }
@@ -115,11 +131,11 @@ fn a_session_without_turns_is_kept_with_no_messages() {
 #[test]
 fn the_slug_joins_the_date_directory_and_the_uuid_from_the_file_name() {
     assert_eq!(
-        slug_at(&format!("sessions/2026/01/18/{UUID_NAME}")),
+        slug_of_a_one_turn_log_at(&format!("sessions/2026/01/18/{UUID_NAME}")),
         "2026-01-18-019bccd1"
     );
     assert_eq!(
-        slug_at("sessions/2026/01/18/rollout-2026-01-19T00-00-00-x.jsonl"),
+        slug_of_a_one_turn_log_at("sessions/2026/01/18/rollout-2026-01-19T00-00-00-x.jsonl"),
         "2026-01-18"
     );
 }
@@ -127,7 +143,7 @@ fn the_slug_joins_the_date_directory_and_the_uuid_from_the_file_name() {
 #[test]
 fn an_archived_log_takes_the_slug_date_from_its_rollout_name() {
     assert_eq!(
-        slug_at(&format!("archived_sessions/{UUID_NAME}")),
+        slug_of_a_one_turn_log_at(&format!("archived_sessions/{UUID_NAME}")),
         "2026-01-18-019bccd1"
     );
 }
@@ -135,23 +151,25 @@ fn an_archived_log_takes_the_slug_date_from_its_rollout_name() {
 #[test]
 fn a_name_without_a_valid_date_or_uuid_falls_back_to_the_session_id() {
     assert_eq!(
-        slug_at("archived_sessions/rollout-x-019bccd1-564a-73b3-b3b0-f6b12671ed24.jsonl"),
+        slug_of_a_one_turn_log_at(
+            "archived_sessions/rollout-x-019bccd1-564a-73b3-b3b0-f6b12671ed24.jsonl"
+        ),
         "019bccd1"
     );
     assert_eq!(
-        slug_at("archived_sessions/rollout-2026-1-18T01.jsonl"),
+        slug_of_a_one_turn_log_at("archived_sessions/rollout-2026-1-18T01.jsonl"),
         "rollout-"
     );
     assert_eq!(
-        slug_at("archived_sessions/rollout-2026-13-01T00-00-00-x.jsonl"),
+        slug_of_a_one_turn_log_at("archived_sessions/rollout-2026-13-01T00-00-00-x.jsonl"),
         "rollout-"
     );
     assert_eq!(
-        slug_at("archived_sessions/rollout-2026-02-30T00-00-00-x.jsonl"),
+        slug_of_a_one_turn_log_at("archived_sessions/rollout-2026-02-30T00-00-00-x.jsonl"),
         "rollout-"
     );
     assert_eq!(
-        slug_at("archived_sessions/other-2026-01-18.jsonl"),
+        slug_of_a_one_turn_log_at("archived_sessions/other-2026-01-18.jsonl"),
         "other-20"
     );
 }
@@ -159,31 +177,41 @@ fn a_name_without_a_valid_date_or_uuid_falls_back_to_the_session_id() {
 #[test]
 fn known_automated_session_sources_mark_the_session_automated() {
     let parent = "01234567-89ab-cdef-0123-456789abcdef";
-    assert!(automated_meta(json!({"source": {"subagent": "review"}})));
-    assert!(automated_meta(json!({"source": {"subagent": "compact"}})));
-    assert!(automated_meta(
+    assert!(only_session_meta_reads_as_automated(
+        json!({"source": {"subagent": "review"}})
+    ));
+    assert!(only_session_meta_reads_as_automated(
+        json!({"source": {"subagent": "compact"}})
+    ));
+    assert!(only_session_meta_reads_as_automated(
         json!({"source": {"subagent": "memory_consolidation"}})
     ));
-    assert!(automated_meta(json!({
+    assert!(only_session_meta_reads_as_automated(json!({
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}}
     })));
-    assert!(automated_meta(
+    assert!(only_session_meta_reads_as_automated(
         json!({"source": {"subagent": {"other": "guardian"}}})
     ));
-    assert!(automated_meta(json!({"source": {"internal": "guardian"}})));
-    assert!(automated_meta(
+    assert!(only_session_meta_reads_as_automated(
+        json!({"source": {"internal": "guardian"}})
+    ));
+    assert!(only_session_meta_reads_as_automated(
         json!({"source": {"internal": "memory_consolidation"}})
     ));
-    assert!(automated_meta(json!({"thread_source": "subagent"})));
-    assert!(automated_meta(json!({"thread_source": "guardian_review"})));
-    assert!(automated_meta(
+    assert!(only_session_meta_reads_as_automated(
+        json!({"thread_source": "subagent"})
+    ));
+    assert!(only_session_meta_reads_as_automated(
+        json!({"thread_source": "guardian_review"})
+    ));
+    assert!(only_session_meta_reads_as_automated(
         json!({"thread_source": "memory_consolidation"})
     ));
-    assert!(automated_meta(json!({
+    assert!(only_session_meta_reads_as_automated(json!({
         "thread_source": "future_feature",
         "source": {"subagent": "review"}
     })));
-    assert!(automated_meta(json!({
+    assert!(only_session_meta_reads_as_automated(json!({
         "thread_source": "guardian_review",
         "source": {"subagent": {"other": "future"}}
     })));
@@ -192,43 +220,49 @@ fn known_automated_session_sources_mark_the_session_automated() {
 #[test]
 fn unknown_or_malformed_session_sources_fail_open_as_human() {
     let parent = "01234567-89ab-cdef-0123-456789abcdef";
-    assert!(!automated_meta(json!({
+    assert!(!only_session_meta_reads_as_automated(json!({
         "source": "exec", "thread_source": "user", "originator": "guardian"
     })));
-    assert!(!automated_meta(json!({
+    assert!(!only_session_meta_reads_as_automated(json!({
         "source": "vscode", "parent_thread_id": parent, "agent_nickname": "guardian"
     })));
-    assert!(!automated_meta(
+    assert!(!only_session_meta_reads_as_automated(
         json!({"thread_source": "agent_created_thread"})
     ));
-    assert!(!automated_meta(
+    assert!(!only_session_meta_reads_as_automated(
         json!({"source": {"subagent": {"other": "unknown"}}})
     ));
-    assert!(!automated_meta(json!({"source": {"subAgent": "review"}})));
-    assert!(!automated_meta(json!({"source": "subagent"})));
-    assert!(!automated_meta(
+    assert!(!only_session_meta_reads_as_automated(
+        json!({"source": {"subAgent": "review"}})
+    ));
+    assert!(!only_session_meta_reads_as_automated(
+        json!({"source": "subagent"})
+    ));
+    assert!(!only_session_meta_reads_as_automated(
         json!({"source": {"subagent": "thread_spawn"}})
     ));
-    assert!(!automated_meta(
+    assert!(!only_session_meta_reads_as_automated(
         json!({"source": {"subagent": {"thread_spawn": {}}}})
     ));
-    assert!(!automated_meta(json!({
+    assert!(!only_session_meta_reads_as_automated(json!({
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent}}}
     })));
-    assert!(!automated_meta(json!({
+    assert!(!only_session_meta_reads_as_automated(json!({
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": "bad", "depth": 1}}}
     })));
-    assert!(!automated_meta(json!({
+    assert!(!only_session_meta_reads_as_automated(json!({
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": "1"}}}
     })));
-    assert!(!automated_meta(json!({
+    assert!(!only_session_meta_reads_as_automated(json!({
         "source": {"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 2_147_483_648_i64}}}
     })));
-    assert!(!automated_meta(
+    assert!(!only_session_meta_reads_as_automated(
         json!({"source": {"subagent": "review", "custom": "human"}})
     ));
-    assert!(!automated_meta(json!({"source": {"internal": "future"}})));
-    assert!(!automated_meta(json!({})));
+    assert!(!only_session_meta_reads_as_automated(
+        json!({"source": {"internal": "future"}})
+    ));
+    assert!(!only_session_meta_reads_as_automated(json!({})));
 }
 
 #[test]
@@ -238,7 +272,7 @@ fn provenance_words_inside_a_message_do_not_mark_the_session_automated() {
     ]);
 
     assert!(
-        !parse_codex_session(tmp.path())
+        !parse_codex_session_checking_classification(tmp.path())
             .unwrap()
             .unwrap()
             .origin
@@ -260,7 +294,9 @@ fn mixed_record_shapes_keep_payload_roles_and_legacy_project_context() {
         r#"{"role":"assistant","content":"answer"}"#,
     ]);
 
-    let parsed = parse_codex_session(tmp.path()).unwrap().unwrap();
+    let parsed = parse_codex_session_checking_classification(tmp.path())
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         turns(&parsed),
@@ -281,7 +317,6 @@ const TURNS: &str = concat!(
     "\n",
 );
 
-/// Parses `body` from a plain log and from a `.jsonl.zst` copy in a dated directory.
 fn plain_and_compressed(body: &str) -> (ParseResult, ParseResult) {
     let root = tempfile::tempdir().unwrap();
     let plain = root
@@ -297,8 +332,12 @@ fn plain_and_compressed(body: &str) -> (ParseResult, ParseResult) {
     fs::write(&plain, body).unwrap();
     fs::write(&compressed, zstd::encode_all(body.as_bytes(), 0).unwrap()).unwrap();
     (
-        parse_codex_session(&plain).unwrap().unwrap(),
-        parse_codex_session(&compressed).unwrap().unwrap(),
+        parse_codex_session_checking_classification(&plain)
+            .unwrap()
+            .unwrap(),
+        parse_codex_session_checking_classification(&compressed)
+            .unwrap()
+            .unwrap(),
     )
 }
 

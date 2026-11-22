@@ -7,13 +7,14 @@ use std::{
     time::Instant,
 };
 
+const UNREACHABLE_DOWNLOAD_ENDPOINT: &str = "http://127.0.0.1:1";
+
 fn spec() -> ModelSpec {
     ModelSpec {
         model_sha256: digest_hex(&Sha256::digest(b"shared weights")),
         tokenizer_sha256: digest_hex(&Sha256::digest(b"shared tokenizer")),
-        // Reuse tests must work without any accessible download endpoint.
-        model_url: "http://127.0.0.1:1/model".into(),
-        tokenizer_url: "http://127.0.0.1:1/tokenizer".into(),
+        model_url: format!("{UNREACHABLE_DOWNLOAD_ENDPOINT}/model"),
+        tokenizer_url: format!("{UNREACHABLE_DOWNLOAD_ENDPOINT}/tokenizer"),
         ..ModelSpec::default()
     }
 }
@@ -81,8 +82,8 @@ fn cache_child() {
                     cached_artifacts(app, &spec, &shared).unwrap(),
                     Some(shared.clone())
                 );
-                // Download also reuses verified files without a live server.
-                download_artifacts(app, &spec, &shared).unwrap();
+                download_artifacts(app, &spec, &shared)
+                    .expect("download reuses verified files without a live server");
             }
             let source = home.join(".cache/sae/models/old-sae");
             assert_eq!(
@@ -93,19 +94,20 @@ fn cache_child() {
             for name in ["model.gguf", "tokenizer.json"] {
                 same_file(&source.join(name), &shared.join(name));
             }
-            // Corruption is detected on reads, and a download can repair it from legacy bytes.
             fs::rename(shared.join("model.gguf"), shared.join("saved-model")).unwrap();
             fs::write(shared.join("model.gguf"), b"corrupt").unwrap();
             assert!(
                 cached_artifacts("recall", &spec, &shared)
                     .unwrap_err()
                     .to_string()
-                    .contains("checksum")
+                    .contains("checksum"),
+                "a read detects a corrupt cached artifact"
             );
             download_artifacts("recall", &spec, &shared).unwrap();
             assert_eq!(
                 fs::read(shared.join("model.gguf")).unwrap(),
-                b"shared weights"
+                b"shared weights",
+                "a download repairs the corrupt artifact from the legacy bytes"
             );
         }
         "download" => {
@@ -219,13 +221,13 @@ fn existing_peer_cache_is_verified_and_reused_offline_without_copying() {
     fs::write(valid.join("tokenizer.json"), b"shared tokenizer").unwrap();
     fs::write(corrupt.join("model.gguf"), b"invalid legacy model").unwrap();
     fs::write(corrupt.join("tokenizer.json"), b"invalid legacy tokenizer").unwrap();
-    // A newly configured cache root must still discover the original home cache.
     assert!(
         child(root, "reuse")
             .env("HF_HOME", root.join("new-hf"))
             .status()
             .unwrap()
-            .success()
+            .success(),
+        "a newly configured cache root still discovers the original home cache"
     );
     assert_eq!(
         fs::read(corrupt.join("model.gguf")).unwrap(),
@@ -372,7 +374,6 @@ fn public_existing_model_is_reused_without_network_or_inference() {
             fs::copy(source.join(name), legacy.join(name)).unwrap();
         }
     }
-    // The child removes explicit model overrides, just like the normal default-cache path.
     assert!(
         child(home.path(), "public-reuse")
             .status()

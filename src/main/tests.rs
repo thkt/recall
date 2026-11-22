@@ -57,6 +57,39 @@ fn create_db_file_errors_when_parent_cannot_be_created() {
 }
 
 #[test]
+fn opening_an_index_built_for_another_model_for_writing_fails_before_changing_its_schema_or_journal_mode()
+ {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let other_model = Connection::open(&db_path).unwrap();
+    other_model
+        .execute_batch(
+            "CREATE TABLE embedding_identity (singleton INTEGER PRIMARY KEY, fingerprint TEXT, manifest TEXT);
+             INSERT INTO embedding_identity VALUES (1, 'another model', '{}');",
+        )
+        .unwrap();
+    drop(other_model);
+
+    open_or_create_db(&db_path).unwrap_err();
+
+    let conn = Connection::open(&db_path).unwrap();
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let journal_mode: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        (tables, journal_mode),
+        (vec!["embedding_identity".to_owned()], "delete".to_owned())
+    );
+}
+
+#[test]
 fn resolve_default_db_path_uses_local_share_when_xdg_unset() {
     let home = Path::new("/home/u");
 
@@ -123,7 +156,7 @@ fn resolve_db_path_defaults_to_recall_db_under_data_dir() {
 }
 
 #[test]
-fn test_format_timestamp() {
+fn format_timestamp_prints_the_utc_calendar_date_or_unknown() {
     for (input, expected) in [
         (None, "unknown"),
         (Some(0), "1970-01-01"),
@@ -389,9 +422,6 @@ fn known_subcommands_covers_every_clap_subcommand() {
     }
 }
 
-/// A remedy that names a removed subcommand reads as a search query after shorthand
-/// expansion (`recall embed` became `recall search embed`), so every `` `recall <word>` ``
-/// in production code must name a subcommand that exists.
 #[test]
 fn every_command_a_message_tells_the_user_to_run_exists() {
     let mut unknown = Vec::new();
@@ -402,7 +432,7 @@ fn every_command_a_message_tells_the_user_to_run_exists() {
     }
     assert!(
         unknown.is_empty(),
-        "messages name commands that do not exist: {unknown:?}"
+        "messages name commands that do not exist, which shorthand expansion runs as a search query (`recall embed` becomes `recall search embed`): {unknown:?}"
     );
 }
 
@@ -550,12 +580,10 @@ fn read_commands_use_pre_generation_index_without_migrating_it() {
     assert_eq!(saved, embedder::f32_as_bytes(&vector));
 }
 
-/// The `--json` envelope a command prints for an output.
 pub(crate) fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
     serde_json::from_str(&render_json_success(out)).unwrap()
 }
 
-/// What a failing command reports: its exit code and the `--json` error envelope.
 pub(crate) fn reported(err: &anyhow::Error) -> (ExitCode, String) {
     (
         classify_exit_code(err),

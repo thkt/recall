@@ -171,7 +171,6 @@ fn create_db_file(path: &Path) -> io::Result<()> {
 }
 
 fn format_timestamp(ts_ms: Option<i64>) -> String {
-    // Display UTC dates; --days filters a rolling 24-hour window.
     let Some(ts) = ts_ms else {
         return "unknown".to_owned();
     };
@@ -187,7 +186,6 @@ fn open_or_create_db(path: &Path) -> Result<Connection> {
         Err(e) => return Err(e).context("Failed to create database file"),
     }
     {
-        // Reject a mismatched model before any schema or journal-mode write.
         let (existing, _) = db::open_db_readonly(path)?;
         model::check_index(&existing, model::selected())
             .map_err(|e| RecallError::DatabaseRead(e.to_string()))?;
@@ -276,9 +274,6 @@ fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome
     )
 }
 
-/// Writes the result to `w` and, in a text run whose result did not fail to write, the notes the
-/// command has not shown to `notes`, so a reader that closed stdout early still gets them. A note
-/// the command already put in its result on stdout is not repeated there.
 fn emit_success_to<W: Write, E: Write>(
     out: &CommandOutput,
     json_mode: bool,
@@ -296,7 +291,6 @@ fn emit_success_to<W: Write, E: Write>(
         write_result(w, &body)
     };
     if !json_mode && written.is_ok() {
-        // A closed stderr must not fail a run whose result was written, as a closed stdout does not.
         let _ = notes.write_all(render_text_notes(out).as_bytes());
     }
     written
