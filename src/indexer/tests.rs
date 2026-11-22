@@ -4961,11 +4961,7 @@ const SESSION_LOGS: &str =
     "SELECT json_array(session_id, file_path) FROM sessions ORDER BY session_id";
 
 fn session_log(session_id: u8, log: &Path) -> String {
-    serde_json::json!([
-        format!("01900000-0000-7000-8000-0000000000{session_id:02}"),
-        log.to_str().unwrap()
-    ])
-    .to_string()
+    session_message(session_id, log.to_str().unwrap())
 }
 
 fn session_message(session_id: u8, text: &str) -> String {

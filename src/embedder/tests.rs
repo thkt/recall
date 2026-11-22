@@ -1,7 +1,7 @@
 use std::sync::Mutex;
 
 use super::*;
-use crate::db::{open_db, seed_chunk, seed_session, setup_test_db};
+use crate::db::{collect_strings, open_db, seed_chunk, seed_session, setup_test_db};
 use crate::index_observer::recording;
 
 #[test]
@@ -74,9 +74,7 @@ fn all_batches_failing_is_non_fatal_and_retryable() {
         err == "batch inference failed",
         "the all-fail run still records the first batch error, got: {err:?}"
     );
-    let vec_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
+    let vec_count = vec_chunk_count(&conn);
     assert_eq!(
         vec_count, 0,
         "the chunk stays pending for the next index to retry"
@@ -132,9 +130,7 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
             .unwrap()
             .eq("batch inference failed")
     );
-    let stored: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
+    let stored = vec_chunk_count(&conn);
     assert_eq!(stored, 1024, "only the poison chunk is left unembedded");
     assert_eq!(pending_chunks(&conn, usize::MAX).unwrap().len(), 1);
 
@@ -491,9 +487,7 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
         after, saved,
         "discarding stale work must not touch current vectors"
     );
-    let count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
+    let count = vec_chunk_count(&conn);
     assert_eq!(count, 1);
     assert!(pending_chunks(&conn, 10).unwrap().is_empty());
     assert_vectors_match_current_content(&conn);
@@ -821,19 +815,18 @@ fn saving_a_changed_chunk_again_replaces_all_its_old_vectors_and_records_the_new
     .unwrap();
 
     assert_eq!(saved.embedded, 1);
-    let rows = |sql: &str| -> Vec<String> {
-        let mut stmt = conn.prepare(sql).unwrap();
-        stmt.query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect()
-    };
     assert_eq!(
-        rows("SELECT json_array(rowid, chunk_id, sub_idx) FROM vec_chunks ORDER BY rowid"),
+        collect_strings(
+            &conn,
+            "SELECT json_array(rowid, chunk_id, sub_idx) FROM vec_chunks ORDER BY rowid"
+        ),
         ["[3,2,0]", "[4,2,1]", "[5,1,0]", "[6,1,1]", "[7,1,2]"]
     );
     assert_eq!(
-        rows("SELECT json_array(id, vec_rowid_lo, vec_rowid_hi) FROM qa_chunks ORDER BY id"),
+        collect_strings(
+            &conn,
+            "SELECT json_array(id, vec_rowid_lo, vec_rowid_hi) FROM qa_chunks ORDER BY id"
+        ),
         ["[1,5,7]", "[2,3,4]"]
     );
 }
