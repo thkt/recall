@@ -64,7 +64,6 @@ pub(crate) fn index_and_report(
     Ok(outcome)
 }
 
-/// Picks the always-probe loader for index and rebuild.
 pub(crate) fn index_embedder(host: &ModelHost<'_>) -> Result<Arc<dyn Embed>, DegradedReason> {
     try_load_embedder_cached_with_reporter(|| host.load_probing(), |_: &str| {})
 }

@@ -217,7 +217,6 @@ impl BatchEmbedder<'_, '_> {
     fn save(&mut self, batch: &[PendingChunk], embeddings: &[ChunkedEmbedding]) {
         let observer = self.observer;
         let progress = &mut *self.progress;
-        // Inference ran without a write lock; validate generations before saving.
         let save = observer.stage("embedding_db_save");
         let saved: Result<usize> = (|| {
             let tx = self

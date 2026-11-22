@@ -139,7 +139,6 @@ pub(crate) fn recording() -> (Observer, Rc<RefCell<Vec<String>>>) {
     )
 }
 
-/// Drops time-throttled progress lines and timings, which vary between runs.
 #[cfg(test)]
 pub(crate) fn stable_lines(lines: &[String]) -> Vec<String> {
     lines

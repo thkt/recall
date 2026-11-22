@@ -19,12 +19,9 @@ use rusqlite::Transaction;
 
 const INDEX_RULES_VERSION: i64 = 2;
 
-/// Written with the messages the scan stores: they are parsed under the current rules, and their
-/// chunks are pending.
 pub(super) const PARSED: i64 = -INDEX_RULES_VERSION;
 
-/// The SQL condition that the chunks of a `sessions` row are pending. It is a macro so that
-/// `concat!` can splice it into a `const` statement.
+// why-not: a const, because `concat!` accepts only literals and cannot splice a const
 macro_rules! chunks_pending {
     () => {
         "(chunks_indexed IS NULL OR chunks_indexed < 0)"
@@ -32,13 +29,10 @@ macro_rules! chunks_pending {
 }
 pub(super) use chunks_pending;
 
-/// Whether a stored value means the session was parsed and chunked under the current rules.
 pub(super) fn is_current(value: Option<i64>) -> bool {
     value == Some(INDEX_RULES_VERSION)
 }
 
-/// Whether the session was chunked under the current rules and still has chunks, so the scan can
-/// match its new messages against them instead of chunking it again.
 pub(super) fn has_current_chunks(tx: &Transaction, session_id: &str) -> Result<bool> {
     Ok(tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id = ?1 AND chunks_indexed = ?2 \
@@ -48,8 +42,6 @@ pub(super) fn has_current_chunks(tx: &Transaction, session_id: &str) -> Result<b
     )?)
 }
 
-/// Records that the session's chunks were made or matched to its messages. A session whose rules
-/// version was unknown or other gets `0`, so the scan still parses it again.
 pub(super) fn record_chunked(tx: &Transaction, session_id: &str) -> Result<()> {
     tx.execute(
         "UPDATE sessions SET chunks_indexed = CASE WHEN chunks_indexed = ?1 THEN ?2 ELSE 0 END \

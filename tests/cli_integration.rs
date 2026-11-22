@@ -23,14 +23,14 @@ fn recall(dir: &Path) -> Command {
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("RECALL_TOKEN_BUDGET")
         .env_remove("RECALL_FORWARD_PAUSE_MS")
-        // Keep the model cache and the probe record off the developer's own directories.
+        // why-not: the developer's own model cache and probe record, which a test run must not touch
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CACHE_HOME", dir.join("cache"))
         .env("HF_HOME", dir.join("hf"))
         .env_remove("__RECALL_GEMMA_PROBE")
         .env_remove("__RECALL_GEMMA_SPEC")
         .env_remove("CLAUDE_CODE_SESSION_ID")
-        // clap colours its errors and help when this is set, even into a pipe.
+        // why-not: CLICOLOR_FORCE, because clap then colours its errors and help even into a pipe
         .env_remove("CLICOLOR_FORCE")
         .env_remove("RUST_LOG");
     cmd
@@ -44,7 +44,6 @@ fn exit_code(cmd: &mut Command) -> i32 {
         .expect("process returned an exit code")
 }
 
-/// What a run shows the user: its exit code, stdout and stderr.
 fn outcome(cmd: &mut Command) -> (Option<i32>, String, String) {
     let out = cmd.output().expect("spawn recall binary");
     (
@@ -63,7 +62,6 @@ fn listing(dir: &Path) -> Vec<String> {
     names
 }
 
-/// `recall --help`, whose `--db-path` line names the `RECALL_DB` that `recall()` sets.
 fn help_text(db: &Path) -> String {
     format!(
         concat!(
@@ -98,7 +96,6 @@ fn help_text(db: &Path) -> String {
     )
 }
 
-/// What a `--json` run shows the user, with stdout parsed as the one-line envelope it prints.
 fn json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
     let (code, stdout, stderr) = outcome(cmd);
     let envelope = stdout
@@ -113,7 +110,6 @@ fn json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
 
 const NO_SESSIONS_INDEXED: &str = "No sessions indexed. Run `recall index` first.\n";
 
-/// What `status` and `doctor` print on stderr when `db` does not exist.
 fn database_not_found(db: &Path) -> String {
     format!(
         "database not found at {}\nrun `recall index` to create the index.\n",
@@ -232,11 +228,15 @@ fn indexing_over_an_empty_old_embedding_table_replaces_it_without_a_warning() {
         .execute_batch("CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB);")
         .unwrap();
 
-    let (code, envelope, stderr) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+    let (code, envelope, stderr) =
+        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
 
     assert_eq!(
         (code, envelope),
-        (Some(0), index_envelope(&[], &serde_json::json!([]), &[]))
+        (
+            Some(0),
+            index_envelope_without_the_model(&[], &serde_json::json!([]), &[])
+        )
     );
     assert!(!stderr.contains("warning:"), "{stderr}");
     assert!(!stderr.contains("`recall index`"), "{stderr}");
@@ -296,7 +296,6 @@ fn seed_indexed_session(dir: &Path) {
     );
 }
 
-/// `recall search hello` when `seed_indexed_session` indexed only `s1`.
 const S1_MATCH: &str = concat!(
     "Found 1 sessions:\n",
     "\n",
@@ -308,7 +307,6 @@ const S1_MATCH: &str = concat!(
     "\n",
 );
 
-/// The `--json` result row of `S1_MATCH`.
 fn s1_match() -> serde_json::Value {
     serde_json::json!({
         "chunk": 1,
@@ -322,7 +320,6 @@ fn s1_match() -> serde_json::Value {
     })
 }
 
-/// `recall show s1` when `seed_indexed_session` indexed `s1`.
 const SHOW_S1: &str = concat!(
     "# s1\n",
     "- session_id: s1\n",
@@ -335,7 +332,6 @@ const SHOW_S1: &str = concat!(
     "\n",
 );
 
-/// The `--json` data of `recall show s1` when `seed_indexed_session` indexed `s1`.
 fn show_s1() -> serde_json::Value {
     serde_json::json!({
         "messages": [{"role": "user", "text": "hello world recall"}],
@@ -347,12 +343,10 @@ fn show_s1() -> serde_json::Value {
     })
 }
 
-/// The `--json` data of `recall status` on an index of one unembedded session.
 fn status_of_one_session() -> serde_json::Value {
     serde_json::json!({"embedded": 0, "model_ready": false, "qa_chunks": 1, "sessions": 1})
 }
 
-/// The `--json` data of `recall doctor` on a sound index without the model installed.
 fn doctor_of_a_sound_index_without_the_model() -> serde_json::Value {
     serde_json::json!({
         "checks": [
@@ -380,12 +374,11 @@ macro_rules! model_not_installed {
     };
 }
 const MODEL_NOT_INSTALLED_STDERR: &str = concat!(model_not_installed!(), "\n");
-/// The same line as an `index --json` note.
 const MODEL_NOT_INSTALLED_INDEX_NOTE: &str = model_not_installed!();
 
-/// What an `index` or `rebuild --json` run shows, without the stage timings that differ on
-/// every run. Its stderr carries those timings too, so it can only be checked line by line.
-fn index_json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, String) {
+fn index_json_outcome_without_stage_timings(
+    cmd: &mut Command,
+) -> (Option<i32>, serde_json::Value, String) {
     let (code, mut envelope, stderr) = json_outcome(cmd);
     let seconds = envelope["data"]["observations"]
         .as_object_mut()
@@ -395,9 +388,7 @@ fn index_json_outcome(cmd: &mut Command) -> (Option<i32>, serde_json::Value, Str
     (code, envelope, stderr)
 }
 
-/// An `index` or `rebuild --json` envelope without the model: the model note first, then
-/// `notes`.
-fn index_envelope(
+fn index_envelope_without_the_model(
     counts: &[(&str, u64)],
     parse_diagnostics: &serde_json::Value,
     notes: &[String],
@@ -417,7 +408,6 @@ fn index_envelope(
     })
 }
 
-/// The index observation counts: the ones given, and 0 for every other.
 fn index_counts(nonzero: &[(&str, u64)]) -> serde_json::Value {
     let mut counts = serde_json::json!({
         "chunks_created_committed": 0, "chunks_failed": 0, "chunks_matched_committed": 0,
@@ -437,7 +427,6 @@ fn index_counts(nonzero: &[(&str, u64)]) -> serde_json::Value {
     counts
 }
 
-/// The counts of a run that parses and chunks one new session, or one that `rebuild` re-parses.
 const ONE_SESSION_PARSED_AND_CHUNKED: &[(&str, u64)] = &[
     ("chunks_created_committed", 1),
     ("chunks_pending_snapshot", 1),
@@ -566,16 +555,20 @@ fn show_without_json_keeps_human_output() {
 }
 
 #[test]
-fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model() {
+fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model_and_prints_stage_lines_on_stderr()
+ {
     let dir = TempDir::new().unwrap();
 
-    let (code, envelope, stderr) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+    let (code, envelope, stderr) =
+        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
 
     assert_eq!(
         (code, envelope),
-        (Some(0), index_envelope(&[], &serde_json::json!([]), &[]))
+        (
+            Some(0),
+            index_envelope_without_the_model(&[], &serde_json::json!([]), &[])
+        )
     );
-    // Only a run of the binary reaches the stage lines the observer writes to stderr.
     assert!(
         stderr.starts_with("index: total: started (not yet complete)\n"),
         "{stderr}"
@@ -587,7 +580,7 @@ fn rebuild_json_reparses_an_unchanged_session_and_reports_it_unembedded() {
     let dir = TempDir::new().unwrap();
     seed_indexed_session(dir.path());
 
-    let (code, envelope, _) = index_json_outcome(
+    let (code, envelope, _) = index_json_outcome_without_stage_timings(
         recall(dir.path())
             .env("RECALL_CLAUDE_DIR", dir.path().join("claude"))
             .args(["rebuild", "--json"]),
@@ -597,7 +590,11 @@ fn rebuild_json_reparses_an_unchanged_session_and_reports_it_unembedded() {
         (code, envelope),
         (
             Some(0),
-            index_envelope(ONE_SESSION_PARSED_AND_CHUNKED, &serde_json::json!([]), &[])
+            index_envelope_without_the_model(
+                ONE_SESSION_PARSED_AND_CHUNKED,
+                &serde_json::json!([]),
+                &[]
+            )
         )
     );
 }
@@ -815,7 +812,6 @@ fn only_current_without_env_exits_usage() {
     );
 }
 
-/// `recall search hello` when it lists only `s2` of `seed_two_matching_sessions`.
 const S2_MATCH: &str = concat!(
     "Found 1 sessions:\n",
     "\n",
@@ -827,7 +823,6 @@ const S2_MATCH: &str = concat!(
     "\n",
 );
 
-/// What `recall search hello` prints when it lists both sessions of `seed_two_matching_sessions`.
 const BOTH_SEEDED_SESSIONS: &str = concat!(
     "Found 2 sessions:\n",
     "\n",
@@ -845,7 +840,6 @@ const BOTH_SEEDED_SESSIONS: &str = concat!(
     "\n",
 );
 
-/// What `recall search hello --exclude-current` prints on stderr when no session id is set.
 const EXCLUDE_CURRENT_HAS_NO_EFFECT_STDERR: &str = concat!(
     "warning: --exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set\n",
     model_not_installed!(),
@@ -993,7 +987,6 @@ fn index_claude_sessions(dir: &Path, sessions: &[(&str, &[&str])]) {
     );
 }
 
-/// The `--json` row of a session whose only turn is `authentication notes` on 2026-03-01.
 fn authentication_notes_match(session_id: &str, chunk: u64) -> serde_json::Value {
     serde_json::json!({
         "chunk": chunk,
@@ -1148,7 +1141,7 @@ fn read_commands_work_in_readonly_directory() {
     let db = dir.path().join("recall.db");
     let _ = fs::remove_file(db.with_file_name("recall.db-wal"));
     let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
-    let read_only = ReadOnlyDir::new(dir.path());
+    let read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1185,7 +1178,7 @@ fn status_reads_an_index_given_by_a_relative_path_from_a_read_only_working_direc
     let db = dir.path().join("recall.db");
     let _ = fs::remove_file(db.with_file_name("recall.db-wal"));
     let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
-    let _read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1207,14 +1200,13 @@ fn status_of_an_unreadable_database_in_a_read_only_directory_names_the_path_it_w
     use std::os::unix::fs::PermissionsExt;
 
     let root = TempDir::new().unwrap();
-    // A URI writes the space and `#` as `%20` and `%23`.
-    let dir = root.path().join("a b#c");
-    fs::create_dir(&dir).unwrap();
-    let db = dir.join("recall.db");
+    let dir_whose_uri_escapes_a_space_and_a_hash = root.path().join("a b#c");
+    fs::create_dir(&dir_whose_uri_escapes_a_space_and_a_hash).unwrap();
+    let db = dir_whose_uri_escapes_a_space_and_a_hash.join("recall.db");
     fs::write(&db, b"").unwrap();
     fs::set_permissions(&db, fs::Permissions::from_mode(0o000)).unwrap();
-    let _read_only = ReadOnlyDir::new(&dir);
-    if root_skip::skip_if_root(&dir) {
+    let _read_only = ReadOnlyUntilDropped::new(&dir_whose_uri_escapes_a_space_and_a_hash);
+    if root_skip::skip_if_root(&dir_whose_uri_escapes_a_space_and_a_hash) {
         return;
     }
 
@@ -1231,8 +1223,6 @@ fn status_of_an_unreadable_database_in_a_read_only_directory_names_the_path_it_w
     );
 }
 
-/// Indexes one session, then leaves a nonempty `-wal` beside the DB the way an
-/// interrupted writer does, so a read from a read-only directory sees a stale snapshot.
 fn seed_stale_wal(dir: &Path) {
     seed_indexed_session(dir);
     let db = dir.join("recall.db");
@@ -1240,13 +1230,11 @@ fn seed_stale_wal(dir: &Path) {
     fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
 }
 
-/// Makes a directory read-only until dropped, so a failed assertion still leaves
-/// `TempDir` able to delete it.
 #[cfg(unix)]
-struct ReadOnlyDir<'a>(&'a Path);
+struct ReadOnlyUntilDropped<'a>(&'a Path);
 
 #[cfg(unix)]
-impl<'a> ReadOnlyDir<'a> {
+impl<'a> ReadOnlyUntilDropped<'a> {
     fn new(dir: &'a Path) -> Self {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o555)).unwrap();
@@ -1255,7 +1243,7 @@ impl<'a> ReadOnlyDir<'a> {
 }
 
 #[cfg(unix)]
-impl Drop for ReadOnlyDir<'_> {
+impl Drop for ReadOnlyUntilDropped<'_> {
     fn drop(&mut self) {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
@@ -1267,7 +1255,7 @@ impl Drop for ReadOnlyDir<'_> {
 fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
-    let _read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1284,9 +1272,7 @@ fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log()
     );
 }
 
-/// An index from before the trigram tokenizer and before embeddings: one session whose log
-/// sits under the Claude root, which is missing in `recall()`'s environment.
-fn seed_pre_trigram_index(dir: &Path) {
+fn seed_pre_trigram_index_under_the_missing_claude_root(dir: &Path) {
     rusqlite::Connection::open(dir.join("recall.db"))
         .unwrap()
         .execute_batch(
@@ -1308,11 +1294,11 @@ fn indexing_an_old_index_whose_claude_root_is_missing_reports_the_preserved_sess
  {
     const MISSING_ROOT_NOTE: &str = "claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions";
     let dir = TempDir::new().unwrap();
-    seed_pre_trigram_index(dir.path());
+    seed_pre_trigram_index_under_the_missing_claude_root(dir.path());
     let skipped_roots = serde_json::json!([
         {"preserved_sessions": 1, "reason": "missing_root", "source": "claude"}
     ]);
-    let mut first_expected = index_envelope(
+    let mut first_expected = index_envelope_without_the_model(
         &[
             ("chunks_created_committed", 1),
             ("chunks_pending_snapshot", 1),
@@ -1326,7 +1312,7 @@ fn indexing_an_old_index_whose_claude_root_is_missing_reports_the_preserved_sess
         &[MISSING_ROOT_NOTE.to_owned()],
     );
     first_expected["data"]["skipped_roots"] = skipped_roots.clone();
-    let mut second_expected = index_envelope(
+    let mut second_expected = index_envelope_without_the_model(
         &[
             ("chunks_pending_snapshot", 1),
             ("chunks_remaining_snapshot", 1),
@@ -1338,8 +1324,10 @@ fn indexing_an_old_index_whose_claude_root_is_missing_reports_the_preserved_sess
     );
     second_expected["data"]["skipped_roots"] = skipped_roots;
 
-    let (first_code, first, _) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
-    let (second_code, second, _) = index_json_outcome(recall(dir.path()).args(["index", "--json"]));
+    let (first_code, first, _) =
+        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
+    let (second_code, second, _) =
+        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
 
     assert_eq!(
         ((first_code, first), (second_code, second)),
@@ -1350,9 +1338,9 @@ fn indexing_an_old_index_whose_claude_root_is_missing_reports_the_preserved_sess
 #[test]
 fn index_upgrading_a_pre_trigram_index_keeps_the_sessions_of_a_missing_root_searchable() {
     let dir = TempDir::new().unwrap();
-    seed_pre_trigram_index(dir.path());
+    seed_pre_trigram_index_under_the_missing_claude_root(dir.path());
 
-    // Its stderr carries stage timings, so only the code counts.
+    // why-not: comparing stderr, because it carries stage timings
     let (index_code, _, index_stderr) = outcome(recall(dir.path()).arg("index"));
     assert_eq!(index_code, Some(0), "{index_stderr}");
 
@@ -1412,7 +1400,7 @@ fn show_from_a_writable_directory_adds_no_stale_snapshot_note() {
 fn read_commands_on_a_stale_snapshot_in_a_read_only_directory_ask_to_index_a_copy() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
-    let _read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1478,7 +1466,7 @@ fn read_commands_on_a_stale_snapshot_in_a_read_only_directory_ask_to_index_a_cop
 fn text_read_commands_on_a_stale_snapshot_in_a_read_only_directory_print_the_note_on_stderr() {
     let dir = TempDir::new().unwrap();
     seed_stale_wal(dir.path());
-    let _read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1539,8 +1527,8 @@ fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
         b"uncheckpointed-frames",
     )
     .unwrap();
-    let _no_sessions_read_only = ReadOnlyDir::new(no_sessions.path());
-    let _no_schema_read_only = ReadOnlyDir::new(no_schema.path());
+    let _no_sessions_read_only = ReadOnlyUntilDropped::new(no_sessions.path());
+    let _no_schema_read_only = ReadOnlyUntilDropped::new(no_schema.path());
     if root_skip::skip_if_root(no_sessions.path()) {
         return;
     }
@@ -1584,7 +1572,7 @@ fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_th
         )
         .unwrap();
     fs::write(dir.path().join("recall.db-wal"), b"uncheckpointed-frames").unwrap();
-    let _read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1620,7 +1608,7 @@ fn status_of_a_stale_snapshot_built_for_another_model_lists_the_snapshot_note_be
         .unwrap();
     let _ = fs::remove_file(db.with_file_name("recall.db-shm"));
     fs::write(db.with_file_name("recall.db-wal"), b"uncheckpointed-frames").unwrap();
-    let _read_only = ReadOnlyDir::new(dir.path());
+    let _read_only = ReadOnlyUntilDropped::new(dir.path());
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
@@ -1709,7 +1697,7 @@ fn text_search_and_status_print_the_notes_they_add_on_stderr() {
             identity_note.to_owned()
         )
     );
-    // A tracing line with a timestamp logs the skipped session before the note.
+    // why-not: a whole-stderr match, because a timestamped tracing line logs the skipped session first
     let (_, _, stderr) =
         outcome(recall(unknown_source.path()).args(["search", "authentication", "--limit", "1"]));
     assert!(
@@ -1734,7 +1722,8 @@ fn the_cli_integration_suite_fails_when_run_as_root() {
 }
 
 #[test]
-fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
+fn index_reports_parse_loss_but_not_excluded_codex_events_on_json_and_human_surfaces_without_repeating_skipped_text_until_source_repair()
+ {
     let dir = TempDir::new().unwrap();
     let claude = dir.path().join("claude");
     let codex = dir.path().join("codex");
@@ -1746,7 +1735,6 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     contents
         .extend_from_slice(b"{broken-secret-body\n\xff\n{\"type\":\"progress\"}\n{\"message\":");
     fs::write(&path, contents).unwrap();
-    // Excluded Codex events are not parse loss.
     fs::write(codex.join("ignored.jsonl"), "{\"type\":\"event_msg\"}\n").unwrap();
     let run = |args: &[&str]| {
         let mut cmd = recall(dir.path());
@@ -1772,8 +1760,7 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         "source": "claude",
     }]);
     let notes = [skipped_lines.clone(), incomplete_tail.clone()];
-    // The second file, the excluded Codex log, is discovered and read as empty.
-    let parsed = [
+    let parsed_with_the_excluded_codex_log_read_as_empty = [
         ONE_SESSION_PARSED_AND_CHUNKED,
         &[("files_discovered", 2), ("files_empty", 1)],
     ]
@@ -1788,24 +1775,44 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         ("sessions_stored", 1),
     ];
 
-    let (code, first, first_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
+    let (code, first, first_stderr) =
+        index_json_outcome_without_stage_timings(&mut run(&["index", "--json"]));
     assert_eq!(
         (code, first),
-        (Some(0), index_envelope(&parsed, &diagnostics, &notes))
+        (
+            Some(0),
+            index_envelope_without_the_model(
+                &parsed_with_the_excluded_codex_log_read_as_empty,
+                &diagnostics,
+                &notes
+            )
+        )
     );
-    let (code, second, second_stderr) = index_json_outcome(&mut run(&["index", "--json"]));
+    let (code, second, second_stderr) =
+        index_json_outcome_without_stage_timings(&mut run(&["index", "--json"]));
     assert_eq!(
         (code, second),
-        (Some(0), index_envelope(&unchanged, &diagnostics, &notes))
+        (
+            Some(0),
+            index_envelope_without_the_model(&unchanged, &diagnostics, &notes)
+        )
     );
-    let (code, rebuilt, rebuilt_stderr) = index_json_outcome(&mut run(&["rebuild", "--json"]));
+    let (code, rebuilt, rebuilt_stderr) =
+        index_json_outcome_without_stage_timings(&mut run(&["rebuild", "--json"]));
     assert_eq!(
         (code, rebuilt),
-        (Some(0), index_envelope(&parsed, &diagnostics, &notes))
+        (
+            Some(0),
+            index_envelope_without_the_model(
+                &parsed_with_the_excluded_codex_log_read_as_empty,
+                &diagnostics,
+                &notes
+            )
+        )
     );
     let (code, stdout, stderr) = outcome(&mut run(&["index"]));
     assert_eq!((code, stdout), (Some(0), String::new()));
-    // Stage timings fill the rest of stderr, so these lines are checked one by one.
+    // why-not: a whole-stderr match, because stage timings fill the rest of stderr
     assert!(
         stderr.contains("\n1 sessions stored; 1 file(s) with unresolved parsing diagnostics\n"),
         "{stderr}"
@@ -1818,7 +1825,6 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         stderr.contains(&format!("\nwarning: {incomplete_tail}\n")),
         "{stderr}"
     );
-    // The skipped lines hold conversation text, which no output may repeat.
     assert!(!first_stderr.contains("secret-"), "{first_stderr}");
     assert!(!second_stderr.contains("secret-"), "{second_stderr}");
     assert!(!rebuilt_stderr.contains("secret-"), "{rebuilt_stderr}");
@@ -1833,13 +1839,14 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         .concat(),
     )
     .unwrap();
-    let (code, repaired, _) = index_json_outcome(&mut run(&["index", "--json"]));
+    let (code, repaired, _) =
+        index_json_outcome_without_stage_timings(&mut run(&["index", "--json"]));
 
     assert_eq!(
         (code, repaired),
         (
             Some(0),
-            index_envelope(
+            index_envelope_without_the_model(
                 &[
                     ("chunks_pending_snapshot", 1),
                     ("chunks_reconciled_created_committed", 1),
@@ -1903,15 +1910,15 @@ fn index_reports_real_file_read_failure_then_recovers() {
     };
 
     fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-    let (code, unreadable, _) = index_json_outcome(&mut run());
+    let (code, unreadable, _) = index_json_outcome_without_stage_timings(&mut run());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-    let (recovered_code, recovered, _) = index_json_outcome(&mut run());
+    let (recovered_code, recovered, _) = index_json_outcome_without_stage_timings(&mut run());
 
     assert_eq!(
         (code, unreadable),
         (
             Some(0),
-            index_envelope(
+            index_envelope_without_the_model(
                 &[("files_discovered", 1), ("files_failed", 1)],
                 &serde_json::json!([{
                     "file_path": path.to_str().unwrap(),
@@ -1932,7 +1939,11 @@ fn index_reports_real_file_read_failure_then_recovers() {
         (recovered_code, recovered),
         (
             Some(0),
-            index_envelope(ONE_SESSION_PARSED_AND_CHUNKED, &serde_json::json!([]), &[])
+            index_envelope_without_the_model(
+                ONE_SESSION_PARSED_AND_CHUNKED,
+                &serde_json::json!([]),
+                &[]
+            )
         )
     );
 }
@@ -1970,7 +1981,7 @@ fn index_stderr_summarizes_new_and_unchanged_runs_in_order() {
     let dir = TempDir::new().unwrap();
     let claude_dir = write_session(dir.path(), SESSION_LINE);
 
-    // Stage timings fill the rest of stderr, and the first summary line ends in the run's time.
+    // why-not: a whole-stderr match, because stage timings fill it and the first summary line ends in the run's time
     let first = index_stderr(dir.path(), &claude_dir);
     assert_in_order(&first, "\nIndexed 1 sessions in ", "\nCreated 1 chunks\n");
 
@@ -2088,7 +2099,7 @@ fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() 
 
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(outcome(&mut search_hello()), found_the_session);
-    // Stage timings fill the rest of stderr, so the warning is checked as one whole line.
+    // why-not: a whole-stderr match, because stage timings fill the rest of stderr
     assert!(
         stderr.contains("\nwarning: claude root could not be fully read — preserved 1 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions\n"),
         "{stderr}"
@@ -2206,8 +2217,7 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
     let (code, default_limit, stderr) =
         json_outcome(recall(dir.path()).args(["search", "authentication", "--json"]));
 
-    // a1 to a5 differ only in age, so their order shifts as they grow older; the head and the
-    // count do not.
+    // why-not: comparing the whole order, because a1 to a5 differ only in age and reorder as they grow older
     assert_eq!(
         (
             code,
@@ -2264,7 +2274,7 @@ fn search_that_skips_only_an_unknown_source_session_outside_the_results_adds_no_
     index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
     mark_source_unknown(dir.path(), "weird");
 
-    // Its stderr holds a tracing warning with a timestamp for the skipped session.
+    // why-not: comparing stderr, because it holds a timestamped tracing warning for the skipped session
     let (code, envelope, _) = json_outcome(recall(dir.path()).args([
         "search",
         "authentication",
@@ -2303,7 +2313,7 @@ fn search_that_skips_an_unknown_source_session_that_could_rank_says_so_in_the_no
     index_claude_sessions(dir.path(), &[("valid", &[&valid]), ("weird", &[&weird])]);
     mark_source_unknown(dir.path(), "weird");
 
-    // Its stderr holds a tracing warning with a timestamp for the skipped session.
+    // why-not: comparing stderr, because it holds a timestamped tracing warning for the skipped session
     let (code, envelope, _) = json_outcome(recall(dir.path()).args([
         "search",
         "authentication",

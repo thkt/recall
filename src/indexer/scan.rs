@@ -11,7 +11,6 @@ use tracing::{debug, warn};
 use super::{IndexOptions, SkippedReason};
 use crate::parser::{Source, is_compressed_log, is_session_log};
 
-/// Values are taken as given; `classify_roots` refuses a root that is not an absolute path.
 pub(crate) fn resolve_claude_dir_with<F>(home: &Path, get: F) -> PathBuf
 where
     F: Fn(&str) -> Option<OsString>,
@@ -44,8 +43,6 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
 
 /// `RECALL_CODEX_DIR` alone turns the default archive off, so pointing recall at
 /// another sessions tree never mixes in the real `~/.codex/archived_sessions`.
-/// An empty `RECALL_CODEX_ARCHIVED_DIR` turns the archive off on its own; any other
-/// value that is not an absolute path is refused by `classify_roots`.
 pub(crate) fn resolve_codex_archived_dir_with<F>(home: &Path, get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -64,14 +61,11 @@ pub(crate) fn resolve_codex_archived_dir(home: &Path) -> Option<PathBuf> {
 
 pub(super) struct ScanOutcome {
     pub(super) sources: Vec<(PathBuf, Source)>,
-    /// Compressed logs left unparsed because their plain copy sits beside them.
-    /// They are still on disk, so a row pointing at one must not be deleted.
     pub(super) set_aside: Vec<PathBuf>,
     pub(super) removal: RemovalGate,
     pub(super) skipped: HashMap<Source, SkippedReason>,
 }
 
-/// Decides which rows a run may delete because their file was not found (DR 0004).
 #[derive(Default)]
 pub(super) struct RemovalGate {
     fully_read: HashSet<Source>,
@@ -91,8 +85,6 @@ impl RemovalGate {
         self.fully_read.contains(&source)
     }
 
-    /// A row may go only when every present root of its source was read in full
-    /// and the row does not lie under a root that is missing this run.
     pub(super) fn allows(&self, source: Option<Source>, path: &Path) -> bool {
         source.is_some_and(|source| {
             self.is_fully_read(source)
@@ -137,12 +129,6 @@ fn set_aside_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)
     set_aside.into_iter().map(|(path, _)| path).collect()
 }
 
-/// One unreadable root blocks every deletion for its source: a session that just moved
-/// into that root would otherwise be deleted from the root it left. A root counts as
-/// missing when it does not exist or is not a directory; `is_dir()` would also call it
-/// missing when `stat` fails on a permission error. A root that is not an absolute path,
-/// such as one from an empty environment variable, is not read and counts as unreadable:
-/// it would resolve against the working directory and change from run to run.
 fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
     let mut any_present = false;
     let mut all_read = true;

@@ -14,7 +14,6 @@ fn assistant(text: &str) -> Message {
     }
 }
 
-/// A chunk of session `s1` with no timestamp, covering message rows `lo..=hi`.
 fn chunk(content: &str, lo: i64, hi: i64) -> QAChunk {
     QAChunk {
         session_id: "s1".to_owned(),
