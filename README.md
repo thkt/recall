@@ -163,7 +163,14 @@ recall model download                       # download and verify the pinned art
 recall model manifest > gemma-manifest.json   # archive with the matching model and index
 ```
 
-The model and tokenizer are verified by SHA-256 before loading. Downloads and
+The model and tokenizer are verified by SHA-256 before loading. When both files
+pass, `search`, `index`, `rebuild` and `doctor` record their dev, inode, size, mtime
+and ctime under `<cache base>/recall/verified-artifacts/`. Only `recall search` reads
+that record, and it skips the hash while those attributes stay the same. `index`,
+`rebuild`, `doctor` and `status` hash every time, and any failed hash removes the
+record. A search therefore misses two cases until one of those commands hashes
+again. In one, someone who can write both the model files and the record replaces
+both. In the other, the content is corrupted without changing those attributes. Downloads and
 updates are explicit; search and index never download a model automatically.
 The default cache is `~/.cache/embedding-models/<artifact-sha256>/`, shared with sae.
 `HF_HOME` takes precedence over absolute `XDG_CACHE_HOME` as the cache base. The key

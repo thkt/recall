@@ -151,7 +151,12 @@ recall model download                       # 固定artifactを取得・検証
 recall model manifest > gemma-manifest.json   # 対応するモデル・索引と一緒に保管
 ```
 
-重みとtokenizerはロード前にSHA-256を検証します。取得・更新は明示操作で、searchやindexから
+重みとtokenizerはロード前にSHA-256を検証します。2つのファイルが検証に通ると、`search`、`index`、`rebuild`、`doctor` は
+それぞれのdev、inode、サイズ、mtime、ctimeを `<キャッシュの基点>/recall/verified-artifacts/` に記録します。
+この記録を読むのは `recall search` だけで、これらの属性が変わらない間はSHA-256の計算を省きます。
+`index`、`rebuild`、`doctor`、`status` は毎回計算し、計算が一致しなければ記録を消します。
+そのため、モデルのファイルと記録の両方に書ける者が両方を差し替えた場合と、これらの属性を変えずに内容だけが壊れた場合は、
+次にこれらのコマンドが計算するまで `recall search` は見つけません。取得・更新は明示操作で、searchやindexから
 自動downloadはしません。既定の保存先はsaeと共通の `~/.cache/embedding-models/<artifact-sha256>/` です。
 基点は `HF_HOME`、絶対パスの `XDG_CACHE_HOME`、`~/.cache` の順に選びます。
 共通キーはモデルとtokenizerのSHA-256をこの順に改行で区切り、末尾にも改行を付けた文字列のSHA-256です。

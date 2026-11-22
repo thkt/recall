@@ -314,7 +314,7 @@ fn probe_child_without_a_handed_root_is_an_error() {
     );
 }
 
-/// The model cache as the artifact check reads it (`verified_root`).
+/// The model cache as the artifact check reads it (`ModelHost::resolve`).
 #[derive(Clone, Copy)]
 pub(crate) enum CachedArtifacts {
     /// Every artifact checksum matches.
@@ -386,17 +386,33 @@ impl FakeHost {
         records_dir: &Path,
         f: impl FnOnce(&ModelHost<'_>) -> R,
     ) -> R {
+        let resolve = |_: ArtifactCheck| match self.artifacts.get() {
+            CachedArtifacts::NotInstalled => Err(DegradedReason::NotInstalled),
+            CachedArtifacts::Corrupt => Err(DegradedReason::ProbeFailed),
+            CachedArtifacts::Verified => Ok(ResolvedArtifacts {
+                root: root.to_path_buf(),
+                trusted_record: None,
+            }),
+        };
+        self.serve_resolving(&resolve, records_dir, f)
+    }
+
+    pub(crate) fn serve_resolving<R>(
+        &self,
+        resolve: ResolveArtifacts<'_>,
+        records_dir: &Path,
+        f: impl FnOnce(&ModelHost<'_>) -> R,
+    ) -> R {
         self.run(|steps| {
-            let resolve = || match self.artifacts.get() {
-                CachedArtifacts::NotInstalled => Err(DegradedReason::NotInstalled),
-                CachedArtifacts::Corrupt => Err(DegradedReason::ProbeFailed),
-                CachedArtifacts::Verified => {
-                    let records = ProbeRecords::new(records_dir.to_path_buf(), "env".to_owned());
-                    Ok((root.to_path_buf(), Some(records)))
-                }
+            let probe_records = || {
+                Some(ProbeRecords::new(
+                    records_dir.to_path_buf(),
+                    "env".to_owned(),
+                ))
             };
             f(&ModelHost {
-                resolve: &resolve,
+                resolve,
+                probe_records: &probe_records,
                 steps,
             })
         })
