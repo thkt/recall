@@ -57,8 +57,8 @@ fn create_db_file_errors_when_parent_cannot_be_created() {
 }
 
 #[test]
-fn opening_an_index_built_for_another_model_for_writing_fails_before_changing_its_schema_or_journal_mode()
- {
+fn opening_an_index_for_another_model_for_writing_fails_before_changing_its_schema_or_journal_mode()
+{
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("recall.db");
     let other_model = Connection::open(&db_path).unwrap();

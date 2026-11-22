@@ -60,8 +60,7 @@ fn test_open_db_idempotent() {
 }
 
 #[test]
-fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions()
- {
+fn upgrading_chunk_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions() {
     use crate::indexer::index_chunks;
 
     let tmp = NamedTempFile::new().unwrap();
@@ -89,7 +88,8 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(
         (error.to_string(), schema_snapshot(&conn)),
-        ("injected migration failure".to_owned(), schema)
+        ("injected migration failure".to_owned(), schema),
+        "a failed upgrade of an index without chunk completion markers leaves its schema as it was"
     );
     conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
         .unwrap();

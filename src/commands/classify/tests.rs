@@ -180,3 +180,37 @@ fn classify_dry_run_removes_control_characters_before_keeping_80_characters_of_t
         )
     );
 }
+
+#[cfg(unix)]
+#[path = "../../../tests/support/root_skip.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "src/db/tests.rs loads the same support file"
+)]
+#[allow(dead_code, reason = "this file calls only skip_if_root")]
+mod root_skip;
+
+#[cfg(unix)]
+#[test]
+fn classify_dry_run_refuses_a_stale_snapshot_whose_unread_log_would_make_its_counts_wrong() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    db::seed_session(&open_or_create_db(&db_path).unwrap(), "human");
+    let _ = fs::remove_file(dir.path().join("recall.db-shm"));
+    fs::write(dir.path().join("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let result = run_classify(true, true, &Some(db_path));
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("cannot see uncheckpointed changes in the write-ahead log"),
+        "a dry run reports counts that the unread log can change, not just shorten, so it refuses: {error}"
+    );
+}

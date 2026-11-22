@@ -53,8 +53,6 @@ impl Snapshot {
         }
     }
 
-    /// Refuses a stale snapshot, for a command whose output would be wrong, not
-    /// just short, without the log.
     pub(crate) fn refuse(&self) -> Result<()> {
         match &self.stale_note {
             Some(note) => Err(RecallError::DatabaseRead(note.clone()).into()),

@@ -265,11 +265,9 @@ where
     }
 
     let mut repairs: Option<Vec<RepairOutcome>> = None;
-    // The read connection closes once the checks have read the index, before the
-    // model probe and any download.
     let (mut checks, identity, snapshot) = match ReadIndex::open(&path) {
-        Ok(index) => {
-            let conn = &index.conn;
+        Ok(index_closed_before_the_model_probe) => {
+            let conn = &index_closed_before_the_model_probe.conn;
             let identity = model::check_index(conn, model::selected());
             let checks = match db::schema_state(conn) {
                 Ok(db::SchemaState::Current) => {
@@ -290,7 +288,11 @@ where
                 Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
             };
-            (checks, Some(identity), Some(index.snapshot))
+            (
+                checks,
+                Some(identity),
+                Some(index_closed_before_the_model_probe.snapshot),
+            )
         }
         Err(e) => (open_failure_checks(e), None, None),
     };

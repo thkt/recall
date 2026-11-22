@@ -557,8 +557,7 @@ fn default_loader_runs_the_probe_even_when_a_matching_record_exists() {
 }
 
 #[test]
-fn default_loader_records_success_only_after_the_parent_self_check_passes_and_still_returns_a_model_that_fails_it()
- {
+fn default_loader_records_success_only_after_the_parent_self_check_passes() {
     let not_recorded: [(FakeHost, Option<DegradedReason>); 4] = [
         (
             FakeHost {
@@ -596,7 +595,11 @@ fn default_loader_records_success_only_after_the_parent_self_check_passes_and_st
 
         let loaded = host.run(|steps| load_probing(dir.path(), Some(&records), steps));
 
-        assert_eq!(loaded.err(), reason);
+        assert_eq!(
+            loaded.err(),
+            reason,
+            "a model that fails only the parent self-check is still returned"
+        );
         assert!(
             !records.may_skip(),
             "a failure clears and withholds the record"
