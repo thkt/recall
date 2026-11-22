@@ -342,7 +342,8 @@ type ResolveArtifacts<'a> = &'a dyn Fn(ArtifactCheck) -> Result<ResolvedArtifact
 /// steps. Commands take it as their only model input, so tests reach the loader each command
 /// picks.
 pub(crate) struct ModelHost<'a> {
-    /// Called per load, so a command that never loads the model skips the SHA-256 check.
+    /// Called only when a command needs the model, so a command that never does skips the
+    /// SHA-256 check.
     pub(crate) resolve: ResolveArtifacts<'a>,
     pub(crate) probe_records: &'a dyn Fn() -> Option<ProbeRecords>,
     pub(crate) steps: &'a LoadSteps<'a>,
@@ -437,15 +438,6 @@ fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'
         parent_check_failed = loaded.is_ok() && !verified;
     }
     (loaded, parent_check_failed)
-}
-
-#[cfg(test)]
-pub(crate) fn load_for_search(
-    root: &Path,
-    records: Option<&ProbeRecords>,
-    steps: &LoadSteps<'_>,
-) -> Result<Arc<dyn Embed>, DegradedReason> {
-    search_load(root, records, steps).0
 }
 
 /// The GPU check, load and self-check run under a running marker, so a crash or hang in them
