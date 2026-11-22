@@ -178,11 +178,10 @@ fn owner_only_new_file() -> OpenOptions {
 }
 
 pub(super) fn write_atomically(target: &Path, contents: &str) -> io::Result<()> {
-    let dir = target
-        .parent()
-        .ok_or_else(|| io::Error::other("a record path has no parent directory"))?;
-    fs::create_dir_all(dir)?;
-    let temp = dir.join(format!(".{}.{}.tmp", process::id(), next_nonce()));
+    if let Some(dir) = target.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let temp = target.with_file_name(format!(".{}.{}.tmp", process::id(), next_nonce()));
     let mut file = owner_only_new_file().open(&temp)?;
     let result = file
         .write_all(contents.as_bytes())
