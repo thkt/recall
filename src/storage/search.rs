@@ -2,21 +2,15 @@ use std::iter::repeat_n;
 
 use rusqlite::Connection;
 
-/// A quoted phrase or a bare word of a query. A phrase runs from a quote to the
-/// next quote, or to the end of the query when the quote is unclosed, and its
-/// text excludes the quotes.
 #[derive(Debug, Clone, Copy)]
 enum Piece<'a> {
     Phrase(&'a str),
     Word(&'a str),
 }
 
-/// Splits a query at whitespace outside quotes into tokens, each the phrases
-/// and words written with nothing between them. A word ends at whitespace or a
-/// quote; a char for which `stands_alone` is true also ends a word and becomes
-/// a one-char word of its own. The plain sanitizer, the short-term expansion
-/// and the operator tokenizer all read phrases through this function, so they
-/// agree on where a phrase starts and ends.
+/// The plain sanitizer, the short-term expansion and the operator tokenizer all
+/// read phrases through this function, so they agree on where a phrase starts
+/// and ends.
 fn scan_tokens(query: &str, stands_alone: fn(char) -> bool) -> Vec<Vec<Piece<'_>>> {
     let mut tokens: Vec<Vec<Piece<'_>>> = Vec::new();
     let mut rest = query;
@@ -155,11 +149,6 @@ pub(crate) fn sanitize_fts_query(query: &str) -> Result<SanitizedFtsQuery, Sanit
     Ok(SanitizedFtsQuery(result))
 }
 
-/// A lone word loses its `^` / `+` / `-` prefix and its outer parentheses. It is
-/// quoted when it holds `:` or `-`. A token holding a phrase keeps the phrase
-/// verbatim and closed, and only the words at its edges lose the prefix and
-/// parentheses. Such a token is never an operator, so `drop_dangling_operators`
-/// leaves the and / or / not words inside a phrase in place.
 fn clean_token(token: &[Piece<'_>]) -> String {
     if let [Piece::Word(word)] = token {
         let cleaned = word
@@ -207,19 +196,10 @@ pub fn prepare_match_query(
     fts_expand_short_terms(conn, &sanitized, vocab_table)
 }
 
-/// A query that uses uppercase AND / OR / NOT is parsed into a tree and
-/// rendered as an FTS5 MATCH without CJK segmentation or short-term vocab
-/// expansion. FTS5 evaluates the operators per message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorQuery {
-    /// Final MATCH string, `None` when every term is shorter than
-    /// `MIN_TRIGRAM_TERM_CHARS`.
     pub match_query: Option<String>,
-    /// MATCH strings for the right side of every NOT whose exclusion applies to
-    /// the whole query (see `Node::render`).
     pub not_operands: Vec<String>,
-    /// Terms outside every NOT right side, for the embedder. Empty only when
-    /// the query holds no term at all, such as `( AND )`.
     pub embed_text: String,
 }
 
@@ -227,8 +207,6 @@ pub struct OperatorQuery {
 #[error("{0}")]
 pub struct QuerySyntaxError(String);
 
-/// The trigram tokenizer indexes nothing shorter than 3 characters, so a
-/// shorter term cannot match on its own.
 pub const MIN_TRIGRAM_TERM_CHARS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,12 +256,9 @@ enum Node {
     Term(String),
     And(Vec<Node>),
     Or(Vec<Node>),
-    /// `left NOT a NOT b` keeps the chain flat, so its length adds no recursion.
     Not(Box<Node>, Vec<Node>),
 }
 
-/// The parser recurses once per parenthesis level; this bound keeps a deeply
-/// nested query from overflowing the stack.
 const MAX_PAREN_DEPTH: usize = 32;
 
 struct Parser {
@@ -392,15 +367,6 @@ fn join_group(mut parts: Vec<String>, separator: &str) -> Option<String> {
 }
 
 impl Node {
-    /// Renders the MATCH string of this node. `required` is true when every
-    /// match of the whole query must also match this node: the root, the
-    /// members of a required AND, and the left side of a required NOT. Only a
-    /// required NOT records its right side in `not_operands`, because only its
-    /// exclusion applies to the whole query. A NOT under an OR, or inside
-    /// another NOT's right side, records nothing. That holds even when the OR's
-    /// other branches render no MATCH, because the embedder still searches for
-    /// their terms. The vector leg then keeps a session that such a NOT would
-    /// exclude, which is preferred to dropping one the query allows.
     fn render(
         &self,
         required: bool,
@@ -425,7 +391,6 @@ impl Node {
                     )));
                 };
                 let rights = Self::render_all(excluded, false, not_operands)?;
-                // `((left NOT a) NOT b)`, built in one pass instead of one copy per NOT.
                 let mut rendered = "(".repeat(rights.len());
                 rendered.push_str(&left);
                 for right in &rights {
@@ -464,8 +429,6 @@ impl Node {
     }
 }
 
-/// Returns `Ok(None)` when the query has no uppercase AND / OR / NOT outside
-/// quotes, so the caller keeps the plain path.
 pub fn prepare_operator_query(query: &str) -> Result<Option<OperatorQuery>, QuerySyntaxError> {
     let tokens = tokenize_operator_query(query);
     if !tokens
@@ -501,9 +464,7 @@ fn expand_token_via_vocab(
     stmt: &mut rusqlite::CachedStatement<'_>,
     token: &str,
 ) -> Result<Option<String>, SanitizeError> {
-    // The trigram tokenizer folds case by default
-    // (https://www.sqlite.org/fts5.html#the_trigram_tokenizer), so the vocabulary has no ASCII
-    // capitals to match.
+    // source: https://www.sqlite.org/fts5.html#the_trigram_tokenizer
     let prefix = token.to_ascii_lowercase();
     // The bound leaves out only the terms whose next character is U+10FFFF.
     let bound = format!("{prefix}{}", char::MAX);
@@ -537,9 +498,8 @@ fn is_valid_sql_identifier(value: &str) -> bool {
     head_ok && tail_ok
 }
 
-/// Selects the 25 most frequent terms from `?1` up to, not including, `?2`.
 fn vocab_lookup_sql(vocab_table: &str) -> String {
-    // fts5vocab narrows its scan by a range on `term`. A LIKE prefix reads every term instead.
+    // why-not: a LIKE prefix makes fts5vocab read every term, while a range on `term` narrows its scan.
     format!(
         "SELECT term FROM {vocab_table} \
          WHERE term >= ?1 AND term < ?2 \
@@ -562,7 +522,6 @@ pub(crate) fn fts_expand_short_terms(
     };
 
     let mut parts = Vec::new();
-    // A phrase is quoted once as a whole instead of once per word.
     let pieces = scan_tokens(query.as_str(), |_| false);
     for piece in pieces.into_iter().flatten() {
         let token = match piece {

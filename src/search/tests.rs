@@ -36,7 +36,6 @@ fn insert_sourceless_session(conn: &Connection, sid: &str, ts: i64) {
     .unwrap();
 }
 
-/// Returns the message rowid, which a chunk's message range refers to.
 fn insert_message(conn: &Connection, sid: &str, role: &str, text: &str) -> i64 {
     conn.execute(
         "INSERT INTO messages (session_id, role, text) VALUES (?1, ?2, ?3)",
@@ -64,7 +63,6 @@ fn embed_chunk(conn: &Connection, chunk_id: i64, text: &str) {
     .unwrap();
 }
 
-/// A chunk without a message range, as chunks were written before #192.
 fn insert_chunk(conn: &Connection, chunk_id: i64, sid: &str, text: &str) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (?1, ?2, ?3, 0)",
@@ -74,7 +72,6 @@ fn insert_chunk(conn: &Connection, chunk_id: i64, sid: &str, text: &str) {
     embed_chunk(conn, chunk_id, text);
 }
 
-/// A chunk built from the messages with rowids `lo..=hi`.
 fn insert_chunk_over(conn: &Connection, chunk_id: i64, sid: &str, text: &str, lo: i64, hi: i64) {
     conn.execute(
         "INSERT INTO qa_chunks (id, session_id, content, timestamp, src_rowid_lo, src_rowid_hi) \
@@ -107,7 +104,6 @@ fn ids(results: &[SearchResult]) -> Vec<&str> {
         .collect()
 }
 
-/// (session id, excerpt, chunk id) for each result, in result order.
 fn found(results: &[SearchResult]) -> Vec<(&str, &str, Option<i64>)> {
     results
         .iter()
@@ -121,7 +117,6 @@ fn found(results: &[SearchResult]) -> Vec<(&str, &str, Option<i64>)> {
         .collect()
 }
 
-/// `found` in session id order, for tests that check excerpts and not ranking.
 fn found_by_session(results: &[SearchResult]) -> Vec<(&str, &str, Option<i64>)> {
     let mut found = found(results);
     found.sort_unstable();
@@ -244,7 +239,6 @@ fn the_excerpt_is_the_chunk_of_the_best_matching_message() {
 fn the_excerpt_of_two_messages_that_match_equally_is_the_chunk_of_the_earlier_one() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
-    // Both messages hold the query once and have the same length, so they rank equally.
     let first = insert_message(&conn, "s1", "user", "authentication alpha");
     let second = insert_message(&conn, "s1", "user", "authentication gamma");
     insert_chunk_over(
@@ -567,8 +561,6 @@ fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order()
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
         insert_message(&conn, sid, "user", "authentication flow");
     }
-    // A limit of 1 reads three candidates, so the tie also decides which
-    // session is left out before the final ranking.
     let one = SearchOptions {
         limit: 1,
         ..at_now()
@@ -583,8 +575,6 @@ fn sessions_that_match_equally_at_the_same_time_are_listed_in_session_id_order()
 
 #[test]
 fn sessions_found_equally_by_the_vector_search_are_listed_in_session_id_order() {
-    // The four sessions tie in the vector search, so they share a rank there and
-    // fuse to the same score.
     let (_dir, conn) = setup_test_db();
     for (chunk_id, sid) in [(1, "m"), (2, "z"), (3, "a"), (4, "q")] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
@@ -603,8 +593,6 @@ fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_sma
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "unrelated weather topic");
-    // Both chunks hold the same text, so they have the same vector and the same distance from
-    // the query.
     insert_chunk(&conn, 1, "s1", "authentication");
     insert_chunk(&conn, 2, "s1", "authentication");
 
@@ -622,10 +610,6 @@ fn the_excerpt_of_two_chunks_at_the_same_vector_distance_is_the_one_with_the_sma
 
 #[test]
 fn a_text_match_and_a_vector_match_that_fuse_equally_are_listed_in_session_id_order() {
-    // a, d, e, h and i are found only by text, and b, c, f, g and j only by
-    // vector. Each search finds its five sessions equally, so all five share the
-    // mean rank 2 there, and all ten fuse to the same score. Text-only and
-    // vector-only sessions alternate in session id order.
     let (_dir, conn) = setup_test_db();
     for sid in ["a", "d", "e", "h", "i"] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
@@ -650,7 +634,6 @@ fn sessions_that_match_the_text_equally_are_ordered_by_the_vector_search() {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
         insert_message(&conn, sid, "user", "authentication flow");
     }
-    // b's chunk is the query itself, so the vector search finds b first.
     insert_chunk(&conn, 1, "a", "authentication flow review");
     insert_chunk(&conn, 2, "b", "authentication");
 
@@ -663,7 +646,6 @@ fn sessions_that_match_the_text_equally_are_ordered_by_the_vector_search() {
 #[test]
 fn sessions_found_equally_by_the_vector_search_are_ordered_by_the_text_search() {
     let (_dir, conn) = setup_test_db();
-    // b's message is shorter, so the text search ranks b first.
     for (sid, message) in [
         ("a", "authentication flow described in a longer message"),
         ("b", "authentication flow"),
@@ -682,8 +664,6 @@ fn sessions_found_equally_by_the_vector_search_are_ordered_by_the_text_search() 
 
 #[test]
 fn three_equal_text_matches_share_the_middle_rank_and_follow_the_first_vector_match() {
-    // a, b and c tie in the text search at positions 0 to 2, so each takes rank 1.
-    // z is found only by the vector search, at rank 0.
     let (_dir, conn) = setup_test_db();
     for sid in ["a", "b", "c"] {
         insert_session(&conn, sid, "claude", "/proj", NOW_MS);
@@ -717,9 +697,6 @@ fn the_new_session_takes_the_only_slot_even_when_it_ranks_third_by_text() {
     assert_eq!(ids(&results), ["new"]);
 }
 
-/// Four year-old sessions match "authentication" equally well, and one new
-/// session matches slightly worse. The new session ranks fifth by text alone,
-/// and the 20% that recency adds to a same-day session lifts it to the front.
 fn seed_new_session_ranked_fifth_by_text(conn: &Connection) {
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     for sid in ["old-a", "old-b", "old-c", "old-d"] {
@@ -751,8 +728,6 @@ fn a_limit_of_one_returns_a_new_session_that_matches_slightly_worse_than_older_o
 #[test]
 fn a_limit_of_one_returns_the_newest_of_sessions_whose_text_matches_equally() {
     let (_dir, conn) = setup_test_db();
-    // "e" is the newest and sorts last by id. Equal text makes the candidate
-    // query order the five sessions by id, so "e" falls outside the first three.
     for (days_ago, sid) in [(4, "a"), (3, "b"), (2, "c"), (1, "d"), (0, "e")] {
         insert_session(
             &conn,
@@ -807,8 +782,6 @@ fn results_for_a_smaller_limit_are_the_first_results_of_a_larger_limit() {
 #[test]
 fn an_unknown_source_session_ranked_first_does_not_leave_a_limit_of_one_empty() {
     let (_dir, conn) = setup_test_db();
-    // Three unknown-source sessions match better than the valid one, so they
-    // fill the whole candidate window of a limit of one.
     for sid in ["u1", "u2", "u3"] {
         insert_session(&conn, sid, "mystery_source_v99", "/proj", NOW_MS);
         insert_message(&conn, sid, "user", "authentication");
@@ -916,8 +889,6 @@ fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_text
 #[test]
 fn hybrid_search_with_a_limit_of_one_returns_a_new_session_ranked_fourth_by_vector() {
     let (_dir, conn) = setup_test_db();
-    // No message matches the query, so only the vector leg ranks the sessions:
-    // old-a, old-b, old-c (identical to the query), then new (farther away).
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     for (chunk_id, sid) in [(1, "old-a"), (2, "old-b"), (3, "old-c")] {
         insert_session(&conn, sid, "claude", "/proj", year_ago);
@@ -1315,8 +1286,6 @@ fn a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query() 
     assert_eq!(ids(&spaced), ["s1"]);
 }
 
-/// Sessions "kousei" and "suru" add fifteen indexed trigrams starting with
-/// "校正" and fifteen starting with "する".
 fn seed_fifteen_words_starting_with_kousei_and_suru(conn: &Connection) {
     insert_session(conn, "kousei", "claude", "/proj", NOW_MS);
     insert_message(
@@ -1376,7 +1345,6 @@ fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_a
 #[test]
 fn a_two_letter_query_that_starts_26_equally_frequent_words_searches_the_first_25_in_word_order() {
     let (_dir, conn) = setup_test_db();
-    // Each session holds one of the words "aba" to "abz", once.
     for last in 'a'..='z' {
         let word = format!("ab{last}");
         insert_session(&conn, &word, "claude", "/proj", NOW_MS);
@@ -1424,8 +1392,6 @@ fn a_hiragana_word_with_a_prolonged_sound_mark_finds_the_session() {
     assert_eq!(ids(&results), ["s1"]);
 }
 
-/// The index stores message text as written, so folding the query alone would
-/// turn ＬＯＧＩＮ into login and miss the message that holds ＬＯＧＩＮ.
 #[test]
 fn a_full_width_query_finds_the_session_that_holds_it_as_typed() {
     let (_dir, conn) = setup_test_db();
@@ -1439,8 +1405,6 @@ fn a_full_width_query_finds_the_session_that_holds_it_as_typed() {
     assert_eq!(ids(&results), ["full"]);
 }
 
-/// Writes two Claude logs: "sess-alpha" in /home/me/alpha asks about
-/// authentication, and "sess-beta" in /home/me/beta asks about quicksort.
 fn write_two_claude_logs(claude_dir: &Path) {
     fs::create_dir_all(claude_dir).unwrap();
     fs::write(
@@ -1819,9 +1783,6 @@ fn text_search_drops_an_unknown_source_and_flags_incomplete() {
 
 #[test]
 fn an_unknown_source_session_too_old_to_reach_the_results_leaves_them_complete() {
-    // Both sessions are a year old, so neither gets a recency boost. "weird"
-    // matches slightly worse by text and would reach the only slot only with
-    // the boost of a session dated today.
     let (_dir, conn) = setup_test_db();
     let year_ago = NOW_MS - 365 * MS_PER_DAY;
     insert_session(&conn, "valid", "claude", "/proj", year_ago);
@@ -1847,9 +1808,6 @@ fn an_unknown_source_session_too_old_to_reach_the_results_leaves_them_complete()
 #[test]
 fn an_unknown_source_session_that_could_not_reach_the_results_leaves_them_complete() {
     let (_dir, conn) = setup_test_db();
-    // Both sessions are dated today, so they get the same recency boost. The
-    // unknown-source session matches worse by text, so even its full boost
-    // leaves it behind "valid" for the only slot.
     insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
     insert_message(&conn, "valid", "user", "authentication");
     insert_session(&conn, "weird", "gemini", "/proj", NOW_MS);
@@ -1879,10 +1837,6 @@ fn an_unknown_source_session_that_could_not_reach_the_results_leaves_them_comple
 fn a_session_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first()
 {
     let (_dir, conn) = setup_test_db();
-    // "valid" is a year old, so its recency boost is close to zero. "ghost" has
-    // no sessions row, so its date is unknown and it is scored with the full
-    // boost; its text match is slightly worse than "valid", yet that boost
-    // lifts it past "valid".
     insert_session(&conn, "valid", "claude", "/proj", NOW_MS - 365 * MS_PER_DAY);
     insert_message(&conn, "valid", "user", "authentication notes");
     insert_message(&conn, "ghost", "user", "authentication notes kept");
@@ -2225,9 +2179,6 @@ fn an_unknown_source_vector_match_does_not_take_the_limit_slot() {
 #[test]
 fn a_vector_match_missing_from_the_sessions_table_marks_the_results_incomplete_when_it_could_rank_first()
  {
-    // "valid" is first by text and "ghost" is first by vector, so both fuse to
-    // the same score. "valid" is dated today. "ghost" has no sessions row, so
-    // its date is unknown and it counts with the full boost, which ties.
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
     insert_message(&conn, "valid", "user", "authentication flow discussion");
@@ -2251,8 +2202,6 @@ fn a_vector_match_missing_from_the_sessions_table_marks_the_results_incomplete_w
 
 #[test]
 fn an_unknown_source_vector_match_too_old_to_reach_the_results_leaves_them_complete() {
-    // "valid" is first by text and "old" is first by vector, so both fuse to
-    // the same score. Only "valid" is dated today and gets the recency boost.
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
     insert_message(&conn, "valid", "user", "authentication flow discussion");
@@ -2268,8 +2217,6 @@ fn an_unknown_source_vector_match_too_old_to_reach_the_results_leaves_them_compl
 
 #[test]
 fn an_unknown_source_session_that_could_not_reach_the_hybrid_results_leaves_them_complete() {
-    // "valid" is first by text and by vector. "weird" is second by text only,
-    // so even the largest recency boost leaves its fused score below "valid".
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "valid", "claude", "/proj", NOW_MS);
     insert_message(&conn, "valid", "user", "authentication");
@@ -2288,8 +2235,7 @@ fn an_unknown_source_session_that_could_not_reach_the_hybrid_results_leaves_them
     assert!(!outcome.results_incomplete);
 }
 
-/// One session reachable by both text and vector search.
-fn seed_filter_case(
+fn seed_session_reachable_by_both_legs(
     conn: &Connection,
     chunk_id: i64,
     sid: &str,
@@ -2304,11 +2250,8 @@ fn seed_filter_case(
     seed_session_file(conn, sid, file);
 }
 
-/// "keep" passes every filter in `every_filter`, and each other session fails
-/// exactly one. All are reachable by both legs, so a filter missing from either
-/// leg lets its decoy back in.
-fn seed_one_decoy_per_filter(conn: &Connection) {
-    seed_filter_case(
+fn seed_one_decoy_per_filter_reachable_by_both_legs(conn: &Connection) {
+    seed_session_reachable_by_both_legs(
         conn,
         1,
         "keep",
@@ -2317,7 +2260,7 @@ fn seed_one_decoy_per_filter(conn: &Connection) {
         NOW_MS,
         "/proj/shared.rs",
     );
-    seed_filter_case(
+    seed_session_reachable_by_both_legs(
         conn,
         2,
         "project",
@@ -2326,7 +2269,7 @@ fn seed_one_decoy_per_filter(conn: &Connection) {
         NOW_MS,
         "/proj/shared.rs",
     );
-    seed_filter_case(
+    seed_session_reachable_by_both_legs(
         conn,
         3,
         "old",
@@ -2335,7 +2278,7 @@ fn seed_one_decoy_per_filter(conn: &Connection) {
         NOW_MS - 8 * MS_PER_DAY,
         "/proj/shared.rs",
     );
-    seed_filter_case(
+    seed_session_reachable_by_both_legs(
         conn,
         4,
         "source",
@@ -2344,8 +2287,16 @@ fn seed_one_decoy_per_filter(conn: &Connection) {
         NOW_MS,
         "/proj/shared.rs",
     );
-    seed_filter_case(conn, 5, "file", "claude", "/proj", NOW_MS, "/proj/other.rs");
-    seed_filter_case(
+    seed_session_reachable_by_both_legs(
+        conn,
+        5,
+        "file",
+        "claude",
+        "/proj",
+        NOW_MS,
+        "/proj/other.rs",
+    );
+    seed_session_reachable_by_both_legs(
         conn,
         6,
         "current",
@@ -2354,7 +2305,7 @@ fn seed_one_decoy_per_filter(conn: &Connection) {
         NOW_MS,
         "/proj/shared.rs",
     );
-    seed_filter_case(
+    seed_session_reachable_by_both_legs(
         conn,
         7,
         "automated",
@@ -2380,7 +2331,7 @@ fn every_filter() -> SearchOptions {
 #[test]
 fn combined_filters_apply_to_text_search() {
     let (_dir, conn) = setup_test_db();
-    seed_one_decoy_per_filter(&conn);
+    seed_one_decoy_per_filter_reachable_by_both_legs(&conn);
 
     let outcome = search_with_embedder(&conn, "authentication", &every_filter(), None).unwrap();
 
@@ -2392,7 +2343,7 @@ fn combined_filters_apply_to_text_search() {
 #[test]
 fn combined_filters_apply_to_hybrid_search() {
     let (_dir, conn) = setup_test_db();
-    seed_one_decoy_per_filter(&conn);
+    seed_one_decoy_per_filter_reachable_by_both_legs(&conn);
 
     let outcome = search_with_embedder(
         &conn,
@@ -2410,7 +2361,7 @@ fn combined_filters_apply_to_hybrid_search() {
 #[test]
 fn combined_filters_apply_to_the_file_list() {
     let (_dir, conn) = setup_test_db();
-    seed_one_decoy_per_filter(&conn);
+    seed_one_decoy_per_filter_reachable_by_both_legs(&conn);
 
     let outcome = search_with_embedder(&conn, None, &every_filter(), None).unwrap();
 

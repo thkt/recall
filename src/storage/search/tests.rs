@@ -82,7 +82,6 @@ fn expand_without_vocab_table_degrades() {
     assert_eq!(result.as_str(), "\"au\" AND \"login\"");
 }
 
-/// An index with the production schema, holding one message per text.
 fn index_with_messages(texts: &[&str]) -> (tempfile::TempDir, Connection) {
     let (dir, conn) = setup_test_db();
     for text in texts {
@@ -134,6 +133,9 @@ fn a_two_character_cjk_word_expands_to_the_trigrams_that_start_with_it() {
     assert_eq!(expand_in(&conn, "設定"), r#"("設定を")"#);
 }
 
+const FTS5_VOCAB_TERM_GE: u32 = 0x0200;
+const FTS5_VOCAB_TERM_LE: u32 = 0x0400;
+
 #[test]
 fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table() {
     let (_dir, conn) = setup_test_db();
@@ -149,9 +151,8 @@ fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table(
         .and_then(|(_, rest)| rest.split(':').next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no index number in the plan: {plan}"));
-    // FTS5_VOCAB_TERM_GE and FTS5_VOCAB_TERM_LE in SQLite's fts5_vocab.c. Without them,
-    // fts5vocab reads every term of the index.
-    assert_eq!(idx_num & 0x600, 0x600, "{plan}");
+    let range_on_term = FTS5_VOCAB_TERM_GE | FTS5_VOCAB_TERM_LE;
+    assert_eq!(idx_num & range_on_term, range_on_term, "{plan}");
 }
 
 #[test]
@@ -555,4 +556,13 @@ fn operator_query_ignores_dangling_operators_and_closes_open_parentheses() {
         operator("(alpha OR beta AND gamma").match_query.as_deref(),
         Some("(\"alpha\" OR (\"beta\" AND \"gamma\"))")
     );
+}
+
+#[test]
+fn operator_query_renders_a_chain_of_100_000_nots_without_overflowing_the_stack() {
+    let query = format!("alpha{}", " NOT beta".repeat(100_000));
+
+    let rendered = operator(&query);
+
+    assert_eq!(rendered.not_operands.len(), 100_000);
 }

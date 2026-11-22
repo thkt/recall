@@ -24,7 +24,6 @@ fn fusion_of_vector_hits_alone_keeps_their_rank_order() {
 
 #[test]
 fn sessions_tied_in_one_search_share_the_mean_of_the_positions_they_span() {
-    // y and z tie at positions 1 and 2, after x at position 0.
     let merged = rrf_merge_sessions([("x", 1.0), ("y", 2.0), ("z", 2.0), ("w", 3.0)], []);
 
     assert_eq!(
@@ -67,4 +66,15 @@ fn a_session_without_a_timestamp_keeps_its_score() {
     apply_recency_boost(&mut results, |_| None, NOW_MS, RECENCY_BOOST_WEIGHT);
 
     assert_eq!(results, [("undated".to_owned(), 0.5)]);
+}
+
+#[test]
+fn the_recency_factor_never_exceeds_max_recency_factor_even_for_a_future_timestamp() {
+    let year_ago = NOW_MS - 365 * MS_PER_DAY;
+    let tomorrow = NOW_MS + MS_PER_DAY;
+
+    for ts in [None, Some(year_ago), Some(NOW_MS), Some(tomorrow)] {
+        assert!(recency_factor(NOW_MS, ts) <= MAX_RECENCY_FACTOR, "{ts:?}");
+    }
+    assert_eq!(recency_factor(NOW_MS, Some(NOW_MS)), MAX_RECENCY_FACTOR);
 }

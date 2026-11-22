@@ -10,10 +10,8 @@ use crate::{db, embedder, open_or_create_db};
 
 use super::*;
 
-/// The markdown of a text-only search for "authentication" in the index of "authentication flow".
 const AUTHENTICATION_FLOW_MATCH_MARKDOWN: &str = "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > **authentication** flow\n    inspect: recall show s1\n\n";
 
-/// The `--json` results of the same search.
 fn authentication_flow_match_results() -> serde_json::Value {
     serde_json::json!([{
         "chunk": null,
@@ -27,7 +25,6 @@ fn authentication_flow_match_results() -> serde_json::Value {
     }])
 }
 
-/// An index whose only session, `s1`, holds one user message.
 fn index_with_one_message(dir: &Path, text: &str) -> PathBuf {
     let db_path = dir.join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -83,9 +80,7 @@ fn search_whose_model_fails_to_load_returns_text_matches_with_an_unavailable_not
 }
 
 #[test]
-fn search_lists_each_match_with_its_date_slug_project_id_excerpt_and_inspect_line() {
-    // Both sessions hold the same message at the same time, so their scores
-    // tie and the session id orders them; the b2c3d4e5 session is inserted first.
+fn search_lists_tied_matches_in_session_id_order_with_date_slug_project_id_excerpt_and_inspect() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     open_or_create_db(&db_path)
@@ -515,7 +510,7 @@ fn search_by_file_without_a_query_lists_its_session_without_loading_the_model() 
 }
 
 #[test]
-fn search_whose_vector_query_fails_returns_the_text_match_with_a_text_only_note() {
+fn search_whose_vector_query_fails_prints_a_text_only_note_to_a_text_reader_with_the_text_match() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
@@ -567,7 +562,6 @@ fn search_whose_vector_query_fails_returns_the_text_match_with_a_text_only_note(
             "notes": ["semantic search unavailable: vector query failed at runtime; results are text-only"],
         })
     );
-    // A tracing line logs the failure; this note tells a text reader what it means for the results.
     assert_eq!(
         render_text_notes(&out),
         "note: semantic search unavailable: vector query failed at runtime; results are text-only\n"
@@ -693,7 +687,6 @@ fn freeze_search_payload_key_set() {
 
 #[test]
 fn search_shows_a_vector_only_match_with_its_closest_chunk_and_a_chunk_inspect_line() {
-    // No message holds the query word, so only the vector search finds the session.
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {

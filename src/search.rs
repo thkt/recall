@@ -24,14 +24,10 @@ use crate::hybrid::{self, MAX_RECENCY_FACTOR, RECENCY_BOOST_WEIGHT, rrf_merge_se
 use crate::model;
 use crate::parser::{SessionData, Source};
 
-/// The largest `--limit` that `recall search` accepts.
 pub(crate) const MAX_LIMIT: u16 = 100;
-/// Every hybrid search reads this many nearest chunks, whatever its `limit`,
-/// so the fused order does not change with `limit`. It is three chunks per
-/// result at the largest limit.
 const VEC_CANDIDATE_COUNT: usize = 3 * MAX_LIMIT as usize;
-// sqlite-vec rejects a KNN query whose k exceeds SQLITE_VEC_VEC0_K_MAX (4096).
-const _: () = assert!(VEC_CANDIDATE_COUNT <= 4096);
+const SQLITE_VEC_VEC0_K_MAX: usize = 4096;
+const _: () = assert!(VEC_CANDIDATE_COUNT <= SQLITE_VEC_VEC0_K_MAX);
 
 pub struct SearchResult {
     pub session: SessionData,
@@ -154,11 +150,6 @@ fn candidate_query_error(err: &rusqlite::Error) -> anyhow::Error {
     .into()
 }
 
-/// The MATCH strings search renders quote every term, so the FTS5 parse errors
-/// they can reach are plain `SQLITE_ERROR`s whose message starts with `fts5`,
-/// such as `fts5: syntax error near` or `fts5: parser stack overflow`.
-/// Corruption also starts with `fts5:` but carries `SQLITE_CORRUPT_VTAB`, and a
-/// busy or locked database carries its own code.
 fn is_fts5_query_syntax_error(err: &rusqlite::Error) -> bool {
     matches!(
         err,
@@ -167,11 +158,8 @@ fn is_fts5_query_syntax_error(err: &rusqlite::Error) -> bool {
     )
 }
 
-/// A `sessions` row as search reads it.
 enum DecodedSession {
     Known(SessionData),
-    /// The row names a source this build does not know. Its date is still
-    /// read, so the incomplete check can use the boost the session would get.
     UnknownSource {
         session_id: String,
         timestamp: Option<i64>,
@@ -185,11 +173,10 @@ fn decode_session(row: &rusqlite::Row) -> rusqlite::Result<Option<SessionData>> 
     })
 }
 
-/// Reads the six `sessions` columns that start at column `first`.
-fn decode_session_at(row: &rusqlite::Row, first: usize) -> rusqlite::Result<DecodedSession> {
-    let session_id: String = row.get(first)?;
-    let source_str: String = row.get(first + 1)?;
-    let timestamp = row.get(first + 5)?;
+fn decode_session_at(row: &rusqlite::Row, first_column: usize) -> rusqlite::Result<DecodedSession> {
+    let session_id: String = row.get(first_column)?;
+    let source_str: String = row.get(first_column + 1)?;
+    let timestamp = row.get(first_column + 5)?;
     let Some(source) = Source::from_db(&source_str) else {
         return Ok(DecodedSession::UnknownSource {
             session_id,
@@ -199,23 +186,18 @@ fn decode_session_at(row: &rusqlite::Row, first: usize) -> rusqlite::Result<Deco
     Ok(DecodedSession::Known(SessionData {
         session_id,
         source,
-        file_path: row.get(first + 2)?,
-        project: row.get(first + 3)?,
-        slug: row.get(first + 4)?,
+        file_path: row.get(first_column + 2)?,
+        project: row.get(first_column + 3)?,
+        slug: row.get(first_column + 4)?,
         timestamp,
     }))
 }
 
-/// Search reads every matching session, with its `sessions` row joined in,
-/// because the recency blend can move any of them to the front. The cut to
-/// `limit` comes after the blend, in `rank_sessions` or the hybrid fusion.
 fn build_keyword_session_query(
     fts_query: &str,
     opts: &SearchOptions,
     now_ms: i64,
 ) -> (String, Vec<Box<dyn ToSql>>) {
-    // Grouping before the join looks up each session once, not once per
-    // matching message.
     let mut inner =
         "SELECT session_id, MIN(rank) AS best_rank FROM messages WHERE messages MATCH ?".to_owned();
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
@@ -230,8 +212,6 @@ fn build_keyword_session_query(
     (sql, params)
 }
 
-/// A matching session left out of the results, with the largest factor the
-/// recency blend could have multiplied its score by.
 struct SkippedSession {
     session_id: String,
     rank: f64,
@@ -240,21 +220,12 @@ struct SkippedSession {
 
 #[derive(Default)]
 struct KeywordSessions {
-    /// Every matching session id with its best rank, in `(best_rank,
-    /// session_id)` order, skipped ones included, so fusion gives a skipped
-    /// session the rank it holds.
     order: Vec<(String, f64)>,
     ranked: Vec<(f64, SessionData)>,
-    /// Sessions skipped for a missing `sessions` row, an unknown source, or
-    /// unreadable metadata.
     skipped: Vec<SkippedSession>,
-    /// A row that could not be read at all has no rank to estimate from.
     unreadable_rows: bool,
 }
 
-/// A session with no `sessions` row or an unknown source is skipped, so it
-/// never takes one of the `limit` slots. `keyword_only_outcome` flags the
-/// results incomplete when that session could have ranked within `limit`.
 fn find_keyword_sessions(
     conn: &Connection,
     opts: &SearchOptions,
@@ -295,8 +266,6 @@ fn find_keyword_sessions(
             Ok((session_id, best_rank, session)) => {
                 rows_read += 1;
                 order.push((session_id.clone(), best_rank));
-                // A session whose date was read keeps its own recency factor;
-                // otherwise it counts with the largest one.
                 let best_factor = match session {
                     Ok(Some(DecodedSession::Known(session))) => {
                         ranked.push((best_rank, session));
@@ -334,8 +303,7 @@ fn find_keyword_sessions(
         }
         warn!(row_errors, %err, "rows skipped during search");
     }
-    // One line per search: every match is read, so a line per session would
-    // repeat for each skipped session on every search.
+    // why-not: a warn line per skipped session would repeat on every search, since every match is read.
     if !skipped.is_empty() {
         let first_error = first_metadata_error
             .map(|e| e.to_string())
@@ -353,8 +321,6 @@ fn find_keyword_sessions(
     })
 }
 
-/// The `sessions` rows of some sessions. A row with an unknown source is left
-/// out of `sessions`, and its date goes to `unknown_source_dates`.
 #[derive(Default)]
 struct SessionRows {
     sessions: HashMap<String, SessionData>,
@@ -409,15 +375,10 @@ fn fetch_session_metadata(conn: &Connection, session_ids: &[&str]) -> Result<Ses
 }
 
 struct RankedSessions {
-    /// Ranked sessions, best first, cut to `limit`.
     sessions: Vec<SessionData>,
-    /// Blended rank of the `limit`-th session, or `None` when fewer than
-    /// `limit` sessions were ranked.
     limit_rank: Option<f64>,
 }
 
-/// Applies the recency blend to every session, sorts, and only then cuts to
-/// `limit`, so a session the blend lifts to the front is not cut beforehand.
 fn rank_sessions(sessions: Vec<(f64, SessionData)>, now_ms: i64, limit: usize) -> RankedSessions {
     let mut scored: Vec<(f64, SessionData)> = sessions
         .into_iter()
@@ -441,14 +402,10 @@ fn rank_sessions(sessions: Vec<(f64, SessionData)>, now_ms: i64, limit: usize) -
     }
 }
 
-/// The `limit`-th item, or `None` when there are fewer than `limit`.
 fn at_limit<T>(items: &[T], limit: usize) -> Option<&T> {
     limit.checked_sub(1).and_then(|i| items.get(i))
 }
 
-/// A left-out session could have reached the results when its best possible
-/// score ties or beats the `limit`-th score, or when a slot is still free.
-/// Higher scores rank first.
 fn left_out_session_could_rank(
     best_scores: impl IntoIterator<Item = f64>,
     limit_score: Option<f64>,
@@ -471,8 +428,7 @@ fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T>
     }
 }
 
-/// `messages.session_id` is UNINDEXED, so a per-session MATCH still reads every
-/// matching row in the index; grouping by session reads them once for all.
+// why-not: `messages.session_id` is UNINDEXED, so a MATCH per session reads every matching row each time.
 fn fts_rows_per_session<T>(
     conn: &Connection,
     fts_query: &str,
@@ -502,10 +458,7 @@ fn fts_rows_per_session<T>(
     Ok(picked)
 }
 
-/// The rowid of the best matching message of each session in `session_ids`. Of
-/// messages that match equally, the earlier one wins. `MIN(rank)` with bare
-/// columns leaves that tie to SQLite, and a window sorts every matching row, so
-/// the pick runs here in one pass over the rows.
+// why-not: `MIN(rank)` with bare columns leaves a rank tie to SQLite, and a window sorts every matching row.
 fn best_matching_messages(
     conn: &Connection,
     fts_query: &str,
@@ -650,7 +603,6 @@ fn has_vec_data(conn: &Connection) -> Result<bool> {
         .is_some())
 }
 
-/// The closest chunk of a session that the vector search found.
 struct VecHit {
     session_id: String,
     chunk_id: i64,
@@ -668,9 +620,6 @@ fn vec_search(
     let embedding = model::timed("query embedding", || embedder.embed_query(query))?;
     let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
 
-    // Of the chunks of a session that the nearest-neighbor search keeps, the one with the
-    // smaller id wins a tie in distance. Which of equally distant vectors survive the LIMIT is
-    // still up to sqlite-vec, which orders them by distance alone.
     let mut sql = String::from(
         "SELECT c.session_id, c.id, v.distance AS d, row_number() OVER ( \
          PARTITION BY c.session_id ORDER BY v.distance, c.id) AS n \
@@ -768,15 +717,9 @@ fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
-/// What the keyword leg and the vector leg search for. `search_with_embedder`
-/// and `count_excluded_automated` each build it with `keyword_query`, so both
-/// agree on which sessions a query matches.
 struct KeywordQuery {
-    /// Final FTS5 MATCH string; `None` when no term is long enough for the trigram index.
     fts: Option<String>,
-    /// MATCH strings for the right side of every NOT.
     not_operands: Vec<String>,
-    /// Embedding input when it differs from the raw query.
     embed_text: Option<String>,
 }
 
@@ -819,11 +762,6 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
     }
 }
 
-/// A session found only by the vector search never went through the keyword
-/// MATCH, so it is dropped here when one of its messages matches a NOT operand.
-/// Sessions the keyword search returned already satisfy the whole expression.
-/// When the NOT query fails, every vector-only session is dropped and the
-/// function returns true, so the caller reports the vector leg as degraded.
 fn drop_vec_only_sessions_matching_not(
     conn: &Connection,
     not_operands: &[String],
@@ -1017,8 +955,6 @@ pub fn search_with_embedder<'q>(
         });
     }
 
-    // The keyword read already carries each session's row; only sessions the
-    // vector search alone found need a metadata query.
     let vec_only: Vec<&str> = merged
         .iter()
         .map(|(sid, _)| sid.as_str())
@@ -1037,7 +973,6 @@ pub fn search_with_embedder<'q>(
         .into_iter()
         .partition(|(sid, _)| meta_map.contains_key(sid));
     merged = kept;
-    // A pruned session counts with the largest recency factor it could get.
     let skipped_factors: HashMap<&str, f64> = found
         .skipped
         .iter()
@@ -1097,8 +1032,6 @@ fn keyword_only_outcome(
     vec_degraded: bool,
 ) -> Result<SearchOutcome> {
     let ranking = rank_sessions(found.ranked, now_ms, opts.limit);
-    // bm25 ranks are negative and lower ranks first, so they are negated into
-    // scores that rank higher first.
     let results_incomplete = found.unreadable_rows
         || left_out_session_could_rank(
             found.skipped.iter().map(|s| -(s.rank * s.best_factor)),

@@ -67,8 +67,7 @@ pub(crate) struct SearchArgs {
     pub(crate) include_automated: bool,
 }
 
-/// The loader has already printed this note on stderr, so a text run does not print it again.
-fn search_fallback_notes(reason: DegradedReason) -> Vec<Note> {
+fn fallback_notes_the_loader_already_printed(reason: DegradedReason) -> Vec<Note> {
     EmbedderDegraded(reason)
         .user_note("recall model download")
         .map(|note| vec![Note::shown(format!("semantic search unavailable: {note}"))])
@@ -79,7 +78,7 @@ fn search_degraded_state(load: &Result<Arc<dyn Embed>, DegradedReason>) -> (bool
     match load {
         Ok(_) => (false, Vec::new()),
         Err(reason) => {
-            let notes = search_fallback_notes(*reason);
+            let notes = fallback_notes_the_loader_already_printed(*reason);
             (!notes.is_empty(), notes)
         }
     }
@@ -130,7 +129,6 @@ pub(crate) fn run_search(args: SearchArgs, db_path: &Option<PathBuf>) -> Result<
     run_search_in(args, db_path, &model::HOST)
 }
 
-/// Picks the probe-skipping loader; the model host is the only injected input.
 pub(crate) fn run_search_in(
     args: SearchArgs,
     db_path: &Option<PathBuf>,
