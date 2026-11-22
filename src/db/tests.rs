@@ -60,13 +60,11 @@ fn test_open_db_idempotent() {
 }
 
 #[test]
-fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions()
- {
+fn upgrading_chunk_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions() {
     use crate::indexer::index_chunks;
 
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
-    // The marker upgrade is the only one that writes chunks_indexed, so the trigger fails it alone.
     conn.execute_batch(
         "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
          INSERT INTO messages (session_id, role, text) VALUES
@@ -90,7 +88,8 @@ fn upgrading_an_index_without_chunk_completion_markers_rolls_back_a_failed_upgra
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(
         (error.to_string(), schema_snapshot(&conn)),
-        ("injected migration failure".to_owned(), schema)
+        ("injected migration failure".to_owned(), schema),
+        "a failed upgrade of an index without chunk completion markers leaves its schema as it was"
     );
     conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
         .unwrap();
@@ -237,7 +236,6 @@ fn upgrading_an_index_without_message_ranges_stores_each_range_and_drops_message
     assert_eq!(schema_snapshot(&open_db(tmp.path()).unwrap()), upgraded);
 }
 
-/// The schema version with every schema object, so a test can show that an open changed nothing.
 fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
     (
         conn.query_row("PRAGMA schema_version", [], |r| r.get(0))
@@ -249,7 +247,6 @@ fn schema_snapshot(conn: &Connection) -> (i64, Vec<String>) {
     )
 }
 
-/// Every stored embedding as `(rowid, chunk_id, sub_idx, embedding)`.
 fn embeddings(conn: &Connection) -> Vec<(i64, i64, i64, Vec<u8>)> {
     conn.prepare("SELECT rowid, chunk_id, sub_idx, embedding FROM vec_chunks ORDER BY rowid")
         .unwrap()
@@ -288,8 +285,6 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
 {
     let tmp = NamedTempFile::new().unwrap();
     create_old_schema_db(tmp.path());
-    // Rowids with gaps, as deleted sessions leave them; chunks find their messages by rowid.
-    // Rowid 9 belongs to no session, so the copy leaves it behind.
     Connection::open(tmp.path())
         .unwrap()
         .execute_batch(
@@ -314,9 +309,9 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
             r#"[1,"s1","user","hello"]"#,
             r#"[3,"s1","assistant","help is here"]"#,
             r#"[7,"s1","user","thanks"]"#
-        ]
+        ],
+        "the copy keeps each gapped rowid, which chunks find their messages by, and drops the sessionless rowid 9"
     );
-    // A trigram index matches a word's inner three letters; the older tokenizers do not.
     assert_eq!(
         collect_strings(
             &conn,
@@ -326,15 +321,19 @@ fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_
         [
             r#"[1,"s1","user","hello"]"#,
             r#"[3,"s1","assistant","help is here"]"#
-        ]
+        ],
+        "only a trigram index matches the first three letters of a longer word"
     );
     let schema = schema_snapshot(&conn);
     drop(conn);
 
     let reopened = open_db(tmp.path()).unwrap();
 
-    // A second open must not migrate the table again.
-    assert_eq!(schema_snapshot(&reopened), schema);
+    assert_eq!(
+        schema_snapshot(&reopened),
+        schema,
+        "a second open must not migrate the table again"
+    );
 }
 
 #[test]
@@ -673,8 +672,12 @@ fn stale_snapshot_note_in_a_directory_that_refuses_the_owner_new_files_asks_to_i
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
     fs::write(wal_path(&db), b"uncommitted").unwrap();
-    // The group may write, so the mode does not read as read-only, but the owner may not.
-    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o575)).unwrap();
+    let owner_unwritable_but_group_writable = 0o575;
+    fs::set_permissions(
+        dir.path(),
+        fs::Permissions::from_mode(owner_unwritable_but_group_writable),
+    )
+    .unwrap();
 
     if root_skip::skip_if_root(dir.path()) {
         return;
@@ -707,9 +710,8 @@ fn stale_snapshot_note_in_a_writable_directory_with_a_leftover_write_probe_file_
 fn a_read_only_open_in_a_writable_directory_opens_the_live_database_and_rejects_writes() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
-    // The writer stays open, so its row sits in the write-ahead log without a checkpoint.
-    let writer = open_db(&db).unwrap();
-    seed_session(&writer, "s1");
+    let uncheckpointed_writer = open_db(&db).unwrap();
+    seed_session(&uncheckpointed_writer, "s1");
 
     let (conn, tier) = open_db_readonly(&db).unwrap();
     let error = conn
@@ -746,6 +748,34 @@ fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
     );
 }
 
+#[test]
+fn opening_an_existing_index_for_writing_leaves_its_schema_and_journal_mode_as_they_were() {
+    let tmp = NamedTempFile::new().unwrap();
+    create_old_schema_db(tmp.path());
+    let before = schema_snapshot(&Connection::open(tmp.path()).unwrap());
+
+    let conn = open_existing_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        (
+            schema_snapshot(&conn),
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap()
+        ),
+        (before, "delete".to_owned())
+    );
+}
+
+#[test]
+fn opening_a_missing_index_for_writing_fails_without_creating_any_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let missing = dir.path().join("nope.db");
+
+    open_existing_db(&missing).unwrap_err();
+
+    assert_eq!(file_names(dir.path()), Vec::<String>::new());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_read_only_open_of_a_missing_database_in_a_read_only_directory_fails_with_the_path_it_was_given()
@@ -776,9 +806,8 @@ fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_fro
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::TempDir::new().unwrap();
-    // Each of `%`, `#` and `?` changes what the URI names unless the open escapes it. The bytes of
-    // `日` must reach the URI as the same bytes.
-    let dir = root.path().join("a%20b#c?d日");
+    let uri_delimiters_and_a_multibyte_character = "a%20b#c?d日";
+    let dir = root.path().join(uri_delimiters_and_a_multibyte_character);
     fs::create_dir(&dir).unwrap();
     let db = dir.join("recall.db");
     seed_session(&open_db(&db).unwrap(), "s1");
@@ -801,7 +830,6 @@ fn a_database_in_a_read_only_directory_whose_name_holds_uri_delimiters_opens_fro
     );
 }
 
-// The expected line holds the POSIX error text.
 #[cfg(unix)]
 #[test]
 fn failing_to_remove_the_write_probe_warns_with_its_path_and_the_error() {

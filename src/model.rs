@@ -31,7 +31,6 @@ pub(crate) use probe_record::ProbeRecords;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-// Field order contributes to the persisted manifest fingerprint.
 pub struct ModelSpec {
     pub model_id: String,
     pub revision: String,
@@ -156,12 +155,11 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(digest_hex(&h.finalize()))
 }
 pub fn cache_dir() -> PathBuf {
-    // A unit test that reaches the host's cache hashes the real model and starts the probe from
-    // the unit-test binary (#427). The ignored public-model test stages its model there instead.
     #[cfg(test)]
     assert!(
         env::var_os("RECALL_MODEL_DIR").is_some(),
-        "a unit test reached the host's model cache; pass the command a FakeHost or a readiness \
+        "a unit test reached the host's model cache, where it would hash the real model and start \
+         the probe from the test binary; pass the command a FakeHost or a readiness \
          closure, or stage a model with RECALL_MODEL_DIR"
     );
     cache::cache_dir("recall", selected())
@@ -254,9 +252,6 @@ pub fn handle_probe_if_needed() {
     })();
     process::exit(if result.is_ok() { 0 } else { 1 });
 }
-/// The parent verifies the artifact checksums right before spawning the probe,
-/// and the probe's model is discarded, so the child loads from the handed root
-/// without hashing the 590 MB of artifacts a second time.
 fn probe_artifacts(root: Option<OsString>) -> Result<VerifiedArtifacts> {
     let root = root.context("probe started without __RECALL_GEMMA_ARTIFACTS")?;
     Ok(VerifiedArtifacts {
@@ -301,7 +296,6 @@ fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
     }
 }
 
-/// Logs a stage's wall time at debug level for `RUST_LOG=recall=debug` timing runs.
 pub(crate) fn timed<T>(stage: &'static str, run: impl FnOnce() -> T) -> T {
     let started = Instant::now();
     let result = run();
@@ -319,7 +313,6 @@ fn self_check(model: &dyn Embed) -> Result<()> {
     Ok(())
 }
 
-/// The load steps that need the GPU, the model weights or a child process.
 pub(crate) struct LoadSteps<'a> {
     pub(crate) probe: &'a dyn Fn(&Path) -> Result<bool>,
     pub(crate) gpu_available: &'a dyn Fn() -> Result<bool>,
@@ -338,27 +331,20 @@ const HOST_STEPS: LoadSteps<'static> = LoadSteps {
 
 type ResolveArtifacts<'a> = &'a dyn Fn(ArtifactCheck) -> Result<ResolvedArtifacts, DegradedReason>;
 
-/// Where a command's model load finds the verified artifacts, the probe record and the load
-/// steps. Commands take it as their only model input, so tests reach the loader each command
-/// picks.
 pub(crate) struct ModelHost<'a> {
-    /// Called only when a command needs the model, so a command that never does skips the
-    /// SHA-256 check.
-    pub(crate) resolve: ResolveArtifacts<'a>,
+    pub(crate) resolve_when_needed: ResolveArtifacts<'a>,
     pub(crate) probe_records: &'a dyn Fn() -> Option<ProbeRecords>,
     pub(crate) steps: &'a LoadSteps<'a>,
 }
 
 impl ModelHost<'_> {
-    /// Used by index, rebuild and doctor: always runs the isolated probe.
     pub(crate) fn load_probing(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
-        let artifacts = (self.resolve)(ArtifactCheck::HashAndRecord)?;
+        let artifacts = (self.resolve_when_needed)(ArtifactCheck::HashAndRecord)?;
         load_probing(&artifacts.root, (self.probe_records)().as_ref(), self.steps)
     }
 
-    /// Used by search: skips the isolated probe in an environment where it already succeeded.
     pub(crate) fn load_for_search(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
-        let artifacts = (self.resolve)(ArtifactCheck::TrustRecord)?;
+        let artifacts = (self.resolve_when_needed)(ArtifactCheck::TrustRecord)?;
         let (loaded, parent_check_failed) =
             search_load(&artifacts.root, (self.probe_records)().as_ref(), self.steps);
         if (loaded.is_err() || parent_check_failed)
@@ -370,7 +356,7 @@ impl ModelHost<'_> {
     }
 
     pub(crate) fn artifacts_ready(&self) -> bool {
-        (self.resolve)(ArtifactCheck::HashOnly).is_ok()
+        (self.resolve_when_needed)(ArtifactCheck::HashOnly).is_ok()
     }
 }
 
@@ -392,13 +378,11 @@ fn probe_records_on_host() -> Option<ProbeRecords> {
 }
 
 pub(crate) const HOST: ModelHost<'static> = ModelHost {
-    resolve: &resolve_on_host,
+    resolve_when_needed: &resolve_on_host,
     probe_records: &probe_records_on_host,
     steps: &HOST_STEPS,
 };
 
-/// Records the environment only after the probe, the parent load and a parent self-check
-/// embedding all succeed; any failure clears the record.
 pub(crate) fn load_probing(
     root: &Path,
     records: Option<&ProbeRecords>,
@@ -410,8 +394,7 @@ pub(crate) fn load_probing(
 type CheckedLoad = (Result<Arc<dyn Embed>, DegradedReason>, bool);
 
 fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_>) -> CheckedLoad {
-    // No skip ever reads the record of an environment marked no-skip, so skip the self-check.
-    let records = records.filter(|records| !records.no_skip());
+    let records_a_skip_can_read = records.filter(|records| !records.no_skip());
     tracing::debug!("starting the isolated model probe");
     let loaded = match timed("isolated probe", || (steps.probe)(root)) {
         Ok(false) => Err(DegradedReason::BackendUnavailable),
@@ -423,8 +406,7 @@ fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'
         )(error)),
     };
     let mut parent_check_failed = false;
-    if let Some(records) = records {
-        // A failed self-check leaves the returned model as before; it only withholds the record.
+    if let Some(records) = records_a_skip_can_read {
         let verified = loaded.as_ref().is_ok_and(|model| {
             timed("self-check embedding", || self_check(model.as_ref()))
                 .inspect_err(|error| tracing::warn!(%error, "parent model self-check failed"))
@@ -440,8 +422,6 @@ fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'
     (loaded, parent_check_failed)
 }
 
-/// The GPU check, load and self-check run under a running marker, so a crash or hang in them
-/// stops later searches in this environment from skipping the probe.
 fn search_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_>) -> CheckedLoad {
     let Some(records) = records.filter(|records| records.may_skip()) else {
         return probing_load(root, records, steps);
@@ -528,7 +508,6 @@ pub fn download_and_verify_model() -> Result<(), ModelDownloadError> {
     }
 }
 
-/// Why an index cannot serve the selected model, or the read error that kept it from telling.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexIdentityError {
     #[error(
@@ -544,8 +523,6 @@ pub enum IndexIdentityError {
 }
 
 impl IndexIdentityError {
-    /// Whether the index belongs to another model, which the selected model cannot serve. An
-    /// identity that could not be read decides nothing about the model.
     pub fn refuses_model(&self) -> bool {
         match self {
             Self::Mismatch | Self::LegacyVectors => true,
@@ -555,7 +532,6 @@ impl IndexIdentityError {
 }
 
 pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<(), IndexIdentityError> {
-    // Equal vector dimensions do not establish compatibility with legacy indexes.
     let table:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='embedding_identity' AND type='table')",[],|r|r.get(0))?;
     if table {
         let saved: Option<String> = conn
@@ -588,7 +564,6 @@ pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<(), IndexIdent
 pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     check_index(&tx, spec).map_err(|e| match e {
-        // The exit code finds a SQLite error only at the top of the error chain.
         IndexIdentityError::Unreadable(sqlite) => anyhow::Error::from(sqlite),
         refusal => refusal.into(),
     })?;

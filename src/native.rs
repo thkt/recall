@@ -182,7 +182,6 @@ impl Gemma {
         );
         let mut result = Vec::new();
         let mut start = 0;
-        // Re-tokenize offset windows with the prefix to enforce the native token budget.
         while start < count {
             let mut end = (start + budget).min(count);
             let lo = if start == 0 { 0 } else { offsets[start].0 };

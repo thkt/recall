@@ -86,17 +86,17 @@ fn quote(term: &str) -> String {
 }
 
 pub fn clean_for_trigram(query: &MatchFtsQuery) -> Option<String> {
-    // The frozen FTS contract caps combinations before discarding short terms.
     let segments = Wire {
         text: query.as_str().as_bytes(),
         pos: 0,
     }
     .segments()?;
-    let combinations = segments.iter().fold(1usize, |n, segment| match segment {
-        Segment::Fixed(_) => n,
-        Segment::Alternatives(terms) => n.saturating_mul(terms.len()),
-    });
-    let overflow = combinations > MAX_COMBINATIONS;
+    let combinations_counting_short_terms =
+        segments.iter().fold(1usize, |n, segment| match segment {
+            Segment::Fixed(_) => n,
+            Segment::Alternatives(terms) => n.saturating_mul(terms.len()),
+        });
+    let overflow = combinations_counting_short_terms > MAX_COMBINATIONS;
     let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
     for segment in segments {
         match segment {

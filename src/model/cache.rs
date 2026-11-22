@@ -1,4 +1,4 @@
-//! Keep this cache protocol identical in sae and recall. Index identities remain app-specific.
+// why-not: do not change this cache protocol in recall alone; sae shares it and must stay identical
 use super::{ModelSpec, digest_hex, hash_file, install_artifact};
 use anyhow::{Result, ensure};
 use reqwest::blocking::Client;
@@ -37,7 +37,6 @@ fn cache_bases() -> Vec<PathBuf> {
 }
 
 pub(super) fn artifact_identity(spec: &ModelSpec) -> String {
-    // Only artifact bytes determine the shared key, never prefixes or app/backend identity.
     digest_hex(&Sha256::digest(format!(
         "{}\n{}\n",
         spec.model_sha256, spec.tokenizer_sha256
@@ -55,7 +54,6 @@ pub(super) fn cache_dir(app: &str, spec: &ModelSpec) -> PathBuf {
 fn legacy_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for base in cache_bases() {
-        // Also reuse unchanged artifacts after a tokenizer/model update or cache-base change.
         if let Ok(entries) = fs::read_dir(base.join("embedding-models")) {
             dirs.extend(entries.flatten().map(|entry| entry.path()));
         }
@@ -107,7 +105,7 @@ fn lock_cache(root: &Path) -> Result<fs::File> {
         options.mode(0o600);
     }
     let lock = options.open(root.join(".install.lock"))?;
-    // The OS releases this on exit/crash. Never unlink it: waiters must share the same inode.
+    // why-not: never unlink the lock file; every waiter must lock the same inode
     lock.lock()?;
     Ok(lock)
 }
@@ -137,7 +135,7 @@ fn reuse_artifact(root: &Path, name: &str, expected: &str, legacy: &[PathBuf]) -
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 return Err(error.into());
             }
-            // A cache may live on a different filesystem, where hard links are unavailable.
+            // why-not: no error on a failed hard link; a cache on another filesystem cannot link, so copy
             Err(_) => install_artifact(root, name, expected, &mut fs::File::open(source)?)?,
         }
         return Ok(true);

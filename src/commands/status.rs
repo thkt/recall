@@ -21,7 +21,6 @@ pub(crate) fn run_status_in(
     run_status_with(verbose, db_path, || host.artifacts_ready())
 }
 
-/// Takes only whether the model is ready, so status never starts the probe or loads the model.
 pub(crate) fn run_status_with(
     verbose: bool,
     db_path: &Option<PathBuf>,
@@ -85,7 +84,6 @@ pub(crate) fn run_status_with(
         "model_ready": model_ok,
     });
 
-    // The stale-snapshot note comes before the identity note.
     let mut out = index.snapshot.finish(CommandOutput::ok(markdown, data));
     if let Err(error) = model::check_index(conn, model::selected()) {
         out.degraded = true;

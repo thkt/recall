@@ -105,7 +105,6 @@ impl LineDiagnostics {
 
 const COMPRESSED_LOG_SUFFIX: &str = ".jsonl.zst";
 
-/// Codex compresses older rollouts to `.jsonl.zst` in place; Claude Code writes plain `.jsonl` only.
 pub(crate) fn is_session_log(path: &Path, source: Source) -> bool {
     path.extension().is_some_and(|ext| ext == "jsonl")
         || (source == Source::Codex && is_compressed_log(path))

@@ -17,7 +17,6 @@ const FTS_TOKENIZER: &str = "trigram";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenTier {
     Direct,
-    // Immutable reads ignore WAL sidecars; callers must report stale snapshots.
     Immutable,
 }
 
@@ -32,9 +31,6 @@ pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {
     ensure_sqlite_vec()?;
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
 
-    // A failed open gets no fallback. This open reads only the main file, and the open from the
-    // last checkpoint reads the same file. A `-wal` or `-shm` that a read-only directory blocks
-    // fails the probe instead.
     let conn = Connection::open_with_flags(path, flags)?;
     conn.busy_timeout(Duration::from_secs(30))?;
     match probe_readable(&conn) {
@@ -60,7 +56,6 @@ fn is_readonly_dir_error(db_path: &Path, e: &rusqlite::Error) -> bool {
 }
 
 fn dir_is_unwritable(db_path: &Path) -> bool {
-    // A bare file name lives in the working directory.
     let dir = match db_path.parent() {
         Some(dir) if dir.as_os_str().is_empty() => Path::new("."),
         Some(dir) => dir,
@@ -90,7 +85,6 @@ fn dir_write_probe_fails(dir: &Path) -> bool {
     }
 }
 
-/// The file `dir_write_probe_fails` creates in `dir`.
 fn write_probe_path(dir: &Path) -> PathBuf {
     dir.join(format!(".recall-write-probe-{}", process::id()))
 }
@@ -184,12 +178,9 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-/// The vocabulary view over `messages` that `schema_state` requires.
 const MESSAGES_VOCAB_SQL: &str =
     "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);";
 
-/// The full-text table of message text under `name`; `create_schema` and the tokenizer migration
-/// both build it from here.
 fn messages_table_sql(name: &str) -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5(
@@ -313,7 +304,6 @@ fn migrate_file_size_if_needed(conn: &mut Connection) -> Result<()> {
 }
 
 fn migrate_qa_chunk_generation_if_needed(conn: &mut Connection) -> Result<()> {
-    // Global generations distinguish deleted/reused chunk IDs from old inference snapshots.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if !table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("generation")) {
         tx.execute_batch(
@@ -360,9 +350,7 @@ fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
         return Ok(());
     };
 
-    // No warning: the writers open the index through `open_or_create_db`, whose
-    // `model::check_index` refuses an old table that holds rows in an index without a model
-    // identity, so the table dropped here is empty.
+    // why-not: no warning; `model::check_index` refuses an identity-less index with old rows, so this table is empty
     if !sql.contains("sub_idx") {
         let tx = conn.transaction()?;
         tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
@@ -455,12 +443,8 @@ fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// The message rowid range stored for a session without messages. It holds no rowid.
 pub(crate) const EMPTY_MESSAGE_RANGE: (i64, i64) = (1, 0);
 
-/// Stores in each session row the rowid range of its messages, which the indexer deletes them
-/// by (DR 0019). The upgrade first removes the messages whose session row is gone, so that a
-/// session without a row has no messages.
 fn migrate_message_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("message_rowid_lo")) {
@@ -566,11 +550,7 @@ fn migrate_vector_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Moves a `messages` table built with an older tokenizer onto `FTS_TOKENIZER` by copying every
-/// row, rowid included, into a new table. Sessions, chunks and the chunks' message rowid ranges
-/// (DR 0005) stay, so the sessions of a missing or unreadable root are not lost (DR 0017).
 fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
-    // Checked inside the write lock, so an opener that waited for it sees the table migrated.
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if table_def(&tx, "messages")?.is_some_and(|sql| !sql.contains(FTS_TOKENIZER)) {
         info(&format!(
@@ -593,9 +573,6 @@ fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-/// Opens an existing index for writing with the flags `open_db` uses, minus CREATE. Unlike
-/// `open_db`, it never creates the file, migrates the schema, changes the journal mode or binds a
-/// model identity.
 pub(crate) fn open_existing_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec()?;
     let mut flags = OpenFlags::default();

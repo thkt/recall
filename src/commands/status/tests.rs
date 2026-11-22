@@ -67,7 +67,6 @@ fn status_of_a_table_less_file_reports_zero_counts_and_a_missing_model_without_d
         out.markdown,
         "Sessions: 0\nQA chunks: 0\nEmbedded: 0/0\nModel: not installed (run `recall model download`)\n"
     );
-    // DR 0001: status reports a missing model on stdout without degrading or adding a note.
     assert_eq!(
         printed_envelope(&out),
         serde_json::json!({

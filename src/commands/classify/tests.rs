@@ -5,8 +5,7 @@ use crate::tests::printed_envelope;
 
 use super::*;
 
-/// Every session's stored label, ordered by session id.
-fn labels(db_path: &Path) -> Vec<(String, Option<String>)> {
+fn stored_labels_by_session_id(db_path: &Path) -> Vec<(String, Option<String>)> {
     db::open_db(db_path)
         .unwrap()
         .prepare("SELECT session_id, session_type FROM sessions ORDER BY session_id")
@@ -17,9 +16,8 @@ fn labels(db_path: &Path) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// An index of two unlabeled sessions whose logs are missing and `tagged`, labeled interactive,
-/// whose readable log names no automated origin. Each is labeled from its first turn.
-fn seed_classify_db() -> (tempfile::TempDir, PathBuf) {
+fn seed_two_logless_unlabeled_sessions_and_one_labeled_interactive() -> (tempfile::TempDir, PathBuf)
+{
     let dir = tempfile::TempDir::new().unwrap();
     let tagged_log = dir.path().join("tagged.jsonl");
     fs::write(&tagged_log, r#"{"type":"user","message":"question"}"#).unwrap();
@@ -46,7 +44,7 @@ fn seed_classify_db() -> (tempfile::TempDir, PathBuf) {
 
 #[test]
 fn classify_all_labels_every_session_from_its_first_turn() {
-    let (_dir, db_path) = seed_classify_db();
+    let (_dir, db_path) = seed_two_logless_unlabeled_sessions_and_one_labeled_interactive();
 
     let out = run_classify(true, false, &Some(db_path.clone())).unwrap();
 
@@ -63,7 +61,7 @@ fn classify_all_labels_every_session_from_its_first_turn() {
         })
     );
     assert_eq!(
-        labels(&db_path),
+        stored_labels_by_session_id(&db_path),
         [
             ("auto".to_owned(), Some("automated".to_owned())),
             ("human".to_owned(), Some("interactive".to_owned())),
@@ -74,7 +72,7 @@ fn classify_all_labels_every_session_from_its_first_turn() {
 
 #[test]
 fn classify_without_all_labels_only_unlabeled_sessions() {
-    let (_dir, db_path) = seed_classify_db();
+    let (_dir, db_path) = seed_two_logless_unlabeled_sessions_and_one_labeled_interactive();
 
     let out = run_classify(false, false, &Some(db_path.clone())).unwrap();
 
@@ -91,7 +89,7 @@ fn classify_without_all_labels_only_unlabeled_sessions() {
         })
     );
     assert_eq!(
-        labels(&db_path),
+        stored_labels_by_session_id(&db_path),
         [
             ("auto".to_owned(), Some("automated".to_owned())),
             ("human".to_owned(), Some("interactive".to_owned())),
@@ -161,7 +159,6 @@ fn classify_dry_run_prints_a_first_turn_with_newlines_on_its_session_line() {
 
 #[test]
 fn classify_dry_run_removes_control_characters_before_keeping_80_characters_of_the_first_turn() {
-    // Cut first, the sequence would straddle the cut and drop the characters after it.
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -181,5 +178,39 @@ fn classify_dry_run_removes_control_characters_before_keeping_80_characters_of_t
             "human [interactive] {}bc\ndry-run: 1 session(s) would be classified (0 automated, 1 interactive)",
             "a".repeat(78)
         )
+    );
+}
+
+#[cfg(unix)]
+#[path = "../../../tests/support/root_skip.rs"]
+#[allow(
+    clippy::duplicate_mod,
+    reason = "src/db/tests.rs loads the same support file"
+)]
+#[allow(dead_code, reason = "this file calls only skip_if_root")]
+mod root_skip;
+
+#[cfg(unix)]
+#[test]
+fn classify_dry_run_refuses_a_stale_snapshot_whose_unread_log_would_make_its_counts_wrong() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    db::seed_session(&open_or_create_db(&db_path).unwrap(), "human");
+    let _ = fs::remove_file(dir.path().join("recall.db-shm"));
+    fs::write(dir.path().join("recall.db-wal"), b"uncheckpointed-frames").unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    if root_skip::skip_if_root(dir.path()) {
+        return;
+    }
+
+    let result = run_classify(true, true, &Some(db_path));
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("cannot see uncheckpointed changes in the write-ahead log"),
+        "a dry run reports counts that the unread log can change, not just shorten, so it refuses: {error}"
     );
 }

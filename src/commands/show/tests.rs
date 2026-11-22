@@ -5,8 +5,7 @@ use crate::{db, open_or_create_db};
 
 use super::*;
 
-/// An index where abc-123 holds a user and an assistant message and abc-456 shares its prefix.
-fn setup_show_db() -> (tempfile::TempDir, PathBuf) {
+fn index_where_abc_456_shares_the_prefix_of_abc_123() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("recall.db");
     open_or_create_db(&db_path)
@@ -25,7 +24,7 @@ fn setup_show_db() -> (tempfile::TempDir, PathBuf) {
 
 #[test]
 fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata() {
-    let (_dir, db_path) = setup_show_db();
+    let (_dir, db_path) = index_where_abc_456_shares_the_prefix_of_abc_123();
 
     let out = run_show("abc-123", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
 
@@ -68,7 +67,7 @@ fn show_prints_every_message_of_an_exactly_matching_session_under_its_metadata()
 
 #[test]
 fn show_of_a_unique_id_prefix_prints_that_session() {
-    let (_dir, db_path) = setup_show_db();
+    let (_dir, db_path) = index_where_abc_456_shares_the_prefix_of_abc_123();
 
     let out = run_show("abc-1", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
 
@@ -111,7 +110,7 @@ fn show_of_a_unique_id_prefix_prints_that_session() {
 
 #[test]
 fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
-    let (_dir, db_path) = setup_show_db();
+    let (_dir, db_path) = index_where_abc_456_shares_the_prefix_of_abc_123();
 
     let err = run_show("abc", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
 
@@ -126,7 +125,7 @@ fn show_of_a_prefix_shared_by_two_sessions_is_a_usage_error_listing_both() {
 
 #[test]
 fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
-    let (_dir, db_path) = setup_show_db();
+    let (_dir, db_path) = index_where_abc_456_shares_the_prefix_of_abc_123();
 
     let err = run_show("zzz", false, None, DEFAULT_WINDOW, &Some(db_path)).unwrap_err();
 
@@ -141,7 +140,7 @@ fn show_of_an_unknown_id_is_a_usage_error_naming_it() {
 
 #[test]
 fn verbose_show_adds_the_session_file_to_the_header() {
-    let (_dir, db_path) = setup_show_db();
+    let (_dir, db_path) = index_where_abc_456_shares_the_prefix_of_abc_123();
 
     let out = run_show("abc-123", true, None, DEFAULT_WINDOW, &Some(db_path)).unwrap();
 
@@ -228,8 +227,6 @@ fn show_prints_an_unknown_stored_source_as_claude() {
 
 #[test]
 fn windowed_show_prints_only_same_session_messages_within_the_window() {
-    // The two sessions' messages interleave, so a rowid window that ignored the
-    // session would pull in sessB's messages.
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -397,7 +394,7 @@ fn windowed_show_errors_when_chunk_belongs_to_another_session() {
 
 #[test]
 fn windowed_show_cuts_a_message_at_4000_characters_and_marks_the_cut() {
-    // 界 takes three bytes, so both messages exceed 4000 bytes.
+    let three_bytes_in_utf8 = "界";
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -407,8 +404,8 @@ fn windowed_show_cuts_a_message_at_4000_characters_and_marks_the_cut() {
              (1, 'w1', 'user', ?1),
              (2, 'w1', 'user', ?2)",
         [
-            format!("{}{}", "a".repeat(3990), "界".repeat(10)),
-            format!("{}{}", "a".repeat(3990), "界".repeat(11)),
+            format!("{}{}", "a".repeat(3990), three_bytes_in_utf8.repeat(10)),
+            format!("{}{}", "a".repeat(3990), three_bytes_in_utf8.repeat(11)),
         ],
     )
     .unwrap();
@@ -442,9 +439,9 @@ fn windowed_show_cuts_a_message_at_4000_characters_and_marks_the_cut() {
                 "\n",
             ),
             "a".repeat(3990),
-            "界".repeat(10),
+            three_bytes_in_utf8.repeat(10),
             "a".repeat(3990),
-            "界".repeat(10),
+            three_bytes_in_utf8.repeat(10),
         )
     );
     assert_eq!(
@@ -457,13 +454,13 @@ fn windowed_show_cuts_a_message_at_4000_characters_and_marks_the_cut() {
                         "in_chunk": false,
                         "role": "user",
                         "rowid": 1,
-                        "text": format!("{}{}", "a".repeat(3990), "界".repeat(10)),
+                        "text": format!("{}{}", "a".repeat(3990), three_bytes_in_utf8.repeat(10)),
                     },
                     {
                         "in_chunk": true,
                         "role": "user",
                         "rowid": 2,
-                        "text": format!("{}{}…", "a".repeat(3990), "界".repeat(10)),
+                        "text": format!("{}{}…", "a".repeat(3990), three_bytes_in_utf8.repeat(10)),
                     },
                 ],
                 "project": "/p",
@@ -616,8 +613,6 @@ fn show_on_a_database_file_without_tables_is_a_usage_error_asking_to_run_index()
     );
 }
 
-/// An index whose session `abc-123` carries control characters in its id, file, project, slug,
-/// messages and chunks. Chunk 1 covers both messages, and chunk 2 has no message range.
 fn index_with_control_characters() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("recall.db");
@@ -814,7 +809,6 @@ fn windowed_show_of_another_sessions_chunk_strips_control_characters_from_the_ow
 
 #[test]
 fn windowed_show_removes_control_characters_before_cutting_a_message_at_4000_characters() {
-    // Cut first, the sequence would straddle the cut and take the … with it.
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();

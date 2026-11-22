@@ -1,7 +1,3 @@
-//! Per-environment record that the isolated model probe succeeded, so `recall search` can
-//! skip the probe child while the binary, model, OS build, hardware and `GGML_*` settings stay
-//! the same (DR 0013). Record I/O failures never fail or degrade a search: an unusable record
-//! only means the probe runs.
 use super::digest_hex;
 use sha2::{Digest, Sha256};
 #[cfg(target_vendor = "apple")]
@@ -17,8 +13,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// Matches the probe child's timeout: a skipped load still running after this is treated as hung.
-const HANG_AFTER: Duration = Duration::from_secs(30);
+const HANG_AFTER_THE_PROBE_CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Snapshot {
@@ -49,21 +44,20 @@ impl Snapshot {
 
     pub(super) fn key(&self) -> String {
         let mut hash = Sha256::new();
-        // Length prefixes keep adjacent fields from shifting into each other.
-        let mut field = |bytes: &[u8]| {
+        let mut length_prefixed_field = |bytes: &[u8]| {
             hash.update(bytes.len().to_le_bytes());
             hash.update(bytes);
         };
-        field(b"recall-probe-record-v1");
-        field(&self.binary_len.to_le_bytes());
-        field(&self.binary_modified_ns.to_le_bytes());
-        field(self.model_identity.as_bytes());
-        field(self.os_build.as_bytes());
-        field(self.hardware_model.as_bytes());
-        field(&self.ggml_vars.len().to_le_bytes());
+        length_prefixed_field(b"recall-probe-record-v1");
+        length_prefixed_field(&self.binary_len.to_le_bytes());
+        length_prefixed_field(&self.binary_modified_ns.to_le_bytes());
+        length_prefixed_field(self.model_identity.as_bytes());
+        length_prefixed_field(self.os_build.as_bytes());
+        length_prefixed_field(self.hardware_model.as_bytes());
+        length_prefixed_field(&self.ggml_vars.len().to_le_bytes());
         for (name, value) in &self.ggml_vars {
-            field(name.as_encoded_bytes());
-            field(value.as_encoded_bytes());
+            length_prefixed_field(name.as_encoded_bytes());
+            length_prefixed_field(value.as_encoded_bytes());
         }
         digest_hex(&hash.finalize())
     }
@@ -125,8 +119,6 @@ fn sysctl_string(name: &CStr) -> io::Result<String> {
     ))
 }
 
-/// Uses the first cache base of the shared model cache, but outside `embedding-models`,
-/// whose layout is kept identical with sae.
 pub(super) fn record_dir(
     hf_home: Option<&OsStr>,
     xdg_cache_home: Option<&OsStr>,
@@ -196,8 +188,6 @@ enum MarkerState {
     Abandoned,
 }
 
-/// The files of one environment: `<key>.ok` (probe succeeded), `<key>.no-skip` (a skipped
-/// load crashed or hung there) and one locked `<key>.<pid>.<n>.running` per skipped load.
 pub(crate) struct ProbeRecords {
     dir: PathBuf,
     key: String,
@@ -224,14 +214,12 @@ impl ProbeRecords {
         self.dir.join(format!("{}.{suffix}", self.key))
     }
 
-    /// True when the probe succeeded in this environment and no skipped load crashed or hung.
     pub(super) fn may_skip(&self) -> bool {
         if self.no_skip() || !self.recorded() {
             return false;
         }
         match self.found_abandoned_marker() {
             Ok(false) => true,
-            // A marker that cannot be inspected blocks this skip without disabling skipping.
             Err(error) => {
                 tracing::warn!(%error, "could not inspect the skipped model load markers; the isolated probe runs");
                 false
@@ -250,7 +238,6 @@ impl ProbeRecords {
         match fs::symlink_metadata(self.path("no-skip")) {
             Ok(_) => true,
             Err(error) if error.kind() == ErrorKind::NotFound => false,
-            // A tombstone that cannot be checked is treated as present.
             Err(error) => {
                 tracing::warn!(%error, "could not check the model probe no-skip marker; the isolated probe runs");
                 true
@@ -279,7 +266,6 @@ impl ProbeRecords {
             }
             let file = match File::open(&path) {
                 Ok(file) => file,
-                // The owner finished and unlinked it after the directory was read.
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
@@ -312,8 +298,6 @@ impl ProbeRecords {
         }
     }
 
-    /// The marker becomes visible only after it is locked, so a reader never takes a load
-    /// that is just starting for a crashed one.
     pub(super) fn begin_skipped_load(&self) -> io::Result<RunningMarker> {
         fs::create_dir_all(&self.dir)?;
         let id = format!("{}.{}", process::id(), next_nonce());
@@ -330,8 +314,6 @@ impl ProbeRecords {
     }
 }
 
-/// Dropped without `finish` (a panic, or the process ending), the file stays and the OS
-/// releases its lock, which the next search reads as a crashed skipped load.
 pub(super) struct RunningMarker {
     path: PathBuf,
     _lock: File,
@@ -339,7 +321,7 @@ pub(super) struct RunningMarker {
 
 impl RunningMarker {
     pub(super) fn finish(self) {
-        // Unlink while the lock is still held, so no reader sees this marker unlocked.
+        // why-not: never release the lock before this unlink, or a reader takes the unlocked marker for a crash
         if let Err(error) = fs::remove_file(&self.path) {
             tracing::warn!(%error, "could not remove the skipped model load marker");
         }
@@ -348,14 +330,13 @@ impl RunningMarker {
 
 fn marker_state(path: &Path, file: &File) -> io::Result<MarkerState> {
     match file.try_lock() {
-        // The owner may have unlinked it and released the lock after we opened it.
         Ok(()) if still_linked(path, file)? => Ok(MarkerState::Abandoned),
         Ok(()) => Ok(MarkerState::Finished),
         Err(TryLockError::WouldBlock) => {
             let age = SystemTime::now()
                 .duration_since(file.metadata()?.modified()?)
                 .unwrap_or_default();
-            Ok(if age > HANG_AFTER {
+            Ok(if age > HANG_AFTER_THE_PROBE_CHILD_TIMEOUT {
                 MarkerState::Abandoned
             } else {
                 MarkerState::Running

@@ -16,8 +16,7 @@ fn user_line(content: &str) -> String {
     json!({"type": "user", "message": {"role": "user", "content": content}}).to_string()
 }
 
-/// The session time a Claude log gets when its only entry carries `timestamp`.
-fn session_timestamp(timestamp: &Value) -> Option<i64> {
+fn session_time_of_a_log_whose_only_entry_carries(timestamp: &Value) -> Option<i64> {
     let line = json!({
         "type": "user",
         "timestamp": timestamp,
@@ -57,35 +56,35 @@ fn noise_tags_are_removed_from_messages_but_command_output_and_plain_text_stay()
 #[test]
 fn iso_timestamps_set_the_session_time_in_utc_milliseconds() {
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T00:00:00Z")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T00:00:00Z")),
         Some(1_772_323_200_000)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:30:45.123Z")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:30:45.123Z")),
         Some(1_772_368_245_123)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:30:45.5Z")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:30:45.5Z")),
         Some(1_772_368_245_500)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:30:45.12Z")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:30:45.12Z")),
         Some(1_772_368_245_120)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:00:00+09:00")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00+09:00")),
         Some(1_772_334_000_000)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:00:00+0900")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00+0900")),
         Some(1_772_334_000_000)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:00:00-05:00")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00-05:00")),
         Some(1_772_384_400_000)
     );
     assert_eq!(
-        session_timestamp(&json!("2026-03-01T12:00:00.500+09:00")),
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00.500+09:00")),
         Some(1_772_334_000_500)
     );
 }
@@ -93,19 +92,37 @@ fn iso_timestamps_set_the_session_time_in_utc_milliseconds() {
 #[test]
 fn numeric_timestamps_are_taken_as_epoch_milliseconds() {
     assert_eq!(
-        session_timestamp(&json!(1_709_251_200_000_i64)),
+        session_time_of_a_log_whose_only_entry_carries(&json!(1_709_251_200_000_i64)),
         Some(1_709_251_200_000)
     );
 }
 
 #[test]
 fn malformed_timestamps_leave_the_session_without_a_time() {
-    assert_eq!(session_timestamp(&Value::Null), None);
-    assert_eq!(session_timestamp(&json!("2026")), None);
-    assert_eq!(session_timestamp(&json!("2026-03-01T00:00:00Ü")), None);
-    assert_eq!(session_timestamp(&json!("2026-03-01T24:00:00Z")), None);
-    assert_eq!(session_timestamp(&json!("2026-03-01T12:60:00Z")), None);
-    assert_eq!(session_timestamp(&json!("2026-03-01T12:00:60Z")), None);
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&Value::Null),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T00:00:00Ü")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T24:00:00Z")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:60:00Z")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:60Z")),
+        None
+    );
 }
 
 #[test]
@@ -120,7 +137,6 @@ fn stored_role_names_map_back_to_roles() {
 #[test]
 fn every_source_round_trips_through_its_stored_name() {
     use clap::ValueEnum;
-    // DR 0002: a variant added later must round-trip too, so this walks every variant.
     for &variant in Source::value_variants() {
         assert_eq!(Source::from_db(variant.as_str()), Some(variant));
     }
@@ -129,9 +145,7 @@ fn every_source_round_trips_through_its_stored_name() {
     assert_eq!(Source::from_db("Claude"), None);
 }
 
-/// Line diagnostics `[invalid JSON, invalid UTF-8, incomplete tail]` for a log holding `bytes`,
-/// read as `[Claude, Codex]`. The classification reader must report the same.
-fn diagnostics_of(bytes: &[u8]) -> [[i64; 3]; 2] {
+fn claude_and_codex_line_diagnostics_checking_classification(bytes: &[u8]) -> [[i64; 3]; 2] {
     let file = tempfile::NamedTempFile::new().unwrap();
     fs::write(file.path(), bytes).unwrap();
     let claude = parse_session_including_empty(file.path(), Source::Claude)
@@ -154,17 +168,43 @@ fn diagnostics_of(bytes: &[u8]) -> [[i64; 3]; 2] {
 #[test]
 fn line_diagnostics_tell_corrupt_lines_from_a_possibly_unfinished_last_line() {
     assert_eq!(
-        diagnostics_of(b"{\"type\":\"progress\"}\n \t\r\n"),
+        claude_and_codex_line_diagnostics_checking_classification(
+            b"{\"type\":\"progress\"}\n \t\r\n"
+        ),
         [[0, 0, 0]; 2]
     );
-    assert_eq!(diagnostics_of(b"{\"type\":\"progress\"}"), [[0, 0, 0]; 2]);
-    assert_eq!(diagnostics_of(b"{\"type\":"), [[0, 0, 1]; 2]);
-    assert_eq!(diagnostics_of(b"{\"type\":\n"), [[1, 0, 0]; 2]);
-    assert_eq!(diagnostics_of(b"{broken"), [[1, 0, 0]; 2]);
-    assert_eq!(diagnostics_of(b"\xff\n"), [[0, 1, 0]; 2]);
-    assert_eq!(diagnostics_of(b"\xff"), [[0, 1, 0]; 2]);
-    assert_eq!(diagnostics_of(b"{\"text\":\"\xe3\x81"), [[0, 0, 1]; 2]);
-    assert_eq!(diagnostics_of(b"{\"text\":\"\xe3\x81\n"), [[0, 1, 0]; 2]);
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"{\"type\":\"progress\"}"),
+        [[0, 0, 0]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"{\"type\":"),
+        [[0, 0, 1]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"{\"type\":\n"),
+        [[1, 0, 0]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"{broken"),
+        [[1, 0, 0]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"\xff\n"),
+        [[0, 1, 0]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"\xff"),
+        [[0, 1, 0]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"{\"text\":\"\xe3\x81"),
+        [[0, 0, 1]; 2]
+    );
+    assert_eq!(
+        claude_and_codex_line_diagnostics_checking_classification(b"{\"text\":\"\xe3\x81\n"),
+        [[0, 1, 0]; 2]
+    );
 }
 
 const CLAUDE_SIDECHAIN: &str =
@@ -174,9 +214,11 @@ const CODEX_GUARDIAN: &str =
     r#"{"type":"session_meta","payload":{"id":"sample","source":{"internal":"guardian"}}}"#;
 const CODEX_OTHER_ID: &str = r#"{"type":"session_meta","payload":{"id":"other"}}"#;
 
-/// `(identity conflict, automated, line diagnostics)` for a log whose first line marks it
-/// automated and whose second line is `tail`. The classification reader must report the same.
-fn origin_after(source: Source, first: &str, tail: &[u8]) -> (bool, bool, [i64; 3]) {
+fn origin_checking_classification_after_an_automated_first_line(
+    source: Source,
+    first: &str,
+    tail: &[u8],
+) -> (bool, bool, [i64; 3]) {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("sample.jsonl");
     let mut input = format!("{first}\n").into_bytes();
@@ -201,35 +243,67 @@ fn origin_after(source: Source, first: &str, tail: &[u8]) -> (bool, bool, [i64; 
 #[test]
 fn a_conflicting_session_id_cancels_automated_evidence_but_bad_lines_do_not() {
     assert_eq!(
-        origin_after(Source::Claude, CLAUDE_SIDECHAIN, CLAUDE_OTHER_ID.as_bytes()),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Claude,
+            CLAUDE_SIDECHAIN,
+            CLAUDE_OTHER_ID.as_bytes()
+        ),
         (true, false, [0, 0, 0])
     );
     assert_eq!(
-        origin_after(Source::Claude, CLAUDE_SIDECHAIN, b"{bad\n"),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Claude,
+            CLAUDE_SIDECHAIN,
+            b"{bad\n"
+        ),
         (false, true, [1, 0, 0])
     );
     assert_eq!(
-        origin_after(Source::Claude, CLAUDE_SIDECHAIN, b"\xff\n"),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Claude,
+            CLAUDE_SIDECHAIN,
+            b"\xff\n"
+        ),
         (false, true, [0, 1, 0])
     );
     assert_eq!(
-        origin_after(Source::Claude, CLAUDE_SIDECHAIN, b"{\"type\":"),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Claude,
+            CLAUDE_SIDECHAIN,
+            b"{\"type\":"
+        ),
         (false, true, [0, 0, 1])
     );
     assert_eq!(
-        origin_after(Source::Codex, CODEX_GUARDIAN, CODEX_OTHER_ID.as_bytes()),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Codex,
+            CODEX_GUARDIAN,
+            CODEX_OTHER_ID.as_bytes()
+        ),
         (true, false, [0, 0, 0])
     );
     assert_eq!(
-        origin_after(Source::Codex, CODEX_GUARDIAN, b"{bad\n"),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Codex,
+            CODEX_GUARDIAN,
+            b"{bad\n"
+        ),
         (false, true, [1, 0, 0])
     );
     assert_eq!(
-        origin_after(Source::Codex, CODEX_GUARDIAN, b"\xff\n"),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Codex,
+            CODEX_GUARDIAN,
+            b"\xff\n"
+        ),
         (false, true, [0, 1, 0])
     );
     assert_eq!(
-        origin_after(Source::Codex, CODEX_GUARDIAN, b"{\"type\":"),
+        origin_checking_classification_after_an_automated_first_line(
+            Source::Codex,
+            CODEX_GUARDIAN,
+            b"{\"type\":"
+        ),
         (false, true, [0, 0, 1])
     );
 }
