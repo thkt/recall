@@ -60,8 +60,8 @@ The record store lives in [src/model/artifact_record.rs](../../src/model/artifac
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Store      | `<cache base>/recall/verified-artifacts/`, with the cache base chosen as for the DR 0013 probe records (`HF_HOME`, then an absolute `XDG_CACHE_HOME`, then `~/.cache`). Nothing is added under `embedding-models/` |
 | Key        | SHA-256 over the model directory as resolved (including one chosen by `RECALL_MODEL_DIR`), the manifest `model_sha256` and the manifest `tokenizer_sha256`. One file `<key>.json` per key                     |
-| Contents   | JSON with the key and both file identities. A partly written file, unknown fields or another shape count as no record                                                                                         |
-| Skip       | Search skips the hash only when the record's key and both identities equal the current ones. It logs `artifact sha256 skipped` at debug level instead of the `artifact sha256` stage                          |
+| Contents   | JSON with both file identities. A partly written file, unknown fields or another shape count as no record                                                                                         |
+| Skip       | Search skips the hash only when the record of the current key holds both identities as they are now. It logs `artifact sha256 skipped` at debug level instead of the `artifact sha256` stage                          |
 | Writing    | The identities are read before the hash and again after it. The record is written to a temporary file and renamed into place, only when the two reads are equal                                              |
 | Platforms  | File identities are read on Unix only. Elsewhere every command hashes                                                                                                                                         |
 
