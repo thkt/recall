@@ -178,9 +178,7 @@ fn owner_only_new_file() -> OpenOptions {
 }
 
 pub(super) fn write_atomically(target: &Path, contents: &str) -> io::Result<()> {
-    if let Some(dir) = target.parent() {
-        fs::create_dir_all(dir)?;
-    }
+    target.parent().map_or(Ok(()), fs::create_dir_all)?;
     let temp = target.with_file_name(format!(".{}.{}.tmp", process::id(), next_nonce()));
     let mut file = owner_only_new_file().open(&temp)?;
     let result = file
