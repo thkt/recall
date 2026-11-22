@@ -73,13 +73,7 @@ fn opening_an_index_for_another_model_for_writing_fails_before_changing_its_sche
     open_or_create_db(&db_path).unwrap_err();
 
     let conn = Connection::open(&db_path).unwrap();
-    let tables: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master ORDER BY name")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
-        .collect();
+    let tables = db::collect_strings(&conn, "SELECT name FROM sqlite_master ORDER BY name");
     let journal_mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();

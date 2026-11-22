@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use super::*;
 use crate::db::{collect_strings, open_db, seed_chunk, seed_session, setup_test_db};
 use crate::index_observer::recording;
+use crate::tests::vec_chunk_count;
 
 #[test]
 fn replaying_the_same_generation_replaces_vectors_without_duplicates() {
@@ -74,9 +75,9 @@ fn all_batches_failing_is_non_fatal_and_retryable() {
         err == "batch inference failed",
         "the all-fail run still records the first batch error, got: {err:?}"
     );
-    let vec_count = vec_chunk_count(&conn);
     assert_eq!(
-        vec_count, 0,
+        vec_chunk_count(&conn),
+        0,
         "the chunk stays pending for the next index to retry"
     );
 }
@@ -130,8 +131,11 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
             .unwrap()
             .eq("batch inference failed")
     );
-    let stored = vec_chunk_count(&conn);
-    assert_eq!(stored, 1024, "only the poison chunk is left unembedded");
+    assert_eq!(
+        vec_chunk_count(&conn),
+        1024,
+        "only the poison chunk is left unembedded"
+    );
     assert_eq!(pending_chunks(&conn, usize::MAX).unwrap().len(), 1);
 
     assert_eq!(counts["pending_pages"], 2);
@@ -160,11 +164,6 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
         )
         .unwrap();
     assert_eq!(pending, 0, "no chunk is left behind after the retry");
-}
-
-fn vec_chunk_count(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap()
 }
 
 #[test]
@@ -487,8 +486,7 @@ fn overlapping_index_processes_keep_vectors_for_the_replacement_text() {
         after, saved,
         "discarding stale work must not touch current vectors"
     );
-    let count = vec_chunk_count(&conn);
-    assert_eq!(count, 1);
+    assert_eq!(vec_chunk_count(&conn), 1);
     assert!(pending_chunks(&conn, 10).unwrap().is_empty());
     assert_vectors_match_current_content(&conn);
 }
