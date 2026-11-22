@@ -106,12 +106,12 @@ fn reread_scanned_files(
     tx: &Transaction,
     fpath: &Path,
     source: &str,
-    source_logs: &HashSet<PathBuf>,
+    logs_read_this_run: &HashSet<PathBuf>,
 ) -> Result<RereadOutcome> {
     let Some(source) = Source::from_db(source) else {
         return Ok(RereadOutcome::Paths(Vec::new()));
     };
-    if !source_logs.contains(fpath) {
+    if !logs_read_this_run.contains(fpath) {
         return Ok(RereadOutcome::Unavailable);
     }
     Ok(
@@ -123,11 +123,9 @@ fn reread_scanned_files(
     )
 }
 
-/// Reads again only the logs in `source_logs`, the ones the index pass reads this run. A session
-/// whose log this run did not find, such as one under a missing root, waits for a run that finds it.
 pub(super) fn backfill_session_files(
     conn: &mut Connection,
-    source_logs: &HashSet<PathBuf>,
+    logs_read_this_run: &HashSet<PathBuf>,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<usize> {
     let sessions: Vec<(String, String, String)> = {
@@ -155,10 +153,11 @@ pub(super) fn backfill_session_files(
         if let Some(cb) = on_progress {
             cb(done + 1, total);
         }
-        let scanned = match reread_scanned_files(&tx, Path::new(file_path), source, source_logs)? {
-            RereadOutcome::Paths(paths) => paths,
-            RereadOutcome::Unavailable => continue,
-        };
+        let scanned =
+            match reread_scanned_files(&tx, Path::new(file_path), source, logs_read_this_run)? {
+                RereadOutcome::Paths(paths) => paths,
+                RereadOutcome::Unavailable => continue,
+            };
         insert_session_files(&tx, session_id, &scanned)?;
         tx.prepare_cached("UPDATE sessions SET files_scanned = 1 WHERE session_id = ?")?
             .execute([session_id])?;

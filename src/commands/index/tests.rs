@@ -28,14 +28,11 @@ fn seed_claude_source(claude_dir: &Path) {
         .unwrap();
 }
 
-/// The `--json` envelope `recall index` prints for an outcome.
 fn printed_envelope(outcome: &IndexOutcome) -> serde_json::Value {
     serde_json::from_str(&render_json_success(&index_command_output(outcome))).unwrap()
 }
 
-/// The `--json` envelope `recall index` prints for a run, without `data.observations.seconds`,
-/// whose stage timings change from run to run.
-fn printed_json(outcome: &IndexOutcome) -> serde_json::Value {
+fn printed_json_without_stage_timings(outcome: &IndexOutcome) -> serde_json::Value {
     let mut envelope = printed_envelope(outcome);
     envelope["data"]["observations"]
         .as_object_mut()
@@ -80,7 +77,7 @@ fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
         "--token-budget 2048 --forward-pause-ms 700 reach the embedder as 2048 tokens and a 700 ms pause"
     );
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 1,
@@ -202,7 +199,7 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
         index_and_report_with(&Some(db_path.clone()), &rebuild_opts, mock_loader).unwrap();
 
     assert_eq!(
-        printed_json(&rebuilt),
+        printed_json_without_stage_timings(&rebuilt),
         serde_json::json!({
             "data": {
                 "embedded": 1,
@@ -260,7 +257,6 @@ fn rebuild_with_the_model_embeds_the_session_again_and_keeps_it_searchable() {
     );
 }
 
-/// Writes a session log whose user turn is followed by an assistant `Edit` of `edit_path`.
 fn write_backfill_session(dir: &Path, file: &str, user_text: &str, edit_path: &str) -> PathBuf {
     fs::create_dir_all(dir).unwrap();
     let user = serde_json::json!({
@@ -359,7 +355,7 @@ fn legacy_file_backfill_records_touched_files_and_parse_loss_without_changing_me
 
     let partial = partial.to_str().unwrap();
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -513,7 +509,7 @@ fn index_with_its_claude_root_missing_keeps_the_session_and_reports_it_skipped_i
         index_and_report_with(&Some(db_path.clone()), &missing_opts, mock_loader).unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -598,7 +594,7 @@ fn index_without_the_model_stores_the_session_for_text_search_and_reports_its_ch
     .unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -691,7 +687,7 @@ fn index_without_the_model_keeps_the_embeddings_of_a_changed_session_and_reports
     .unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -782,7 +778,7 @@ fn rebuild_whose_model_fails_its_probe_keeps_the_stored_embeddings() {
     .unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -992,7 +988,7 @@ fn rebuild_without_the_model_keeps_the_embedded_session_and_indexes_a_new_one_fo
     .unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1104,7 +1100,7 @@ fn model_absent_rebuild_reindexes_cached_session_without_embeddings() {
     .unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1185,15 +1181,16 @@ fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_o
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    // The load probe is the embedder's first call and the only one that succeeds; every batch
-    // after it fails.
+    let only_the_load_probe_call_succeeds = 1;
     let failed = index_and_report_with(&Some(db_path.clone()), &opts, || {
-        Ok(Arc::new(embedder::MockEmbedder::failing_after(1)) as Arc<dyn Embed>)
+        Ok(Arc::new(embedder::MockEmbedder::failing_after(
+            only_the_load_probe_call_succeeds,
+        )) as Arc<dyn Embed>)
     })
     .unwrap();
 
     assert_eq!(
-        printed_json(&failed),
+        printed_json_without_stage_timings(&failed),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1247,7 +1244,7 @@ fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_o
     let retried = index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
     assert_eq!(
-        printed_json(&retried),
+        printed_json_without_stage_timings(&retried),
         serde_json::json!({
             "data": {
                 "embedded": 1,
@@ -1299,7 +1296,6 @@ fn index_whose_embedding_batch_fails_reports_the_failed_chunks_and_embeds_them_o
     assert_eq!(vec_chunk_count(&conn), 1, "the retried chunk is stored");
 }
 
-/// One session-log line holding a user turn whose text is `text`.
 fn user_turn_line(text: &str) -> String {
     let turn = serde_json::json!({
         "type": "user",
@@ -1317,15 +1313,13 @@ fn index_whose_second_embedding_batch_fails_keeps_the_first_batch_and_hands_the_
     let claude_dir = src.path().join("claude");
     let (_, codex_dir) = absent_source_dirs(src.path());
     fs::create_dir_all(&claude_dir).unwrap();
-    // Pending chunks are embedded shortest first, so the 128 short turns fill the first batch
-    // and the one longer turn is the whole second batch.
-    let long_text = "wombat batch, the longest turn";
+    let longest_turn_embedded_alone_in_the_last_batch = "wombat batch, the longest turn";
     fs::write(
         claude_dir.join("s1.jsonl"),
         format!(
             "{}{}",
             user_turn_line("wombat batch").repeat(128),
-            user_turn_line(long_text)
+            user_turn_line(longest_turn_embedded_alone_in_the_last_batch)
         ),
     )
     .unwrap();
@@ -1338,7 +1332,9 @@ fn index_whose_second_embedding_batch_fails_keeps_the_first_batch_and_hands_the_
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    let embedder = Arc::new(embedder::MockEmbedder::failing_on_text(long_text));
+    let embedder = Arc::new(embedder::MockEmbedder::failing_on_text(
+        longest_turn_embedded_alone_in_the_last_batch,
+    ));
 
     let outcome = index_and_report_observed(
         &Some(db_path),
@@ -1350,7 +1346,7 @@ fn index_whose_second_embedding_batch_fails_keeps_the_first_batch_and_hands_the_
     .unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 128,
@@ -1427,7 +1423,6 @@ fn lone_parse_diagnostic_degrades_and_prints_a_240_character_path_without_contro
         ..IndexOutcome::default()
     };
 
-    // The color escape and the newline are dropped and the tab becomes a space.
     let path = format!("/logs/file {}", "界".repeat(229));
     assert_eq!(
         printed_envelope(&outcome),
@@ -1472,12 +1467,11 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
 
-    // An empty root is not an absolute path, so index does not read it and reports it as
-    // incompletely enumerated.
+    let empty_root_that_is_not_an_absolute_path = Path::new("");
     let opts = indexer::IndexOptions {
         force: false,
         claude_dir: &claude_dir,
-        codex_dir: Path::new(""),
+        codex_dir: empty_root_that_is_not_an_absolute_path,
         codex_archived_dir: None,
     };
     let rebuild_opts = indexer::IndexOptions {
@@ -1509,7 +1503,7 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
     .unwrap();
 
     assert_eq!(
-        printed_json(&failed),
+        printed_json_without_stage_timings(&failed),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1569,7 +1563,7 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
     .unwrap();
 
     assert_eq!(
-        printed_json(&rebuilt),
+        printed_json_without_stage_timings(&rebuilt),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1677,17 +1671,17 @@ fn index_with_a_claude_root_that_cannot_be_read_reports_its_preserved_session_as
     };
     index_and_report_with(&Some(db_path.clone()), &opts, mock_loader).unwrap();
 
-    // An empty root is not an absolute path, so index does not read it.
+    let empty_root_that_is_not_an_absolute_path = Path::new("");
     let unread_opts = indexer::IndexOptions {
         force: false,
-        claude_dir: Path::new(""),
+        claude_dir: empty_root_that_is_not_an_absolute_path,
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path.clone()), &unread_opts, mock_loader).unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1759,17 +1753,17 @@ fn index_with_a_claude_root_that_cannot_be_read_and_no_stored_sessions_warns_tha
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
 
-    // An empty root is not an absolute path, so index does not read it.
+    let empty_root_that_is_not_an_absolute_path = Path::new("");
     let unread_opts = indexer::IndexOptions {
         force: false,
-        claude_dir: Path::new(""),
+        claude_dir: empty_root_that_is_not_an_absolute_path,
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
     let outcome = index_and_report_with(&Some(db_path), &unread_opts, mock_loader).unwrap();
 
     assert_eq!(
-        printed_json(&outcome),
+        printed_json_without_stage_timings(&outcome),
         serde_json::json!({
             "data": {
                 "embedded": 0,
@@ -1925,6 +1919,7 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
             String::new(),
             "note: 2 chunk(s) failed to embed (batch failed); rerun `recall index` to retry\n"
                 .to_owned()
-        )
+        ),
+        "index_and_report prints every other note itself; the embed failure reaches stderr only as a tracing line without the remedy"
     );
 }

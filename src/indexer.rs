@@ -54,9 +54,7 @@ pub struct IndexStats {
     pub elapsed_secs: f64,
     pub skipped_roots: Vec<SkippedRoot>,
     pub preserved_embedded: usize,
-    /// The logs the index pass took from the roots this run. A compressed copy set aside beside its
-    /// plain log is not among them.
-    pub source_logs: HashSet<PathBuf>,
+    pub logs_read_this_run: HashSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,11 +91,7 @@ impl SkippedRoot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkippedReason {
-    MissingRoot {
-        /// `true` when the source's other roots were read in full, so their deleted sessions were
-        /// removed. `false` when every root of the source was missing, as Claude's one root can be.
-        others_reconciled: bool,
-    },
+    MissingRoot { others_reconciled: bool },
     IncompleteEnumeration,
 }
 
@@ -164,11 +158,6 @@ fn resolve_file_stamp(fpath: &Path) -> Option<FileStamp> {
     })
 }
 
-/// Deletes the messages of `session_id` through the rowid range its session row stores.
-///
-/// `messages.session_id` is UNINDEXED, so a delete by it reads every message of the index (DR
-/// 0019). The range covers every message of the session, and the `session_id` test keeps the
-/// rows of any other session inside it. Call this before deleting the session row.
 fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
     let stored = tx
         .prepare_cached(
@@ -179,7 +168,6 @@ fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
         })
         .optional()?;
     match stored {
-        // No messages outlive their session row; the schema upgrade removed the ones that did.
         None => {}
         Some((Some(lo), Some(hi))) => {
             tx.prepare_cached(
@@ -187,7 +175,6 @@ fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
             )?
             .execute(rusqlite::params![lo, hi, session_id])?;
         }
-        // A row that an older recall wrote holds no range.
         Some(_) => {
             tx.prepare_cached("DELETE FROM messages WHERE session_id = ?1")?
                 .execute([session_id])?;
@@ -196,8 +183,6 @@ fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletes everything stored for `session_id` except its session row. Call this before deleting
-/// the session row.
 fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     delete_session_messages(tx, session_id)?;
     delete_recorded_vectors(tx, session_id, "")?;
@@ -217,10 +202,6 @@ fn session_row_names_log(tx: &Transaction, session_id: &str, log: &str) -> Resul
     .map_err(Into::into)
 }
 
-/// Deletes `session_id` and everything stored for it while its session row still names
-/// `owner_log`. A log read earlier in the same run may have taken the session over, and its row
-/// then names that log. The messages go first, because their delete reads the range from the
-/// session row.
 fn delete_session(tx: &Transaction, session_id: &str, owner_log: &str) -> Result<()> {
     if !session_row_names_log(tx, session_id, owner_log)? {
         return Ok(());
@@ -287,7 +268,7 @@ fn upsert_session(
             session_type,
             1,
             stamp.and_then(|s| i64::try_from(s.size).ok()),
-            chunk_state::PARSED,
+            chunk_state::PARSED_WITH_CHUNKS_PENDING,
         ],
     )?;
 
@@ -656,19 +637,15 @@ pub(crate) fn index_from_dirs_observed(
             &scan.removal,
         ),
         preserved_embedded: totals.preserved_embedded,
-        source_logs: scan.sources.into_iter().map(|(path, _)| path).collect(),
+        logs_read_this_run: scan.sources.into_iter().map(|(path, _)| path).collect(),
     })
 }
 
-/// What [`settle`] reports once the chunks and the legacy backfill are up to date.
 pub(crate) struct Settled {
     pub(crate) chunks_created: usize,
-    /// Every unresolved parse diagnostic, read back after the backfill recorded its own.
     pub(crate) parse_diagnostics: Vec<FileParseDiagnostics>,
 }
 
-/// Chunks the sessions the scan stored, then fills in what an index from an older version lacks.
-/// The backfill reads again only the logs the scan took this run.
 pub(crate) fn settle(
     conn: &mut Connection,
     scanned: &IndexStats,
@@ -687,8 +664,11 @@ pub(crate) fn settle(
     let on_backfill_progress = |done: usize, total: usize| {
         backfill.progress(done.saturating_sub(1), total, 0);
     };
-    let scanned_backfilled =
-        backfill_session_files(conn, &scanned.source_logs, Some(&on_backfill_progress))?;
+    let scanned_backfilled = backfill_session_files(
+        conn,
+        &scanned.logs_read_this_run,
+        Some(&on_backfill_progress),
+    )?;
     let parse_diagnostics = load_parse_diagnostics(conn)?;
     if scanned_backfilled > 0 {
         debug!(
@@ -798,7 +778,6 @@ fn cleanup_orphans(
         return Ok(());
     }
     for (fp, entry) in existing {
-        // A missing/unreadable source root is not evidence that its sessions were deleted.
         if !removal.allows(entry.source, Path::new(fp.as_str()))
             || preserved_sessions.contains(&entry.session_id)
         {

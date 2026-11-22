@@ -96,18 +96,12 @@ pub(super) fn save_read_error(tx: &Transaction, path: &Path, source: Source) -> 
     Ok(())
 }
 
-/// What reading a log found.
 pub(super) enum LogRead {
     Parsed(ParseResult),
-    /// The file name gives no session id, so the log is not opened.
     Empty,
     Unreadable,
 }
 
-/// Parses the log at `path` with `parse` and records what the read found: the
-/// parse diagnostics of a parsed log, or a read error. Every read of a log by
-/// the indexer goes through here, so a parsed log also clears an earlier read
-/// error.
 pub(super) fn read_log(
     tx: &Transaction,
     path: &Path,

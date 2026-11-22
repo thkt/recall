@@ -64,7 +64,6 @@ pub(crate) fn index_and_report(
     Ok(outcome)
 }
 
-/// Picks the always-probe loader for index and rebuild.
 pub(crate) fn index_embedder(host: &ModelHost<'_>) -> Result<Arc<dyn Embed>, DegradedReason> {
     try_load_embedder_cached_with_reporter(|| host.load_probing(), |_: &str| {})
 }
@@ -88,8 +87,6 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         outcome.degraded_note.is_none() || outcome.failed_count == 0,
         "model-absent and embed-stop degradation are mutually exclusive"
     );
-    // index_and_report and the index_and_report_observed it calls print every note but the
-    // embed failure, which reaches stderr only as a tracing log line without the remedy.
     let mut notes = Vec::new();
     if let Some(note) = &outcome.degraded_note {
         notes.push(Note::shown(note.clone()));
