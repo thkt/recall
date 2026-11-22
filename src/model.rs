@@ -19,10 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "model/artifact_record.rs"]
+mod artifact_record;
 #[path = "model/cache.rs"]
 mod cache;
 #[path = "model/probe_record.rs"]
 mod probe_record;
+pub(crate) use artifact_record::{ArtifactCheck, ResolvedArtifacts};
+use artifact_record::{ArtifactRecords, resolve_artifacts};
 pub(crate) use probe_record::ProbeRecords;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -332,18 +336,7 @@ const HOST_STEPS: LoadSteps<'static> = LoadSteps {
     load: &load_verified,
 };
 
-fn verified_root() -> Result<PathBuf, DegradedReason> {
-    match timed("artifact sha256", cached_artifacts) {
-        Ok(None) => Err(DegradedReason::NotInstalled),
-        Err(error) => {
-            tracing::warn!(%error,"model artifact validation failed");
-            Err(DegradedReason::ProbeFailed)
-        }
-        Ok(Some(artifacts)) => Ok(artifacts.root),
-    }
-}
-
-type ResolveArtifacts<'a> = &'a dyn Fn() -> Result<(PathBuf, Option<ProbeRecords>), DegradedReason>;
+type ResolveArtifacts<'a> = &'a dyn Fn(ArtifactCheck) -> Result<ResolvedArtifacts, DegradedReason>;
 
 /// Where a command's model load finds the verified artifacts, the probe record and the load
 /// steps. Commands take it as their only model input, so tests reach the loader each command
@@ -351,30 +344,55 @@ type ResolveArtifacts<'a> = &'a dyn Fn() -> Result<(PathBuf, Option<ProbeRecords
 pub(crate) struct ModelHost<'a> {
     /// Called per load, so a command that never loads the model skips the SHA-256 check.
     pub(crate) resolve: ResolveArtifacts<'a>,
+    pub(crate) probe_records: &'a dyn Fn() -> Option<ProbeRecords>,
     pub(crate) steps: &'a LoadSteps<'a>,
 }
 
 impl ModelHost<'_> {
     /// Used by index, rebuild and doctor: always runs the isolated probe.
     pub(crate) fn load_probing(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
-        let (root, records) = (self.resolve)()?;
-        load_probing(&root, records.as_ref(), self.steps)
+        let artifacts = (self.resolve)(ArtifactCheck::HashAndRecord)?;
+        load_probing(&artifacts.root, (self.probe_records)().as_ref(), self.steps)
     }
 
     /// Used by search: skips the isolated probe in an environment where it already succeeded.
     pub(crate) fn load_for_search(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
-        let (root, records) = (self.resolve)()?;
-        load_for_search(&root, records.as_ref(), self.steps)
+        let artifacts = (self.resolve)(ArtifactCheck::TrustRecord)?;
+        let (loaded, parent_check_failed) =
+            search_load(&artifacts.root, (self.probe_records)().as_ref(), self.steps);
+        if (loaded.is_err() || parent_check_failed)
+            && let Some(record) = &artifacts.trusted_record
+        {
+            record.clear();
+        }
+        loaded
+    }
+
+    pub(crate) fn artifacts_ready(&self) -> bool {
+        (self.resolve)(ArtifactCheck::HashOnly).is_ok()
     }
 }
 
-fn resolve_on_host() -> Result<(PathBuf, Option<ProbeRecords>), DegradedReason> {
-    let root = verified_root()?;
-    Ok((root, ProbeRecords::host(&selected().identity())))
+fn resolve_on_host(check: ArtifactCheck) -> Result<ResolvedArtifacts, DegradedReason> {
+    resolve_artifacts(
+        check,
+        &cache_dir(),
+        selected(),
+        ArtifactRecords::host().as_ref(),
+        || {
+            timed("artifact sha256", cached_artifacts)
+                .map(|artifacts| artifacts.map(|artifacts| artifacts.root))
+        },
+    )
+}
+
+fn probe_records_on_host() -> Option<ProbeRecords> {
+    ProbeRecords::host(&selected().identity())
 }
 
 pub(crate) const HOST: ModelHost<'static> = ModelHost {
     resolve: &resolve_on_host,
+    probe_records: &probe_records_on_host,
     steps: &HOST_STEPS,
 };
 
@@ -385,6 +403,12 @@ pub(crate) fn load_probing(
     records: Option<&ProbeRecords>,
     steps: &LoadSteps<'_>,
 ) -> Result<Arc<dyn Embed>, DegradedReason> {
+    probing_load(root, records, steps).0
+}
+
+type CheckedLoad = (Result<Arc<dyn Embed>, DegradedReason>, bool);
+
+fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_>) -> CheckedLoad {
     // No skip ever reads the record of an environment marked no-skip, so skip the self-check.
     let records = records.filter(|records| !records.no_skip());
     tracing::debug!("starting the isolated model probe");
@@ -397,6 +421,7 @@ pub(crate) fn load_probing(
             DegradedReason::ProbeFailed,
         )(error)),
     };
+    let mut parent_check_failed = false;
     if let Some(records) = records {
         // A failed self-check leaves the returned model as before; it only withholds the record.
         let verified = loaded.as_ref().is_ok_and(|model| {
@@ -409,25 +434,31 @@ pub(crate) fn load_probing(
         } else {
             records.clear();
         }
+        parent_check_failed = loaded.is_ok() && !verified;
     }
-    loaded
+    (loaded, parent_check_failed)
 }
 
-/// The GPU check, load and self-check run under a running marker, so a crash or hang in them
-/// stops later searches in this environment from skipping the probe.
+#[cfg(test)]
 pub(crate) fn load_for_search(
     root: &Path,
     records: Option<&ProbeRecords>,
     steps: &LoadSteps<'_>,
 ) -> Result<Arc<dyn Embed>, DegradedReason> {
+    search_load(root, records, steps).0
+}
+
+/// The GPU check, load and self-check run under a running marker, so a crash or hang in them
+/// stops later searches in this environment from skipping the probe.
+fn search_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_>) -> CheckedLoad {
     let Some(records) = records.filter(|records| records.may_skip()) else {
-        return load_probing(root, records, steps);
+        return probing_load(root, records, steps);
     };
     let marker = match records.begin_skipped_load() {
         Ok(marker) => marker,
         Err(error) => {
             tracing::warn!(%error, "could not mark the skipped model load; running the isolated probe");
-            return load_probing(root, Some(records), steps);
+            return probing_load(root, Some(records), steps);
         }
     };
     tracing::debug!("isolated model probe skipped: this environment already passed it");
@@ -436,7 +467,7 @@ pub(crate) fn load_for_search(
     if loaded.is_err() {
         records.clear();
     }
-    loaded
+    (loaded, false)
 }
 
 fn load_skipping_probe(

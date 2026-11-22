@@ -26,6 +26,7 @@ This directory contains important decisions about the project.
 | [0018](0018-give-sessions-tied-in-one-search-the-mean-of-their-rrf-ranks.md) | Give Sessions Tied in One Search the Mean of Their RRF Ranks | accepted | 2026-11-16 |
 | [0019](0019-delete-session-messages-by-their-stored-rowid-range.md) | Delete Session Messages by Their Stored Rowid Range | accepted | 2026-11-17 |
 | [0020](0020-delete-chunk-embeddings-by-their-stored-rowid-range.md) | Delete Chunk Embeddings by Their Stored Rowid Range | accepted | 2026-11-22 |
+| [0021](0021-skip-the-artifact-sha-256-on-search-for-unchanged-files.md) | Skip the Artifact SHA-256 on Search for Unchanged Files | accepted | 2026-11-22 |
 
 ## By Status
 
@@ -51,6 +52,7 @@ This directory contains important decisions about the project.
 - **0018**: Give Sessions Tied in One Search the Mean of Their RRF Ranks
 - **0019**: Delete Session Messages by Their Stored Rowid Range
 - **0020**: Delete Chunk Embeddings by Their Stored Rowid Range
+- **0021**: Skip the Artifact SHA-256 on Search for Unchanged Files
 
 ## About MADR Format
 

@@ -132,6 +132,24 @@ pub(super) fn record_dir(
     xdg_cache_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
+    state_dir(hf_home, xdg_cache_home, home, "probe")
+}
+
+pub(super) fn host_state_dir(leaf: &str) -> Option<PathBuf> {
+    state_dir(
+        env::var_os("HF_HOME").as_deref(),
+        env::var_os("XDG_CACHE_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+        leaf,
+    )
+}
+
+fn state_dir(
+    hf_home: Option<&OsStr>,
+    xdg_cache_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    leaf: &str,
+) -> Option<PathBuf> {
     let base = hf_home
         .map(PathBuf::from)
         .or_else(|| {
@@ -140,7 +158,7 @@ pub(super) fn record_dir(
                 .filter(|path| path.is_absolute())
         })
         .or_else(|| home.map(|home| Path::new(home).join(".cache")))?;
-    Some(base.join("recall").join("probe"))
+    Some(base.join("recall").join(leaf))
 }
 
 fn next_nonce() -> u64 {
@@ -157,6 +175,19 @@ fn owner_only_new_file() -> OpenOptions {
         options.mode(0o600);
     }
     options
+}
+
+pub(super) fn write_atomically(dir: &Path, target: &Path, contents: &str) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    let temp = dir.join(format!(".{}.{}.tmp", process::id(), next_nonce()));
+    let mut file = owner_only_new_file().open(&temp)?;
+    let result = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| fs::rename(&temp, target));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 enum MarkerState {
@@ -282,18 +313,7 @@ impl ProbeRecords {
     }
 
     fn write(&self, target: &Path, contents: &str) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
-        let temp = self
-            .dir
-            .join(format!(".{}.{}.tmp", process::id(), next_nonce()));
-        let mut file = owner_only_new_file().open(&temp)?;
-        let result = file
-            .write_all(contents.as_bytes())
-            .and_then(|()| fs::rename(&temp, target));
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        write_atomically(&self.dir, target, contents)
     }
 
     /// The marker becomes visible only after it is locked, so a reader never takes a load

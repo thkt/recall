@@ -5,14 +5,20 @@ use anyhow::Result;
 
 use crate::commands::{ReadIndex, build_markdown};
 use crate::envelope::{CommandOutput, Note};
-use crate::model::{self, cached_artifacts};
+use crate::model::{self, ModelHost};
 use crate::resolve_db_path;
 use crate::runtime::info as cli_info;
 
 pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
-    run_status_with(verbose, db_path, || {
-        cached_artifacts().map(|opt| opt.is_some()).unwrap_or(false)
-    })
+    run_status_in(verbose, db_path, &model::HOST)
+}
+
+pub(crate) fn run_status_in(
+    verbose: bool,
+    db_path: &Option<PathBuf>,
+    host: &ModelHost<'_>,
+) -> Result<CommandOutput> {
+    run_status_with(verbose, db_path, || host.artifacts_ready())
 }
 
 /// Takes only whether the model is ready, so status never starts the probe or loads the model.
