@@ -156,8 +156,8 @@ fn applying_the_patches_changes_the_staged_copy_and_leaves_the_source_tree_uncha
 }
 
 #[test]
-fn syncing_a_staged_tree_rewrites_only_the_destination_files_whose_content_differs_with_a_newer_modification_time_even_from_an_equally_old_staged_file_and_keeps_the_modification_time_of_the_rest()
- {
+fn syncing_a_staged_tree_rewrites_only_differing_files_and_keeps_the_modification_time_of_the_rest()
+{
     let work = TempDir::new().unwrap();
     let staged = work.path().join("staged");
     let dest = work.path().join("dest");
@@ -184,7 +184,10 @@ fn syncing_a_staged_tree_rewrites_only_the_destination_files_whose_content_diffe
     assert_eq!(read(&dest, "src/changed.txt"), "new\n");
     assert_eq!(read(&dest, "src/added.txt"), "added\n");
     assert_eq!(modified_time(&dest.join("src/same.txt")), long_ago);
-    assert!(modified_time(&dest.join("src/changed.txt")) > long_ago);
+    assert!(
+        modified_time(&dest.join("src/changed.txt")) > long_ago,
+        "a rewritten file gets a newer modification time even when the staged file is as old as the destination, so CMake sees the rewrite"
+    );
 }
 
 #[test]

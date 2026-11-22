@@ -1919,6 +1919,7 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
             String::new(),
             "note: 2 chunk(s) failed to embed (batch failed); rerun `recall index` to retry\n"
                 .to_owned()
-        )
+        ),
+        "index_and_report prints every other note itself; the embed failure reaches stderr only as a tracing line without the remedy"
     );
 }

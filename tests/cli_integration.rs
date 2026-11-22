@@ -555,8 +555,7 @@ fn show_without_json_keeps_human_output() {
 }
 
 #[test]
-fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model_and_prints_stage_lines_on_stderr()
- {
+fn index_json_without_sessions_reports_nothing_to_embed_the_missing_model_and_its_stage_lines() {
     let dir = TempDir::new().unwrap();
 
     let (code, envelope, stderr) =
@@ -571,7 +570,7 @@ fn index_json_without_sessions_reports_nothing_to_embed_and_the_missing_model_an
     );
     assert!(
         stderr.starts_with("index: total: started (not yet complete)\n"),
-        "{stderr}"
+        "only a run of the binary reaches the stage lines the observer writes to stderr: {stderr}"
     );
 }
 
@@ -1532,7 +1531,6 @@ fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
     if root_skip::skip_if_root(no_sessions.path()) {
         return;
     }
-    // Every session may sit in the log this snapshot cannot read.
     let text = (
         Some(0),
         String::new(),
@@ -1541,7 +1539,8 @@ fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
 
     assert_eq!(
         outcome(recall(no_sessions.path()).args(["search", "anything"])),
-        text
+        text,
+        "every session may sit in the log this snapshot cannot read"
     );
     assert_eq!(
         json_outcome(recall(no_sessions.path()).args(["search", "anything", "--json"])),
@@ -1557,7 +1556,8 @@ fn search_of_a_stale_snapshot_that_shows_no_sessions_keeps_the_note() {
     );
     assert_eq!(
         outcome(recall(no_schema.path()).args(["search", "anything"])),
-        text
+        text,
+        "every session may sit in the log this snapshot cannot read"
     );
 }
 
@@ -1576,7 +1576,6 @@ fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_th
     if root_skip::skip_if_root(dir.path()) {
         return;
     }
-    // The newer schema may sit in the log this snapshot cannot read.
     let error = (
         Some(65),
         String::new(),
@@ -1587,9 +1586,14 @@ fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_th
 
     assert_eq!(
         outcome(recall(dir.path()).args(["search", "anything"])),
-        error
+        error,
+        "the newer schema may sit in the log this snapshot cannot read"
     );
-    assert_eq!(outcome(recall(dir.path()).arg("status")), error);
+    assert_eq!(
+        outcome(recall(dir.path()).arg("status")),
+        error,
+        "the newer schema may sit in the log this snapshot cannot read"
+    );
 }
 
 #[cfg(unix)]
@@ -1722,8 +1726,7 @@ fn the_cli_integration_suite_fails_when_run_as_root() {
 }
 
 #[test]
-fn index_reports_parse_loss_but_not_excluded_codex_events_on_json_and_human_surfaces_without_repeating_skipped_text_until_source_repair()
- {
+fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     let dir = TempDir::new().unwrap();
     let claude = dir.path().join("claude");
     let codex = dir.path().join("codex");
@@ -1786,7 +1789,8 @@ fn index_reports_parse_loss_but_not_excluded_codex_events_on_json_and_human_surf
                 &diagnostics,
                 &notes
             )
-        )
+        ),
+        "excluded Codex events are not parse loss"
     );
     let (code, second, second_stderr) =
         index_json_outcome_without_stage_timings(&mut run(&["index", "--json"]));
@@ -1825,10 +1829,24 @@ fn index_reports_parse_loss_but_not_excluded_codex_events_on_json_and_human_surf
         stderr.contains(&format!("\nwarning: {incomplete_tail}\n")),
         "{stderr}"
     );
-    assert!(!first_stderr.contains("secret-"), "{first_stderr}");
-    assert!(!second_stderr.contains("secret-"), "{second_stderr}");
-    assert!(!rebuilt_stderr.contains("secret-"), "{rebuilt_stderr}");
-    assert!(!stderr.contains("secret-"), "{stderr}");
+    let repeats_skipped_text =
+        "the skipped lines hold conversation text, which no output may repeat";
+    assert!(
+        !first_stderr.contains("secret-"),
+        "{repeats_skipped_text}: {first_stderr}"
+    );
+    assert!(
+        !second_stderr.contains("secret-"),
+        "{repeats_skipped_text}: {second_stderr}"
+    );
+    assert!(
+        !rebuilt_stderr.contains("secret-"),
+        "{repeats_skipped_text}: {rebuilt_stderr}"
+    );
+    assert!(
+        !stderr.contains("secret-"),
+        "{repeats_skipped_text}: {stderr}"
+    );
 
     fs::write(
         &path,
@@ -2051,9 +2069,6 @@ fn index_stderr_warns_when_a_root_with_indexed_sessions_is_unavailable() {
     );
 }
 
-/// #398: an empty `CLAUDE_CONFIG_DIR` must neither turn a `projects/` dir in the cwd into
-/// the Claude root nor fall back to the default root; either run would read an empty root
-/// in full and delete the session indexed from the configured one.
 #[test]
 fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() {
     let dir = TempDir::new().unwrap();
@@ -2098,7 +2113,11 @@ fn empty_claude_config_dir_keeps_indexed_sessions_when_cwd_has_a_projects_dir() 
     );
 
     assert_eq!(code, Some(0), "{stderr}");
-    assert_eq!(outcome(&mut search_hello()), found_the_session);
+    assert_eq!(
+        outcome(&mut search_hello()),
+        found_the_session,
+        "neither the cwd's projects/ dir nor the default root becomes the Claude root; reading either empty root in full would delete the session"
+    );
     // why-not: a whole-stderr match, because stage timings fill the rest of stderr
     assert!(
         stderr.contains("\nwarning: claude root could not be fully read — preserved 1 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions\n"),
@@ -2192,16 +2211,17 @@ fn mark_source_unknown(dir: &Path, session_id: &str) {
 #[test]
 fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
     let dir = TempDir::new().unwrap();
-    // Equal text gives equal raw ranks, so only the recency blend separates the
-    // sessions. "z-newest" sorts last by id, so a cut before the blend drops it.
-    // It is dated in the future, which always gets the largest boost, so the
-    // order holds however late the test runs.
-    let a1 = user_line("authentication notes", "2026-01-01T00:00:00Z");
-    let a2 = user_line("authentication notes", "2026-01-02T00:00:00Z");
-    let a3 = user_line("authentication notes", "2026-01-03T00:00:00Z");
-    let a4 = user_line("authentication notes", "2026-01-04T00:00:00Z");
-    let a5 = user_line("authentication notes", "2026-01-05T00:00:00Z");
-    let newest = user_line("authentication notes", "2999-01-01T00:00:00Z");
+    let text_with_equal_raw_ranks = "authentication notes";
+    let a1 = user_line(text_with_equal_raw_ranks, "2026-01-01T00:00:00Z");
+    let a2 = user_line(text_with_equal_raw_ranks, "2026-01-02T00:00:00Z");
+    let a3 = user_line(text_with_equal_raw_ranks, "2026-01-03T00:00:00Z");
+    let a4 = user_line(text_with_equal_raw_ranks, "2026-01-04T00:00:00Z");
+    let a5 = user_line(text_with_equal_raw_ranks, "2026-01-05T00:00:00Z");
+    let future_date_with_the_largest_recency_boost = "2999-01-01T00:00:00Z";
+    let newest = user_line(
+        text_with_equal_raw_ranks,
+        future_date_with_the_largest_recency_boost,
+    );
     index_claude_sessions(
         dir.path(),
         &[
@@ -2232,7 +2252,8 @@ fn search_with_limit_one_prints_the_first_result_of_the_default_limit() {
             6,
             &serde_json::json!([MODEL_NOT_INSTALLED_NOTE]),
             MODEL_NOT_INSTALLED_STDERR.to_owned()
-        )
+        ),
+        "only the recency blend ranks z-newest first; it sorts last by id, so a cut before the blend drops it"
     );
     assert_eq!(
         json_outcome(recall(dir.path()).args([

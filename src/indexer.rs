@@ -268,7 +268,7 @@ fn upsert_session(
             session_type,
             1,
             stamp.and_then(|s| i64::try_from(s.size).ok()),
-            chunk_state::PARSED,
+            chunk_state::PARSED_WITH_CHUNKS_PENDING,
         ],
     )?;
 

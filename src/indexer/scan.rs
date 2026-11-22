@@ -41,8 +41,6 @@ pub(crate) fn resolve_codex_dir(home: &Path) -> PathBuf {
     resolve_codex_dir_with(home, |key| env::var_os(key))
 }
 
-/// `RECALL_CODEX_DIR` alone turns the default archive off, so pointing recall at
-/// another sessions tree never mixes in the real `~/.codex/archived_sessions`.
 pub(crate) fn resolve_codex_archived_dir_with<F>(home: &Path, get: F) -> Option<PathBuf>
 where
     F: Fn(&str) -> Option<OsString>,
@@ -113,8 +111,6 @@ pub(super) fn collect_sources(opts: &IndexOptions) -> ScanOutcome {
     out
 }
 
-/// While Codex compresses a log, the plain file and its `.zst` copy coexist.
-/// Indexing both would make each run replace the session row with the other path.
 fn set_aside_compressed_copies_of_plain_logs(sources: &mut Vec<(PathBuf, Source)>) -> Vec<PathBuf> {
     let plain: HashSet<PathBuf> = sources
         .iter()

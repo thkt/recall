@@ -2069,15 +2069,14 @@ fn a_session_chunked_to_nothing_is_not_chunked_again_after_a_reopen_until_its_lo
     assert_eq!(index_from_dirs(&mut conn, &opts, true).unwrap().indexed, 0);
     let (unchanged, lines) = recording();
     let stats = index_chunks_observed(&mut conn, &unchanged).unwrap();
-    // Performance guard (docs/audit/2026-09-20-chunk-index.md): a session already chunked to
-    // nothing costs no FTS scan, no body batch and no message read.
     assert_eq!(
         (
             stats.message_scans,
             stats.message_batches,
             stats.messages_read
         ),
-        (0, 0, 0)
+        (0, 0, 0),
+        "performance guard (docs/audit/2026-09-20-chunk-index.md): a session already chunked to nothing costs no FTS scan, no body batch and no message read"
     );
     assert_eq!(
         stable_lines(&lines.borrow()),
@@ -2779,16 +2778,17 @@ fn chunk_pass_with_pending_sessions_reports_its_stage_lines_and_counts_and_store
 
 #[test]
 fn chunk_batches_limit_session_count_and_source_bytes() {
-    // Performance guard (docs/audit/2026-09-20-chunk-index.md): a body batch holds at most 64
-    // sessions and 8 MiB of message text, and a session over 8 MiB is read alone. The guard
-    // calls the private chunk_batch_len with session sizes, because reaching 8 MiB through
-    // index_chunks would need megabytes of message text.
+    // why-not: index_chunks, because reaching 8 MiB through it would need megabytes of message text
     let one_byte = ("s".to_owned(), None, 1);
     let four_mib = ("s".to_owned(), None, 4_194_304);
     let over_eight_mib = ("s".to_owned(), None, 8_388_609);
     let no_bytes = ("s".to_owned(), None, 0);
 
-    assert_eq!(chunk_batch_len(&vec![one_byte.clone(); 65]), 64);
+    assert_eq!(
+        chunk_batch_len(&vec![one_byte.clone(); 65]),
+        64,
+        "performance guard (docs/audit/2026-09-20-chunk-index.md): a body batch holds at most 64 sessions"
+    );
     assert_eq!(
         chunk_batch_len(&[four_mib.clone(), four_mib, one_byte.clone()]),
         2,
@@ -2825,8 +2825,7 @@ fn query_plan(conn: &Connection, sql: &str, params: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn chunk_batches_of_65_interleaved_sessions_cross_the_64_session_limit_and_preserve_order_and_search_ranges()
- {
+fn chunk_batches_of_65_interleaved_sessions_preserve_order_and_search_ranges() {
     let (_dir, mut conn) = setup_test_db();
     conn.execute_batch(
         "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
@@ -2886,28 +2885,33 @@ fn chunk_batches_of_65_interleaved_sessions_cross_the_64_session_limit_and_prese
         0,
         "every chunk's rowid range runs from its own session's first message to its last"
     );
-    // Performance guard (docs/audit/2026-09-20-chunk-index.md): one FTS scan stages every
-    // pending message, the 65 sessions are read in two body batches, and each of the 260
-    // messages is fetched once.
+    let sessions = 65;
+    let turns_per_session = 4;
+    let sessions_per_body_batch = 64;
     assert_eq!(
         (
             stats.message_scans,
             stats.message_batches,
             stats.messages_read
         ),
-        (1, 2, 260)
+        (
+            1,
+            usize::div_ceil(sessions, sessions_per_body_batch),
+            sessions * turns_per_session
+        ),
+        "performance guard (docs/audit/2026-09-20-chunk-index.md): one FTS scan stages every pending message, the sessions cross the 64-session limit into two body batches, and each message is fetched once"
     );
-    // Performance guard (same audit): staging keeps FTS as the single outer scan and probes
-    // sessions by key. Each batch reads message bodies by rowid equality. No other row scans
-    // messages or sessions. Index names and the FTS5 index string change with the SQLite
-    // version and the schema, so the asserts read only the access and the table. A virtual
-    // table row always reads SCAN, and FTS5 marks a rowid equality with `=` in its index string.
+    // why-not: whole plan rows, because index names and the FTS5 index string change with the SQLite version and schema
     conn.execute_batch(CREATE_CHUNK_MESSAGE_ROWS).unwrap();
     let stage = query_plan(&conn, STAGE_CHUNK_MESSAGES, &[]);
-    assert_eq!(stage.len(), 2, "{stage:?}");
+    assert_eq!(
+        stage.len(),
+        2,
+        "no plan row but the two below scans messages or sessions: {stage:?}"
+    );
     assert!(
         stage[0].starts_with("SCAN m VIRTUAL TABLE "),
-        "FTS is the single outer scan: {stage:?}"
+        "performance guard (docs/audit/2026-09-20-chunk-index.md): FTS is the single outer scan: {stage:?}"
     );
     assert!(
         stage[1].starts_with("SEARCH s ")
@@ -2916,14 +2920,18 @@ fn chunk_batches_of_65_interleaved_sessions_cross_the_64_session_limit_and_prese
         "each staged message probes sessions by their key index, not an automatic one: {stage:?}"
     );
     let read = query_plan(&conn, READ_CHUNK_BATCH, &["s000", "s064"]);
-    assert_eq!(read.len(), 2, "{read:?}");
+    assert_eq!(
+        read.len(),
+        2,
+        "no plan row but the two below scans messages or sessions: {read:?}"
+    );
     assert!(
         read[0].starts_with("SEARCH r USING PRIMARY KEY "),
         "a batch reads its sessions' staged rows by key range: {read:?}"
     );
     assert!(
         read[1].starts_with("SCAN m VIRTUAL TABLE ") && read[1].contains('='),
-        "each staged row reads its message body by rowid equality: {read:?}"
+        "each staged row reads its message body by rowid equality, which FTS5 marks with `=` in a virtual table row that always reads SCAN: {read:?}"
     );
 }
 
@@ -3631,8 +3639,6 @@ fn embedded_contents(conn: &Connection) -> Vec<String> {
     )
 }
 
-/// Both connections run on one thread and the writer does not wait for the lock, so the test
-/// fixes one order. It does not reproduce a second `recall index`, which would wait instead.
 fn assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(embed_capable: bool) {
     use rusqlite::{Error as SqliteError, ErrorCode};
     use std::cell::{Cell, RefCell};
@@ -3641,7 +3647,10 @@ fn assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(embed_capa
     let (db_dir, mut conn) = setup_test_db();
     let log = Rc::new(OneLog::new("claude", "new.jsonl"));
     let writer = open_db(&db_dir.path().join("test.db")).unwrap();
-    writer.busy_timeout(Duration::ZERO).unwrap();
+    let writer_does_not_wait_for_the_lock = Duration::ZERO;
+    writer
+        .busy_timeout(writer_does_not_wait_for_the_lock)
+        .unwrap();
     let writer = RefCell::new(writer);
     let writer_log = Rc::clone(&log);
     let saved = Rc::new(RefCell::new(None));
@@ -3682,7 +3691,10 @@ fn assert_a_session_indexed_after_enumeration_survives_orphan_cleanup(embed_capa
     });
 
     index_from_dirs_observed(&mut conn, &log.opts(), embed_capable, &observer).unwrap();
-    assert!(attempted.get());
+    assert!(
+        attempted.get(),
+        "the writer ran once on this thread, which fixes one order; a second `recall index` would wait for the lock instead"
+    );
     // why-not: unconditional, because indexing again would restore a session the run's cleanup deleted
     if saved.borrow().is_none() {
         index_new().unwrap();
@@ -4495,7 +4507,7 @@ fn plain_codex_log_is_indexed_once_when_its_compressed_copy_sits_beside_it() {
     assert_eq!((first.indexed, first.total_sessions), (1, 1));
     assert_eq!(
         second.indexed, 0,
-        "the two copies must not replace each other"
+        "while Codex compresses a log, the plain file and its .zst copy coexist; indexing both would make each run replace the session row with the other path"
     );
     assert_eq!(
         collect_strings(&conn, "SELECT file_path FROM sessions"),
@@ -5010,7 +5022,11 @@ fn codex_archived_dir_defaults_under_home_unless_only_the_sessions_dir_is_overri
         resolve(&[]),
         Some(PathBuf::from("/fake/home/.codex/archived_sessions"))
     );
-    assert_eq!(resolve(&[("RECALL_CODEX_DIR", "/tmp/codex")]), None);
+    assert_eq!(
+        resolve(&[("RECALL_CODEX_DIR", "/tmp/codex")]),
+        None,
+        "pointing recall at another sessions tree never mixes in the real ~/.codex/archived_sessions"
+    );
     assert_eq!(
         resolve(&[
             ("RECALL_CODEX_DIR", "/tmp/codex"),
