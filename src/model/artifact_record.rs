@@ -40,7 +40,6 @@ struct RecordContents {
     artifacts: [FileIdentity; 2],
 }
 
-#[cfg(unix)]
 fn file_identity(path: &Path) -> io::Result<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::metadata(path)?;
@@ -53,14 +52,6 @@ fn file_identity(path: &Path) -> io::Result<FileIdentity> {
         ctime_sec: metadata.ctime(),
         ctime_nsec: metadata.ctime_nsec(),
     })
-}
-
-#[cfg(not(unix))]
-fn file_identity(_path: &Path) -> io::Result<FileIdentity> {
-    Err(io::Error::new(
-        ErrorKind::Unsupported,
-        "artifact file identities are read only on Unix",
-    ))
 }
 
 fn current_identities(root: &Path) -> Option<[FileIdentity; 2]> {

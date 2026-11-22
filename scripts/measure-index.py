@@ -108,7 +108,6 @@ def main():
     def run(name, db, interrupt=False, rebuild=False):
         env["RECALL_DB"] = str(db)
         start = time.monotonic()
-        usage = None
         interrupted = False
         last_counts = None
         with (output / f"{name}.stdout").open("w") as stdout, (output / f"{name}.stderr").open("w") as stderr:

@@ -72,7 +72,7 @@ Commands report what limits a result as a note. With `--json`, the envelope list
 ### Search
 
 ```sh
-recall search "error handling"                                   # keyword search
+recall search "error handling"
 recall search "database migration" --project /Users/me/GitHub/app  # filter by project
 recall search "React Router" --days 7                            # last 7 days
 recall search "async runtime" --source codex                     # Codex sessions only
@@ -366,7 +366,7 @@ Run once after cloning to enable commit checks:
 git config --local core.hooksPath .githooks
 ```
 
-This installs a pre-commit hook that runs `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` before each commit. Violations abort the commit. To skip for one commit: `git commit --no-verify`.
+When a commit includes Rust source files, Cargo.toml, Cargo.lock, or files under .github/, the hook runs `cargo fmt -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`. Violations abort the commit. To skip for one commit: `git commit --no-verify`.
 
 ### Common commands
 

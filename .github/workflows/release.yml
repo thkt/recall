@@ -164,8 +164,6 @@ jobs:
           end
           FORMULA
 
-          sed -i 's/^          //' Formula/recall.rb
-
       - name: Commit and push
         env:
           VERSION: ${{ needs.release.outputs.version }}

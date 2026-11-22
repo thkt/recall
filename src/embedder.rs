@@ -507,10 +507,6 @@ impl MockEmbedder {
         }
     }
 
-    pub(crate) fn capturing_options() -> Self {
-        Self::new()
-    }
-
     pub(crate) fn with_vectors_per_text(vectors_per_text: usize) -> Self {
         Self {
             vectors_per_text,
