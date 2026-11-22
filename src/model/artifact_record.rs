@@ -37,7 +37,6 @@ struct FileIdentity {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RecordContents {
-    key: String,
     artifacts: [FileIdentity; 2],
 }
 
@@ -99,19 +98,16 @@ impl ArtifactRecords {
         field(root.as_os_str().as_encoded_bytes());
         field(spec.model_sha256.as_bytes());
         field(spec.tokenizer_sha256.as_bytes());
-        let key = digest_hex(&hash.finalize());
         ArtifactRecord {
-            dir: self.dir.clone(),
-            path: self.dir.join(format!("{key}.json")),
-            key,
+            path: self
+                .dir
+                .join(format!("{}.json", digest_hex(&hash.finalize()))),
         }
     }
 }
 
 pub(crate) struct ArtifactRecord {
-    dir: PathBuf,
     path: PathBuf,
-    key: String,
 }
 
 impl ArtifactRecord {
@@ -127,7 +123,6 @@ impl ArtifactRecord {
         serde_json::from_str::<RecordContents>(&text).is_ok_and(|contents| {
             contents
                 == RecordContents {
-                    key: self.key.clone(),
                     artifacts: *identities,
                 }
         })
@@ -135,12 +130,11 @@ impl ArtifactRecord {
 
     fn write(&self, identities: [FileIdentity; 2]) {
         let contents = RecordContents {
-            key: self.key.clone(),
             artifacts: identities,
         };
         let written = serde_json::to_string(&contents)
             .map_err(io::Error::other)
-            .and_then(|json| write_atomically(&self.dir, &self.path, &json));
+            .and_then(|json| write_atomically(&self.path, &json));
         if let Err(error) = written {
             tracing::warn!(%error, "could not record the verified model artifacts");
         }

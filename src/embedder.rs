@@ -492,11 +492,8 @@ impl MockEmbedder {
 
     pub(crate) fn failing_after(n: usize) -> Self {
         Self {
-            call_count: AtomicUsize::new(0),
             fail_after: Some(n),
-            fail_on_texts: Vec::new(),
-            captured_options: Mutex::new(Vec::new()),
-            vectors_per_text: 1,
+            ..Self::new()
         }
     }
 
@@ -506,11 +503,8 @@ impl MockEmbedder {
 
     pub(crate) fn failing_on_texts(texts: &[&str]) -> Self {
         Self {
-            call_count: AtomicUsize::new(0),
-            fail_after: None,
             fail_on_texts: texts.iter().map(|text| (*text).to_owned()).collect(),
-            captured_options: Mutex::new(Vec::new()),
-            vectors_per_text: 1,
+            ..Self::new()
         }
     }
 

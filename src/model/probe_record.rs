@@ -177,9 +177,9 @@ fn owner_only_new_file() -> OpenOptions {
     options
 }
 
-pub(super) fn write_atomically(dir: &Path, target: &Path, contents: &str) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let temp = dir.join(format!(".{}.{}.tmp", process::id(), next_nonce()));
+pub(super) fn write_atomically(target: &Path, contents: &str) -> io::Result<()> {
+    target.parent().map_or(Ok(()), fs::create_dir_all)?;
+    let temp = target.with_file_name(format!(".{}.{}.tmp", process::id(), next_nonce()));
     let mut file = owner_only_new_file().open(&temp)?;
     let result = file
         .write_all(contents.as_bytes())
@@ -291,14 +291,14 @@ impl ProbeRecords {
     }
 
     fn forbid_skipping(&self) {
-        if let Err(error) = self.write(&self.path("no-skip"), "") {
+        if let Err(error) = write_atomically(&self.path("no-skip"), "") {
             tracing::warn!(%error, "could not record that this environment must run the probe");
         }
         self.clear();
     }
 
     pub(super) fn record_success(&self) {
-        if let Err(error) = self.write(&self.path("ok"), &self.key) {
+        if let Err(error) = write_atomically(&self.path("ok"), &self.key) {
             tracing::warn!(%error, "could not record the successful model probe");
         }
     }
@@ -310,10 +310,6 @@ impl ProbeRecords {
             }
             _ => {}
         }
-    }
-
-    fn write(&self, target: &Path, contents: &str) -> io::Result<()> {
-        write_atomically(&self.dir, target, contents)
     }
 
     /// The marker becomes visible only after it is locked, so a reader never takes a load
