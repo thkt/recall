@@ -24,14 +24,10 @@ pub(super) struct ClaudeEntry<'a> {
 
 impl<'a> ClaudeEntry<'a> {
     pub(super) fn from_json(entry: &'a Value) -> Self {
-        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
-        let role_field = entry.get("role").and_then(Value::as_str).unwrap_or("");
-        let role = if role_field == "user" || matches!(entry_type, "user" | "human") {
-            Some(Role::User)
-        } else if role_field == "assistant" || entry_type == "assistant" {
-            Some(Role::Assistant)
-        } else {
-            None
+        let role = match entry.get("type").and_then(Value::as_str) {
+            Some("user") => Some(Role::User),
+            Some("assistant") => Some(Role::Assistant),
+            _ => None,
         };
         Self {
             role,
@@ -45,14 +41,13 @@ impl<'a> ClaudeEntry<'a> {
                 .filter(|cwd| !cwd.is_empty()),
             slug: entry
                 .get("slug")
-                .or_else(|| entry.get("leafName"))
                 .and_then(Value::as_str)
                 .filter(|slug| !slug.is_empty()),
             timestamp: entry.get("timestamp").and_then(parse_iso_timestamp),
             content: match entry.get("message") {
                 Some(Value::Object(msg)) => msg.get("content"),
                 message @ Some(Value::String(_)) => message,
-                _ => entry.get("content"),
+                _ => None,
             },
         }
     }
