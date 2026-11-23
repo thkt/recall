@@ -210,12 +210,23 @@ fn slow_loader_is_announced_before_work_and_run_counts_distinguish_changes() {
         codex_archived_dir: None,
     };
     let db = Some(dir.path().join("index.db"));
-    for (run, updated, unchanged) in [(0, 1, 0), (1, 0, 1), (2, 1, 0)] {
+    for (run, updated, unchanged, checked_stages) in [
+        (
+            0,
+            1,
+            0,
+            vec!["fts_transaction", "chunking", "embedding_db_save"],
+        ),
+        (1, 0, 1, vec!["fts_transaction"]),
+        (2, 1, 0, vec!["fts_transaction", "embedding_db_save"]),
+    ] {
         if run == 2 {
             fs::write(&file, line.repeat(2)).unwrap();
         }
         let lines = Rc::new(RefCell::new(Vec::new()));
         let output = Rc::clone(&lines);
+        let checked = Rc::new(RefCell::new(Vec::new()));
+        let checked_by_reporter = Rc::clone(&checked);
         let db_file = db.as_ref().unwrap().clone();
         let observer = Observer::with_reporter(move |line| {
             output.borrow_mut().push(line.to_owned());
@@ -227,18 +238,21 @@ fn slow_loader_is_announced_before_work_and_run_counts_distinguish_changes() {
                         .unwrap()
                 };
                 if line.contains("fts_transaction:") {
+                    checked_by_reporter.borrow_mut().push("fts_transaction");
                     assert_eq!(
                         count("SELECT count(*) FROM messages"),
                         if run == 2 { 2 } else { 1 },
                         "FTS must be visible to another reader when saved is announced"
                     );
                 } else if line.contains("chunking:") {
+                    checked_by_reporter.borrow_mut().push("chunking");
                     assert_eq!(
                         count("SELECT count(*) FROM sessions WHERE chunks_indexed = 2"),
                         1
                     );
                     assert!(count("SELECT count(*) FROM qa_chunks") > 0);
                 } else if line.contains("embedding_db_save:") {
+                    checked_by_reporter.borrow_mut().push("embedding_db_save");
                     assert!(
                         count("SELECT count(*) FROM vec_chunks") > 0,
                         "vectors must be visible before save notification"
@@ -269,6 +283,7 @@ fn slow_loader_is_announced_before_work_and_run_counts_distinguish_changes() {
             &observer,
         )
         .unwrap();
+        assert_eq!(*checked.borrow(), checked_stages, "run {run}");
         let observations = &outcome.observations;
         assert!(
             observations["seconds"]["model_load_probe"]

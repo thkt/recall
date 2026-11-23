@@ -67,9 +67,15 @@ fn manifest_validation_and_cache_failures_are_explicit() {
             .arg("--model-manifest")
             .arg(&path)
             .args(["model", "manifest"]));
-        assert!(
-            !out.status.success(),
+        assert_eq!(
+            out.status.code(),
+            Some(65),
             "invalid manifest field accepted: {field}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.starts_with("error: invalid model manifest: "),
+            "{field}: {stderr}"
         );
         assert!(!root.join("index.db").exists());
     }

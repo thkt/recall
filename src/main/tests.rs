@@ -162,12 +162,6 @@ fn format_timestamp_prints_the_utc_calendar_date_or_unknown() {
 }
 
 #[test]
-fn try_load_embedder_cached_records_degraded_non_install_failure() {
-    let result = try_load_embedder_cached_with(|| Err(DegradedReason::ProbeFailed));
-    assert!(result.is_err());
-}
-
-#[test]
 fn try_load_embedder_cached_reports_reason_aware_notes_once() {
     for (reason, expected) in [
         (
@@ -209,16 +203,11 @@ fn search_degraded_note_covers_backend_failures() {
 #[test]
 fn try_load_embedder_cached_returns_loaded_embedder() {
     let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
-    let result = try_load_embedder_cached_with(|| Ok(loaded));
-    assert!(result.is_ok(), "a loaded embedder must be returned");
-}
-
-#[test]
-fn try_load_embedder_cached_returns_err_when_model_not_installed() {
-    let result = try_load_embedder_cached_with(|| Err(DegradedReason::NotInstalled));
+    let returned = try_load_embedder_cached_with(|| Ok(Arc::clone(&loaded)))
+        .expect("a loaded embedder must be returned");
     assert!(
-        result.is_err(),
-        "a not-installed model must degrade (Err), not abort"
+        Arc::ptr_eq(&returned, &loaded),
+        "the returned embedder must be the one the loader opened"
     );
 }
 
@@ -400,7 +389,14 @@ fn doctor_fix_flag_parses() {
 #[test]
 fn embed_token_shorthand_expands_to_search() {
     let args: Vec<OsString> = ["recall", "embed"].iter().map(OsString::from).collect();
-    assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_some());
+    let expected: Vec<OsString> = ["recall", "search", "embed"]
+        .iter()
+        .map(OsString::from)
+        .collect();
+    assert_eq!(
+        try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS),
+        Some(expected)
+    );
 }
 
 #[test]
