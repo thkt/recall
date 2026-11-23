@@ -6,7 +6,7 @@ use rusqlite::Connection;
 use crate::db::collect_strings;
 use crate::envelope::{render_json_success, render_text_notes};
 use crate::model::tests::FakeHost;
-use crate::tests::{mock_loader, payload_keys, vec_chunk_count};
+use crate::test_support::{mock_loader, payload_keys, vec_chunk_count};
 use crate::{parser, search};
 
 use super::*;

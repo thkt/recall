@@ -1,5 +1,5 @@
 use super::*;
-use crate::tests::reported;
+use crate::test_support::reported;
 
 #[test]
 fn a_usage_error_exits_64_and_points_at_the_help() {

@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use super::*;
 use crate::db::{collect_strings, open_db, seed_chunk, seed_session, setup_test_db};
 use crate::index_observer::recording;
-use crate::tests::vec_chunk_count;
+use crate::test_support::vec_chunk_count;
 
 #[test]
 fn replaying_the_same_generation_replaces_vectors_without_duplicates() {

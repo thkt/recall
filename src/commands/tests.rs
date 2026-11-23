@@ -1,7 +1,11 @@
 use std::fs;
 
+use super::search::run_search_with;
+use super::show::{DEFAULT_WINDOW, run_show};
+use super::status::run_status_with;
 use super::*;
 use crate::embedder;
+use crate::test_support::{mock_loader, search_command, vec_chunk_count};
 
 #[cfg(unix)]
 #[test]
@@ -192,4 +196,64 @@ fn try_load_embedder_cached_returns_loaded_embedder() {
         Arc::ptr_eq(&returned, &loaded),
         "the returned embedder must be the one the loader opened"
     );
+}
+
+#[test]
+fn read_commands_use_pre_generation_index_without_migrating_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("recall.db");
+    let conn = open_or_create_db(&path).unwrap();
+    conn.execute_batch(
+        "DROP TRIGGER qa_chunks_insert_generation;
+             DROP TRIGGER qa_chunks_update_generation;
+             DROP TABLE qa_chunk_generation;
+             ALTER TABLE qa_chunks DROP COLUMN generation;",
+    )
+    .unwrap();
+    db::seed_session(&conn, "s1");
+    let content = "synthetic legacy content";
+    db::seed_chunk(&conn, 1, content);
+    conn.execute(
+        "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
+        [content],
+    )
+    .unwrap();
+    let vector = embedder::MockEmbedder::deterministic_vector(content);
+    conn.execute(
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
+        [embedder::f32_as_bytes(&vector)],
+    )
+    .unwrap();
+    let schema_version: i64 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+
+    let db_path = Some(path.clone());
+    let status = run_status_with(false, &db_path, || true).unwrap();
+    assert_eq!(status.data["sessions"], 1);
+    assert_eq!(status.data["qa_chunks"], 1);
+    assert_eq!(status.data["embedded"], 1);
+    let show = run_show("s1", false, None, DEFAULT_WINDOW, &db_path).unwrap();
+    assert!(show.markdown.contains(content));
+    let search = run_search_with(search_command(content), &db_path, mock_loader).unwrap();
+    assert!(!search.degraded);
+    let results = search.data["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["session_id"], "s1");
+    assert!(search.markdown.contains(content));
+
+    let (conn, _) = db::open_db_readonly(&path).unwrap();
+    let after: i64 = conn
+        .query_row("PRAGMA schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        after, schema_version,
+        "read commands must not migrate the DB"
+    );
+    assert_eq!(vec_chunk_count(&conn), 1);
+    let saved: Vec<u8> = conn
+        .query_row("SELECT embedding FROM vec_chunks", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(saved, embedder::f32_as_bytes(&vector));
 }

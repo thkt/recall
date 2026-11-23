@@ -3,18 +3,9 @@ use std::assert_matches;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
-
-use rusqlite::Connection;
 
 use super::*;
-use crate::commands::open_or_create_db;
-use crate::commands::search::{SearchArgs, run_search_with};
-use crate::commands::show::{DEFAULT_WINDOW, run_show};
-use crate::commands::status::run_status_with;
-use crate::embedding::Embed;
 use crate::envelope::Note;
-use crate::model::DegradedReason;
 
 struct FailingWriter;
 
@@ -269,129 +260,6 @@ fn readme_describes_index_time_embedding_not_post_search_growth() {
             );
         }
     }
-}
-
-pub(crate) fn vec_chunk_count(conn: &Connection) -> i64 {
-    conn.query_row("SELECT COUNT(*) FROM vec_chunks", [], |r| r.get(0))
-        .unwrap()
-}
-
-pub(crate) fn mock_loader() -> Result<Arc<dyn Embed>, DegradedReason> {
-    Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>)
-}
-
-pub(crate) fn seed_healthy_index(conn: &Connection) {
-    db::seed_session(conn, "s1");
-    db::seed_chunk(conn, 1, "healthy chunk");
-    let emb = embedder::MockEmbedder::deterministic_vector("healthy chunk");
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        rusqlite::params![embedder::f32_as_bytes(&emb)],
-    )
-    .unwrap();
-}
-
-pub(crate) fn bare_empty_db(dir: &Path) -> PathBuf {
-    let db_path = dir.join("recall.db");
-    drop(rusqlite::Connection::open(&db_path).unwrap());
-    db_path
-}
-
-pub(crate) fn search_command(query: &str) -> SearchArgs {
-    SearchArgs {
-        query: Some(query.to_owned()),
-        project: None,
-        days: None,
-        source: None,
-        file: None,
-        limit: 10,
-        exclude_current: false,
-        include_current: false,
-        only_current: false,
-        include_automated: false,
-    }
-}
-
-#[test]
-fn read_commands_use_pre_generation_index_without_migrating_it() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let path = dir.path().join("recall.db");
-    let conn = open_or_create_db(&path).unwrap();
-    conn.execute_batch(
-        "DROP TRIGGER qa_chunks_insert_generation;
-             DROP TRIGGER qa_chunks_update_generation;
-             DROP TABLE qa_chunk_generation;
-             ALTER TABLE qa_chunks DROP COLUMN generation;",
-    )
-    .unwrap();
-    db::seed_session(&conn, "s1");
-    let content = "synthetic legacy content";
-    db::seed_chunk(&conn, 1, content);
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', ?1)",
-        [content],
-    )
-    .unwrap();
-    let vector = embedder::MockEmbedder::deterministic_vector(content);
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        [embedder::f32_as_bytes(&vector)],
-    )
-    .unwrap();
-    let schema_version: i64 = conn
-        .query_row("PRAGMA schema_version", [], |r| r.get(0))
-        .unwrap();
-    drop(conn);
-
-    let db_path = Some(path.clone());
-    let status = run_status_with(false, &db_path, || true).unwrap();
-    assert_eq!(status.data["sessions"], 1);
-    assert_eq!(status.data["qa_chunks"], 1);
-    assert_eq!(status.data["embedded"], 1);
-    let show = run_show("s1", false, None, DEFAULT_WINDOW, &db_path).unwrap();
-    assert!(show.markdown.contains(content));
-    let search = run_search_with(search_command(content), &db_path, mock_loader).unwrap();
-    assert!(!search.degraded);
-    let results = search.data["results"].as_array().unwrap();
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0]["session_id"], "s1");
-    assert!(search.markdown.contains(content));
-
-    let (conn, _) = db::open_db_readonly(&path).unwrap();
-    let after: i64 = conn
-        .query_row("PRAGMA schema_version", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        after, schema_version,
-        "read commands must not migrate the DB"
-    );
-    assert_eq!(vec_chunk_count(&conn), 1);
-    let saved: Vec<u8> = conn
-        .query_row("SELECT embedding FROM vec_chunks", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(saved, embedder::f32_as_bytes(&vector));
-}
-
-pub(crate) fn printed_envelope(out: &CommandOutput) -> serde_json::Value {
-    serde_json::from_str(&render_json_success(out)).unwrap()
-}
-
-pub(crate) fn reported(err: &anyhow::Error) -> (ExitCode, String) {
-    (
-        classify_exit_code(err),
-        render_json_error(&error_envelope(err)),
-    )
-}
-
-pub(crate) fn payload_keys(v: &serde_json::Value) -> Vec<String> {
-    let mut keys: Vec<String> = v
-        .as_object()
-        .expect("payload must be a JSON object")
-        .keys()
-        .cloned()
-        .collect();
-    keys.sort();
-    keys
 }
 
 #[test]

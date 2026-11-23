@@ -18,6 +18,8 @@ mod output;
 mod parser;
 mod runtime;
 mod search;
+#[cfg(test)]
+mod test_support;
 
 use std::borrow::Cow;
 use std::env;
@@ -129,9 +131,6 @@ enum ModelCommand {
     Manifest,
 }
 
-/// Embed-pass tuning flags shared verbatim by `index` and `rebuild`
-/// (`#[command(flatten)]`), so the two subcommands' flag definitions and docs
-/// cannot drift apart.
 #[derive(Debug, Args)]
 struct EmbedFlags {
     /// Forward-pass token budget override; smaller values shorten each GPU

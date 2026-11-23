@@ -19,11 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "model/artifact_record.rs"]
 mod artifact_record;
-#[path = "model/cache.rs"]
 mod cache;
-#[path = "model/probe_record.rs"]
 mod probe_record;
 pub(crate) use artifact_record::{ArtifactCheck, ResolvedArtifacts};
 use artifact_record::{ArtifactRecords, resolve_artifacts};
@@ -580,5 +577,4 @@ pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "model/tests.rs"]
 pub(crate) mod tests;
