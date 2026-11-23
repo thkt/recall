@@ -496,6 +496,22 @@ fn opening_a_v0_14_index_for_writing_adds_both_rowid_ranges_and_keeps_its_rows()
 }
 
 #[test]
+fn opening_an_index_that_still_has_the_update_generation_trigger_drops_it() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_index(tmp.path(), &V0_14);
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name"
+        ),
+        ["qa_chunks_insert_generation"]
+    );
+}
+
+#[test]
 fn every_inserted_chunk_gets_the_next_generation_and_a_message_range_update_keeps_it() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();

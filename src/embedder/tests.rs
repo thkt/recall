@@ -265,9 +265,7 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
              DELETE FROM qa_chunks WHERE id IN (3, 4, 5, 7);
              INSERT INTO qa_chunks (id, session_id, content) VALUES
                 (4, 's1', 'replacement content'), (5, 's1', 'old 5'),
-                (7, 's1', 'another worker saved this');
-             UPDATE qa_chunks SET content = 'intermediate' WHERE id = 6;
-             UPDATE qa_chunks SET content = 'old 6' WHERE id = 6;",
+                (7, 's1', 'another worker saved this');",
         )
         .unwrap();
         tx.commit().unwrap();
@@ -307,20 +305,23 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
         &observer,
     )
     .unwrap();
-    assert_eq!(result.embedded, 1, "only the unchanged chunk is a success");
+    assert_eq!(
+        result.embedded, 2,
+        "only the unchanged chunks are a success"
+    );
     assert_eq!(
         result.failed_count, 0,
         "stale work is not an inference failure"
     );
-    assert_eq!(*progress.lock().unwrap(), vec![(1, 7)]);
+    assert_eq!(*progress.lock().unwrap(), vec![(2, 7)]);
     let counts = observer.snapshot()["counts"].clone();
     assert_eq!(counts["chunks_pending_snapshot"], 7);
-    assert_eq!(counts["chunks_saved"], 1);
-    assert_eq!(counts["chunks_stale"], 6);
+    assert_eq!(counts["chunks_saved"], 2);
+    assert_eq!(counts["chunks_stale"], 5);
     assert_eq!(counts["chunks_failed"], 0);
     assert_eq!(counts["chunks_save_failed"], 0);
     assert_eq!(counts["chunks_unattempted"], 0);
-    assert_eq!(counts["chunks_remaining_snapshot"], 6);
+    assert_eq!(counts["chunks_remaining_snapshot"], 5);
     let preserved = conn
         .query_row(
             "SELECT rowid, embedding FROM vec_chunks WHERE chunk_id = 7",
@@ -336,10 +337,10 @@ fn interrupted_inference_saves_only_unchanged_generations_and_preserves_newer_ve
         .map(|c| c.id)
         .collect();
     pending.sort_unstable();
-    assert_eq!(pending, vec![2, 4, 5, 6]);
-    assert_eq!(pending_count(&conn).unwrap(), 4);
+    assert_eq!(pending, vec![2, 4, 5]);
+    assert_eq!(pending_count(&conn).unwrap(), 3);
     let retry = embed_recent_chunks(&mut conn, &MockEmbedder::new(), 10, None).unwrap();
-    assert_eq!(retry.embedded, 4);
+    assert_eq!(retry.embedded, 3);
     assert!(pending_chunks(&conn, 10).unwrap().is_empty());
     assert_vectors_match_current_content(&conn);
 }
@@ -703,14 +704,9 @@ fn later_pages_reject_replaced_and_deleted_generations_without_loading_new_bodie
             }
             let mut writer = other.lock().unwrap();
             writer
-                .execute("DELETE FROM qa_chunks WHERE id IN (1025, 1027)", [])
+                .execute("DELETE FROM qa_chunks WHERE id IN (1025, 1026, 1027)", [])
                 .unwrap();
-            writer
-                .execute(
-                    "UPDATE qa_chunks SET content = ?1 WHERE id = 1026",
-                    [&"x".repeat(PENDING_PAGE_BYTES + 1)],
-                )
-                .unwrap();
+            seed_chunk(&writer, 1026, &"x".repeat(PENDING_PAGE_BYTES + 1));
             seed_chunk(&writer, 1027, "input 1027");
             seed_chunk(&writer, 1028, "new input");
             let current: Vec<_> = pending_chunks(&writer, usize::MAX)

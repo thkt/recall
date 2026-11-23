@@ -285,6 +285,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             read_error INTEGER NOT NULL DEFAULT 0
         );
         DROP INDEX IF EXISTS idx_sessions_project;
+        DROP TRIGGER IF EXISTS qa_chunks_update_generation;
         CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);
         CREATE TABLE IF NOT EXISTS session_files (
             session_id TEXT NOT NULL,
@@ -341,12 +342,6 @@ fn create_generation_tracking(conn: &mut Connection) -> Result<()> {
          INSERT OR IGNORE INTO qa_chunk_generation VALUES (1, 0);
          CREATE TRIGGER IF NOT EXISTS qa_chunks_insert_generation
          AFTER INSERT ON qa_chunks BEGIN
-            UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
-            UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
-            WHERE id = NEW.id;
-         END;
-         CREATE TRIGGER IF NOT EXISTS qa_chunks_update_generation
-         AFTER UPDATE OF id, session_id, content ON qa_chunks BEGIN
             UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
             UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
             WHERE id = NEW.id;
