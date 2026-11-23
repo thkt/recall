@@ -8,9 +8,8 @@ BF16 via the pinned llama.cpp/Metal backend; old Ruri/MLX measurements in
 | Script | Purpose | Requirements |
 | --- | --- | --- |
 | `fetch-gemma-test-artifacts.py` | Stage the public model and tokenizer from a manifest, verifying SHA-256 before replacement. Used by CI coverage. | Network access; Python standard library |
-| `verify-gemma-independent.py` | Exercise the real CLI against synthetic sessions, separate model identities, checksum failure, legacy reads and update/rollback. | Built Gemma binary, verified artifacts, Python `sqlite-vec` |
+| `verify-gemma-independent.py` | Exercise the real CLI against synthetic sessions, separate model identities, checksum failure and update/rollback. | Built Gemma binary, verified artifacts, Python `sqlite-vec` |
 | `measure-index.py` | Measure initial index, no-change, append and interrupt/resume on synthetic logs; optionally verify chunk reuse and pending-body bounds. | Built binary and a working model; macOS or another platform with `os.wait4` |
-| `measure-classify.py` | Compare classification parsing and writer contention against the pinned pre-change parser, using synthetic logs. | Full Git history containing its baseline, Rust build tools and initialized native submodules |
 
 ## Public-model tests
 
@@ -66,18 +65,5 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/test/new-mea
   --conditions 'commit, chip, RAM, OS, Rust, cache state and load'
 ```
 
-For the classification benchmark:
-
-```sh
-git submodule update --init --recursive
-python3 scripts/measure-classify.py
-```
-
-This stages the current sources and vendored native dependencies in a temporary
-checkout, inserts only the pinned parser/classification baseline, and runs the
-36 comparison conditions at least five times each. The current model dependencies
-remain in the staged build; the old MLX build settings in the
-[original report](../docs/research/issue-342-scope.md) describe historical runs.
-The benchmark uses synthetic classification inputs and does not load a model or
-measure Gemma inference. All scripts preserve their results separately from the
+All scripts preserve their results separately from the
 [dated migration validation record](../docs/audit/2026-10-16-gemma-validation.json).

@@ -103,7 +103,7 @@ fn check_model_identity(identity: Result<(), IndexIdentityError>) -> DoctorCheck
             could_not_run(e),
             UNREADABLE_IDENTITY_REMEDY,
         ),
-        Err(refusal @ (IndexIdentityError::Mismatch | IndexIdentityError::LegacyVectors)) => {
+        Err(refusal @ IndexIdentityError::Mismatch) => {
             DoctorCheck::fail("model_identity", refusal.to_string(), MODEL_INDEX_REMEDY)
         }
     }

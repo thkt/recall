@@ -82,11 +82,10 @@ database path in use. Each database records that value in the `fingerprint` colu
 
 The legacy `~/.local/share/recall/recall.db` is left in place. Every command refuses an
 index whose schema predates v0.14.0, before the identity check
-([DR 0022](decisions/0022-refuse-indexes-built-before-v0140.md)). A nonempty vector
-index without identity is treated as legacy, never inferred to be Gemma just
-because it also has 768 dimensions. Semantic reads fall back to FTS with a
-degraded note; status and doctor also flag the mismatch, and writes refuse before schema migration. A mismatched identified
-index also refuses rebinding, including when empty. Existing session/message
+([DR 0022](decisions/0022-refuse-indexes-built-before-v0140.md)). For an index recorded
+under another model identity, semantic reads fall back to FTS with a degraded note,
+status and doctor flag the mismatch, and writes refuse before any schema change,
+including when the index is empty. Existing session/message
 deletion rules and generation-checked embedding saves remain in force.
 
 ## Evaluate an update

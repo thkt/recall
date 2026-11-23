@@ -514,20 +514,13 @@ pub enum IndexIdentityError {
         "index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest"
     )]
     Mismatch,
-    #[error(
-        "legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path"
-    )]
-    LegacyVectors,
     #[error(transparent)]
     Unreadable(#[from] rusqlite::Error),
 }
 
 impl IndexIdentityError {
     pub fn refuses_model(&self) -> bool {
-        match self {
-            Self::Mismatch | Self::LegacyVectors => true,
-            Self::Unreadable(_) => false,
-        }
+        matches!(self, Self::Mismatch)
     }
 }
 
@@ -546,18 +539,6 @@ pub fn check_index(conn: &Connection, spec: &ModelSpec) -> Result<(), IndexIdent
         } else {
             Err(IndexIdentityError::Mismatch)
         };
-    }
-    let vectors: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='vec_chunks')",
-        [],
-        |r| r.get(0),
-    )?;
-    if vectors {
-        let count: bool =
-            conn.query_row("SELECT EXISTS(SELECT 1 FROM vec_chunks)", [], |r| r.get(0))?;
-        if count {
-            return Err(IndexIdentityError::LegacyVectors);
-        }
     }
     Ok(())
 }

@@ -169,21 +169,6 @@ after = invoke('rollback-current-search', query, old_db, old_manifest)
 assert after['data']['results'] == before['data']['results'] and not after['degraded']
 assert digest(old_db) == old_hash
 
-legacy = root/'legacy.db'
-with connect(old_db) as source, connect(legacy) as dest:
-    source.backup(dest)
-with connect(legacy) as conn:
-    conn.execute('DROP TABLE embedding_identity')
-    conn.commit()
-    conn.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchall()
-legacy_hash = digest(legacy)
-rejected = invoke('legacy-write-refused', ['rebuild'], legacy, old_manifest, expected=65)
-assert 'legacy vector index' in rejected['error']['message']
-assert digest(legacy) == legacy_hash
-fallback = invoke('legacy-read-FTS-only', ['search', 'manifest'], legacy, old_manifest)
-assert fallback['degraded'] and any('legacy vector index' in n for n in fallback['notes'])
-assert digest(legacy) == legacy_hash
-
 tampered = root/'tampered-artifacts'
 tampered.mkdir()
 shutil.copyfile(model_dir/'tokenizer.json', tampered/'tokenizer.json')
@@ -202,7 +187,7 @@ summary = {'status': 'complete', 'binary_sha256': digest(binary), 'sessions': 6,
            'candidate_is_simulated_prefix_update': True,
            'default_model_namespaces_separate': True,
            'no_change_new_inference_chunks': 0, 'old_index_unchanged_by_candidate_and_rollback': True,
-           'rollback_search_exactly_reproduced': True, 'legacy_index_unchanged': True,
+           'rollback_search_exactly_reproduced': True,
            'checksums_rejected_before_native_load': True, 'real_CLI_doctor_probe': True,
            'standalone_relocated_binary_with_embedded_Metal': True,
            'production_index_accessed': False, 'amici_used': False, 'calls': calls}

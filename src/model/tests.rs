@@ -189,26 +189,6 @@ fn model_or_tokenizer_or_prefix_changes_select_a_new_index_identity() {
     }
 }
 #[test]
-fn legacy_vectors_are_rejected_without_stamping_or_deleting_them() {
-    let mut c = empty_index();
-    c.execute("INSERT INTO vec_chunks VALUES(7)", []).unwrap();
-    assert!(bind_index(&mut c, &ModelSpec::default()).is_err());
-    assert_eq!(
-        c.query_row("SELECT id FROM vec_chunks", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        7
-    );
-    assert_eq!(
-        c.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='embedding_identity'",
-            [],
-            |r| r.get::<_, i64>(0)
-        )
-        .unwrap(),
-        0
-    );
-}
-#[test]
 fn binding_an_index_whose_identity_cannot_be_read_exits_as_an_io_failure() {
     let mut c = empty_index();
     c.execute_batch(

@@ -51,6 +51,3 @@ mod integration_tests;
 
 #[cfg(test)]
 mod reclassification_tests;
-
-#[cfg(test)]
-mod benchmark;

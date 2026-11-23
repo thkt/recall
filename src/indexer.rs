@@ -789,6 +789,3 @@ fn cleanup_orphans(
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod benchmarks;
