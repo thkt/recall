@@ -1,3 +1,4 @@
+use std::mem;
 use std::path::Path;
 
 use serde_json::Value;
@@ -82,12 +83,17 @@ pub(super) fn codex_automated(payload: &Value) -> bool {
     }
 }
 
+enum LegacyIdentity {
+    RuledOut,
+    Unconfirmed,
+    Parent(String),
+}
+
 pub(super) struct ClaudeOrigin<'a> {
     session_id: &'a str,
     agent_id: Option<&'a str>,
     parent: Option<&'a str>,
-    legacy_identity_matches: bool,
-    legacy_parent: Option<String>,
+    legacy: LegacyIdentity,
     origin: SessionOrigin,
 }
 
@@ -99,8 +105,11 @@ impl<'a> ClaudeOrigin<'a> {
             session_id,
             agent_id,
             parent,
-            legacy_identity_matches: parent.is_none() && agent_id.is_some(),
-            legacy_parent: None,
+            legacy: if parent.is_none() && agent_id.is_some() {
+                LegacyIdentity::Unconfirmed
+            } else {
+                LegacyIdentity::RuledOut
+            },
             origin: SessionOrigin {
                 automated: parent.is_some(),
                 ..Default::default()
@@ -120,21 +129,22 @@ impl<'a> ClaudeOrigin<'a> {
         if let Some(id) = id {
             self.origin.identity_conflict |= id != self.session_id && Some(id) != self.parent;
         }
-        self.legacy_identity_matches = self.legacy_identity_matches
-            && !entry.is_meta
-            && entry.sidechain
-            && entry.agent_id == self.agent_id
-            && id.is_some_and(is_uuid);
-        if self.legacy_identity_matches
-            && let Some(id) = id
-        {
-            let expected = self.legacy_parent.get_or_insert_with(|| id.to_owned());
-            self.legacy_identity_matches &= expected == id;
-        }
+        let agrees = !entry.is_meta && entry.sidechain && entry.agent_id == self.agent_id;
+        let parent_id = id.filter(|id| agrees && is_uuid(id));
+        self.legacy = match (
+            mem::replace(&mut self.legacy, LegacyIdentity::RuledOut),
+            parent_id,
+        ) {
+            (LegacyIdentity::Unconfirmed, Some(id)) => LegacyIdentity::Parent(id.to_owned()),
+            (LegacyIdentity::Parent(expected), Some(id)) if expected == id => {
+                LegacyIdentity::Parent(expected)
+            }
+            _ => LegacyIdentity::RuledOut,
+        };
     }
 
     pub fn finish(mut self) -> SessionOrigin {
-        self.origin.identity_conflict &= !self.legacy_identity_matches;
+        self.origin.identity_conflict &= matches!(self.legacy, LegacyIdentity::RuledOut);
         self.origin.automated &= !self.origin.identity_conflict;
         self.origin
     }

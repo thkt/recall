@@ -924,17 +924,13 @@ fn doctor_flags_model_that_fails_to_embed() {
 fn run_db_check_converts_query_error_into_fail_verdict() {
     let check = run_db_check("integrity", || Err(anyhow::anyhow!("disk I/O error")));
 
-    assert!(!check.ok);
+    assert!(!check.ok());
     assert!(
-        check
-            .detail
-            .as_deref()
-            .unwrap()
-            .contains("check could not run"),
+        check.detail().unwrap().contains("check could not run"),
         "got: {:?}",
-        check.detail
+        check.detail()
     );
-    assert_eq!(check.remedy, Some(CORRUPT_DB_REMEDY));
+    assert_eq!(check.remedy(), Some(CORRUPT_DB_REMEDY));
 }
 
 #[test]

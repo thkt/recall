@@ -90,36 +90,44 @@ fn search_idle_output() -> CommandOutput {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CurrentSessionFlags {
-    exclude: bool,
-    include: bool,
-    only: bool,
+enum CurrentSessionFlag {
+    Unset,
+    Exclude,
+    Include,
+    Only,
+}
+
+impl CurrentSessionFlag {
+    fn from_args(exclude: bool, include: bool, only: bool) -> Self {
+        match (exclude, include, only) {
+            (_, _, true) => Self::Only,
+            (_, true, false) => Self::Include,
+            (true, false, false) => Self::Exclude,
+            (false, false, false) => Self::Unset,
+        }
+    }
 }
 
 fn resolve_current_session(
-    flags: CurrentSessionFlags,
+    flag: CurrentSessionFlag,
     env_session_id: Option<String>,
 ) -> Result<search::CurrentSession, RecallError> {
     use search::CurrentSession;
     let env_session_id = env_session_id.filter(|s| !s.trim().is_empty());
-    if flags.only {
-        return match env_session_id {
-            Some(id) => Ok(CurrentSession::Only(id)),
-            None => Err(RecallError::Usage(
-                "--only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session"
-                    .to_owned(),
-            )),
-        };
-    }
-    if flags.include {
-        return Ok(CurrentSession::Ignore);
-    }
-    match env_session_id {
-        Some(id) => Ok(CurrentSession::Exclude(id)),
-        None => {
-            if flags.exclude {
-                warning("--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set");
-            }
+    match (flag, env_session_id) {
+        (CurrentSessionFlag::Only, Some(id)) => Ok(CurrentSession::Only(id)),
+        (CurrentSessionFlag::Only, None) => Err(RecallError::Usage(
+            "--only-current requires CLAUDE_CODE_SESSION_ID; run recall from inside a Claude Code session"
+                .to_owned(),
+        )),
+        (CurrentSessionFlag::Include, _) | (CurrentSessionFlag::Unset, None) => {
+            Ok(CurrentSession::Ignore)
+        }
+        (CurrentSessionFlag::Exclude | CurrentSessionFlag::Unset, Some(id)) => {
+            Ok(CurrentSession::Exclude(id))
+        }
+        (CurrentSessionFlag::Exclude, None) => {
+            warning("--exclude-current has no effect: CLAUDE_CODE_SESSION_ID is not set");
             Ok(CurrentSession::Ignore)
         }
     }
@@ -161,11 +169,7 @@ where
     } = args;
 
     let current = resolve_current_session(
-        CurrentSessionFlags {
-            exclude: exclude_current,
-            include: include_current,
-            only: only_current,
-        },
+        CurrentSessionFlag::from_args(exclude_current, include_current, only_current),
         env::var("CLAUDE_CODE_SESSION_ID").ok(),
     )?;
 
