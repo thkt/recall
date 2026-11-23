@@ -133,7 +133,11 @@ Move the ten functions behind a subcommand.
 
 Supersedes DR 0017: `migrate_fts_if_needed`, its contract, is deleted.
 
-Narrows DR 0007 as stated in Decision Outcome. DR 0007 itself is left unchanged.
+Narrows DR 0007 as stated in Decision Outcome. DR 0007 itself is left unchanged. The old-index upgrade tests that DR 0007's Confirmation names are deleted with the migrations they covered; this record's Confirmation replaces that part.
+
+DR 0020 required `migrate_vec_chunks_if_needed` to clear every stored vector range when it rebuilt a `vec_chunks` table without `sub_idx`. That function is deleted, and such a table is now refused before any write.
+
+`open_or_create_db` applies the same refusal before `model::check_index`, so an old index that also holds vectors without a model identity gets this record's message from every command, not the legacy-vector message.
 
 DR 0005 keeps its `instr` fallback and `backfill_rowid_ranges` for chunks with a NULL `src_rowid_lo`, and `backfill_session_files` keeps serving rows with a NULL `files_scanned`. Such rows can remain in a v0.14.0-shaped index: an index upgraded in place from before v0.9.0 holds them for sessions under a missing root, and the Migration Plan below produces exactly that index. Under the first Decision Driver those fallbacks therefore stay while the v0.16.1 upgrade path is offered.
 
