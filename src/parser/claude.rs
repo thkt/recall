@@ -15,7 +15,6 @@ pub(super) struct ClaudeEntry<'a> {
     pub(super) is_meta: bool,
     pub(super) sidechain: bool,
     pub(super) session_id: Option<&'a str>,
-    pub(super) agent_id: Option<&'a str>,
     cwd: Option<&'a str>,
     slug: Option<&'a str>,
     timestamp: Option<i64>,
@@ -34,7 +33,6 @@ impl<'a> ClaudeEntry<'a> {
             is_meta: entry.get("isMeta").and_then(Value::as_bool) == Some(true),
             sidechain: entry.get("isSidechain").and_then(Value::as_bool) == Some(true),
             session_id: entry.get("sessionId").and_then(Value::as_str),
-            agent_id: entry.get("agentId").and_then(Value::as_str),
             cwd: entry
                 .get("cwd")
                 .and_then(Value::as_str)
@@ -44,11 +42,9 @@ impl<'a> ClaudeEntry<'a> {
                 .and_then(Value::as_str)
                 .filter(|slug| !slug.is_empty()),
             timestamp: entry.get("timestamp").and_then(parse_iso_timestamp),
-            content: match entry.get("message") {
-                Some(Value::Object(msg)) => msg.get("content"),
-                message @ Some(Value::String(_)) => message,
-                _ => None,
-            },
+            content: entry
+                .get("message")
+                .and_then(|message| message.get("content")),
         }
     }
 }

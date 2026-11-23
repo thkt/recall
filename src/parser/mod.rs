@@ -247,93 +247,46 @@ pub(super) fn extract_text(content: Option<&Value>) -> String {
     strip_noise_tags(raw)
 }
 
-const ISO_SECONDS_END: usize = 19;
-const ISO_FRAC_START: usize = 20;
-
-fn parse_fractional_millis(s: &str, b: &[u8]) -> i64 {
-    if s.len() <= ISO_FRAC_START || b[ISO_SECONDS_END] != b'.' {
-        return 0;
-    }
-    let end = s[ISO_FRAC_START..]
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(s.len() - ISO_FRAC_START);
-    let frac = &b[ISO_FRAC_START..ISO_FRAC_START + end];
-    let d = |i: usize| (frac[i] - b'0') as i64;
-    match frac.len().min(3) {
-        1 => d(0) * 100,
-        2 => d(0) * 100 + d(1) * 10,
-        3 => d(0) * 100 + d(1) * 10 + d(2),
-        _ => 0,
-    }
-}
-
-fn parse_hhmm(s: &str) -> Option<(i64, i64)> {
-    let b = s.as_bytes();
-    if s.len() >= 5 && b[2] == b':' {
-        Some((s[0..2].parse().ok()?, s[3..5].parse().ok()?))
-    } else if s.len() >= 4 {
-        Some((s[0..2].parse().ok()?, s[2..4].parse().ok()?))
+fn parse_fractional_millis_before_z(fraction_and_zone: &str) -> Option<i64> {
+    let fraction = fraction_and_zone.strip_suffix('Z')?;
+    let digits = if fraction.is_empty() {
+        ""
     } else {
-        None
-    }
-}
-
-fn parse_tz_offset_ms(s: &str, b: &[u8]) -> i64 {
-    let tz_start = if s.len() > ISO_SECONDS_END && b[ISO_SECONDS_END] == b'.' {
-        s[ISO_FRAC_START..]
-            .find(|c: char| !c.is_ascii_digit())
-            .map(|i| ISO_FRAC_START + i)
-            .unwrap_or(s.len())
-    } else {
-        ISO_SECONDS_END
+        fraction.strip_prefix('.')?
     };
-    if tz_start >= s.len() {
-        return 0;
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    match b[tz_start] {
-        b'Z' => 0,
-        b'+' | b'-' => {
-            let sign = if b[tz_start] == b'+' { 1_i64 } else { -1_i64 };
-            let Some((h, m)) = parse_hhmm(&s[tz_start + 1..]) else {
-                return 0;
-            };
-            sign * (h * 3_600_000 + m * 60_000)
-        }
-        _ => 0,
-    }
+    Some(
+        digits
+            .bytes()
+            .zip([100, 10, 1])
+            .map(|(digit, place)| i64::from(digit - b'0') * place)
+            .sum(),
+    )
 }
 
 pub(super) fn parse_iso_timestamp(val: &Value) -> Option<i64> {
-    match val {
-        Value::String(s) => {
-            let s = s.trim();
-            if s.len() < 19 || !s.is_ascii() {
-                return None;
-            }
-            let b = s.as_bytes();
-            if b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
-                return None;
-            }
-            let year: i64 = s[0..4].parse().ok()?;
-            let month: i64 = s[5..7].parse().ok()?;
-            let day: i64 = s[8..10].parse().ok()?;
-            let hour: i64 = s[11..13].parse().ok()?;
-            let min: i64 = s[14..16].parse().ok()?;
-            let sec: i64 = s[17..19].parse().ok()?;
-            if !(0..24).contains(&hour) || !(0..60).contains(&min) || !(0..60).contains(&sec) {
-                return None;
-            }
-            let millis = parse_fractional_millis(s, b);
-            let tz_offset = parse_tz_offset_ms(s, b);
-            let days = date::days_from_civil(year, month, day)?;
-            Some(
-                days * date::MS_PER_DAY + hour * 3_600_000 + min * 60_000 + sec * 1000 + millis
-                    - tz_offset,
-            )
-        }
-        Value::Number(n) => n.as_i64(),
-        _ => None,
+    let s = val.as_str()?.trim();
+    if s.len() < 20 || !s.is_ascii() {
+        return None;
     }
+    let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let year: i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day: i64 = s[8..10].parse().ok()?;
+    let hour: i64 = s[11..13].parse().ok()?;
+    let min: i64 = s[14..16].parse().ok()?;
+    let sec: i64 = s[17..19].parse().ok()?;
+    if !(0..24).contains(&hour) || !(0..60).contains(&min) || !(0..60).contains(&sec) {
+        return None;
+    }
+    let millis = parse_fractional_millis_before_z(&s[19..])?;
+    let days = date::days_from_civil(year, month, day)?;
+    Some(days * date::MS_PER_DAY + hour * 3_600_000 + min * 60_000 + sec * 1000 + millis)
 }
 
 pub(super) fn parse_jsonl_entries(

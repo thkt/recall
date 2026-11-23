@@ -24,7 +24,7 @@ fn fixture() -> (tempfile::TempDir, Connection, Connection) {
         let log = root.path().join(format!("{id}.jsonl"));
         fs::write(
             &log,
-            r#"{"type":"user","message":"question","isSidechain":true}"#,
+            r#"{"type":"user","message":{"content":"question"},"isSidechain":true}"#,
         )
         .unwrap();
         conn.execute(
@@ -348,7 +348,7 @@ fn source_changes_during_read_and_before_apply_discard_old_candidates() {
                     let replacement = root.path().join("replacement");
                     fs::write(
                         &replacement,
-                        "{\"type\":\"user\",\"message\":\"now interactive\"}\n",
+                        "{\"type\":\"user\",\"message\":{\"content\":\"now interactive\"}}\n",
                     )
                     .unwrap();
                     fs::rename(replacement, &log).unwrap();

@@ -2997,7 +2997,7 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     let codex_dir = tmp.path().join("codex");
     fs::create_dir(&claude_dir).unwrap();
     let path = claude_dir.join("partial.jsonl");
-    let valid = "{\"type\":\"user\",\"message\":\"retained question\"}\n";
+    let valid = "{\"type\":\"user\",\"message\":{\"content\":\"retained question\"}}\n";
     fs::write(&path, format!("{valid}{{broken\n")).unwrap();
     let opts = IndexOptions {
         force: false,
@@ -3067,7 +3067,7 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     let tail = claude_dir.join("tail.jsonl");
     fs::write(
         &tail,
-        "{\"type\":\"user\",\"message\":\"completed by append",
+        "{\"type\":\"user\",\"message\":{\"content\":\"completed by append",
     )
     .unwrap();
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
@@ -3086,7 +3086,7 @@ fn parse_diagnostics_survive_freshness_preservation_and_root_outages_until_repai
     {
         use std::io::Write;
         let mut file = fs::OpenOptions::new().append(true).open(&tail).unwrap();
-        file.write_all(b"\"}\n").unwrap();
+        file.write_all(b"\"}}\n").unwrap();
     }
     let stats = index_from_dirs(&mut conn, &opts, true).unwrap();
     index_chunks(&mut conn).unwrap();
@@ -3137,7 +3137,7 @@ fn read_failure_retains_body_and_line_diagnostics_then_retries_unchanged_metadat
     let log = OneLog::new("claude", "s.jsonl");
     fs::write(
         &log.file,
-        "{\"type\":\"user\",\"message\":\"kept\"}\ninvalid\n",
+        "{\"type\":\"user\",\"message\":{\"content\":\"kept\"}}\ninvalid\n",
     )
     .unwrap();
     let first = index_from_dirs(&mut conn, &log.opts(), true).unwrap();
@@ -3281,7 +3281,11 @@ fn colliding_display_paths_keep_independent_diagnostics_until_each_file_is_resol
 
     drop(conn);
     let mut conn = open_db(&db_dir.path().join("test.db")).unwrap();
-    fs::write(&paths[2], "{\"type\":\"user\",\"message\":\"readable\"}\n").unwrap();
+    fs::write(
+        &paths[2],
+        "{\"type\":\"user\",\"message\":{\"content\":\"readable\"}}\n",
+    )
+    .unwrap();
     let unreadable_only = [
         DiagnosedFile {
             file_path: paths[1].clone(),

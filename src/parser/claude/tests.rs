@@ -237,10 +237,12 @@ const AGENT_TURN: &str = r#"{"type":"user","sessionId":"11111111-1111-4111-8111-
 const AGENT_ANSWER: &str = r#"{"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"type":"assistant","message":{"content":"The sample looks correct."}}"#;
 
 #[test]
-fn a_legacy_agent_log_is_automated_when_its_name_and_records_agree() {
+fn an_agent_log_is_automated_only_under_its_parent_subagents_directory() {
     let root = tempfile::tempdir().unwrap();
     let alone = root.path().join("agent-example.jsonl");
-    let nested = root.path().join("project/subagents/agent-example.jsonl");
+    let nested = root
+        .path()
+        .join("11111111-1111-4111-8111-111111111111/subagents/agent-example.jsonl");
     fs::create_dir_all(nested.parent().unwrap()).unwrap();
     fs::write(&alone, AGENT_TURN).unwrap();
     fs::write(&nested, format!("{AGENT_TURN}\n{AGENT_ANSWER}\n")).unwrap();
@@ -254,7 +256,7 @@ fn a_legacy_agent_log_is_automated_when_its_name_and_records_agree() {
 
     assert_eq!(
         (alone.origin.automated, alone.origin.identity_conflict),
-        (true, false)
+        (false, true)
     );
     assert_eq!(alone.metadata.session_id, "agent-example");
     assert_eq!(alone.messages.len(), 1);
@@ -267,60 +269,9 @@ fn a_legacy_agent_log_is_automated_when_its_name_and_records_agree() {
 }
 
 #[test]
-fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
+fn an_agent_record_in_a_file_that_is_not_its_own_subagents_log_is_not_automated() {
     let root = tempfile::tempdir().unwrap();
     let valid = json!({"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}});
-    let mut invalid_records = Vec::new();
-    for (field, values) in [
-        (
-            "agentId",
-            vec![json!("other"), json!(""), json!(42), Value::Null],
-        ),
-        (
-            "sessionId",
-            vec![
-                json!("22222222-2222-4222-8222-222222222222"),
-                json!("invalid"),
-                json!(""),
-                json!(42),
-                Value::Null,
-            ],
-        ),
-        (
-            "isSidechain",
-            vec![json!("true"), json!(false), Value::Null],
-        ),
-    ] {
-        for value in values {
-            let mut record = valid.clone();
-            if value.is_null() {
-                record.as_object_mut().unwrap().remove(field);
-            } else {
-                record[field] = value;
-            }
-            invalid_records.push(record);
-        }
-    }
-    let mut meta = valid.clone();
-    meta["isMeta"] = json!(true);
-    invalid_records.push(meta);
-    invalid_records.push(json!({"type":"user","message":{"content":valid.to_string()}}));
-    let path = root.path().join("agent-example.jsonl");
-    for invalid in invalid_records {
-        let mut as_assistant = invalid.clone();
-        as_assistant["type"] = json!("assistant");
-        for records in [
-            format!("{valid}\n{invalid}"),
-            format!("{as_assistant}\n{valid}"),
-        ] {
-            fs::write(&path, &records).unwrap();
-            let parsed = parse_claude_session_checking_classification(&path)
-                .unwrap()
-                .unwrap();
-            assert!(!parsed.origin.automated, "{records}");
-            assert!(parsed.origin.identity_conflict, "{records}");
-        }
-    }
     for relative in [
         "agent-other.jsonl",
         "agent-.jsonl",
@@ -343,12 +294,13 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
 fn the_record_type_alone_decides_the_role_and_only_boolean_flags_count() {
     let tmp = write_jsonl(&[
         "null",
-        r#"{"type":"progress","cwd":"/project","slug":"from-progress","timestamp":100}"#,
-        r#"{"type":"user","role":"assistant","isMeta":"true","isSidechain":"true","message":"question"}"#,
+        r#"{"type":"progress","cwd":"/project","slug":"from-progress","timestamp":"2026-03-01T00:00:00Z"}"#,
+        r#"{"type":"user","role":"assistant","isMeta":"true","isSidechain":"true","message":{"content":"question"}}"#,
         r#"{"type":"human","message":{"content":"a record type no current log uses"}}"#,
         r#"{"role":"assistant","content":[{"type":"text","text":"a record without a type"}]}"#,
+        r#"{"type":"user","message":"a message that is a bare string"}"#,
         r#"{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}"#,
-        r#"{"type":"user","isMeta":true,"cwd":"/ignored","timestamp":1,"message":"meta"}"#,
+        r#"{"type":"user","isMeta":true,"cwd":"/ignored","timestamp":"2020-01-01T00:00:00Z","message":{"content":"meta"}}"#,
     ]);
     let parsed = parse_claude_session_checking_classification(tmp.path())
         .unwrap()
@@ -359,7 +311,7 @@ fn the_record_type_alone_decides_the_role_and_only_boolean_flags_count() {
     );
     assert_eq!(parsed.metadata.project, "/project");
     assert_eq!(parsed.metadata.slug, "from-progress");
-    assert_eq!(parsed.metadata.timestamp, Some(100));
+    assert_eq!(parsed.metadata.timestamp, Some(1_772_323_200_000));
     assert!(parsed.origin.has_records);
     assert!(!parsed.origin.automated);
     assert!(parsed.diagnostics.is_empty());
