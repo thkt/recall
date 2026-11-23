@@ -9,6 +9,7 @@ BF16 via the pinned llama.cpp/Metal backend.
 | `fetch-gemma-test-artifacts.py` | Stage the public model and tokenizer from a manifest, verifying SHA-256 before replacement. Used by CI coverage. | Network access; Python standard library |
 | `verify-gemma-independent.py` | Exercise the real CLI against synthetic sessions, separate model identities, checksum failure and update/rollback. | Built Gemma binary, verified artifacts, Python `sqlite-vec` |
 | `measure-index.py` | Measure initial index, no-change, append and interrupt/resume on synthetic logs; optionally verify chunk reuse and pending-body bounds. | Built binary and a working model; macOS or another platform with `os.wait4` |
+| `measure-search.py` | Time `recall search` on an existing index, with and without the model, and compare the 95th percentile with the 2-second indicator in `.claude/OUTCOME.md`. | Built binary, an index, a file of queries |
 
 ## Public-model tests
 
@@ -63,6 +64,21 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/test/new-mea
   --model 'model ID, revision and artifact identity' \
   --conditions 'commit, chip, RAM, OS, Rust, cache state and load'
 ```
+
+## Search time
+
+Write one query per line to a file and pass the binary and the file:
+
+```sh
+python3 scripts/measure-search.py /absolute/path/to/recall /absolute/path/to/queries.txt
+```
+
+The script searches the binary's default index; `--db-path` selects another one. It runs each
+query three times with the model and three times without it, after one unmeasured search. The
+report is JSON with the index size and, per mode, the median, the 95th percentile, the slowest
+search, and the number of searches over the limit. It prints no query and no result, so it can
+run on a real index. The exit status is 1 when a 95th percentile exceeds `--limit-seconds`
+(default 2) or a search fails.
 
 All scripts preserve their results separately from the
 [dated migration validation record](../docs/audit/2026-10-16-gemma-validation.json).

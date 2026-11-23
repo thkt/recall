@@ -191,3 +191,57 @@ fn public_model_cli_contract() {
         indexed["degraded"], first["degraded"]
     );
 }
+
+#[test]
+#[ignore = "requires explicitly staged pinned public artifacts; runs under CI coverage"]
+fn public_model_cli_contract_reaches_a_session_that_shares_no_word_with_the_query() {
+    let model =
+        env::var_os("RECALL_GEMMA_TEST_ARTIFACT_DIR").expect("explicit public model directory");
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("claude")).unwrap();
+    fs::write(root.join("claude/password.jsonl"), concat!(
+        "{\"type\":\"user\",\"cwd\":\"/fixture\",\"message\":{\"role\":\"user\",\"content\":\"How do I reset a forgotten password?\"},\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
+        "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"Open the sign-in page and choose the reset link.\"}}\n"
+    )).unwrap();
+    fs::write(root.join("claude/bread.jsonl"), concat!(
+        "{\"type\":\"user\",\"cwd\":\"/fixture\",\"message\":{\"role\":\"user\",\"content\":\"What hydration should a sourdough starter have?\"},\"timestamp\":\"2026-03-01T00:00:00Z\"}\n",
+        "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"Feed it equal weights of flour and water.\"}}\n"
+    )).unwrap();
+    let with_model = || {
+        let mut c = cli(root);
+        c.env("RECALL_MODEL_DIR", &model);
+        c
+    };
+    let session_ids = |output: &Value| -> Vec<String> {
+        output["data"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|result| result["session_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let query = "locked out after losing credentials";
+
+    let indexed = value(&run(with_model().args(["index", "--json"])));
+    let without_model = session_ids(&value(&run(cli(root).args(["search", query, "--json"]))));
+    let with_embeddings = session_ids(&value(&run(with_model().args(["search", query, "--json"]))));
+
+    assert_eq!(
+        without_model,
+        Vec::<String>::new(),
+        "no word of the query occurs in either session"
+    );
+    if indexed["degraded"] == false {
+        assert_eq!(
+            with_embeddings.first().map(String::as_str),
+            Some("password")
+        );
+    } else {
+        assert_eq!(with_embeddings, Vec::<String>::new());
+    }
+    println!(
+        "public model CLI: index degraded={}; query without a shared word found {with_embeddings:?}",
+        indexed["degraded"]
+    );
+}
