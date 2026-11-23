@@ -24,6 +24,7 @@ jobs:
           submodules: recursive
 
       - name: Install Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
@@ -38,9 +39,16 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Cache the llama.cpp build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vendor-${{ steps.vendor.outputs.hash }}
-          cache-workspace-crates: "true"
+          path: |
+            target/debug/build/llama-cpp-sys-2
+            target/debug/build/llama-cpp-2
+          key: llama-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            llama-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-
 
       - name: Format check
         run: cargo fmt -- --check
@@ -70,6 +78,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
@@ -84,9 +93,16 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Cache the llama.cpp build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          key: vendor-${{ steps.vendor.outputs.hash }}
-          cache-workspace-crates: "true"
+          path: |
+            target/llvm-cov-target/debug/build/llama-cpp-sys-2
+            target/llvm-cov-target/debug/build/llama-cpp-2
+          key: llama-coverage-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            llama-coverage-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
