@@ -1,6 +1,6 @@
 # index観測の実測（2026-09-21）
 
-[Issue #324](https://github.com/thkt/recall/issues/324) の受入条件に対するホスト測定。段階時間の定義は[観測仕様](../docs/index-observability.md)、丸め前の数値・各試行・ソースhashは[測定データ](index-observability-measurements.json)に残す。合成データだけを使用し、私的ログや本番DBは参照していない。
+[Issue #324](https://github.com/thkt/recall/issues/324) の受入条件に対するホスト測定。段階時間の定義は[観測仕様](../index-observability.md)、丸め前の数値・各試行・ソースhashは[測定データ](index-observability-measurements.json)に残す。合成データだけを使用し、私的ログや本番DBは参照していない。
 
 ## 対象と条件
 

@@ -3,7 +3,7 @@
 These are maintainer tools, not prerequisites for normal `recall` use. Run them
 from the repository root with Python 3. The current binary uses EmbeddingGemma 2
 BF16 via the pinned llama.cpp/Metal backend; old Ruri/MLX measurements in
-`research/` and `docs/research/` are historical evidence, not Gemma benchmarks.
+`docs/research/` are historical evidence, not Gemma benchmarks.
 
 | Script | Purpose | Requirements |
 | --- | --- | --- |

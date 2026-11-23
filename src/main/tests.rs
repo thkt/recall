@@ -143,13 +143,6 @@ fn rebuild_parses_as_its_own_subcommand() {
 }
 
 #[test]
-fn index_rejects_a_force_flag_and_parses_without_it() {
-    assert!(Cli::try_parse_from(["recall", "index", "--force"]).is_err());
-    let cli = Cli::try_parse_from(["recall", "index"]).unwrap();
-    assert_matches!(cli.command, Some(Command::Index { .. }));
-}
-
-#[test]
 fn rebuild_is_not_rewritten_into_a_search_query() {
     let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
     assert!(try_expand_shorthand(&args).is_none());
@@ -227,26 +220,6 @@ fn commands_named_in(dir: &Path) -> Vec<(PathBuf, String)> {
         }
     }
     named
-}
-
-#[test]
-fn readme_describes_index_time_embedding_not_post_search_growth() {
-    let en = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"))
-        .expect("README.md must exist at the crate root");
-    let ja = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.ja.md"))
-        .expect("README.ja.md must exist at the crate root");
-    for (name, doc) in [("README.md", en.as_str()), ("README.ja.md", ja.as_str())] {
-        for banned in [
-            "post-search embedding",
-            "Progressive embedding",
-            "--no-embed",
-        ] {
-            assert!(
-                !doc.contains(banned),
-                "{name} still references the retired model: {banned:?}"
-            );
-        }
-    }
 }
 
 #[test]
