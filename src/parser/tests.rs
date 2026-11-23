@@ -106,6 +106,14 @@ fn malformed_timestamps_leave_the_session_without_a_time() {
         None
     );
     assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026/03/01T12:00:00Z")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00.5xZ")),
+        None
+    );
+    assert_eq!(
         session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T24:00:00Z")),
         None
     );
