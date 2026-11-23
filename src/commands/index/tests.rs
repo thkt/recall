@@ -1617,14 +1617,15 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
 #[test]
 fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characters_of_the_error() {
     let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 0,
-        failed_count: 2,
-        first_error: Some(format!(
-            "batch: \x1b[31mboom\x1b[0m {}{}",
-            "e".repeat(100),
-            "界".repeat(200)
-        )),
+        embed: EmbedPass::Ran(embedder::EmbedResult {
+            embedded: 0,
+            failed_count: 2,
+            first_error: Some(format!(
+                "batch: \x1b[31mboom\x1b[0m {}{}",
+                "e".repeat(100),
+                "界".repeat(200)
+            )),
+        }),
         skipped_roots: Vec::new(),
         preserved_embedded: 0,
         parse_diagnostics: Vec::new(),
@@ -1822,10 +1823,11 @@ fn index_with_a_claude_root_that_cannot_be_read_and_no_stored_sessions_warns_tha
 #[test]
 fn freeze_index_payload_key_set() {
     let outcome = IndexOutcome {
-        degraded_note: None,
-        embedded: 4,
-        failed_count: 0,
-        first_error: None,
+        embed: EmbedPass::Ran(embedder::EmbedResult {
+            embedded: 4,
+            failed_count: 0,
+            first_error: None,
+        }),
         skipped_roots: vec![indexer::SkippedRoot {
             source: parser::Source::Codex,
             preserved_sessions: 2,
@@ -1885,7 +1887,7 @@ fn index_still_starts_the_probe_in_an_environment_search_has_recorded() {
 #[test]
 fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_printed() {
     let printed = IndexOutcome {
-        degraded_note: Some("note: embedding model not installed".to_owned()),
+        embed: EmbedPass::Deferred(Some("note: embedding model not installed".to_owned())),
         skipped_roots: vec![indexer::SkippedRoot {
             source: parser::Source::Codex,
             preserved_sessions: 2,
@@ -1905,8 +1907,11 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
         ..IndexOutcome::default()
     };
     let failed = IndexOutcome {
-        failed_count: 2,
-        first_error: Some("batch failed".to_owned()),
+        embed: EmbedPass::Ran(embedder::EmbedResult {
+            embedded: 0,
+            failed_count: 2,
+            first_error: Some("batch failed".to_owned()),
+        }),
         ..IndexOutcome::default()
     };
 

@@ -5,9 +5,9 @@ use std::thread;
 use std::time::Duration;
 
 use super::*;
-use crate::commands::index::index_and_report_observed;
+use crate::commands::index::{EmbedPass, index_and_report_observed};
 use crate::db::{open_db, open_db_readonly};
-use crate::embedder::{EmbedOptions, MockEmbedder};
+use crate::embedder::{EmbedOptions, EmbedResult, MockEmbedder};
 use crate::embedding::Embed;
 use crate::indexer::IndexOptions;
 use crate::model::DegradedReason;
@@ -80,14 +80,14 @@ fn index_runs_keep_their_stage_order_for_ready_unavailable_legacy_and_failed_bac
 
     let (outcome, first_lines, counts) = run(ready());
     let outcome = outcome.unwrap();
-    assert_eq!(
-        (
-            outcome.embedded,
-            outcome.failed_count,
-            outcome.degraded_note
-        ),
-        (1, 0, None)
-    );
+    assert!(matches!(
+        outcome.embed,
+        EmbedPass::Ran(EmbedResult {
+            embedded: 1,
+            failed_count: 0,
+            ..
+        })
+    ));
     assert_eq!(counts["sessions_stored"], 1);
     assert_eq!(
         first_lines,
@@ -114,7 +114,8 @@ fn index_runs_keep_their_stage_order_for_ready_unavailable_legacy_and_failed_bac
     );
 
     let (outcome, unavailable_lines, _) = run(Err(DegradedReason::NotInstalled));
-    let note = outcome.unwrap().degraded_note.unwrap();
+    let outcome = outcome.unwrap();
+    let note = outcome.degraded_note().unwrap();
     assert!(note.contains("recall model download"), "{note}");
     assert_eq!(
         unavailable_lines,
@@ -133,7 +134,8 @@ fn index_runs_keep_their_stage_order_for_ready_unavailable_legacy_and_failed_bac
     );
 
     let (outcome, probe_failed_lines, _) = run(Ok(Arc::new(MockEmbedder::failing_after(0))));
-    let note = outcome.unwrap().degraded_note.unwrap();
+    let outcome = outcome.unwrap();
+    let note = outcome.degraded_note().unwrap();
     assert!(note.contains("unavailable"), "{note}");
     assert!(!note.contains("download"), "{note}");
     assert_eq!(probe_failed_lines, unavailable_lines);
