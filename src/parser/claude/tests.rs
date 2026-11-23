@@ -234,7 +234,7 @@ fn other_sidechain_values_and_near_miss_layouts_fail_open_as_human() {
 }
 
 const AGENT_TURN: &str = r#"{"type":"user","sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"message":{"content":"Review this sample module."}}"#;
-const AGENT_ANSWER: &str = r#"{"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"role":"assistant","message":{"content":"The sample looks correct."}}"#;
+const AGENT_ANSWER: &str = r#"{"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true,"type":"assistant","message":{"content":"The sample looks correct."}}"#;
 
 #[test]
 fn a_legacy_agent_log_is_automated_when_its_name_and_records_agree() {
@@ -307,12 +307,11 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
     invalid_records.push(json!({"type":"user","message":{"content":valid.to_string()}}));
     let path = root.path().join("agent-example.jsonl");
     for invalid in invalid_records {
-        let mut role_only = invalid.clone();
-        role_only.as_object_mut().unwrap().remove("type");
-        role_only["role"] = json!("assistant");
+        let mut as_assistant = invalid.clone();
+        as_assistant["type"] = json!("assistant");
         for records in [
             format!("{valid}\n{invalid}"),
-            format!("{role_only}\n{valid}"),
+            format!("{as_assistant}\n{valid}"),
         ] {
             fs::write(&path, &records).unwrap();
             let parsed = parse_claude_session_checking_classification(&path)
@@ -341,13 +340,14 @@ fn legacy_agent_provenance_does_not_borrow_mismatched_or_incomplete_evidence() {
 }
 
 #[test]
-fn mixed_record_shapes_preserve_role_precedence_and_boolean_metadata() {
+fn the_record_type_alone_decides_the_role_and_only_boolean_flags_count() {
     let tmp = write_jsonl(&[
         "null",
         r#"{"type":"progress","cwd":"/project","slug":"from-progress","timestamp":100}"#,
-        r#"{"type":"assistant","role":"user","isMeta":"true","isSidechain":"true","message":"question"}"#,
-        r#"{"type":"human","role":"assistant","message":{"content":"follow-up"}}"#,
-        r#"{"role":"assistant","content":[{"type":"text","text":"answer"}]}"#,
+        r#"{"type":"user","role":"assistant","isMeta":"true","isSidechain":"true","message":"question"}"#,
+        r#"{"type":"human","message":{"content":"a record type no current log uses"}}"#,
+        r#"{"role":"assistant","content":[{"type":"text","text":"a record without a type"}]}"#,
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}"#,
         r#"{"type":"user","isMeta":true,"cwd":"/ignored","timestamp":1,"message":"meta"}"#,
     ]);
     let parsed = parse_claude_session_checking_classification(tmp.path())
@@ -355,11 +355,7 @@ fn mixed_record_shapes_preserve_role_precedence_and_boolean_metadata() {
         .unwrap();
     assert_eq!(
         turns(&parsed),
-        [
-            (Role::User, "question"),
-            (Role::User, "follow-up"),
-            (Role::Assistant, "answer")
-        ]
+        [(Role::User, "question"), (Role::Assistant, "answer")]
     );
     assert_eq!(parsed.metadata.project, "/project");
     assert_eq!(parsed.metadata.slug, "from-progress");

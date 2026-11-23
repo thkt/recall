@@ -281,7 +281,7 @@ fn provenance_words_inside_a_message_do_not_mark_the_session_automated() {
 }
 
 #[test]
-fn mixed_record_shapes_keep_payload_roles_and_legacy_project_context() {
+fn only_response_items_carry_messages_and_only_session_metadata_sets_the_project() {
     let tmp = write_jsonl(&[
         "null",
         r#"{"type":"session_meta","payload":{"id":17,"thread_source":"subagent"}}"#,
@@ -289,9 +289,10 @@ fn mixed_record_shapes_keep_payload_roles_and_legacy_project_context() {
         r#"{"type":"turn_context","role":"assistant","content":"ignored context"}"#,
         r#"{"type":"response_item","role":"user","payload":{"role":"developer","content":"ignored developer"}}"#,
         r#"{"type":"response_item","payload":{"role":17,"content":"ignored malformed role"}}"#,
-        r#"{"type":"legacy","role":"user","content":[{"type":"input_text","text":"<environment_context>\nCurrent working directory: /legacy\n</environment_context>"}]}"#,
+        r#"{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\nCurrent working directory: /ignored\n</environment_context>"}]}"#,
         r#"{"type":"response_item","role":"assistant","payload":{"role":"user","content":"question"}}"#,
-        r#"{"role":"assistant","content":"answer"}"#,
+        r#"{"role":"assistant","content":"a record without a type"}"#,
+        r#"{"type":"response_item","payload":{"role":"assistant","content":"answer"}}"#,
     ]);
 
     let parsed = parse_codex_session_checking_classification(tmp.path())
@@ -302,7 +303,7 @@ fn mixed_record_shapes_keep_payload_roles_and_legacy_project_context() {
         turns(&parsed),
         [(Role::User, "question"), (Role::Assistant, "answer")]
     );
-    assert_eq!(parsed.metadata.project, "/legacy");
+    assert_eq!(parsed.metadata.project, "");
     assert!(parsed.origin.has_records);
     assert!(!parsed.origin.automated);
     assert!(parsed.diagnostics.is_empty());

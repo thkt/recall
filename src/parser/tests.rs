@@ -209,7 +209,7 @@ fn line_diagnostics_tell_corrupt_lines_from_a_possibly_unfinished_last_line() {
 
 const CLAUDE_SIDECHAIN: &str =
     r#"{"type":"user","sessionId":"sample","isSidechain":true,"message":"question"}"#;
-const CLAUDE_OTHER_ID: &str = r#"{"role":"assistant","sessionId":"other"}"#;
+const CLAUDE_OTHER_ID: &str = r#"{"type":"assistant","sessionId":"other"}"#;
 const CODEX_GUARDIAN: &str =
     r#"{"type":"session_meta","payload":{"id":"sample","source":{"internal":"guardian"}}}"#;
 const CODEX_OTHER_ID: &str = r#"{"type":"session_meta","payload":{"id":"other"}}"#;

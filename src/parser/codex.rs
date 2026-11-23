@@ -27,7 +27,6 @@ pub(super) enum CodexEntry<'a> {
     Message {
         role: Role,
         content: Option<&'a Value>,
-        legacy: bool,
     },
     Ignored,
 }
@@ -48,11 +47,8 @@ impl<'a> CodexEntry<'a> {
                     .filter(|cwd| !cwd.is_empty()),
                 automated: codex_automated(payload),
             },
-            "event_msg" | "turn_context" => Self::Ignored,
-            _ => {
-                let legacy = entry_type != "response_item";
-                let message = if legacy { entry } else { payload };
-                let Some(role) = message
+            "response_item" => {
+                let Some(role) = payload
                     .get("role")
                     .and_then(Value::as_str)
                     .and_then(Role::from_db)
@@ -61,10 +57,10 @@ impl<'a> CodexEntry<'a> {
                 };
                 Self::Message {
                     role,
-                    content: message.get("content"),
-                    legacy,
+                    content: payload.get("content"),
                 }
             }
+            _ => Self::Ignored,
         }
     }
 }
@@ -97,25 +93,7 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
                 }
                 None
             }
-            CodexEntry::Message {
-                role,
-                content,
-                legacy,
-            } => {
-                if legacy
-                    && project.is_empty()
-                    && let Some(Value::Array(blocks)) = content
-                {
-                    project = blocks
-                        .iter()
-                        .find_map(|block| {
-                            block
-                                .get("text")
-                                .and_then(Value::as_str)
-                                .and_then(extract_cwd_from_env_context)
-                        })
-                        .unwrap_or_default();
-                }
+            CodexEntry::Message { role, content } => {
                 let text = extract_text(content);
                 if text.is_empty() || CODEX_SKIP_MARKERS.iter().any(|m| text.starts_with(m)) {
                     None
@@ -196,20 +174,6 @@ fn extract_uuid_short(filename: &str) -> Option<String> {
             && window[1].chars().all(|c| c.is_ascii_hexdigit())
         {
             return Some(window[0].to_owned());
-        }
-    }
-    None
-}
-
-fn extract_cwd_from_env_context(text: &str) -> Option<String> {
-    const MARKER: &str = "Current working directory:";
-    for line in text.lines() {
-        if let Some(pos) = line.find(MARKER) {
-            let after = &line[pos + MARKER.len()..];
-            let trimmed = after.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_owned());
-            }
         }
     }
     None
