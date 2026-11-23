@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::compat::anon_placeholders;
 use crate::compat::filter::{
     append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
 };
-use crate::compat::{anon_placeholders, clean_for_trigram};
 use crate::embedding::Embed;
 use crate::storage::{
     MIN_TRIGRAM_TERM_CHARS, SanitizeError, prepare_match_query, prepare_operator_query,
@@ -747,7 +747,7 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
     };
     match prepare_match_query(conn, &fts_input, "messages_vocab") {
         Ok(m) => Ok(Some(KeywordQuery {
-            fts: clean_for_trigram(&m),
+            fts: m.to_trigram_match(),
             not_operands: Vec::new(),
             embed_text: None,
         })),

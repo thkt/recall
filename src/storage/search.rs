@@ -1,3 +1,4 @@
+use std::fmt;
 use std::iter::repeat_n;
 
 use rusqlite::Connection;
@@ -110,11 +111,91 @@ impl SanitizedFtsQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MatchFtsQuery(String);
+enum MatchSegment {
+    Fixed(String),
+    Alternatives(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchFtsQuery(Vec<MatchSegment>);
+
+const MAX_TRIGRAM_COMBINATIONS: usize = 100;
 
 impl MatchFtsQuery {
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn to_trigram_match(&self) -> Option<String> {
+        let combinations_counting_short_terms =
+            self.0.iter().fold(1usize, |n, segment| match segment {
+                MatchSegment::Fixed(_) => n,
+                MatchSegment::Alternatives(terms) => n.saturating_mul(terms.len()),
+            });
+        let overflow = combinations_counting_short_terms > MAX_TRIGRAM_COMBINATIONS;
+        let long_enough = |term: &&String| term.chars().count() >= MIN_TRIGRAM_TERM_CHARS;
+        let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
+        for segment in &self.0 {
+            match segment {
+                MatchSegment::Fixed(term) if long_enough(&term) => {
+                    let term = fts_quote(term);
+                    for clause in &mut clauses {
+                        clause.push(term.clone());
+                    }
+                }
+                MatchSegment::Alternatives(terms) if !overflow => {
+                    let terms: Vec<_> = terms
+                        .iter()
+                        .filter(long_enough)
+                        .map(|t| fts_quote(t))
+                        .collect();
+                    if terms.is_empty() {
+                        continue;
+                    }
+                    clauses = clauses
+                        .into_iter()
+                        .flat_map(|clause| {
+                            terms.iter().map(move |term| {
+                                let mut expanded = clause.clone();
+                                expanded.push(term.clone());
+                                expanded
+                            })
+                        })
+                        .collect();
+                }
+                _ => {}
+            }
+        }
+        if clauses[0].is_empty() {
+            return None;
+        }
+        if clauses.len() == 1 {
+            return Some(clauses.remove(0).join(" AND "));
+        }
+        Some(
+            clauses
+                .into_iter()
+                .map(|terms| format!("({})", terms.join(" AND ")))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+}
+
+impl fmt::Display for MatchFtsQuery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parts: Vec<String> = self
+            .0
+            .iter()
+            .map(|segment| match segment {
+                MatchSegment::Fixed(term) => fts_quote(term),
+                MatchSegment::Alternatives(terms) => format!(
+                    "({})",
+                    terms
+                        .iter()
+                        .map(|t| fts_quote(t))
+                        .collect::<Vec<_>>()
+                        .join(" OR ")
+                ),
+            })
+            .collect();
+        f.write_str(&parts.join(" AND "))
     }
 }
 
@@ -460,7 +541,7 @@ pub fn prepare_operator_query(query: &str) -> Result<Option<OperatorQuery>, Quer
 fn expand_token_via_vocab(
     stmt: &mut rusqlite::CachedStatement<'_>,
     token: &str,
-) -> Result<Option<String>, SanitizeError> {
+) -> Result<Option<Vec<String>>, SanitizeError> {
     // source: https://www.sqlite.org/fts5.html#the_trigram_tokenizer
     let prefix = token.to_ascii_lowercase();
     let bound = format!("{prefix}{}", char::MAX);
@@ -468,10 +549,7 @@ fn expand_token_via_vocab(
         .query_map([&prefix, &bound], |row| row.get::<_, String>(0))
         .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
     {
-        Ok(terms) if !terms.is_empty() => {
-            let quoted: Vec<String> = terms.iter().map(|t| fts_quote(t)).collect();
-            Ok(Some(format!("({})", quoted.join(" OR "))))
-        }
+        Ok(terms) if !terms.is_empty() => Ok(Some(terms)),
         Ok(_) => Ok(None),
         Err(e) if is_missing_table_error(&e) => Ok(None),
         Err(e) => Err(SanitizeError::VocabLookupFailed(e.to_string())),
@@ -523,22 +601,25 @@ pub(crate) fn fts_expand_short_terms(
         let token = match piece {
             Piece::Phrase("") => continue,
             Piece::Phrase(text) => {
-                parts.push(fts_quote(text));
+                parts.push(MatchSegment::Fixed(text.to_owned()));
                 continue;
             }
             Piece::Word(word) => word,
         };
         if token.chars().count() >= MIN_TRIGRAM_TERM_CHARS || is_fts5_operator(token) {
-            parts.push(fts_quote(token));
+            parts.push(MatchSegment::Fixed(token.to_owned()));
             continue;
         }
         let expanded = match stmt.as_mut() {
             Some(s) => expand_token_via_vocab(s, token)?,
             None => None,
         };
-        parts.push(expanded.unwrap_or_else(|| fts_quote(token)));
+        parts.push(match expanded {
+            Some(terms) => MatchSegment::Alternatives(terms),
+            None => MatchSegment::Fixed(token.to_owned()),
+        });
     }
-    Ok(MatchFtsQuery(parts.join(" AND ")))
+    Ok(MatchFtsQuery(parts))
 }
 
 #[cfg(test)]
