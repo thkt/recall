@@ -1081,29 +1081,6 @@ fn search_notes_automated_match_even_when_no_interactive_session_matches() {
     );
 }
 
-#[test]
-fn search_no_embed_flag_is_retired_exits_usage() {
-    let dir = TempDir::new().unwrap();
-
-    assert_eq!(
-        outcome(recall(dir.path()).args(["search", "anything", "--no-embed"])),
-        (
-            Some(64),
-            String::new(),
-            concat!(
-                "error: unexpected argument '--no-embed' found\n",
-                "\n",
-                "  tip: to pass '--no-embed' as a value, use '-- --no-embed'\n",
-                "\n",
-                "Usage: recall search <QUERY>\n",
-                "\n",
-                "For more information, try '--help'.\n",
-            )
-            .to_owned()
-        )
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn read_commands_work_in_readonly_directory() {

@@ -613,7 +613,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
     let out = host
         .serve(db_dir.path(), &db_dir.path().join("probe"), |model_host| {
             run_doctor_in(false, true, &Some(db_path.clone()), model_host, || {
-                Err(RecallError::Internal("MLX backend unavailable".to_owned()))
+                Err(RecallError::Internal("GPU backend unavailable".to_owned()))
             })
         })
         .unwrap();
@@ -623,7 +623,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
         concat!(
             "Health: healthy\n",
             "Repaired orphan_embeddings: 0 row(s)\n",
-            "Model recovery failed: MLX backend unavailable\n",
+            "Model recovery failed: GPU backend unavailable\n",
             "  integrity [ok]\n",
             "  orphan_embeddings [ok]\n",
             "  orphan_chunks [ok]\n",
@@ -653,7 +653,7 @@ fn doctor_fix_surfaces_model_recovery_failure() {
                 "repaired": { "orphan_embeddings": 0 },
             },
             "degraded": true,
-            "notes": ["fix: model: recovery failed: MLX backend unavailable"],
+            "notes": ["fix: model: recovery failed: GPU backend unavailable"],
         })
     );
 }
