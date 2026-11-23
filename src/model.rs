@@ -468,8 +468,8 @@ fn load_skipping_probe(
 pub enum ModelDownloadError {
     #[error("model download failed: {0}")]
     DownloadFailed(String),
-    #[error("model probe failed: {0:?}")]
-    ProbeFailed(Option<String>),
+    #[error("model probe failed: {0}")]
+    ProbeFailed(String),
     #[error("backend unavailable")]
     BackendUnavailable,
 }
@@ -504,7 +504,7 @@ pub fn download_and_verify_model() -> Result<(), ModelDownloadError> {
     match probe(&root) {
         Ok(true) => Ok(()),
         Ok(false) => Err(ModelDownloadError::BackendUnavailable),
-        Err(error) => Err(ModelDownloadError::ProbeFailed(Some(error.to_string()))),
+        Err(error) => Err(ModelDownloadError::ProbeFailed(error.to_string())),
     }
 }
 

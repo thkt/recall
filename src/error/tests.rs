@@ -143,11 +143,19 @@ fn a_failed_model_download_is_retryable_but_a_missing_backend_is_not() {
         ExitCode::from(75)
     );
     assert_eq!(
-        exit(ModelDownloadError::ProbeFailed(Some("corrupt".into()))),
+        exit(ModelDownloadError::ProbeFailed("corrupt".into())),
         ExitCode::from(75)
     );
     assert_eq!(
         exit(ModelDownloadError::BackendUnavailable),
         ExitCode::from(70)
+    );
+}
+
+#[test]
+fn a_failed_model_probe_is_reported_with_its_cause_as_plain_text() {
+    assert_eq!(
+        download_error(&ModelDownloadError::ProbeFailed("corrupt".into())).to_string(),
+        "model probe failed: corrupt"
     );
 }

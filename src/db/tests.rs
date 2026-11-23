@@ -26,13 +26,30 @@ fn test_open_db_creates_schema() {
             &conn,
             "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
         ),
-        [
-            "idx_qa_chunks_session",
-            "idx_sessions_project",
-            "idx_sessions_timestamp"
-        ]
+        ["idx_qa_chunks_session", "idx_sessions_timestamp"]
     );
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
+}
+
+#[test]
+fn opening_an_index_that_still_has_the_unused_project_index_drops_it() {
+    let tmp = NamedTempFile::new().unwrap();
+    drop(open_db(tmp.path()).unwrap());
+    let earlier_release = Connection::open(tmp.path()).unwrap();
+    earlier_release
+        .execute_batch("CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project)")
+        .unwrap();
+    drop(earlier_release);
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        collect_strings(
+            &conn,
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name"
+        ),
+        ["idx_qa_chunks_session", "idx_sessions_timestamp"]
+    );
 }
 
 #[test]

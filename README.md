@@ -152,7 +152,7 @@ recall index --token-budget 2048 --forward-pause-ms 700
 RECALL_TOKEN_BUDGET=2048 RECALL_FORWARD_PAUSE_MS=700 recall index
 ```
 
-`--token-budget` (`RECALL_TOKEN_BUDGET`) controls packing of document windows into a forward pass; the Gemma backend caps actual packing at 8192 tokens and 32 sequences. A single bidirectional window remains atomic, so it may exceed a smaller requested packing budget. Documents are never silently shortened to satisfy it. `--forward-pause-ms` (`RECALL_FORWARD_PAUSE_MS`) pauses after each forward pass. The CLI retains its existing 256000 upper input clamp; values above the Gemma packing cap have the same effective packing budget.
+`--token-budget` (`RECALL_TOKEN_BUDGET`) controls packing of document windows into a forward pass; the Gemma backend caps actual packing at 8192 tokens and 32 sequences. A single bidirectional window remains atomic, so it may exceed a smaller requested packing budget. Documents are never silently shortened to satisfy it. `--forward-pause-ms` (`RECALL_FORWARD_PAUSE_MS`) pauses after each forward pass. A value above 8192 behaves as 8192.
 
 Model-specific index paths and upgrading from Ruri are covered under [Model](#model).
 
