@@ -436,9 +436,6 @@ fn fts_rows_per_session<T>(
     pick: &str,
     decode: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
 ) -> Result<HashMap<String, T>> {
-    if session_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
     let sql = format!(
         "SELECT session_id, {pick} FROM messages \
          WHERE messages MATCH ? AND session_id IN ({}) GROUP BY session_id",
@@ -464,9 +461,6 @@ fn best_matching_messages(
     fts_query: &str,
     session_ids: &[&str],
 ) -> Result<HashMap<String, i64>> {
-    if session_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
     let sql = format!(
         "SELECT session_id, rowid, rank FROM messages \
          WHERE messages MATCH ? AND session_id IN ({})",
@@ -944,14 +938,6 @@ pub fn search_with_embedder<'q>(
     let fts_ids: HashSet<&str> = found.order.iter().map(|(sid, _)| sid.as_str()).collect();
     let vec_degraded =
         drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
-
-    if merged.is_empty() {
-        return Ok(SearchOutcome {
-            results: Vec::new(),
-            vec_degraded,
-            results_incomplete: incomplete,
-        });
-    }
 
     let vec_only: Vec<&str> = merged
         .iter()

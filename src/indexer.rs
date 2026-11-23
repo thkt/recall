@@ -774,9 +774,6 @@ fn cleanup_orphans(
     removal: &RemovalGate,
     preserved_sessions: &HashSet<String>,
 ) -> Result<()> {
-    if existing.is_empty() {
-        return Ok(());
-    }
     for (fp, entry) in existing {
         if !removal.allows(entry.source, Path::new(fp.as_str()))
             || preserved_sessions.contains(&entry.session_id)
