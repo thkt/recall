@@ -17,8 +17,6 @@ use crate::index_observer::Observer;
 
 pub(crate) use crate::embedding::EmbedOptions;
 
-pub(crate) const TOKEN_BUDGET_CEILING: usize = 256_000;
-
 #[derive(Default)]
 pub(crate) struct EmbedResult {
     pub embedded: usize,

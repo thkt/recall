@@ -25,7 +25,6 @@ use std::borrow::Cow;
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -134,10 +133,9 @@ enum ModelCommand {
 #[derive(Debug, Args)]
 struct EmbedFlags {
     /// Forward-pass token budget override; smaller values shorten each GPU
-    /// forward so the host stays responsive during large embed runs. Clamped
-    /// down to 256_000 (never up). Gemma packing is additionally capped at
-    /// 8192 tokens; one attention window remains atomic.
-    #[arg(long, env = "RECALL_TOKEN_BUDGET", value_parser = parse_token_budget)]
+    /// forward so the host stays responsive during large embed runs. Gemma
+    /// packing is capped at 8192 tokens; one attention window remains atomic.
+    #[arg(long, env = "RECALL_TOKEN_BUDGET")]
     token_budget: Option<usize>,
 
     /// Pause (in milliseconds) after each GPU forward pass, yielding the GPU
@@ -145,11 +143,6 @@ struct EmbedFlags {
     /// during large embed runs.
     #[arg(long, env = "RECALL_FORWARD_PAUSE_MS")]
     forward_pause_ms: Option<u64>,
-}
-
-fn parse_token_budget(s: &str) -> Result<usize, ParseIntError> {
-    let value: usize = s.parse()?;
-    Ok(value.min(embedder::TOKEN_BUDGET_CEILING))
 }
 
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {

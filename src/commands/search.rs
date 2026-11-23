@@ -20,9 +20,7 @@ use crate::{ansi, search};
 pub(crate) struct SearchArgs {
     /// Search query. Optional when `--file` is given: a query-less
     /// `--file <path>` lists the sessions that touched the path, newest
-    /// first. A call with neither a query nor `--file` is a usage error —
-    /// rejected declaratively here, with `file_list_outcome` keeping the
-    /// same guard for direct (non-CLI) callers.
+    /// first.
     #[arg(required_unless_present = "file")]
     pub(crate) query: Option<String>,
 

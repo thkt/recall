@@ -150,19 +150,6 @@ fn test_index_no_longer_accepts_force_flag() {
 }
 
 #[test]
-fn index_token_budget_flag_clamps_above_256000_ceiling_down() {
-    let cli = Cli::try_parse_from(["recall", "index", "--token-budget", "500000"]).unwrap();
-    let Some(Command::Index { embed_flags }) = cli.command else {
-        panic!("expected Command::Index with a token_budget field");
-    };
-    assert_eq!(
-        embed_flags.token_budget,
-        Some(256_000),
-        "500_000 exceeds the 256_000 ceiling and must clamp down, never up"
-    );
-}
-
-#[test]
 fn test_rebuild_recognized_by_shorthand_expansion() {
     let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
     assert!(try_expand_shorthand(&args).is_none());

@@ -246,7 +246,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     conn.execute_batch("DROP TABLE IF EXISTS embedded_chunk_ids;")?;
 
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project);
+        "DROP INDEX IF EXISTS idx_sessions_project;
          CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);",
     )?;
 

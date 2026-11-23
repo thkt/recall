@@ -923,10 +923,6 @@ fn file_list_outcome(
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<SearchOutcome> {
-    if opts.file.is_none() {
-        return Err(RecallError::Usage("A search query or --file is required.".to_owned()).into());
-    }
-
     let mut sql = "SELECT s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
                    FROM sessions s WHERE 1 = 1"
         .to_owned();
