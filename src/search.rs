@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{panic, thread};
 
 use crate::compat::filter::{
     append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
@@ -611,14 +612,12 @@ struct VecHit {
 
 fn vec_search(
     conn: &Connection,
-    embedder: &dyn Embed,
-    query: &str,
+    embedding: &[f32],
     limit: usize,
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<VecHit>> {
-    let embedding = model::timed("query embedding", || embedder.embed_query(query))?;
-    let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
+    let embedding_bytes: &[u8] = f32_as_bytes(embedding);
 
     let mut sql = String::from(
         "SELECT c.session_id, c.id, v.distance AS d, row_number() OVER ( \
@@ -894,36 +893,47 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
-    let found = match fts_query {
-        Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
-        None => KeywordSessions::default(),
+    let hybrid_embedder = match embedder {
+        Some(embedder) => has_vec_data(conn).map(|has_data| has_data.then_some(embedder)),
+        None => Ok(None),
     };
+    let embed_text = keyword.embed_text.as_deref().unwrap_or(query);
 
-    let run_hybrid = match embedder {
-        Some(_) => match has_vec_data(conn) {
-            Ok(has_data) => has_data,
-            Err(e) => {
-                warn!(error = %e, "vec_chunks probe failed, using text search only");
-                return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
-            }
-        },
-        None => false,
-    };
+    let (found, embedding) = thread::scope(|scope| {
+        let embedding = match &hybrid_embedder {
+            Ok(Some(embedder)) => Some(scope.spawn(move || {
+                model::timed("query embedding", || embedder.embed_query(embed_text))
+            })),
+            _ => None,
+        };
+        let found = match fts_query {
+            Some(q) => find_keyword_sessions(conn, opts, q, now_ms),
+            None => Ok(KeywordSessions::default()),
+        };
+        let embedding = embedding.map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|payload| panic::resume_unwind(payload))
+        });
+        (found, embedding)
+    });
+    let found = found?;
 
-    let Some(embedder) = embedder.filter(|_| run_hybrid) else {
+    if let Err(e) = &hybrid_embedder {
+        warn!(error = %e, "vec_chunks probe failed, using text search only");
+        return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
+    }
+
+    let Some(embedding) = embedding else {
         return keyword_only_outcome(conn, fts_query, found, opts, now_ms, false);
     };
 
     let incomplete = found.unreadable_rows;
 
-    let vec_hits = match vec_search(
-        conn,
-        embedder,
-        keyword.embed_text.as_deref().unwrap_or(query),
-        VEC_CANDIDATE_COUNT,
-        opts,
-        now_ms,
-    ) {
+    let vec_hits = match embedding
+        .map_err(anyhow::Error::from)
+        .and_then(|embedding| vec_search(conn, &embedding, VEC_CANDIDATE_COUNT, opts, now_ms))
+    {
         Ok(hits) => hits,
         Err(e) => {
             warn!(error = %e, "vector search failed, using text search only");
