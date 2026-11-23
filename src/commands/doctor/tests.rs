@@ -1039,7 +1039,7 @@ fn doctor_of_a_never_indexed_database_file_reports_unhealthy_with_a_failing_inde
 }
 
 #[test]
-fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
+fn doctor_of_an_index_older_than_v0_14_reports_an_unsupported_schema_and_both_ways_out() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     {
@@ -1060,7 +1060,7 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
         out.markdown,
         concat!(
             "Health: degraded\n",
-            "  schema [FAIL] database schema is out of date -> run `recall rebuild`\n",
+            "  schema [FAIL] this index's schema predates recall 0.14.0 and cannot be opened -> build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it\n",
             "  model_identity [ok]\n",
             "  model [ok]\n",
         )
@@ -1071,10 +1071,10 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
             "data": {
                 "checks": [
                     {
-                        "detail": "database schema is out of date",
+                        "detail": "this index's schema predates recall 0.14.0 and cannot be opened",
                         "name": "schema",
                         "ok": false,
-                        "remedy": "run `recall rebuild`",
+                        "remedy": "build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it",
                     },
                     { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
@@ -1085,7 +1085,7 @@ fn doctor_of_an_index_from_an_older_version_reports_an_out_of_date_schema() {
                 "repaired": null,
             },
             "degraded": true,
-            "notes": ["schema: run `recall rebuild`"],
+            "notes": ["schema: build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it"],
         })
     );
 }
@@ -1291,7 +1291,7 @@ fn doctor_fix_of_an_index_built_for_another_model_reports_the_mismatch_once_and_
 }
 
 #[test]
-fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cached_sessions() {
+fn doctor_fix_of_an_index_older_than_v0_14_reports_it_and_keeps_the_cached_sessions() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = db_dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
@@ -1315,7 +1315,7 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
         out.markdown,
         concat!(
             "Health: degraded\n",
-            "  schema [FAIL] database schema is out of date -> run `recall rebuild`\n",
+            "  schema [FAIL] this index's schema predates recall 0.14.0 and cannot be opened -> build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it\n",
             "  model_identity [ok]\n",
             "  model [ok]\n",
         )
@@ -1326,10 +1326,10 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
             "data": {
                 "checks": [
                     {
-                        "detail": "database schema is out of date",
+                        "detail": "this index's schema predates recall 0.14.0 and cannot be opened",
                         "name": "schema",
                         "ok": false,
-                        "remedy": "run `recall rebuild`",
+                        "remedy": "build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it",
                     },
                     { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
                     { "detail": null, "name": "model", "ok": true, "remedy": null },
@@ -1340,7 +1340,7 @@ fn doctor_fix_of_an_index_with_an_outdated_schema_reports_it_and_keeps_the_cache
                 "repaired": null,
             },
             "degraded": true,
-            "notes": ["schema: run `recall rebuild`"],
+            "notes": ["schema: build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it"],
         })
     );
     assert_eq!(

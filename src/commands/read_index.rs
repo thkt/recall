@@ -37,9 +37,8 @@ impl ReadIndex {
 fn require_current_schema(state: SchemaState) -> Result<(), RecallError> {
     match state {
         SchemaState::Current | SchemaState::Empty => Ok(()),
-        SchemaState::Stale => Err(RecallError::DataError(
-            "database schema is out of date; run `recall rebuild` to migrate it".to_owned(),
-        )),
+        SchemaState::Incomplete => Err(db::INCOMPLETE_INDEX.error()),
+        SchemaState::Unsupported => Err(db::UNSUPPORTED_INDEX.error()),
     }
 }
 

@@ -77,148 +77,6 @@ fn opening_an_index_a_second_time_leaves_its_schema_unchanged() {
 }
 
 #[test]
-fn upgrading_chunk_markers_rolls_back_a_failed_upgrade_then_marks_only_chunked_sessions() {
-    use crate::indexer::index_chunks;
-
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_db(tmp.path()).unwrap();
-    conn.execute_batch(
-        "INSERT INTO sessions (session_id) VALUES ('s1'), ('empty'), ('pending');
-         INSERT INTO messages (session_id, role, text) VALUES
-             ('empty', 'assistant', 'unpaired answer'), ('pending', 'user', 'new question');
-         INSERT INTO qa_chunks (id, session_id, content, timestamp) VALUES (1, 's1', 'q\na', 0);
-         ALTER TABLE sessions DROP COLUMN chunks_indexed;
-         CREATE TRIGGER fail_marker_upgrade BEFORE UPDATE OF chunks_indexed ON sessions
-         BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        [f32_as_bytes(&[0.1f32; EMBEDDING_DIMS])],
-    )
-    .unwrap();
-    let schema = schema_snapshot(&conn);
-    drop(conn);
-
-    let error = open_db(tmp.path()).err().unwrap();
-
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(
-        (error.to_string(), schema_snapshot(&conn)),
-        ("injected migration failure".to_owned(), schema),
-        "a failed upgrade of an index without chunk completion markers leaves its schema as it was"
-    );
-    conn.execute_batch("DROP TRIGGER fail_marker_upgrade;")
-        .unwrap();
-    drop(conn);
-
-    let mut conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(session_id, chunks_indexed) FROM sessions ORDER BY session_id"
-        ),
-        [r#"["empty",null]"#, r#"["pending",null]"#, r#"["s1",1]"#]
-    );
-    let first = index_chunks(&mut conn).unwrap();
-    drop(conn);
-    let mut conn = open_db(tmp.path()).unwrap();
-    let second = index_chunks(&mut conn).unwrap();
-
-    assert_eq!(
-        [
-            (first.sessions_chunked, first.chunks_created),
-            (second.sessions_chunked, second.chunks_created),
-        ],
-        [(2, 1), (0, 0)]
-    );
-    assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(session_id, chunks_indexed) FROM sessions ORDER BY session_id"
-        ),
-        [r#"["empty",0]"#, r#"["pending",0]"#, r#"["s1",1]"#]
-    );
-    assert_eq!(
-        collect_strings(&conn, CHUNK_ROWS),
-        [
-            r#"[1,"s1","q\na",0,null,null,1]"#,
-            r#"[2,"pending","new question",null,2,2,2]"#
-        ]
-    );
-    assert_eq!(
-        embeddings(&conn),
-        [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
-    );
-}
-
-#[test]
-fn a_failed_parse_diagnostics_upgrade_leaves_the_schema_and_the_session_times_as_they_were() {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_db(tmp.path()).unwrap();
-    seed_session(&conn, "s1");
-    conn.execute_batch(
-        "DROP TABLE parse_diagnostics;
-         CREATE TRIGGER fail_upgrade BEFORE UPDATE OF mtime ON sessions
-         BEGIN SELECT RAISE(ABORT, 'injected migration failure'); END;",
-    )
-    .unwrap();
-    let schema = schema_snapshot(&conn);
-    drop(conn);
-
-    let error = open_db(tmp.path()).err().unwrap();
-
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(
-        (
-            error.to_string(),
-            schema_snapshot(&conn),
-            collect_strings(&conn, "SELECT json_array(session_id, mtime) FROM sessions"),
-        ),
-        (
-            "injected migration failure".to_owned(),
-            schema,
-            vec![r#"["s1",0.0]"#.to_owned()],
-        )
-    );
-}
-
-#[test]
-fn upgrading_an_index_without_session_types_keeps_its_session_rows() {
-    let tmp = NamedTempFile::new().unwrap();
-    {
-        let conn = Connection::open(tmp.path()).unwrap();
-        conn.execute_batch(&format!(
-            "CREATE TABLE sessions (
-                    session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
-                    project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
-                );
-                CREATE VIRTUAL TABLE messages USING fts5(
-                    session_id UNINDEXED, role, text, tokenize='{FTS_TOKENIZER}'
-                );"
-        ))
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
-            [],
-        )
-        .unwrap();
-    }
-
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        collect_strings(&conn, SESSION_ROWS),
-        [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
-    );
-}
-
-const SESSION_ROWS: &str = "SELECT json_array(session_id, source, file_path, project, slug, \
-     timestamp, mtime, file_size, session_type, files_scanned, chunks_indexed) FROM sessions \
-     ORDER BY session_id";
-
-#[test]
 fn upgrading_an_index_without_message_ranges_stores_each_range_and_drops_messages_without_a_session()
  {
     let tmp = NamedTempFile::new().unwrap();
@@ -273,253 +131,400 @@ fn embeddings(conn: &Connection) -> Vec<(i64, i64, i64, Vec<u8>)> {
         .collect()
 }
 
-fn create_old_schema_db(path: &Path) {
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(
-        "CREATE TABLE sessions (
-                session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
-                project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
-            );
-            CREATE VIRTUAL TABLE messages USING fts5(
-                session_id UNINDEXED, role, text, tokenize='unicode61'
-            );",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO sessions VALUES ('s1', 'claude', '/f', '/p', 'slug', 0, 0.0)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello')",
-        [],
-    )
-    .unwrap();
+const SESSIONS_V0_14: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
+     project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, file_size INTEGER, \
+     session_type TEXT, files_scanned INTEGER, chunks_indexed INTEGER";
+const CHUNKS_V0_14: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, \
+     content TEXT NOT NULL, timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, \
+     generation INTEGER NOT NULL DEFAULT 0";
+const VECTORS_V0_14: &str = "+chunk_id INTEGER, +sub_idx INTEGER";
+const SUPPORT_TABLES_V0_14: &str = "CREATE TABLE parse_diagnostics (
+         file_path TEXT PRIMARY KEY, source TEXT NOT NULL,
+         invalid_json_lines INTEGER NOT NULL DEFAULT 0,
+         invalid_utf8_lines INTEGER NOT NULL DEFAULT 0,
+         incomplete_tail_lines INTEGER NOT NULL DEFAULT 0,
+         read_error INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE TABLE qa_chunk_generation (
+         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+         value INTEGER NOT NULL CHECK (typeof(value) = 'integer' AND value >= 0)
+     );
+     INSERT INTO qa_chunk_generation VALUES (1, 0);
+     CREATE TRIGGER qa_chunks_insert_generation AFTER INSERT ON qa_chunks BEGIN
+         UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
+         UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
+         WHERE id = NEW.id;
+     END;
+     CREATE TRIGGER qa_chunks_update_generation
+     AFTER UPDATE OF id, session_id, content ON qa_chunks BEGIN
+         UPDATE qa_chunk_generation SET value = value + 1 WHERE singleton = 1;
+         UPDATE qa_chunks SET generation = (SELECT value FROM qa_chunk_generation)
+         WHERE id = NEW.id;
+     END;";
+
+struct Shape<'a> {
+    sessions: &'a str,
+    tokenizer: &'a str,
+    chunks: &'a str,
+    vectors: &'a str,
+    support_tables: &'a str,
 }
 
-#[test]
-fn opening_an_index_with_an_older_tokenizer_moves_its_messages_onto_trigram_and_keeps_its_sessions()
-{
-    let tmp = NamedTempFile::new().unwrap();
-    create_old_schema_db(tmp.path());
-    Connection::open(tmp.path())
-        .unwrap()
-        .execute_batch(
-            "INSERT INTO messages (rowid, session_id, role, text)
-                 VALUES (3, 's1', 'assistant', 'help is here'), (7, 's1', 'user', 'thanks'),
-                        (9, 'gone', 'user', 'a message whose session row is gone');",
-        )
-        .unwrap();
+const V0_14: Shape<'static> = Shape {
+    sessions: SESSIONS_V0_14,
+    tokenizer: FTS_TOKENIZER,
+    chunks: CHUNKS_V0_14,
+    vectors: VECTORS_V0_14,
+    support_tables: SUPPORT_TABLES_V0_14,
+};
 
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        collect_strings(&conn, SESSION_ROWS),
-        [r#"["s1","claude","/f","/p","slug",0,null,null,null,null,null]"#]
-    );
-    assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(rowid, session_id, role, text) FROM messages ORDER BY rowid"
-        ),
-        [
-            r#"[1,"s1","user","hello"]"#,
-            r#"[3,"s1","assistant","help is here"]"#,
-            r#"[7,"s1","user","thanks"]"#
-        ],
-        "the copy keeps each gapped rowid, which chunks find their messages by, and drops the sessionless rowid 9"
-    );
-    assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT json_array(rowid, session_id, role, text) FROM messages
-             WHERE messages MATCH 'hel' ORDER BY rowid"
-        ),
-        [
-            r#"[1,"s1","user","hello"]"#,
-            r#"[3,"s1","assistant","help is here"]"#
-        ],
-        "only a trigram index matches the first three letters of a longer word"
-    );
-    let schema = schema_snapshot(&conn);
-    drop(conn);
-
-    let reopened = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        schema_snapshot(&reopened),
-        schema,
-        "a second open must not migrate the table again"
-    );
-}
-
-#[test]
-fn opening_the_oldest_index_shape_keeps_its_chunks_and_reaches_the_current_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    create_old_schema_db(tmp.path());
-    Connection::open(tmp.path())
-        .unwrap()
-        .execute_batch(
-            "CREATE TABLE qa_chunks (
-                 id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
-                 user_text TEXT NOT NULL, assistant_text TEXT,
-                 content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
-             );
-             INSERT INTO qa_chunks VALUES (1, 's1', 'q', 'a', 'content', 0, 'hash1');",
-        )
-        .unwrap();
-
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert!(matches!(schema_state(&conn), Ok(SchemaState::Current)));
-    assert_eq!(
-        conn.prepare("SELECT id, session_id, content FROM qa_chunks")
-            .unwrap()
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap)
-            .collect::<Vec<_>>(),
-        [(1, "s1".to_owned(), "content".to_owned())]
-    );
-    assert_eq!(
-        conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-}
-
-fn create_pre_cleanup_db(path: &Path) {
+fn build_index(path: &Path, shape: &Shape<'_>) {
     ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e)).unwrap();
     let conn = Connection::open(path).unwrap();
     conn.execute_batch(&format!(
-        "CREATE TABLE sessions (
-                session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
-                project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
-            );
-            CREATE VIRTUAL TABLE messages USING fts5(
-                session_id UNINDEXED, role, text, tokenize='{FTS_TOKENIZER}'
-            );
-            CREATE TABLE qa_chunks (
-                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
-                user_text TEXT NOT NULL, assistant_text TEXT,
-                content TEXT NOT NULL, timestamp INTEGER, chunk_hash TEXT NOT NULL
-            );
-            CREATE INDEX idx_qa_chunks_hash ON qa_chunks(chunk_hash);
-            CREATE TABLE embedded_chunk_ids (
-                chunk_id INTEGER NOT NULL, sub_idx INTEGER NOT NULL,
-                vec_rowid INTEGER NOT NULL, PRIMARY KEY (chunk_id, sub_idx)
-            );
-            CREATE VIRTUAL TABLE vec_chunks USING vec0(
-                embedding FLOAT[{EMBEDDING_DIMS}], +chunk_id INTEGER, +sub_idx INTEGER
-            );"
+        "CREATE TABLE sessions ({});
+         CREATE VIRTUAL TABLE messages USING fts5(
+             session_id UNINDEXED, role, text, tokenize='{}'
+         );
+         CREATE TABLE qa_chunks ({});
+         CREATE VIRTUAL TABLE vec_chunks USING vec0(
+             embedding FLOAT[{EMBEDDING_DIMS}], {}
+         );
+         CREATE VIRTUAL TABLE messages_vocab USING fts5vocab(messages, row);
+         {}",
+        shape.sessions, shape.tokenizer, shape.chunks, shape.vectors, shape.support_tables
     ))
-    .unwrap();
-    conn.execute(
-            "INSERT INTO qa_chunks (id, session_id, user_text, assistant_text, content, timestamp, chunk_hash) \
-             VALUES (1, 's1', 'q', 'a', 'q\na', 0, 'deadbeef')",
-            [],
-        )
-        .unwrap();
-    let emb = vec![0.1f32; EMBEDDING_DIMS];
-    conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        [f32_as_bytes(&emb)],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO embedded_chunk_ids (chunk_id, sub_idx, vec_rowid) VALUES (1, 0, 1)",
-        [],
-    )
     .unwrap();
 }
 
-#[test]
-fn upgrading_an_index_with_write_only_chunk_columns_drops_them_and_keeps_chunks_and_embeddings() {
+fn state_of(shape: &Shape<'_>) -> SchemaState {
     let tmp = NamedTempFile::new().unwrap();
-    create_pre_cleanup_db(tmp.path());
+    build_index(tmp.path(), shape);
+    schema_state(&Connection::open(tmp.path()).unwrap()).unwrap()
+}
+
+fn without(columns: &str, column: &str) -> String {
+    assert!(
+        columns.contains(column),
+        "the fixture has no `{column}` to remove"
+    );
+    columns.replace(column, "")
+}
+
+fn state_after(statement: &str) -> SchemaState {
+    let tmp = NamedTempFile::new().unwrap();
+    build_index(tmp.path(), &V0_14);
+    let conn = Connection::open(tmp.path()).unwrap();
+    conn.execute_batch(statement).unwrap();
+    schema_state(&conn).unwrap()
+}
+
+#[test]
+fn an_index_shaped_like_v0_14_0_has_a_current_schema() {
+    assert_eq!(state_of(&V0_14), SchemaState::Current);
+}
+
+#[test]
+fn an_index_whose_sessions_lack_a_type_is_unsupported() {
+    let sessions = without(SESSIONS_V0_14, ", session_type TEXT");
+    assert_eq!(
+        state_of(&Shape {
+            sessions: &sessions,
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_sessions_lack_a_scanned_files_marker_is_unsupported() {
+    let sessions = without(SESSIONS_V0_14, ", files_scanned INTEGER");
+    assert_eq!(
+        state_of(&Shape {
+            sessions: &sessions,
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_sessions_lack_a_file_size_is_unsupported() {
+    let sessions = without(SESSIONS_V0_14, ", file_size INTEGER");
+    assert_eq!(
+        state_of(&Shape {
+            sessions: &sessions,
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_sessions_lack_a_chunk_marker_is_unsupported() {
+    let sessions = without(SESSIONS_V0_14, ", chunks_indexed INTEGER");
+    assert_eq!(
+        state_of(&Shape {
+            sessions: &sessions,
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_tokenized_without_trigrams_is_unsupported() {
+    assert_eq!(
+        state_of(&Shape {
+            tokenizer: "unicode61",
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_chunks_still_carry_a_hash_is_unsupported() {
+    let chunks = format!("{CHUNKS_V0_14}, chunk_hash TEXT");
+    assert_eq!(
+        state_of(&Shape {
+            chunks: &chunks,
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_chunks_lack_a_message_range_is_unsupported() {
+    let chunks = without(CHUNKS_V0_14, ", src_rowid_lo INTEGER, src_rowid_hi INTEGER");
+    assert_eq!(
+        state_of(&Shape {
+            chunks: &chunks,
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_chunks_lack_a_generation_is_unsupported() {
+    let chunks = without(CHUNKS_V0_14, ", generation INTEGER NOT NULL DEFAULT 0");
+    assert_eq!(
+        state_of(&Shape {
+            chunks: &chunks,
+            support_tables: "",
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_whose_embeddings_lack_a_sub_index_is_unsupported() {
+    assert_eq!(
+        state_of(&Shape {
+            vectors: "+chunk_id INTEGER",
+            ..V0_14
+        }),
+        SchemaState::Unsupported
+    );
+}
+
+#[test]
+fn an_index_without_its_vocabulary_table_has_an_incomplete_schema() {
+    assert_eq!(
+        state_after("DROP TABLE messages_vocab"),
+        SchemaState::Incomplete
+    );
+}
+
+#[test]
+fn an_index_without_its_parse_diagnostics_table_has_an_incomplete_schema() {
+    assert_eq!(
+        state_after("DROP TABLE parse_diagnostics"),
+        SchemaState::Incomplete
+    );
+}
+
+#[test]
+fn an_index_without_its_generation_counter_has_an_incomplete_schema() {
+    assert_eq!(
+        state_after("DROP TABLE qa_chunk_generation"),
+        SchemaState::Incomplete
+    );
+}
+
+#[test]
+fn a_current_sessions_table_alone_has_an_incomplete_schema() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
+    conn.execute_batch(&format!("CREATE TABLE sessions ({SESSIONS_V0_14})"))
+        .unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Incomplete);
+}
+
+#[test]
+fn an_older_sessions_table_alone_is_unsupported() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
+    conn.execute_batch("CREATE TABLE sessions (session_id TEXT PRIMARY KEY)")
+        .unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Unsupported);
+}
+
+#[test]
+fn an_older_embedding_table_without_a_sessions_table_is_unsupported() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = Connection::open(tmp.path()).unwrap();
+    conn.execute_batch("CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB)")
+        .unwrap();
+    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Unsupported);
+}
+
+const SESSIONS_V0_13: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
+     project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT, \
+     files_scanned INTEGER";
+const CHUNKS_V0_13: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, \
+     content TEXT NOT NULL, timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER";
+
+fn build_v0_13_index(path: &Path) {
+    build_index(
+        path,
+        &Shape {
+            sessions: SESSIONS_V0_13,
+            chunks: CHUNKS_V0_13,
+            support_tables: "INSERT INTO sessions (session_id) VALUES ('s1');",
+            ..V0_14
+        },
+    );
+}
+
+#[test]
+fn opening_a_v0_13_index_for_writing_is_refused_and_leaves_its_schema_rows_and_journal_mode_as_they_were()
+ {
+    let tmp = NamedTempFile::new().unwrap();
+    build_v0_13_index(tmp.path());
+    let before = schema_snapshot(&Connection::open(tmp.path()).unwrap());
+
+    let error = open_db(tmp.path()).err().unwrap();
+
+    let conn = Connection::open(tmp.path()).unwrap();
+    assert_eq!(
+        (
+            error.to_string(),
+            schema_snapshot(&conn),
+            collect_strings(&conn, "SELECT session_id FROM sessions"),
+            conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap()
+        ),
+        (
+            "this index's schema predates recall 0.14.0 and cannot be opened; build a new index \
+             with `recall index` at another `--db-path`, or upgrade this one by running \
+             `recall classify` from recall 0.16.1 on it"
+                .to_owned(),
+            before,
+            vec!["s1".to_owned()],
+            "delete".to_owned()
+        )
+    );
+}
+
+fn schema_object_names(conn: &Connection) -> Vec<String> {
+    collect_strings(
+        conn,
+        "SELECT type || ' ' || name FROM sqlite_master ORDER BY type, name",
+    )
+}
+
+#[test]
+fn opening_an_index_whose_create_stopped_after_the_sessions_table_finishes_the_create() {
+    let fresh = NamedTempFile::new().unwrap();
+    let complete = schema_object_names(&open_db(fresh.path()).unwrap());
+    let tmp = NamedTempFile::new().unwrap();
+    Connection::open(tmp.path())
+        .unwrap()
+        .execute_batch(&format!(
+            "CREATE TABLE sessions ({SESSIONS_V0_14}, message_rowid_lo INTEGER, \
+             message_rowid_hi INTEGER)"
+        ))
+        .unwrap();
 
     let conn = open_db(tmp.path()).unwrap();
-    let (schema, chunks, vectors) = (
-        schema_snapshot(&conn),
-        collect_strings(&conn, CHUNK_ROWS),
-        embeddings(&conn),
-    );
 
     assert_eq!(
-        collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
-        [
-            "id",
-            "session_id",
-            "content",
-            "timestamp",
-            "src_rowid_lo",
-            "src_rowid_hi",
-            "generation",
-            "vec_rowid_lo",
-            "vec_rowid_hi",
-        ]
+        (schema_state(&conn).unwrap(), schema_object_names(&conn)),
+        (SchemaState::Current, complete)
     );
-    assert_eq!(chunks, [r#"[1,"s1","q\na",0,null,null,0]"#]);
-    assert_eq!(
-        vectors,
-        [(1, 1, 0, f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec())]
-    );
-    assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT name FROM sqlite_master WHERE name = 'embedded_chunk_ids'"
-        ),
-        Vec::<String>::new()
-    );
+}
+
+#[test]
+fn opening_a_v0_14_index_for_writing_adds_both_rowid_ranges_and_keeps_its_rows() {
+    let tmp = NamedTempFile::new().unwrap();
+    build_index(tmp.path(), &V0_14);
+    let conn = Connection::open(tmp.path()).unwrap();
+    seed_session(&conn, "s1");
+    seed_chunk(&conn, 1, "kept chunk");
     drop(conn);
 
-    let reopened = open_db(tmp.path()).unwrap();
+    let conn = open_db(tmp.path()).unwrap();
 
     assert_eq!(
         (
-            schema_snapshot(&reopened),
-            collect_strings(&reopened, CHUNK_ROWS),
-            embeddings(&reopened)
+            schema_state(&conn).unwrap(),
+            collect_strings(
+                &conn,
+                "SELECT name FROM pragma_table_info('sessions') WHERE name LIKE '%rowid%' \
+                 UNION ALL \
+                 SELECT name FROM pragma_table_info('qa_chunks') WHERE name LIKE 'vec_rowid%'"
+            ),
+            collect_strings(&conn, "SELECT session_id FROM sessions"),
+            collect_strings(&conn, "SELECT content FROM qa_chunks"),
         ),
-        (schema, chunks, vectors)
+        (
+            SchemaState::Current,
+            vec![
+                "message_rowid_lo".to_owned(),
+                "message_rowid_hi".to_owned(),
+                "vec_rowid_lo".to_owned(),
+                "vec_rowid_hi".to_owned()
+            ],
+            vec!["s1".to_owned()],
+            vec!["kept chunk".to_owned()]
+        )
     );
 }
 
-const SESSIONS_FULL: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
-     project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT";
-const SESSIONS_NO_TYPE: &str = "session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
-     project TEXT, slug TEXT, timestamp INTEGER, mtime REAL";
-const QA_NO_GENERATION: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
-     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER";
-const QA_FULL: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
-     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, generation INTEGER NOT NULL DEFAULT 0";
-const QA_NO_ROWID: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, timestamp INTEGER, generation INTEGER NOT NULL DEFAULT 0";
-const QA_CHUNK_HASH: &str = "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, content TEXT NOT NULL, \
-     timestamp INTEGER, src_rowid_lo INTEGER, src_rowid_hi INTEGER, chunk_hash TEXT, generation INTEGER NOT NULL DEFAULT 0";
-const VEC_FULL: &str = "+chunk_id INTEGER, +sub_idx INTEGER";
-const VEC_NO_SUB: &str = "+chunk_id INTEGER";
+#[test]
+fn every_inserted_chunk_gets_the_next_generation_and_a_message_range_update_keeps_it() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    seed_chunk(&conn, 1, "first");
+    seed_chunk(&conn, 2, "second");
 
-fn build_schema(path: &Path, sessions_cols: &str, tokenizer: &str, qa_cols: &str, vec_cols: &str) {
-    ensure_sqlite_vec().map_err(|e| anyhow::anyhow!(e)).unwrap();
-    let conn = Connection::open(path).unwrap();
-    conn.execute_batch(&format!(
-        "CREATE TABLE sessions ({sessions_cols});
-         CREATE VIRTUAL TABLE messages USING fts5(
-             session_id UNINDEXED, role, text, tokenize='{tokenizer}'
-         );
-         CREATE TABLE qa_chunks ({qa_cols});
-         CREATE VIRTUAL TABLE vec_chunks USING vec0(
-             embedding FLOAT[{EMBEDDING_DIMS}], {vec_cols}
-         );
-         CREATE VIRTUAL TABLE messages_vocab USING fts5vocab(messages, row);"
-    ))
+    conn.execute(
+        "UPDATE qa_chunks SET src_rowid_lo = 1, src_rowid_hi = 2",
+        [],
+    )
     .unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","first",0,1,2,1]"#,
+            r#"[2,"s1","second",0,1,2,2]"#
+        ]
+    );
+    conn.execute("DELETE FROM qa_chunks WHERE id = 2", [])
+        .unwrap();
+    seed_chunk(&conn, 2, "second");
+    assert_eq!(
+        collect_strings(&conn, CHUNK_ROWS),
+        [
+            r#"[1,"s1","first",0,1,2,1]"#,
+            r#"[2,"s1","second",0,null,null,3]"#
+        ]
+    );
 }
 
 #[test]
@@ -527,88 +532,6 @@ fn a_database_without_a_sessions_table_has_an_empty_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = Connection::open(tmp.path()).unwrap();
     assert_eq!(schema_state(&conn).unwrap(), SchemaState::Empty);
-}
-
-#[test]
-fn a_database_with_only_a_sessions_table_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = Connection::open(tmp.path()).unwrap();
-    conn.execute_batch(&format!("CREATE TABLE sessions ({SESSIONS_FULL});"))
-        .unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
-}
-
-#[test]
-fn an_index_without_its_vocabulary_table_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(tmp.path(), SESSIONS_FULL, FTS_TOKENIZER, QA_FULL, VEC_FULL);
-    let conn = Connection::open(tmp.path()).unwrap();
-    conn.execute_batch("DROP TABLE messages_vocab;").unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
-}
-
-#[test]
-fn an_index_whose_sessions_lack_a_type_column_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(
-        tmp.path(),
-        SESSIONS_NO_TYPE,
-        FTS_TOKENIZER,
-        QA_FULL,
-        VEC_FULL,
-    );
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
-}
-
-#[test]
-fn an_index_whose_embeddings_lack_a_sub_index_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(
-        tmp.path(),
-        SESSIONS_FULL,
-        FTS_TOKENIZER,
-        QA_FULL,
-        VEC_NO_SUB,
-    );
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
-}
-
-#[test]
-fn an_index_whose_chunks_lack_a_message_range_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(
-        tmp.path(),
-        SESSIONS_FULL,
-        FTS_TOKENIZER,
-        QA_NO_ROWID,
-        VEC_FULL,
-    );
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
-}
-
-#[test]
-fn an_index_whose_chunks_still_carry_a_hash_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(
-        tmp.path(),
-        SESSIONS_FULL,
-        FTS_TOKENIZER,
-        QA_CHUNK_HASH,
-        VEC_FULL,
-    );
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
-}
-
-#[test]
-fn an_index_tokenized_without_trigrams_has_a_stale_schema() {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(tmp.path(), SESSIONS_FULL, "unicode61", QA_FULL, VEC_FULL);
-    let conn = Connection::open(tmp.path()).unwrap();
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Stale);
 }
 
 const WRITABLE_DIR_NOTE: &str = "read-only open cannot see uncheckpointed changes in the \
@@ -768,7 +691,7 @@ fn a_read_only_open_of_a_missing_database_fails_without_creating_any_file() {
 #[test]
 fn opening_an_existing_index_for_writing_leaves_its_schema_and_journal_mode_as_they_were() {
     let tmp = NamedTempFile::new().unwrap();
-    create_old_schema_db(tmp.path());
+    build_v0_13_index(tmp.path());
     let before = schema_snapshot(&Connection::open(tmp.path()).unwrap());
 
     let conn = open_existing_db(tmp.path()).unwrap();
@@ -1052,143 +975,6 @@ fn db_tests_leave_the_root_probe_file_name_to_the_shared_root_check() {
 }
 
 #[test]
-fn upgrading_chunks_without_generations_keeps_their_embeddings_and_gives_every_later_insert_a_new_generation()
- {
-    let tmp = NamedTempFile::new().unwrap();
-    build_schema(
-        tmp.path(),
-        SESSIONS_FULL,
-        FTS_TOKENIZER,
-        QA_NO_GENERATION,
-        VEC_FULL,
-    );
-    let conn = Connection::open(tmp.path()).unwrap();
-    seed_chunk(&conn, 1, "existing content");
-    let embedding = f32_as_bytes(&[0.25_f32; EMBEDDING_DIMS]);
-    conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (1, 0, ?1)",
-        [&embedding],
-    )
-    .unwrap();
-    assert_eq!(
-        collect_strings(&conn, "SELECT name FROM pragma_table_info('qa_chunks')"),
-        [
-            "id",
-            "session_id",
-            "content",
-            "timestamp",
-            "src_rowid_lo",
-            "src_rowid_hi"
-        ]
-    );
-    assert_eq!(
-        collect_strings(
-            &conn,
-            "SELECT name FROM sqlite_master WHERE name = 'qa_chunk_generation'"
-        ),
-        Vec::<String>::new()
-    );
-    assert_eq!(schema_state(&conn).unwrap(), SchemaState::Current);
-    drop(conn);
-
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        collect_strings(&conn, CHUNK_ROWS),
-        [r#"[1,"s1","existing content",0,null,null,0]"#]
-    );
-    seed_chunk(&conn, 2, "new content");
-    assert_eq!(
-        collect_strings(&conn, CHUNK_ROWS),
-        [
-            r#"[1,"s1","existing content",0,null,null,0]"#,
-            r#"[2,"s1","new content",0,null,null,1]"#
-        ]
-    );
-    drop(conn);
-
-    let conn = open_db(tmp.path()).unwrap();
-    conn.execute(
-        "UPDATE qa_chunks SET src_rowid_lo = 1, src_rowid_hi = 2",
-        [],
-    )
-    .unwrap();
-
-    assert_eq!(embeddings(&conn), [(1, 1, 0, embedding.to_vec())]);
-    assert_eq!(
-        collect_strings(&conn, CHUNK_ROWS),
-        [
-            r#"[1,"s1","existing content",0,1,2,0]"#,
-            r#"[2,"s1","new content",0,1,2,1]"#
-        ]
-    );
-    conn.execute("DELETE FROM qa_chunks WHERE id = 2", [])
-        .unwrap();
-    seed_chunk(&conn, 2, "new content");
-    assert_eq!(
-        collect_strings(&conn, CHUNK_ROWS),
-        [
-            r#"[1,"s1","existing content",0,1,2,0]"#,
-            r#"[2,"s1","new content",0,null,null,2]"#
-        ]
-    );
-}
-
-#[test]
-fn parse_diagnostics_upgrade_preserves_content_and_schedules_one_read() {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_db(tmp.path()).unwrap();
-    seed_session(&conn, "s");
-    conn.execute(
-        "INSERT INTO messages (session_id, role, text) VALUES ('s', 'user', 'kept')",
-        [],
-    )
-    .unwrap();
-    conn.execute_batch(
-        "UPDATE sessions SET mtime = 123, file_size = 42; DROP TABLE parse_diagnostics;",
-    )
-    .unwrap();
-    drop(conn);
-
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        (
-            collect_strings(&conn, SESSION_ROWS),
-            collect_strings(
-                &conn,
-                "SELECT json_array(rowid, session_id, role, text) FROM messages"
-            )
-        ),
-        (
-            vec![r#"["s","claude","/f","/p","slug",0,null,42,null,null,null]"#.to_owned()],
-            vec![r#"[1,"s","user","kept"]"#.to_owned()]
-        )
-    );
-    conn.execute("UPDATE sessions SET mtime = 456", []).unwrap();
-    conn.execute("INSERT INTO parse_diagnostics (file_path, source, invalid_json_lines) VALUES ('/s.jsonl', 'claude', 2)", []).unwrap();
-    drop(conn);
-
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        (
-            collect_strings(&conn, SESSION_ROWS),
-            collect_strings(
-                &conn,
-                "SELECT json_array(file_path, source, invalid_json_lines, invalid_utf8_lines,
-                                   incomplete_tail_lines, read_error)
-                 FROM parse_diagnostics"
-            )
-        ),
-        (
-            vec![r#"["s","claude","/f","/p","slug",0,456.0,42,null,null,null]"#.to_owned()],
-            vec![r#"["/s.jsonl","claude",2,0,0,0]"#.to_owned()]
-        )
-    );
-}
-
-#[test]
 fn deleting_one_chunk_vector_reads_only_the_row_with_that_rowid() {
     let (_dir, conn) = setup_test_db();
 
@@ -1279,30 +1065,5 @@ fn upgrading_an_index_without_vector_ranges_stores_each_range_and_returns_gapped
             embeddings(&reopened)
         ),
         (schema, ranges, vectors)
-    );
-}
-
-#[test]
-fn rebuilding_the_vector_table_without_a_sub_index_clears_every_stored_vector_range() {
-    let tmp = NamedTempFile::new().unwrap();
-    let conn = open_db(tmp.path()).unwrap();
-    seed_session(&conn, "s1");
-    seed_chunk(&conn, 1, "embedded before");
-    seed_chunk(&conn, 2, "also embedded");
-    conn.execute_batch(&format!(
-        "UPDATE qa_chunks SET vec_rowid_lo = id, vec_rowid_hi = id;
-         DROP TABLE vec_chunks;
-         CREATE VIRTUAL TABLE vec_chunks USING vec0(
-             embedding FLOAT[{EMBEDDING_DIMS}], {VEC_NO_SUB}
-         );"
-    ))
-    .unwrap();
-    drop(conn);
-
-    let conn = open_db(tmp.path()).unwrap();
-
-    assert_eq!(
-        collect_strings(&conn, VECTOR_RANGES),
-        ["[1,null,null]", "[2,null,null]"]
     );
 }

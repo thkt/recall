@@ -221,32 +221,6 @@ fn status_verbose_includes_db_path() {
 }
 
 #[test]
-fn indexing_over_an_empty_old_embedding_table_replaces_it_without_a_warning() {
-    let dir = TempDir::new().unwrap();
-    rusqlite::Connection::open(dir.path().join("recall.db"))
-        .unwrap()
-        .execute_batch("CREATE TABLE vec_chunks (chunk_id INTEGER, embedding BLOB);")
-        .unwrap();
-
-    let (code, envelope, stderr) =
-        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
-
-    assert_eq!(
-        (code, envelope),
-        (
-            Some(0),
-            index_envelope_without_the_model(&[], &serde_json::json!([]), &[])
-        )
-    );
-    assert!(!stderr.contains("warning:"), "{stderr}");
-    assert!(!stderr.contains("`recall index`"), "{stderr}");
-    assert_eq!(
-        outcome(recall(dir.path()).args(["search", "anything"])),
-        (Some(0), String::new(), NO_SESSIONS_INDEXED.to_owned())
-    );
-}
-
-#[test]
 fn indexing_over_an_old_embedding_table_with_rows_refuses_and_keeps_them() {
     let dir = TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
@@ -1271,112 +1245,70 @@ fn show_of_a_session_missing_from_a_stale_snapshot_reports_the_write_ahead_log()
     );
 }
 
-fn seed_pre_trigram_index_under_the_missing_claude_root(dir: &Path) {
+const UNSUPPORTED_INDEX: &str = "this index's schema predates recall 0.14.0 and cannot be opened; build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it";
+
+fn seed_v0_13_index(dir: &Path) {
     rusqlite::Connection::open(dir.join("recall.db"))
         .unwrap()
         .execute_batch(
             "CREATE TABLE sessions (
-                 session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
-                 project TEXT, slug TEXT, timestamp INTEGER, mtime REAL
+                 session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, project TEXT,
+                 slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT,
+                 files_scanned INTEGER
              );
              CREATE VIRTUAL TABLE messages USING fts5(
-                 session_id UNINDEXED, role, text, tokenize='porter unicode61'
+                 session_id UNINDEXED, role, text, tokenize='trigram'
              );
-             INSERT INTO sessions VALUES ('s1', 'claude', '/gone/s1.jsonl', '/p', 'slug', 0, 0.0);
-             INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello world recall');",
+             INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp)
+                 VALUES ('s1', 'claude', '/gone/s1.jsonl', '/p', 'slug', 0);
+             INSERT INTO messages (session_id, role, text) VALUES ('s1', 'user', 'hello world');",
         )
         .unwrap();
 }
 
 #[test]
-fn indexing_an_old_index_whose_claude_root_is_missing_reports_the_preserved_session_and_no_read_error_on_each_run()
- {
-    const MISSING_ROOT_NOTE: &str = "claude root unavailable — preserved 1 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions";
+fn every_command_refuses_an_index_older_than_v0_14_with_one_message_and_leaves_the_file_as_it_was()
+{
     let dir = TempDir::new().unwrap();
-    seed_pre_trigram_index_under_the_missing_claude_root(dir.path());
-    let skipped_roots = serde_json::json!([
-        {"preserved_sessions": 1, "reason": "missing_root", "source": "claude"}
-    ]);
-    let mut first_expected = index_envelope_without_the_model(
-        &[
-            ("chunks_created_committed", 1),
-            ("chunks_pending_snapshot", 1),
-            ("chunks_remaining_snapshot", 1),
-            ("chunks_unattempted", 1),
-            ("sessions_chunk_pending", 1),
-            ("sessions_chunked_committed", 1),
-            ("sessions_stored", 1),
-        ],
-        &serde_json::json!([]),
-        &[MISSING_ROOT_NOTE.to_owned()],
+    seed_v0_13_index(dir.path());
+    let stored = || {
+        let mut names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        (names, fs::read(dir.path().join("recall.db")).unwrap())
+    };
+    let before = stored();
+    let refusal = format!("error: {UNSUPPORTED_INDEX}\n");
+
+    for args in [
+        vec!["search", "hello"],
+        vec!["status"],
+        vec!["show", "s1"],
+        vec!["classify", "--dry-run"],
+        vec!["classify"],
+    ] {
+        assert_eq!(
+            outcome(recall(dir.path()).args(&args)),
+            (Some(65), String::new(), refusal.clone()),
+            "recall {args:?}"
+        );
+    }
+    for command in ["index", "rebuild"] {
+        // why-not: a whole-stderr match, because stage timings fill the rest of stderr
+        let (code, stdout, stderr) = outcome(recall(dir.path()).arg(command));
+        assert_eq!((code, stdout.as_str()), (Some(65), ""), "recall {command}");
+        assert!(stderr.ends_with(&refusal), "recall {command}: {stderr}");
+    }
+    let (_, doctor, _) = outcome(recall(dir.path()).arg("doctor"));
+    assert!(
+        doctor.contains(
+            "  schema [FAIL] this index's schema predates recall 0.14.0 and cannot be opened -> build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it\n"
+        ),
+        "{doctor}"
     );
-    first_expected["data"]["skipped_roots"] = skipped_roots.clone();
-    let mut second_expected = index_envelope_without_the_model(
-        &[
-            ("chunks_pending_snapshot", 1),
-            ("chunks_remaining_snapshot", 1),
-            ("chunks_unattempted", 1),
-            ("sessions_stored", 1),
-        ],
-        &serde_json::json!([]),
-        &[MISSING_ROOT_NOTE.to_owned()],
-    );
-    second_expected["data"]["skipped_roots"] = skipped_roots;
-
-    let (first_code, first, _) =
-        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
-    let (second_code, second, _) =
-        index_json_outcome_without_stage_timings(recall(dir.path()).args(["index", "--json"]));
-
-    assert_eq!(
-        ((first_code, first), (second_code, second)),
-        ((Some(0), first_expected), (Some(0), second_expected))
-    );
-}
-
-#[test]
-fn index_upgrading_a_pre_trigram_index_keeps_the_sessions_of_a_missing_root_searchable() {
-    let dir = TempDir::new().unwrap();
-    seed_pre_trigram_index_under_the_missing_claude_root(dir.path());
-
-    // why-not: comparing stderr, because it carries stage timings
-    let (index_code, _, index_stderr) = outcome(recall(dir.path()).arg("index"));
-    assert_eq!(index_code, Some(0), "{index_stderr}");
-
-    assert_eq!(
-        outcome(recall(dir.path()).arg("status")),
-        (Some(0), STATUS_OF_ONE_SESSION.to_owned(), String::new())
-    );
-    assert_eq!(
-        outcome(recall(dir.path()).args(["search", "hello"])),
-        (
-            Some(0),
-            "Found 1 sessions:\n\n[1] 1970-01-01 | slug | p [claude]\n    /p\n    ID: s1\n    > hello world recall\n    inspect: recall show s1 --chunk 1 --window 3\n\n".to_owned(),
-            MODEL_NOT_INSTALLED_STDERR.to_owned()
-        )
-    );
-}
-
-#[test]
-fn show_on_an_index_from_an_older_version_asks_for_a_rebuild() {
-    let dir = TempDir::new().unwrap();
-    rusqlite::Connection::open(dir.path().join("recall.db"))
-        .unwrap()
-        .execute_batch("CREATE TABLE sessions (session_id TEXT PRIMARY KEY);")
-        .unwrap();
-
-    assert_eq!(
-        outcome(recall(dir.path()).args(["show", "s1", "--json"])),
-        (
-            Some(65),
-            String::new(),
-            concat!(
-                r#"{"error":{"code":"DATA_ERROR","message":"database schema is out of date; run `recall rebuild` to migrate it","retryable":false}}"#,
-                "\n"
-            )
-            .to_owned()
-        )
-    );
+    assert!(stored() == before, "a refused command changed the index");
 }
 
 #[test]
@@ -1579,9 +1511,7 @@ fn search_and_status_of_a_stale_snapshot_with_an_older_schema_add_the_note_to_th
     let error = (
         Some(65),
         String::new(),
-        format!(
-            "error: database schema is out of date; run `recall rebuild` to migrate it; {READ_ONLY_DIR_NOTE}\n"
-        ),
+        format!("error: {UNSUPPORTED_INDEX}; {READ_ONLY_DIR_NOTE}\n"),
     );
 
     assert_eq!(

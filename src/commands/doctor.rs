@@ -117,6 +117,10 @@ fn open_failure_checks(e: impl Display) -> Vec<DoctorCheck> {
     )]
 }
 
+fn unusable_schema_check(refusal: &db::Refusal) -> DoctorCheck {
+    DoctorCheck::fail("schema", refusal.detail.to_owned(), refusal.remedy)
+}
+
 fn empty_index_check(path: &Path) -> DoctorCheck {
     DoctorCheck::fail(
         "index",
@@ -301,11 +305,12 @@ where
                     }
                     db_checks(conn)
                 }
-                Ok(db::SchemaState::Stale) => vec![DoctorCheck::fail(
-                    "schema",
-                    "database schema is out of date".to_owned(),
-                    "run `recall rebuild`",
-                )],
+                Ok(db::SchemaState::Unsupported) => {
+                    vec![unusable_schema_check(&db::UNSUPPORTED_INDEX)]
+                }
+                Ok(db::SchemaState::Incomplete) => {
+                    vec![unusable_schema_check(&db::INCOMPLETE_INDEX)]
+                }
                 Ok(db::SchemaState::Empty) => vec![empty_index_check(&path)],
                 Err(e) => open_failure_checks(e),
             };

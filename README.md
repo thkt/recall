@@ -138,7 +138,7 @@ Embedding needs the model: run `recall model download` (~558 MB plus tokenizer) 
 
 Overlapping `index` or `rebuild` runs save an embedding only if the chunk still has the same content and generation inside the save transaction. Results for updated, deleted, or replaced chunks are discarded without deleting another run's current vectors or increasing the embedded count. Any replacement still missing an embedding is eligible on the next `recall index`. This protects new writes when all overlapping runs use this guard; it does not detect previously stored content/vector mismatches. With a working model and available source logs, `recall rebuild` regenerates those embeddings.
 
-An otherwise compatible index without generation tracking remains readable by `search`, `status`, and `show`, without migration or a rebuild. Opening it for writing adds generation tracking while preserving existing chunks and embeddings.
+An index whose schema predates v0.14.0 is refused by every command and left unchanged. Build a new index with `recall index` at another `--db-path`, or upgrade the old file by running `recall classify` from recall 0.16.1 on it once. Only an index that holds no embeddings can be upgraded this way.
 
 The first `index`, `rebuild` or `classify` that opens an index from an earlier release records where each session's messages are stored, so later runs delete a session's old messages without reading every message. It prints a one-line notice, reads all stored messages, and deletes the messages that belong to no session. Search never shows those messages. In the same way, the first such run records where each chunk's embeddings are stored, so later runs delete a chunk's embeddings without reading every embedding. It prints its own one-line notice and reads all stored embeddings once. A chunk whose embeddings do not sit in consecutive storage positions loses them, and the next `recall index` embeds it again. `search`, `status` and `show` read the index without this step.
 
@@ -233,7 +233,7 @@ When reindexing a metadata-only log, records resolving to a different session ID
 
 For an existing index, preview with `recall classify --all --dry-run`, then apply with `recall classify --all`. Both dry-run modes open the DB read-only: they do not create the DB or parent directories, migrate the schema, or change stored data or existing file permissions. A missing DB returns zero classifications in the usual JSON envelope when `--json` is set.
 
-Older schemas can be previewed if `sessions` has `session_id`, `source`, `file_path`, and `session_type`, and `messages` has `session_id`, `role`, `text`, and `rowid`; index-only columns and `parse_diagnostics` are not required. Missing read structures produce an error with rebuild guidance, without writing. Applying without `--dry-run` still performs any required migrations.
+Missing read structures produce an error with rebuild guidance, without writing. Applying without `--dry-run` still performs any required migrations.
 
 Committed WAL changes are read through SQLite's normal read-only connection; SQLite may use shared memory (`-shm`) to coordinate readers. If the read-only-directory fallback cannot read a nonempty WAL, preview stops with guidance to copy the DB and its sidecars to a writable location.
 

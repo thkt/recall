@@ -11,7 +11,7 @@ use crate::commands::{ReadIndex, open_or_create_db, resolve_db_path};
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser::Source;
-use crate::{ansi, classify, parser};
+use crate::{ansi, classify, db, parser};
 
 pub(crate) struct ClassifyOutcome {
     session_id: String,
@@ -296,6 +296,9 @@ pub(crate) fn run_classify(
         if path.try_exists()? {
             let mut index = ReadIndex::open(&path)?;
             index.snapshot.refuse()?;
+            if db::schema_state(&index.conn)? == db::SchemaState::Unsupported {
+                return Err(db::UNSUPPORTED_INDEX.error().into());
+            }
             reclassify_sessions(&mut index.conn, all, true)?
         } else {
             Vec::new()

@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::embedding::EMBEDDING_DIMS;
+use crate::error::RecallError;
 use crate::runtime::info;
 use anyhow::Result;
 use rusqlite::ffi::{SQLITE_OK, sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
@@ -27,8 +28,31 @@ pub enum OpenTier {
 pub enum SchemaState {
     Empty,
     Current,
-    Stale,
+    Incomplete,
+    Unsupported,
 }
+
+pub(crate) struct Refusal {
+    pub(crate) detail: &'static str,
+    pub(crate) remedy: &'static str,
+}
+
+impl Refusal {
+    pub(crate) fn error(&self) -> RecallError {
+        RecallError::DataError(format!("{}; {}", self.detail, self.remedy))
+    }
+}
+
+pub(crate) const UNSUPPORTED_INDEX: Refusal = Refusal {
+    detail: "this index's schema predates recall 0.14.0 and cannot be opened",
+    remedy: "build a new index with `recall index` at another `--db-path`, or upgrade this one \
+             by running `recall classify` from recall 0.16.1 on it",
+};
+
+pub(crate) const INCOMPLETE_INDEX: Refusal = Refusal {
+    detail: "this index was not fully created",
+    remedy: "run `recall index` to finish it",
+};
 
 #[allow(unsafe_code)]
 fn ensure_sqlite_vec() -> anyhow::Result<()> {
@@ -144,29 +168,47 @@ fn wal_path(path: &Path) -> PathBuf {
 }
 
 pub fn schema_state(conn: &Connection) -> Result<SchemaState> {
-    let Some(sessions_sql) = table_def(conn, "sessions")? else {
+    let sessions = table_def(conn, "sessions")?;
+    let messages = table_def(conn, "messages")?;
+    let chunks = table_def(conn, "qa_chunks")?;
+    let vectors = table_def(conn, "vec_chunks")?;
+
+    let sessions_predate = sessions.as_deref().is_some_and(|sql| {
+        [
+            "session_type",
+            "files_scanned",
+            "file_size",
+            "chunks_indexed",
+        ]
+        .iter()
+        .any(|column| !sql.contains(column))
+    });
+    let messages_predate = messages
+        .as_deref()
+        .is_some_and(|sql| !sql.contains(FTS_TOKENIZER));
+    let chunks_predate = chunks.as_deref().is_some_and(|sql| {
+        sql.contains("chunk_hash") || !sql.contains("src_rowid_lo") || !sql.contains("generation")
+    });
+    let vectors_predate = vectors
+        .as_deref()
+        .is_some_and(|sql| !sql.contains("sub_idx"));
+    if sessions_predate || messages_predate || chunks_predate || vectors_predate {
+        return Ok(SchemaState::Unsupported);
+    }
+    if sessions.is_none() {
         return Ok(SchemaState::Empty);
-    };
+    }
 
-    let (Some(messages_sql), Some(qa_sql), Some(vec_sql), Some(_)) = (
-        table_def(conn, "messages")?,
-        table_def(conn, "qa_chunks")?,
-        table_def(conn, "vec_chunks")?,
-        table_def(conn, "messages_vocab")?,
-    ) else {
-        return Ok(SchemaState::Stale);
-    };
-
-    let stale = !sessions_sql.contains("session_type")
-        || !messages_sql.contains(FTS_TOKENIZER)
-        || !vec_sql.contains("sub_idx")
-        || qa_sql.contains("chunk_hash")
-        || !qa_sql.contains("src_rowid_lo");
-
-    Ok(if stale {
-        SchemaState::Stale
-    } else {
+    let complete = messages.is_some()
+        && chunks.is_some()
+        && vectors.is_some()
+        && table_def(conn, "messages_vocab")?.is_some()
+        && table_def(conn, "parse_diagnostics")?.is_some()
+        && table_def(conn, "qa_chunk_generation")?.is_some();
+    Ok(if complete {
         SchemaState::Current
+    } else {
+        SchemaState::Incomplete
     })
 }
 
@@ -194,6 +236,9 @@ pub fn open_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec()?;
     let mut conn = Connection::open(path)?;
     conn.busy_timeout(Duration::from_secs(30))?;
+    if schema_state(&conn)? == SchemaState::Unsupported {
+        return Err(UNSUPPORTED_INDEX.error().into());
+    }
     let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
     conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
     create_schema(&mut conn)?;
@@ -203,9 +248,9 @@ pub fn open_db(path: &Path) -> Result<Connection> {
 const MESSAGES_VOCAB_SQL: &str =
     "CREATE VIRTUAL TABLE IF NOT EXISTS messages_vocab USING fts5vocab(messages, row);";
 
-fn messages_table_sql(name: &str) -> String {
+fn messages_table_sql() -> String {
     format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS messages USING fts5(
             session_id UNINDEXED,
             role,
             text,
@@ -230,35 +275,25 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
             chunks_indexed INTEGER,
             message_rowid_lo INTEGER,
             message_rowid_hi INTEGER
-        );",
-    )?;
-
-    migrate_parse_diagnostics_if_needed(conn)?;
-
-    migrate_fts_if_needed(conn)?;
-    migrate_vec_chunks_if_needed(conn)?;
-    migrate_qa_chunks_if_needed(conn)?;
-    migrate_qa_chunk_rowid_link_if_needed(conn)?;
-    migrate_session_type_if_needed(conn)?;
-    migrate_files_scanned_if_needed(conn)?;
-    migrate_file_size_if_needed(conn)?;
-
-    conn.execute_batch("DROP TABLE IF EXISTS embedded_chunk_ids;")?;
-
-    conn.execute_batch(
-        "DROP INDEX IF EXISTS idx_sessions_project;
-         CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);",
-    )?;
-
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_files (
+        );
+        CREATE TABLE IF NOT EXISTS parse_diagnostics (
+            file_path TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            invalid_json_lines INTEGER NOT NULL DEFAULT 0,
+            invalid_utf8_lines INTEGER NOT NULL DEFAULT 0,
+            incomplete_tail_lines INTEGER NOT NULL DEFAULT 0,
+            read_error INTEGER NOT NULL DEFAULT 0
+        );
+        DROP INDEX IF EXISTS idx_sessions_project;
+        CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);
+        CREATE TABLE IF NOT EXISTS session_files (
             session_id TEXT NOT NULL,
             path TEXT NOT NULL,
             PRIMARY KEY (session_id, path)
         );",
     )?;
 
-    conn.execute_batch(&messages_table_sql("messages"))?;
+    conn.execute_batch(&messages_table_sql())?;
 
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qa_chunks (
@@ -275,7 +310,7 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_qa_chunks_session ON qa_chunks(session_id);",
     )?;
 
-    migrate_qa_chunk_generation_if_needed(conn)?;
+    create_generation_tracking(conn)?;
 
     conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
@@ -287,51 +322,17 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     conn.execute_batch(MESSAGES_VOCAB_SQL)?;
 
-    migrate_chunks_indexed_if_needed(conn)?;
     migrate_message_rowid_range_if_needed(conn)?;
     migrate_vector_rowid_range_if_needed(conn)?;
 
     Ok(())
 }
 
-fn migrate_parse_diagnostics_if_needed(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if table_def(&tx, "parse_diagnostics")?.is_some() {
-        tx.commit()?;
+fn create_generation_tracking(conn: &mut Connection) -> Result<()> {
+    if table_def(conn, "qa_chunk_generation")?.is_some() {
         return Ok(());
     }
-    tx.execute_batch(
-        "CREATE TABLE IF NOT EXISTS parse_diagnostics (
-            file_path TEXT PRIMARY KEY,
-            source TEXT NOT NULL,
-            invalid_json_lines INTEGER NOT NULL DEFAULT 0,
-            invalid_utf8_lines INTEGER NOT NULL DEFAULT 0,
-            incomplete_tail_lines INTEGER NOT NULL DEFAULT 0,
-            read_error INTEGER NOT NULL DEFAULT 0
-        );",
-    )?;
-
-    tx.execute("UPDATE sessions SET mtime = NULL", [])?;
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_file_size_if_needed(conn: &mut Connection) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if !table_def(&tx, "sessions")?.is_some_and(|sql| sql.contains("file_size")) {
-        tx.execute_batch("ALTER TABLE sessions ADD COLUMN file_size INTEGER;")?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_qa_chunk_generation_if_needed(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if !table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("generation")) {
-        tx.execute_batch(
-            "ALTER TABLE qa_chunks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
-        )?;
-    }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS qa_chunk_generation (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -365,104 +366,6 @@ pub(crate) fn table_def(conn: &Connection, name: &str) -> Result<Option<String>>
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
-}
-
-fn migrate_vec_chunks_if_needed(conn: &mut Connection) -> Result<()> {
-    let Some(sql) = table_def(conn, "vec_chunks")? else {
-        return Ok(());
-    };
-
-    // why-not: no warning; `model::check_index` refuses an identity-less index with old rows, so this table is empty
-    if !sql.contains("sub_idx") {
-        let tx = conn.transaction()?;
-        tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
-        if table_def(&tx, "qa_chunks")?.is_some_and(|sql| sql.contains("vec_rowid_lo")) {
-            tx.execute(
-                "UPDATE qa_chunks SET vec_rowid_lo = NULL, vec_rowid_hi = NULL",
-                [],
-            )?;
-        }
-        tx.commit()?;
-    }
-
-    Ok(())
-}
-
-fn migrate_qa_chunks_if_needed(conn: &mut Connection) -> Result<()> {
-    let Some(sql) = table_def(conn, "qa_chunks")? else {
-        return Ok(());
-    };
-
-    if sql.contains("chunk_hash") {
-        let tx = conn.transaction()?;
-        tx.execute_batch(
-            "DROP INDEX IF EXISTS idx_qa_chunks_hash;
-             ALTER TABLE qa_chunks DROP COLUMN chunk_hash;
-             ALTER TABLE qa_chunks DROP COLUMN user_text;
-             ALTER TABLE qa_chunks DROP COLUMN assistant_text;",
-        )?;
-        tx.commit()?;
-    }
-
-    Ok(())
-}
-
-fn migrate_qa_chunk_rowid_link_if_needed(conn: &mut Connection) -> Result<()> {
-    let Some(sql) = table_def(conn, "qa_chunks")? else {
-        return Ok(());
-    };
-
-    if !sql.contains("src_rowid_lo") {
-        let tx = conn.transaction()?;
-        tx.execute_batch(
-            "ALTER TABLE qa_chunks ADD COLUMN src_rowid_lo INTEGER;
-             ALTER TABLE qa_chunks ADD COLUMN src_rowid_hi INTEGER;",
-        )?;
-        tx.commit()?;
-    }
-
-    Ok(())
-}
-
-fn migrate_session_type_if_needed(conn: &mut Connection) -> Result<()> {
-    let Some(sql) = table_def(conn, "sessions")? else {
-        return Ok(());
-    };
-
-    if !sql.contains("session_type") {
-        let tx = conn.transaction()?;
-        tx.execute_batch("ALTER TABLE sessions ADD COLUMN session_type TEXT;")?;
-        tx.commit()?;
-    }
-
-    Ok(())
-}
-
-fn migrate_files_scanned_if_needed(conn: &mut Connection) -> Result<()> {
-    let Some(sql) = table_def(conn, "sessions")? else {
-        return Ok(());
-    };
-
-    if !sql.contains("files_scanned") {
-        let tx = conn.transaction()?;
-        tx.execute_batch("ALTER TABLE sessions ADD COLUMN files_scanned INTEGER;")?;
-        tx.commit()?;
-    }
-
-    Ok(())
-}
-
-fn migrate_chunks_indexed_if_needed(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction()?;
-    if table_def(&tx, "sessions")?.is_some_and(|sql| !sql.contains("chunks_indexed")) {
-        tx.execute_batch(
-            "ALTER TABLE sessions ADD COLUMN chunks_indexed INTEGER;
-             UPDATE sessions SET chunks_indexed = 1
-             WHERE EXISTS (SELECT 1 FROM qa_chunks c WHERE c.session_id = sessions.session_id);",
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
 }
 
 pub(crate) const EMPTY_MESSAGE_RANGE: (i64, i64) = (1, 0);
@@ -567,29 +470,6 @@ fn migrate_vector_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
                 }
             }
         }
-    }
-    tx.commit()?;
-    Ok(())
-}
-
-fn migrate_fts_if_needed(conn: &mut Connection) -> Result<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if table_def(&tx, "messages")?.is_some_and(|sql| !sql.contains(FTS_TOKENIZER)) {
-        info(&format!(
-            "recall: rebuilding the full-text index for the {FTS_TOKENIZER} tokenizer; sessions are kept"
-        ));
-        tx.execute_batch(&format!(
-            "DROP TABLE IF EXISTS messages_retokenized;
-             {}
-             INSERT INTO messages_retokenized (rowid, session_id, role, text)
-                 SELECT rowid, session_id, role, text FROM messages
-                 WHERE session_id IN (SELECT session_id FROM sessions);
-             DROP TABLE IF EXISTS messages_vocab;
-             DROP TABLE messages;
-             ALTER TABLE messages_retokenized RENAME TO messages;
-             {MESSAGES_VOCAB_SQL}",
-            messages_table_sql("messages_retokenized")
-        ))?;
     }
     tx.commit()?;
     Ok(())
