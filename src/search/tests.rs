@@ -2505,10 +2505,13 @@ fn excluded_automated_count_reports_a_broken_vocab_table_as_an_error() {
     conn.execute_batch("DROP TABLE messages_vocab; CREATE TABLE messages_vocab (term TEXT);")
         .unwrap();
 
-    let result = count_excluded_automated(&conn, Some("ab"), &SearchOptions::default());
+    let err = count_excluded_automated(&conn, Some("ab"), &SearchOptions::default()).unwrap_err();
 
     assert!(
-        result.is_err(),
-        "a vocab table without the cnt column must surface as an error, got {result:?}"
+        matches!(
+            err.downcast_ref::<SanitizeError>(),
+            Some(SanitizeError::VocabLookupFailed(_))
+        ),
+        "a vocab table without the cnt column must surface as a vocab lookup failure, got {err:?}"
     );
 }

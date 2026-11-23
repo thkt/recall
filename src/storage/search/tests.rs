@@ -404,14 +404,8 @@ fn prefix_only_returns_error() {
 }
 
 #[test]
-fn drop_dangling_operators_drops_operator_at_position_zero() {
-    let tokens: Vec<String> = vec!["AND".into(), "foo".into(), "bar".into()];
-    let result = drop_dangling_operators(&tokens);
-    assert_eq!(
-        result,
-        vec!["foo", "bar"],
-        "operator at index 0 has no left neighbour → must drop"
-    );
+fn an_operator_that_opens_the_query_is_dropped() {
+    assert_eq!(sanitize_fts_query("AND foo bar"), ok("foo bar"));
 }
 
 #[test]
@@ -498,9 +492,20 @@ fn operator_query_drops_short_terms_by_tree_position() {
 
 #[test]
 fn operator_query_rejects_a_not_without_a_usable_left_side() {
-    assert!(prepare_operator_query("zz NOT beta").is_err());
-    assert!(prepare_operator_query("NOT beta").is_err());
-    assert!(prepare_operator_query("alpha AND NOT beta").is_err());
+    for (query, message) in [
+        (
+            "zz NOT beta",
+            "NOT needs a left term of at least 3 characters",
+        ),
+        ("NOT beta", "NOT needs a term on its left"),
+        ("alpha AND NOT beta", "NOT needs a term on its left"),
+    ] {
+        assert_eq!(
+            prepare_operator_query(query).unwrap_err().to_string(),
+            message,
+            "query: {query:?}"
+        );
+    }
 }
 
 #[test]
