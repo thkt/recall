@@ -57,7 +57,8 @@ def main():
     env = dict(os.environ)
     for key in ("RECALL_TOKEN_BUDGET", "RECALL_FORWARD_PAUSE_MS", "CLAUDE_CODE_SESSION_ID"):
         env.pop(key, None)
-    env.update(RECALL_CLAUDE_DIR=str(source), RECALL_CODEX_DIR=str(output / "absent-codex"))
+    env.update(RECALL_CLAUDE_DIR=str(source), RECALL_CODEX_DIR=str(output / "absent-codex"),
+               RECALL_CODEX_ARCHIVED_DIR="")
 
     def turn(number):
         repeats = 64 if args.body_profile == "long" or (args.body_profile == "mixed" and number % 2) else 1
