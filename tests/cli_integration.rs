@@ -1638,7 +1638,7 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
     fs::create_dir(&claude).unwrap();
     fs::create_dir(&codex).unwrap();
     let path = claude.join("partial.jsonl");
-    let good = b"{\"type\":\"user\",\"message\":\"secret-conversation-body\"}\n";
+    let good = b"{\"type\":\"user\",\"message\":{\"content\":\"secret-conversation-body\"}}\n";
     let mut contents = good.to_vec();
     contents
         .extend_from_slice(b"{broken-secret-body\n\xff\n{\"type\":\"progress\"}\n{\"message\":");
@@ -1757,7 +1757,7 @@ fn index_reports_parse_loss_on_json_and_human_surfaces_until_source_repair() {
         &path,
         [
             good.as_slice(),
-            b"{\"type\":\"assistant\",\"message\":\"repaired-answer\"}\n",
+            b"{\"type\":\"assistant\",\"message\":{\"content\":\"repaired-answer\"}}\n",
         ]
         .concat(),
     )
@@ -1822,7 +1822,7 @@ fn index_reports_real_file_read_failure_then_recovers() {
     let path = claude.join("unreadable.jsonl");
     fs::write(
         &path,
-        "{\"type\":\"user\",\"message\":\"readable-again\"}\n",
+        "{\"type\":\"user\",\"message\":{\"content\":\"readable-again\"}}\n",
     )
     .unwrap();
     let run = || {

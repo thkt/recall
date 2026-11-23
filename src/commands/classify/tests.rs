@@ -20,7 +20,11 @@ fn seed_two_logless_unlabeled_sessions_and_one_labeled_interactive() -> (tempfil
 {
     let dir = tempfile::TempDir::new().unwrap();
     let tagged_log = dir.path().join("tagged.jsonl");
-    fs::write(&tagged_log, r#"{"type":"user","message":"question"}"#).unwrap();
+    fs::write(
+        &tagged_log,
+        r#"{"type":"user","message":{"content":"question"}}"#,
+    )
+    .unwrap();
     let db_path = dir.path().join("recall.db");
     let conn = open_or_create_db(&db_path).unwrap();
     conn.execute_batch(

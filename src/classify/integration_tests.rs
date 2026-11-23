@@ -233,7 +233,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             "agent-example",
             json!({"sessionId":"11111111-1111-4111-8111-111111111111","agentId":"example","isSidechain":true}),
             "Review this sample authentication module.",
-            true,
+            false,
         ),
         (
             "claude",
@@ -398,14 +398,14 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             *automated && classify_first_turn(text) == SessionType::Interactive
         })
         .count();
-    assert_eq!(baseline_mixing, 7);
+    assert_eq!(baseline_mixing, 6);
     let path = db_dir.path().join("test.db");
     let files = persistent_files(&path);
     assert!(!files[1].as_ref().unwrap().0.is_empty(), "live WAL fixture");
-    for (all, count) in [(false, 0), (true, 13)] {
+    for (all, count) in [(false, 0), (true, 12)] {
         let planned = run_classify(all, true, &Some(path.clone())).unwrap();
         assert_eq!(planned.data["classified"], count);
-        assert_eq!(planned.data["automated"], if all { 7 } else { 0 });
+        assert_eq!(planned.data["automated"], if all { 6 } else { 0 });
         assert!(!planned.degraded);
         assert!(
             persistent_files(&path) == files,
@@ -422,7 +422,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
     for _ in 0..2 {
         assert_eq!(
             reclassify_sessions(&mut conn, true, false).unwrap().len(),
-            13,
+            12,
         );
         assert_eq!(labels(&conn), expected);
         assert_eq!(bodies_and_vectors(&conn), before);
@@ -444,7 +444,7 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
     };
     let ordinary = ids(false);
     let inclusive = ids(true);
-    assert_eq!(ordinary.len(), 7);
+    assert_eq!(ordinary.len(), 8);
     assert_eq!(inclusive.len(), 14);
     for (_, id, _, _, automated) in cases {
         assert_eq!(
@@ -481,7 +481,8 @@ fn provenance_classification_removes_synthetic_contamination_without_human_omiss
             .iter()
             .map(|r| r.session.session_id.as_str())
             .collect();
-        assert_eq!(ids.contains(&"agent-example"), include_automated);
+        assert_eq!(ids.contains(&"agent-child"), include_automated);
+        assert!(ids.contains(&"agent-example"));
         assert!(ids.contains(&"agent-mismatch"));
         assert!(ids.contains(&"human"));
     }
@@ -558,7 +559,7 @@ fn reclassification_retries_after_a_writer_commits_during_source_read() {
     let path = root.path().join("index.db");
     let mut conn = open_db(&path).unwrap();
     let log = root.path().join("s.jsonl");
-    fs::write(&log, r#"{"type":"user","message":"question"}"#).unwrap();
+    fs::write(&log, r#"{"type":"user","message":{"content":"question"}}"#).unwrap();
     conn.execute(
         "INSERT INTO sessions (session_id, source, file_path) VALUES ('s', 'claude', ?1)",
         [log.to_str().unwrap()],

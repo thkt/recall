@@ -1,4 +1,3 @@
-use std::mem;
 use std::path::Path;
 
 use serde_json::Value;
@@ -83,33 +82,18 @@ pub(super) fn codex_automated(payload: &Value) -> bool {
     }
 }
 
-enum LegacyIdentity {
-    RuledOut,
-    Unconfirmed,
-    Parent(String),
-}
-
 pub(super) struct ClaudeOrigin<'a> {
     session_id: &'a str,
-    agent_id: Option<&'a str>,
     parent: Option<&'a str>,
-    legacy: LegacyIdentity,
     origin: SessionOrigin,
 }
 
 impl<'a> ClaudeOrigin<'a> {
     pub fn new(path: &'a Path, session_id: &'a str) -> Self {
-        let agent_id = claude_agent_id(path);
-        let parent = agent_id.and_then(|_| claude_parent(path));
+        let parent = claude_agent_id(path).and_then(|_| claude_parent(path));
         Self {
             session_id,
-            agent_id,
             parent,
-            legacy: if parent.is_none() && agent_id.is_some() {
-                LegacyIdentity::Unconfirmed
-            } else {
-                LegacyIdentity::RuledOut
-            },
             origin: SessionOrigin {
                 automated: parent.is_some(),
                 ..Default::default()
@@ -125,26 +109,12 @@ impl<'a> ClaudeOrigin<'a> {
             self.origin.has_records = true;
             self.origin.automated |= entry.sidechain;
         }
-        let id = entry.session_id;
-        if let Some(id) = id {
+        if let Some(id) = entry.session_id {
             self.origin.identity_conflict |= id != self.session_id && Some(id) != self.parent;
         }
-        let agrees = !entry.is_meta && entry.sidechain && entry.agent_id == self.agent_id;
-        let parent_id = id.filter(|id| agrees && is_uuid(id));
-        self.legacy = match (
-            mem::replace(&mut self.legacy, LegacyIdentity::RuledOut),
-            parent_id,
-        ) {
-            (LegacyIdentity::Unconfirmed, Some(id)) => LegacyIdentity::Parent(id.to_owned()),
-            (LegacyIdentity::Parent(expected), Some(id)) if expected == id => {
-                LegacyIdentity::Parent(expected)
-            }
-            _ => LegacyIdentity::RuledOut,
-        };
     }
 
     pub fn finish(mut self) -> SessionOrigin {
-        self.origin.identity_conflict &= matches!(self.legacy, LegacyIdentity::RuledOut);
         self.origin.automated &= !self.origin.identity_conflict;
         self.origin
     }

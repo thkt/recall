@@ -71,30 +71,24 @@ fn iso_timestamps_set_the_session_time_in_utc_milliseconds() {
         session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:30:45.12Z")),
         Some(1_772_368_245_120)
     );
-    assert_eq!(
-        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00+09:00")),
-        Some(1_772_334_000_000)
-    );
-    assert_eq!(
-        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00+0900")),
-        Some(1_772_334_000_000)
-    );
-    assert_eq!(
-        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00-05:00")),
-        Some(1_772_384_400_000)
-    );
-    assert_eq!(
-        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00.500+09:00")),
-        Some(1_772_334_000_500)
-    );
 }
 
 #[test]
-fn numeric_timestamps_are_taken_as_epoch_milliseconds() {
-    assert_eq!(
-        session_time_of_a_log_whose_only_entry_carries(&json!(1_709_251_200_000_i64)),
-        Some(1_709_251_200_000)
-    );
+fn timestamps_that_are_not_utc_strings_leave_the_session_without_a_time() {
+    for timestamp in [
+        json!("2026-03-01T12:00:00+09:00"),
+        json!("2026-03-01T12:00:00+0900"),
+        json!("2026-03-01T12:00:00-05:00"),
+        json!("2026-03-01T12:00:00.500+09:00"),
+        json!("2026-03-01T12:00:00"),
+        json!(1_709_251_200_000_i64),
+    ] {
+        assert_eq!(
+            session_time_of_a_log_whose_only_entry_carries(&timestamp),
+            None,
+            "{timestamp}"
+        );
+    }
 }
 
 #[test]
@@ -109,6 +103,14 @@ fn malformed_timestamps_leave_the_session_without_a_time() {
     );
     assert_eq!(
         session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T00:00:00Ü")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026/03/01T12:00:00Z")),
+        None
+    );
+    assert_eq!(
+        session_time_of_a_log_whose_only_entry_carries(&json!("2026-03-01T12:00:00.5xZ")),
         None
     );
     assert_eq!(
@@ -208,7 +210,7 @@ fn line_diagnostics_tell_corrupt_lines_from_a_possibly_unfinished_last_line() {
 }
 
 const CLAUDE_SIDECHAIN: &str =
-    r#"{"type":"user","sessionId":"sample","isSidechain":true,"message":"question"}"#;
+    r#"{"type":"user","sessionId":"sample","isSidechain":true,"message":{"content":"question"}}"#;
 const CLAUDE_OTHER_ID: &str = r#"{"type":"assistant","sessionId":"other"}"#;
 const CODEX_GUARDIAN: &str =
     r#"{"type":"session_meta","payload":{"id":"sample","source":{"internal":"guardian"}}}"#;
