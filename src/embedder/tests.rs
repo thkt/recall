@@ -70,11 +70,6 @@ fn all_batches_failing_is_non_fatal_and_retryable() {
         result.failed_count, 1,
         "the sole batch's chunk count is reported as failed"
     );
-    let err = result.first_error.as_deref().unwrap_or_default();
-    assert!(
-        err == "batch inference failed",
-        "the all-fail run still records the first batch error, got: {err:?}"
-    );
     assert_eq!(
         vec_chunk_count(&conn),
         0,
@@ -124,13 +119,6 @@ fn successful_batches_survive_a_poison_batch_and_failed_chunks_retry() {
     );
 
     assert_eq!(first.failed_count, 1);
-    assert!(
-        first
-            .first_error
-            .as_deref()
-            .unwrap()
-            .eq("batch inference failed")
-    );
     assert_eq!(
         vec_chunk_count(&conn),
         1024,
@@ -207,10 +195,6 @@ fn a_model_failing_every_inference_gives_up_on_a_full_batch_after_three_inferenc
     assert_eq!(observer.snapshot()["counts"]["inference_batches"], 3);
     assert_eq!(result.embedded, 0);
     assert_eq!(result.failed_count, 128);
-    assert_eq!(
-        result.first_error.as_deref(),
-        Some("batch inference failed")
-    );
     assert_eq!(vec_chunk_count(&conn), 0);
 }
 

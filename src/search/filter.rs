@@ -1,5 +1,3 @@
-use std::slice;
-
 use rusqlite::types::ToSql;
 
 use super::{CurrentSession, SearchOptions};
@@ -39,21 +37,11 @@ fn append_like_prefix_filter(
     sql: &mut String,
     p: &mut Vec<Box<dyn ToSql>>,
     col: &str,
-    vals: &[String],
+    v: Option<&str>,
 ) {
-    if !vals.is_empty() {
-        sql.push_str(" AND (");
-        sql.push_str(
-            &vals
-                .iter()
-                .map(|_| format!("{col} LIKE ? ESCAPE '\\'"))
-                .collect::<Vec<_>>()
-                .join(" OR "),
-        );
-        sql.push(')');
-        for v in vals {
-            p.push(Box::new(format!("{}%", escape_like(v))));
-        }
+    if let Some(v) = v {
+        sql.push_str(&format!(" AND ({col} LIKE ? ESCAPE '\\')"));
+        p.push(Box::new(format!("{}%", escape_like(v))));
     }
 }
 
@@ -68,9 +56,7 @@ pub(super) fn append_search_filters(
         sql.push_str(" AND ");
         sql.push_str(column);
         sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
-        if let Some(ref project) = opts.project {
-            append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
-        }
+        append_like_prefix_filter(sql, params, "s2.project", opts.project.as_deref());
         let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
         append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
         let source_str = opts.source.as_ref().map(Source::as_str);

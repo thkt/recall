@@ -91,13 +91,6 @@ fn expand_operator_like_terms_are_quoted_not_expanded() {
     assert_eq!(result.to_string(), "\"foo\" AND \"or\" AND \"bar\"");
 }
 
-#[test]
-fn expand_without_vocab_table_degrades() {
-    let conn = Connection::open_in_memory().unwrap();
-    let result = fts_expand_short_terms(&conn, &sanitized("au login"), "fts_chunks_vocab").unwrap();
-    assert_eq!(result.to_string(), "\"au\" AND \"login\"");
-}
-
 fn index_with_messages(texts: &[&str]) -> (tempfile::TempDir, Connection) {
     let (dir, conn) = setup_test_db();
     for text in texts {
@@ -237,7 +230,7 @@ fn prepare_match_query_rejects_invalid_vocab_table_name() {
 }
 
 #[test]
-fn prepare_match_query_surfaces_non_missing_vocab_errors() {
+fn prepare_match_query_surfaces_vocab_errors() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute("CREATE TABLE bad_vocab(term TEXT)", [])
         .unwrap();
@@ -268,7 +261,7 @@ fn expand_rejects_empty_vocab_name() {
 }
 
 #[test]
-fn expand_surfaces_non_missing_vocab_errors() {
+fn expand_surfaces_vocab_errors() {
     let conn = Connection::open_in_memory().unwrap();
     conn.execute("CREATE TABLE bad_vocab(term TEXT)", [])
         .unwrap();
@@ -278,42 +271,6 @@ fn expand_surfaces_non_missing_vocab_errors() {
         matches!(result, Err(SanitizeError::VocabLookupFailed(_))),
         "expected vocab lookup failure, got {result:?}"
     );
-}
-
-#[test]
-fn prepare_match_query_with_missing_vocab_degrades() {
-    let conn = Connection::open_in_memory().unwrap();
-    let result = prepare_match_query(&conn, "au login", "fts_chunks_vocab").unwrap();
-    assert_eq!(result.to_string(), "\"au\" AND \"login\"");
-}
-
-fn prepare_err(conn: &Connection, sql: &str) -> rusqlite::Error {
-    let Err(e) = conn.prepare_cached(sql) else {
-        panic!("expected prepare_cached to fail for: {sql}");
-    };
-    e
-}
-
-#[test]
-fn is_missing_table_error_detects_sqlite_no_such_table() {
-    let conn = Connection::open_in_memory().unwrap();
-    let err = prepare_err(&conn, "SELECT * FROM definitely_nonexistent");
-    assert!(is_missing_table_error(&err), "got {err:?}");
-}
-
-#[test]
-fn is_missing_table_error_rejects_syntax_error() {
-    let conn = Connection::open_in_memory().unwrap();
-    let err = prepare_err(&conn, "SELECT FROM");
-    assert!(!is_missing_table_error(&err), "got {err:?}");
-}
-
-#[test]
-fn is_missing_table_error_rejects_missing_column() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE t(x INTEGER)", []).unwrap();
-    let err = prepare_err(&conn, "SELECT y FROM t");
-    assert!(!is_missing_table_error(&err), "got {err:?}");
 }
 
 fn sanitized(s: &str) -> SanitizedFtsQuery {

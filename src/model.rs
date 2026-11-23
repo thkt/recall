@@ -221,8 +221,8 @@ impl EmbedderDegraded {
         }
     }
 }
-pub fn record_degraded(reason: DegradedReason, stage: &str) {
-    tracing::warn!(%reason,stage,"semantic search unavailable");
+pub fn record_degraded(reason: DegradedReason) {
+    tracing::warn!(%reason,stage="embedder load","semantic search unavailable");
 }
 pub fn degrade_with_warn<E: fmt::Display>(
     stage: &'static str,
