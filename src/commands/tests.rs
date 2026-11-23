@@ -56,6 +56,17 @@ fn create_db_file_errors_when_parent_cannot_be_created() {
 }
 
 #[test]
+fn opening_an_index_whose_parent_directory_cannot_be_created_fails_naming_the_database_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let blocker = dir.path().join("not_a_dir");
+    create_db_file(&blocker).unwrap();
+
+    let err = open_or_create_db(&blocker.join("sub").join("recall.db")).unwrap_err();
+
+    assert_eq!(err.to_string(), "Failed to create database file");
+}
+
+#[test]
 fn opening_an_index_for_another_model_for_writing_fails_before_changing_its_schema_or_journal_mode()
 {
     let dir = tempfile::TempDir::new().unwrap();
