@@ -69,7 +69,7 @@ pub(crate) struct SearchArgs {
 
 fn fallback_notes_the_loader_already_printed(reason: DegradedReason) -> Vec<Note> {
     EmbedderDegraded(reason)
-        .user_note("recall model download")
+        .user_note()
         .map(|note| vec![Note::shown(format!("semantic search unavailable: {note}"))])
         .unwrap_or_default()
 }

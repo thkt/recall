@@ -247,7 +247,7 @@ where
 
 fn search_degraded_note(reason: DegradedReason) -> Option<String> {
     EmbedderDegraded(reason)
-        .user_note("recall model download")
+        .user_note()
         .map(|note| format!("note: {note}."))
 }
 

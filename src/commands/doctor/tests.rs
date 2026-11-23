@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::commands::search::run_search_in;
 use crate::embedder;
-use crate::embedding::{ChunkedEmbedding, EmbedError};
+use crate::embedding::{ChunkedEmbedding, EmbedError, EmbedOptions};
 use crate::envelope::render_text_notes;
 use crate::model::tests::{CachedArtifacts, FakeHost};
 use crate::open_or_create_db;
@@ -25,10 +25,11 @@ impl Embed for WidthEmbedder {
     fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
         unreachable!("doctor probe only calls embed_query")
     }
-    fn embed_documents_batch(&self, _texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        unreachable!("doctor probe only calls embed_query")
-    }
-    fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
+    fn embed_documents_batch(
+        &self,
+        _texts: &[&str],
+        _options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
         unreachable!("doctor probe only calls embed_query")
     }
 }

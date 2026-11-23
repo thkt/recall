@@ -63,15 +63,15 @@ pub(crate) fn run_status_with(
         writeln!(buf, "Sessions: {sessions}")?;
         writeln!(buf, "QA chunks: {chunks}")?;
         writeln!(buf, "Embedded: {embedded}/{chunks}")?;
-        writeln!(
-            buf,
-            "Model: {}",
-            if model_ok {
-                "ready"
-            } else {
-                "not installed (run `recall model download`)"
-            }
-        )?;
+        if model_ok {
+            writeln!(buf, "Model: ready")?;
+        } else {
+            writeln!(
+                buf,
+                "Model: not installed (run `{}`)",
+                model::DOWNLOAD_COMMAND
+            )?;
+        }
         if verbose {
             writeln!(buf, "DB: {}", path.display())?;
         }

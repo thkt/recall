@@ -3,10 +3,10 @@ use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{panic, thread};
 
+use crate::compat::anon_placeholders;
 use crate::compat::filter::{
     append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
 };
-use crate::compat::{anon_placeholders, clean_for_trigram};
 use crate::embedding::Embed;
 use crate::storage::{
     MIN_TRIGRAM_TERM_CHARS, SanitizeError, prepare_match_query, prepare_operator_query,
@@ -21,7 +21,7 @@ use crate::date::MS_PER_DAY;
 use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
-use crate::hybrid::{self, MAX_RECENCY_FACTOR, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
+use crate::hybrid::{self, MAX_RECENCY_FACTOR, rrf_merge_sessions};
 use crate::model;
 use crate::parser::{SessionData, Source};
 
@@ -607,7 +607,6 @@ struct VecHit {
 fn vec_search(
     conn: &Connection,
     embedding: &[f32],
-    limit: usize,
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<VecHit>> {
@@ -629,7 +628,7 @@ fn vec_search(
     append_search_filters(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
     let sql = format!("SELECT session_id, id, d FROM ({sql}) WHERE n = 1 ORDER BY d, session_id");
 
-    let limit_i64 = limit as i64;
+    let limit_i64 = VEC_CANDIDATE_COUNT as i64;
     let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());
     refs.push(&embedding_bytes);
     refs.push(&limit_i64);
@@ -741,7 +740,7 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
     };
     match prepare_match_query(conn, &fts_input, "messages_vocab") {
         Ok(m) => Ok(Some(KeywordQuery {
-            fts: clean_for_trigram(&m),
+            fts: m.to_trigram_match(),
             not_operands: Vec::new(),
             embed_text: None,
         })),
@@ -926,7 +925,7 @@ pub fn search_with_embedder<'q>(
 
     let vec_hits = match embedding
         .map_err(anyhow::Error::from)
-        .and_then(|embedding| vec_search(conn, &embedding, VEC_CANDIDATE_COUNT, opts, now_ms))
+        .and_then(|embedding| vec_search(conn, &embedding, opts, now_ms))
     {
         Ok(hits) => hits,
         Err(e) => {
@@ -1000,7 +999,6 @@ pub fn search_with_embedder<'q>(
         &mut merged,
         |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
         now_ms,
-        RECENCY_BOOST_WEIGHT,
     );
     let limit_score = at_limit(&merged, opts.limit).map(|(_, score)| *score);
     let incomplete = incomplete || left_out_session_could_rank(pruned_best, limit_score);

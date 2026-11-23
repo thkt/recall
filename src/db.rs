@@ -582,12 +582,18 @@ pub(crate) fn open_existing_db(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+const ORPHAN_EMBEDDINGS: &str = "FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)";
+
+pub(crate) fn count_orphan_embeddings(conn: &Connection) -> Result<i64> {
+    Ok(
+        conn.query_row(&format!("SELECT COUNT(*) {ORPHAN_EMBEDDINGS}"), [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 pub(crate) fn fix_orphan_embeddings(conn: &Connection) -> Result<usize> {
-    let deleted = conn.execute(
-        "DELETE FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
-        [],
-    )?;
-    Ok(deleted)
+    Ok(conn.execute(&format!("DELETE {ORPHAN_EMBEDDINGS}"), [])?)
 }
 
 #[cfg(test)]

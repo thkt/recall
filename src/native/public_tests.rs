@@ -50,7 +50,7 @@ fn public_model_contract() {
             &texts[..]
         };
         let out = gemma
-            .embed_documents_batch_with_options(
+            .embed_documents_batch(
                 inputs,
                 &EmbedOptions {
                     token_budget: budget,
@@ -73,7 +73,12 @@ fn public_model_contract() {
             );
         }
     }
-    assert!(gemma.embed_documents_batch(&[]).unwrap().is_empty());
+    assert!(
+        gemma
+            .embed_documents_batch(&[], &EmbedOptions::default())
+            .unwrap()
+            .is_empty()
+    );
     {
         let model = gemma.model.lock().unwrap();
         assert!(Gemma::encode(&model, &[], &EmbedOptions::default()).is_err());
@@ -92,9 +97,7 @@ fn public_model_contract() {
                         == target
                 })
                 .expect("exact tokenizer boundary");
-            let tokens = gemma
-                .query_tokens(&model, &text, &gemma.spec.query_prefix)
-                .unwrap();
+            let tokens = gemma.query_tokens(&model, &text).unwrap();
             assert_eq!(tokens.len(), target.min(MAX_TOKENS));
             if target > MAX_TOKENS {
                 assert_eq!(tokens.last(), Some(&model.vocab().eos()));

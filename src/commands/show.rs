@@ -38,6 +38,16 @@ fn write_show_header(
     writeln!(buf)
 }
 
+fn session_data(session: &parser::SessionData) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session.session_id,
+        "slug": session.slug,
+        "project": session.project,
+        "source": session.source.to_string(),
+        "timestamp": session.timestamp,
+    })
+}
+
 fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<CommandOutput> {
     let session = resolve_session(conn, session_id)?;
 
@@ -58,17 +68,11 @@ fn show_session(conn: &Connection, session_id: &str, verbose: bool) -> Result<Co
         Ok(())
     });
 
-    let data = serde_json::json!({
-        "session_id": session.session_id,
-        "slug": session.slug,
-        "project": session.project,
-        "source": session.source.to_string(),
-        "timestamp": session.timestamp,
-        "messages": messages
-            .iter()
-            .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
-            .collect::<Vec<_>>(),
-    });
+    let mut data = session_data(&session);
+    data["messages"] = messages
+        .iter()
+        .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
+        .collect();
 
     Ok(CommandOutput::ok(markdown, data))
 }
@@ -228,24 +232,20 @@ fn render_windowed(
         Ok(())
     });
 
-    let data = serde_json::json!({
-        "session_id": session.session_id,
-        "slug": session.slug,
-        "project": session.project,
-        "source": session.source.to_string(),
-        "timestamp": session.timestamp,
-        "chunk": chunk_id,
-        "window": n,
-        "messages": slice
-            .iter()
-            .map(|(rid, role, text)| serde_json::json!({
+    let mut data = session_data(session);
+    data["chunk"] = chunk_id.into();
+    data["window"] = n.into();
+    data["messages"] = slice
+        .iter()
+        .map(|(rid, role, text)| {
+            serde_json::json!({
                 "rowid": rid,
                 "role": role,
                 "text": cap_message(text),
                 "in_chunk": *rid >= lo && *rid <= hi,
-            }))
-            .collect::<Vec<_>>(),
-    });
+            })
+        })
+        .collect();
 
     Ok(CommandOutput::ok(markdown, data))
 }
@@ -269,17 +269,11 @@ fn render_chunk_fallback(
         writeln!(buf, "{hint}")
     });
 
-    let data = serde_json::json!({
-        "session_id": session.session_id,
-        "slug": session.slug,
-        "project": session.project,
-        "source": session.source.to_string(),
-        "timestamp": session.timestamp,
-        "chunk": chunk_id,
-        "content": body,
-        "windowed": false,
-        "next_step": hint,
-    });
+    let mut data = session_data(session);
+    data["chunk"] = chunk_id.into();
+    data["content"] = body.into();
+    data["windowed"] = false.into();
+    data["next_step"] = hint.into();
 
     CommandOutput::ok(markdown, data)
 }

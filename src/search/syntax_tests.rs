@@ -6,7 +6,7 @@ use rusqlite::ffi::{self, SQLITE_BUSY, SQLITE_CORRUPT_VTAB, SQLITE_ERROR};
 use super::*;
 use crate::db::setup_test_db;
 use crate::embedder::MockEmbedder;
-use crate::embedding::{ChunkedEmbedding, EmbedError};
+use crate::embedding::{ChunkedEmbedding, EmbedError, EmbedOptions};
 
 const TS: i64 = 1709251200000;
 
@@ -462,10 +462,11 @@ impl Embed for EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
     fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
         unreachable!("search only calls embed_query")
     }
-    fn embed_documents_batch(&self, _texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        unreachable!("search only calls embed_query")
-    }
-    fn embed_text(&self, _text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
+    fn embed_documents_batch(
+        &self,
+        _texts: &[&str],
+        _options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
         unreachable!("search only calls embed_query")
     }
 }

@@ -45,15 +45,11 @@ pub struct EmbedOptions {
 pub trait Embed: Send + Sync {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError>;
     fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError>;
-    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError>;
-    fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError>;
-    fn embed_documents_batch_with_options(
+    fn embed_documents_batch(
         &self,
         texts: &[&str],
-        _options: &EmbedOptions,
-    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        self.embed_documents_batch(texts)
-    }
+        options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError>;
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use crate::compat::assert_filter_symmetric;
 use super::*;
 use crate::db::{seed_session_file, setup_test_db};
 use crate::embedder::MockEmbedder;
+use crate::hybrid::RECENCY_BOOST_WEIGHT;
 use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
 
 const NOW_MS: i64 = 1_750_000_000_000;

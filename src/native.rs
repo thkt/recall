@@ -131,12 +131,8 @@ impl Gemma {
         result
     }
 
-    fn query_tokens(
-        &self,
-        model: &LlamaModel,
-        text: &str,
-        prefix: &str,
-    ) -> Result<Vec<LlamaToken>> {
+    fn query_tokens(&self, model: &LlamaModel, text: &str) -> Result<Vec<LlamaToken>> {
+        let prefix = &self.spec.query_prefix;
         let mut t = model
             .vocab()
             .tokenize(format!("{prefix}{text}").as_bytes(), true, false);
@@ -219,23 +215,19 @@ impl Gemma {
 
 impl Embed for Gemma {
     fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        self.embed_text(text, &self.spec.query_prefix)
-    }
-    fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
         let m = self
             .model
             .lock()
             .map_err(|_| anyhow::anyhow!("model lock poisoned"))?;
-        let t = self.query_tokens(&m, text, prefix)?;
+        let t = self.query_tokens(&m, text)?;
         Ok(Self::encode(&m, &[t], &EmbedOptions::default())?.remove(0))
     }
     fn embed_document(&self, text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-        Ok(self.embed_documents_batch(&[text])?.remove(0))
+        Ok(self
+            .embed_documents_batch(&[text], &EmbedOptions::default())?
+            .remove(0))
     }
-    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        self.embed_documents_batch_with_options(texts, &EmbedOptions::default())
-    }
-    fn embed_documents_batch_with_options(
+    fn embed_documents_batch(
         &self,
         texts: &[&str],
         options: &EmbedOptions,
