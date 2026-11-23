@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{panic, thread};
 
 use crate::compat::anon_placeholders;
 use crate::compat::filter::{
@@ -436,9 +437,6 @@ fn fts_rows_per_session<T>(
     pick: &str,
     decode: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
 ) -> Result<HashMap<String, T>> {
-    if session_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
     let sql = format!(
         "SELECT session_id, {pick} FROM messages \
          WHERE messages MATCH ? AND session_id IN ({}) GROUP BY session_id",
@@ -464,9 +462,6 @@ fn best_matching_messages(
     fts_query: &str,
     session_ids: &[&str],
 ) -> Result<HashMap<String, i64>> {
-    if session_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
     let sql = format!(
         "SELECT session_id, rowid, rank FROM messages \
          WHERE messages MATCH ? AND session_id IN ({})",
@@ -611,13 +606,11 @@ struct VecHit {
 
 fn vec_search(
     conn: &Connection,
-    embedder: &dyn Embed,
-    query: &str,
+    embedding: &[f32],
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<VecHit>> {
-    let embedding = model::timed("query embedding", || embedder.embed_query(query))?;
-    let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
+    let embedding_bytes: &[u8] = f32_as_bytes(embedding);
 
     let mut sql = String::from(
         "SELECT c.session_id, c.id, v.distance AS d, row_number() OVER ( \
@@ -893,35 +886,47 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
-    let found = match fts_query {
-        Some(q) => find_keyword_sessions(conn, opts, q, now_ms)?,
-        None => KeywordSessions::default(),
+    let hybrid_embedder = match embedder {
+        Some(embedder) => has_vec_data(conn).map(|has_data| has_data.then_some(embedder)),
+        None => Ok(None),
     };
+    let embed_text = keyword.embed_text.as_deref().unwrap_or(query);
 
-    let run_hybrid = match embedder {
-        Some(_) => match has_vec_data(conn) {
-            Ok(has_data) => has_data,
-            Err(e) => {
-                warn!(error = %e, "vec_chunks probe failed, using text search only");
-                return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
-            }
-        },
-        None => false,
-    };
+    let (found, embedding) = thread::scope(|scope| {
+        let embedding = match &hybrid_embedder {
+            Ok(Some(embedder)) => Some(scope.spawn(move || {
+                model::timed("query embedding", || embedder.embed_query(embed_text))
+            })),
+            _ => None,
+        };
+        let found = match fts_query {
+            Some(q) => find_keyword_sessions(conn, opts, q, now_ms),
+            None => Ok(KeywordSessions::default()),
+        };
+        let embedding = embedding.map(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|payload| panic::resume_unwind(payload))
+        });
+        (found, embedding)
+    });
+    let found = found?;
 
-    let Some(embedder) = embedder.filter(|_| run_hybrid) else {
+    if let Err(e) = &hybrid_embedder {
+        warn!(error = %e, "vec_chunks probe failed, using text search only");
+        return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
+    }
+
+    let Some(embedding) = embedding else {
         return keyword_only_outcome(conn, fts_query, found, opts, now_ms, false);
     };
 
     let incomplete = found.unreadable_rows;
 
-    let vec_hits = match vec_search(
-        conn,
-        embedder,
-        keyword.embed_text.as_deref().unwrap_or(query),
-        opts,
-        now_ms,
-    ) {
+    let vec_hits = match embedding
+        .map_err(anyhow::Error::from)
+        .and_then(|embedding| vec_search(conn, &embedding, opts, now_ms))
+    {
         Ok(hits) => hits,
         Err(e) => {
             warn!(error = %e, "vector search failed, using text search only");
@@ -942,14 +947,6 @@ pub fn search_with_embedder<'q>(
     let fts_ids: HashSet<&str> = found.order.iter().map(|(sid, _)| sid.as_str()).collect();
     let vec_degraded =
         drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
-
-    if merged.is_empty() {
-        return Ok(SearchOutcome {
-            results: Vec::new(),
-            vec_degraded,
-            results_incomplete: incomplete,
-        });
-    }
 
     let vec_only: Vec<&str> = merged
         .iter()

@@ -15,43 +15,62 @@ use crate::model::{self, DegradedReason, IndexIdentityError, download_and_verify
 use crate::runtime::info as cli_info;
 use crate::{resolve_db_path, try_load_embedder_cached_with};
 
+enum CheckStatus {
+    Pass,
+    Info(String),
+    Fail {
+        detail: String,
+        remedy: &'static str,
+    },
+}
+
 struct DoctorCheck {
     name: &'static str,
-    ok: bool,
-    detail: Option<String>,
-    remedy: Option<&'static str>,
+    status: CheckStatus,
 }
 
 impl DoctorCheck {
     fn pass(name: &'static str) -> Self {
         Self {
             name,
-            ok: true,
-            detail: None,
-            remedy: None,
+            status: CheckStatus::Pass,
         }
     }
 
     fn info(name: &'static str, detail: String) -> Self {
         Self {
             name,
-            ok: true,
-            detail: Some(detail),
-            remedy: None,
+            status: CheckStatus::Info(detail),
         }
     }
 
     fn fail(name: &'static str, detail: String, remedy: &'static str) -> Self {
         Self {
             name,
-            ok: false,
-            detail: Some(detail),
-            remedy: Some(remedy),
+            status: CheckStatus::Fail { detail, remedy },
+        }
+    }
+
+    fn ok(&self) -> bool {
+        !matches!(self.status, CheckStatus::Fail { .. })
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match &self.status {
+            CheckStatus::Pass => None,
+            CheckStatus::Info(detail) | CheckStatus::Fail { detail, .. } => Some(detail),
+        }
+    }
+
+    fn remedy(&self) -> Option<&'static str> {
+        match self.status {
+            CheckStatus::Fail { remedy, .. } => Some(remedy),
+            CheckStatus::Pass | CheckStatus::Info(_) => None,
         }
     }
 
     fn is_fully_usable(&self) -> bool {
-        self.ok && self.detail.is_none()
+        matches!(self.status, CheckStatus::Pass)
     }
 }
 
@@ -319,7 +338,7 @@ fn render_doctor_report(
     repairs: &Option<Vec<RepairOutcome>>,
     model_recovery: &ModelRecovery,
 ) -> CommandOutput {
-    let healthy = checks.iter().all(|c| c.ok);
+    let healthy = checks.iter().all(DoctorCheck::ok);
     let notes = doctor_notes(checks, repairs, model_recovery);
     let markdown = doctor_markdown(verbose, path, healthy, checks, repairs, model_recovery);
     let data = doctor_data(healthy, checks, repairs, model_recovery);
@@ -338,7 +357,10 @@ fn doctor_notes(
 ) -> Vec<Note> {
     let mut notes: Vec<Note> = checks
         .iter()
-        .filter_map(|c| c.remedy.map(|r| Note::shown(format!("{}: {}", c.name, r))))
+        .filter_map(|c| {
+            c.remedy()
+                .map(|r| Note::shown(format!("{}: {}", c.name, r)))
+        })
         .collect();
     if let Some(outcomes) = repairs {
         for o in outcomes {
@@ -389,16 +411,15 @@ fn doctor_markdown(
             ModelRecovery::Skipped => {}
         }
         for c in checks {
-            let status = if c.ok { "ok" } else { "FAIL" };
-            match (&c.detail, c.remedy) {
-                (Some(detail), Some(remedy)) => {
-                    writeln!(buf, "  {} [{status}] {detail} -> {remedy}", c.name)?;
+            match &c.status {
+                CheckStatus::Fail { detail, remedy } => {
+                    writeln!(buf, "  {} [FAIL] {detail} -> {remedy}", c.name)?;
                 }
-                (Some(detail), None) => {
-                    writeln!(buf, "  {} [{status}] {detail}", c.name)?;
+                CheckStatus::Info(detail) => {
+                    writeln!(buf, "  {} [ok] {detail}", c.name)?;
                 }
-                (None, _) => {
-                    writeln!(buf, "  {} [{status}]", c.name)?;
+                CheckStatus::Pass => {
+                    writeln!(buf, "  {} [ok]", c.name)?;
                 }
             }
         }
@@ -420,9 +441,9 @@ fn doctor_data(
         .map(|c| {
             serde_json::json!({
                 "name": c.name,
-                "ok": c.ok,
-                "detail": c.detail,
-                "remedy": c.remedy,
+                "ok": c.ok(),
+                "detail": c.detail(),
+                "remedy": c.remedy(),
             })
         })
         .collect();

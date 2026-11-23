@@ -1743,6 +1743,24 @@ fn an_index_without_embeddings_answers_from_text_without_flags() {
 }
 
 #[test]
+fn an_index_without_embeddings_never_asks_the_model_to_embed_the_query() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "s1", "user", "authentication flow discussion");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &at_now(),
+        Some(&MockEmbedder::failing_after(0)),
+    )
+    .unwrap();
+
+    assert_eq!(ids(&outcome.results), ["s1"]);
+    assert!(!outcome.vec_degraded);
+}
+
+#[test]
 fn hybrid_search_drops_an_unknown_source_and_flags_incomplete_only() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
