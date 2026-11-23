@@ -24,13 +24,31 @@ jobs:
           submodules: recursive
 
       - name: Install Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
           components: clippy, rustfmt
 
+      - name: Give the vendored sources a fixed modification time
+        run: find vendor -exec touch -h -t 202001010000 {} +
+
+      - name: Hash the vendored sources
+        id: vendor
+        run: echo "hash=$(git ls-files -s vendor | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Cache the llama.cpp build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/build/llama-cpp-sys-2
+            target/debug/build/llama-cpp-2
+          key: llama-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            llama-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-
 
       - name: Format check
         run: cargo fmt -- --check
@@ -49,7 +67,6 @@ jobs:
   coverage:
     runs-on: macos-latest
     timeout-minutes: 30
-    if: github.event_name == 'pull_request'
     permissions:
       contents: read
 
@@ -61,31 +78,85 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust
+        id: toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: stable
           components: llvm-tools-preview
 
+      - name: Give the vendored sources a fixed modification time
+        run: find vendor -exec touch -h -t 202001010000 {} +
+
+      - name: Hash the vendored sources
+        id: vendor
+        run: echo "hash=$(git ls-files -s vendor | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Cache the llama.cpp build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/llvm-cov-target/debug/build/llama-cpp-sys-2
+            target/llvm-cov-target/debug/build/llama-cpp-2
+          key: llama-coverage-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            llama-coverage-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-llvm-cov
 
+      - name: Install the Python tools
+        run: |
+          python3 -m venv /tmp/ci-venv
+          /tmp/ci-venv/bin/pip install --quiet pytest diff-cover
+
+      - name: Test the Python scripts
+        run: |
+          /tmp/ci-venv/bin/python -m pytest \
+            .github/scripts/test_filter_lcov_cfg_test.py \
+            scripts/test_measure_search.py -q
+
       - name: Measure standard tests
         run: |
           cargo llvm-cov clean --workspace
           cargo llvm-cov --locked --no-report
 
+      - name: Decide whether the real-model tests must run
+        id: model
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MODEL_PATHS: '^(src/(native|model|embedder|embedding)|vendor/|Cargo\.(toml|lock)$|tests/gemma_cli\.rs$|scripts/fetch-gemma-test-artifacts\.py$|\.github/workflows/ci\.yml$)'
+        run: |
+          needed=false
+          if [ "$EVENT_NAME" != pull_request ]; then
+            needed=true
+          else
+            git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+            if git diff --name-only origin/main...HEAD | grep -Eq "$MODEL_PATHS"; then
+              needed=true
+            else
+              cargo llvm-cov report --lcov --output-path lcov.info
+              python3 .github/scripts/filter_lcov_cfg_test.py \
+                lcov.info lcov.filtered.info --repo-root "$GITHUB_WORKSPACE"
+              /tmp/ci-venv/bin/diff-cover lcov.filtered.info \
+                --compare-branch=origin/main --fail-under=95 || needed=true
+            fi
+          fi
+          echo "needed=$needed" >> "$GITHUB_OUTPUT"
+
       - name: Stage checksum-pinned public Gemma artifacts
+        if: steps.model.outputs.needed == 'true'
         run: |
           target/llvm-cov-target/debug/recall model manifest > "$RUNNER_TEMP/gemma-manifest.json"
           python3 scripts/fetch-gemma-test-artifacts.py \
             "$RUNNER_TEMP/gemma-manifest.json" "$RUNNER_TEMP/gemma-public-model"
 
       - name: Measure public model inference contracts
+        if: steps.model.outputs.needed == 'true'
         env:
           RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
           RECALL_MODEL_DIR: ${{ runner.temp }}/gemma-public-model
@@ -94,6 +165,7 @@ jobs:
             --ignored public_model_contract --test-threads=1
 
       - name: Measure public model CLI and probe contracts
+        if: steps.model.outputs.needed == 'true'
         env:
           RECALL_GEMMA_TEST_ARTIFACT_DIR: ${{ runner.temp }}/gemma-public-model
         run: |
@@ -103,14 +175,6 @@ jobs:
       - name: Generate combined lcov coverage
         run: cargo llvm-cov report --lcov --output-path lcov.info
 
-      - name: Test the Python scripts
-        run: |
-          python3 -m venv /tmp/pytest-venv
-          /tmp/pytest-venv/bin/pip install --quiet pytest
-          /tmp/pytest-venv/bin/python -m pytest \
-            .github/scripts/test_filter_lcov_cfg_test.py \
-            scripts/test_measure_search.py -q
-
       - name: Strip cfg(test) blocks from lcov via filter script
         run: |
           python3 .github/scripts/filter_lcov_cfg_test.py \
@@ -119,11 +183,10 @@ jobs:
             --repo-root "$GITHUB_WORKSPACE"
 
       - name: Diff coverage gate (changed lines >= 95%)
+        if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-          python3 -m venv /tmp/diff-cover-venv
-          /tmp/diff-cover-venv/bin/pip install --quiet diff-cover
-          /tmp/diff-cover-venv/bin/diff-cover lcov.filtered.info \
+          /tmp/ci-venv/bin/diff-cover lcov.filtered.info \
             --compare-branch=origin/main \
             --fail-under=95
 
