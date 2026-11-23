@@ -7,7 +7,7 @@ mod stale_snapshot_note;
 use stale_snapshot_note::READ_ONLY_DIR_NOTE;
 
 #[test]
-fn test_open_db_creates_schema() {
+fn a_new_index_opens_with_empty_tables_its_two_indexes_and_the_current_schema() {
     let tmp = NamedTempFile::new().unwrap();
     let conn = open_db(tmp.path()).unwrap();
 
@@ -67,7 +67,7 @@ fn an_opened_database_runs_the_pinned_sqlite_vec() {
 }
 
 #[test]
-fn test_open_db_idempotent() {
+fn opening_an_index_a_second_time_leaves_its_schema_unchanged() {
     let tmp = NamedTempFile::new().unwrap();
     let first = schema_snapshot(&open_db(tmp.path()).unwrap());
 
@@ -185,7 +185,7 @@ fn a_failed_parse_diagnostics_upgrade_leaves_the_schema_and_the_session_times_as
 }
 
 #[test]
-fn test_session_type_migration_adds_column_preserving_rows() {
+fn upgrading_an_index_without_session_types_keeps_its_session_rows() {
     let tmp = NamedTempFile::new().unwrap();
     {
         let conn = Connection::open(tmp.path()).unwrap();
@@ -440,7 +440,7 @@ fn create_pre_cleanup_db(path: &Path) {
 }
 
 #[test]
-fn test_qa_chunks_migration_drops_write_only_columns_preserving_embeddings() {
+fn upgrading_an_index_with_write_only_chunk_columns_drops_them_and_keeps_chunks_and_embeddings() {
     let tmp = NamedTempFile::new().unwrap();
     create_pre_cleanup_db(tmp.path());
 
@@ -624,7 +624,7 @@ fn file_names(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn test_stale_wal_note_immutable_nonempty_wal_is_some() {
+fn stale_snapshot_note_in_a_writable_directory_asks_to_run_recall_index_and_leaves_no_probe_file() {
     let dir = tempfile::TempDir::new().unwrap();
     let db = dir.path().join("recall.db");
     fs::write(wal_path(&db), b"uncommitted").unwrap();

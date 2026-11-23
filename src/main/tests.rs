@@ -130,27 +130,27 @@ fn exit_code_for_write_maps_written_to_success() {
 }
 
 #[test]
-fn test_search_requires_query_or_file_at_parse_time() {
+fn search_without_a_query_or_file_is_rejected_when_arguments_are_parsed() {
     assert!(Cli::try_parse_from(["recall", "search"]).is_err());
     assert!(Cli::try_parse_from(["recall", "search", "--file", "a.rs"]).is_ok());
     assert!(Cli::try_parse_from(["recall", "search", "auth"]).is_ok());
 }
 
 #[test]
-fn test_rebuild_is_a_distinct_subcommand() {
+fn rebuild_parses_as_its_own_subcommand() {
     let cli = Cli::try_parse_from(["recall", "rebuild"]).unwrap();
     assert_matches!(cli.command, Some(Command::Rebuild { .. }));
 }
 
 #[test]
-fn test_index_no_longer_accepts_force_flag() {
+fn index_rejects_a_force_flag_and_parses_without_it() {
     assert!(Cli::try_parse_from(["recall", "index", "--force"]).is_err());
     let cli = Cli::try_parse_from(["recall", "index"]).unwrap();
     assert_matches!(cli.command, Some(Command::Index { .. }));
 }
 
 #[test]
-fn test_rebuild_recognized_by_shorthand_expansion() {
+fn rebuild_is_not_rewritten_into_a_search_query() {
     let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
     assert!(try_expand_shorthand(&args).is_none());
 }
