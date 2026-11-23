@@ -1,5 +1,5 @@
 ---
-status: "proposed"
+status: "accepted"
 date: "2026-11-23"
 decision-makers: "thkt"
 scope: "Which index shapes recall opens (schema_state and open_db in src/db.rs) and which schema migrations create_schema runs. The two migrations added after v0.16.1 (DR 0019, DR 0020), the model identity check (model::check_index) and row-level fallbacks for rows an older recall wrote are out of scope"
@@ -131,7 +131,7 @@ Move the ten functions behind a subcommand.
 
 ## More Information
 
-Supersedes DR 0017 when this record is accepted: `migrate_fts_if_needed`, its contract, is deleted. DR 0017's status is left unchanged while this record is proposed.
+Supersedes DR 0017: `migrate_fts_if_needed`, its contract, is deleted.
 
 Narrows DR 0007 as stated in Decision Outcome. DR 0007 itself is left unchanged.
 
@@ -139,7 +139,7 @@ DR 0005 keeps its `instr` fallback and `backfill_rowid_ranges` for chunks with a
 
 Release dates and first tags come from `git tag --contains` on e4bdde9, d8e798e, 92c1125, db6e29b, da5a4c0 (all v0.14.0), 3460eb1 (v0.13.0), 1bce16a and cee91c2 (no tag). The ten deleted functions are the complete migration set of `git show v0.16.1:src/db.rs`. In v0.14.0 through v0.16.1, `migrate_chunks_indexed_if_needed` runs last of the ten.
 
-Agreement: thkt, 2026-11-23, in the session that produced PR #504 ("古すぎる情報は切り捨てていい"). The floor at v0.14.0, the two-state split and the refusal wording are proposed here and not yet confirmed.
+Agreement: thkt, 2026-11-23, in the session that produced PR #504 ("古すぎる情報は切り捨てていい"). thkt confirmed the floor at v0.14.0, the refusal wording and the absence of a warning period in the same session, after reading PR #505.
 
 Challenge (2026-11-23): weakened. It holds while the refusal is decided only from pre-v0.14.0 markers in stored definitions, an interrupted create is still finished, and `doctor` and `classify --dry-run` refuse through the same check as the other commands. The critic-design corrections are in the sections above.
 
