@@ -1,6 +1,6 @@
 ---
-status: "accepted"
-date: 2026-11-13
+status: "superseded by DR-0022"
+date: 2026-11-23
 decision-makers: thkt
 scope: "src/db.rs schema migrations run by create_schema, chiefly migrate_fts_if_needed; deletions by the indexer (cleanup_orphans, DR 0004) are out of scope"
 ---
