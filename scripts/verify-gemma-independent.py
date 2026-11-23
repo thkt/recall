@@ -43,7 +43,7 @@ for key in ['RECALL_DB', 'RECALL_MODEL_MANIFEST', 'CLAUDE_CODE_SESSION_ID',
             '__RECALL_GEMMA_PROBE', '__RECALL_GEMMA_SPEC']:
     env.pop(key, None)
 env.update(RECALL_MODEL_DIR=str(model_dir), RECALL_CLAUDE_DIR=str(claude),
-           RECALL_CODEX_DIR=str(codex), HF_HOME=str(root/'empty-hf'),
+           RECALL_CODEX_DIR=str(codex), RECALL_CODEX_ARCHIVED_DIR='', HF_HOME=str(root/'empty-hf'),
            XDG_DATA_HOME=str(root/'default-data'))
 calls = []
 def digest(path):
