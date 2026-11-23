@@ -57,7 +57,7 @@ fn index_hands_the_token_budget_and_forward_pause_flags_to_the_embedder() {
         codex_archived_dir: None,
     };
 
-    let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
+    let embedder = Arc::new(embedder::MockEmbedder::new());
 
     let outcome = index_and_report_observed(
         &Some(db_path),
@@ -141,7 +141,7 @@ fn index_without_the_token_budget_and_forward_pause_flags_hands_the_embedder_the
         codex_dir: &codex_dir,
         codex_archived_dir: None,
     };
-    let embedder = Arc::new(embedder::MockEmbedder::capturing_options());
+    let embedder = Arc::new(embedder::MockEmbedder::new());
     let no_flags = embed_options_from_flags(None, None);
 
     index_and_report_observed(

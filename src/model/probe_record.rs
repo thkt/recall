@@ -346,7 +346,6 @@ fn marker_state(path: &Path, file: &File) -> io::Result<MarkerState> {
     }
 }
 
-#[cfg(unix)]
 fn still_linked(path: &Path, file: &File) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let opened = file.metadata()?;
@@ -355,11 +354,6 @@ fn still_linked(path: &Path, file: &File) -> io::Result<bool> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error),
     }
-}
-
-#[cfg(not(unix))]
-fn still_linked(path: &Path, _file: &File) -> io::Result<bool> {
-    Ok(path.exists())
 }
 
 #[cfg(test)]

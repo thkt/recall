@@ -70,7 +70,7 @@ APIキー不要。データはマシンの外に出ません。embeddingモデ�
 ### 検索
 
 ```sh
-recall search "error handling"                                     # キーワード検索
+recall search "error handling"
 recall search "database migration" --project /Users/me/GitHub/app  # プロジェクト絞り込み
 recall search "React Router" --days 7                              # 直近7日間
 recall search "async runtime" --source codex                       # Codexセッションのみ
