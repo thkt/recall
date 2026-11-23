@@ -319,6 +319,30 @@ fn a_not_chain_too_long_for_the_full_text_index_is_rejected_as_a_query_syntax_er
 }
 
 #[test]
+fn a_query_syntax_error_is_reported_even_when_the_vector_search_could_answer() {
+    let (_dir, conn) = db_with_messages(&[("alpha", "alpha release notes")]);
+    add_embedded_chunk(&conn, 1, "alpha", "alpha release notes");
+    let query = format!("alpha{}", " NOT beta".repeat(10_000));
+
+    let err = search_with_embedder(
+        &conn,
+        query.as_str(),
+        &SearchOptions::default(),
+        Some(&MockEmbedder::new()),
+    )
+    .err()
+    .expect("a query the full-text index cannot parse must be rejected");
+
+    assert!(
+        matches!(
+            err.downcast_ref::<RecallError>(),
+            Some(RecallError::QuerySyntax(_))
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn a_search_failure_that_is_not_a_query_syntax_error_stays_a_data_error() {
     let (_dir, conn) = db_with_messages(&[]);
     conn.execute(
