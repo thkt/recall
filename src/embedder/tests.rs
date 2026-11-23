@@ -225,14 +225,14 @@ impl<F: Fn() + Send + Sync> Embed for InterruptedEmbedder<F> {
         MockEmbedder::new().embed_document(text)
     }
 
-    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        let result = MockEmbedder::new().embed_documents_batch(texts)?;
+    fn embed_documents_batch(
+        &self,
+        texts: &[&str],
+        options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+        let result = MockEmbedder::new().embed_documents_batch(texts, options)?;
         (self.0)();
         Ok(result)
-    }
-
-    fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
-        MockEmbedder::new().embed_text(text, prefix)
     }
 }
 
@@ -506,16 +506,13 @@ fn later_page_database_save_failure_preserves_other_batches_and_retries_only_fai
         fn embed_documents_batch(
             &self,
             texts: &[&str],
+            options: &EmbedOptions,
         ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-            let mut vectors = MockEmbedder::new().embed_documents_batch(texts)?;
+            let mut vectors = MockEmbedder::new().embed_documents_batch(texts, options)?;
             if self.0.fetch_add(1, Ordering::SeqCst) == 8 {
                 vectors[1] = ChunkedEmbedding::try_new(vec![vec![0.0; 1]])?;
             }
             Ok(vectors)
-        }
-
-        fn embed_text(&self, text: &str, prefix: &str) -> Result<Vec<f32>, EmbedError> {
-            MockEmbedder::new().embed_text(text, prefix)
         }
     }
 

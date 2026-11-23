@@ -20,7 +20,7 @@ use crate::date::MS_PER_DAY;
 use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
-use crate::hybrid::{self, MAX_RECENCY_FACTOR, RECENCY_BOOST_WEIGHT, rrf_merge_sessions};
+use crate::hybrid::{self, MAX_RECENCY_FACTOR, rrf_merge_sessions};
 use crate::model;
 use crate::parser::{SessionData, Source};
 
@@ -613,7 +613,6 @@ fn vec_search(
     conn: &Connection,
     embedder: &dyn Embed,
     query: &str,
-    limit: usize,
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<VecHit>> {
@@ -636,7 +635,7 @@ fn vec_search(
     append_search_filters(&mut sql, &mut filter_params, "c.session_id", opts, now_ms);
     let sql = format!("SELECT session_id, id, d FROM ({sql}) WHERE n = 1 ORDER BY d, session_id");
 
-    let limit_i64 = limit as i64;
+    let limit_i64 = VEC_CANDIDATE_COUNT as i64;
     let mut refs: Vec<&dyn ToSql> = Vec::with_capacity(2 + filter_params.len());
     refs.push(&embedding_bytes);
     refs.push(&limit_i64);
@@ -920,7 +919,6 @@ pub fn search_with_embedder<'q>(
         conn,
         embedder,
         keyword.embed_text.as_deref().unwrap_or(query),
-        VEC_CANDIDATE_COUNT,
         opts,
         now_ms,
     ) {
@@ -1004,7 +1002,6 @@ pub fn search_with_embedder<'q>(
         &mut merged,
         |sid| meta_map.get(sid).and_then(|sd| sd.timestamp),
         now_ms,
-        RECENCY_BOOST_WEIGHT,
     );
     let limit_score = at_limit(&merged, opts.limit).map(|(_, score)| *score);
     let incomplete = incomplete || left_out_session_could_rank(pruned_best, limit_score);

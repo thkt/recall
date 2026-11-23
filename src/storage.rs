@@ -1,7 +1,7 @@
 mod search;
 use rusqlite::ffi::{SQLITE_OK, sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 pub use search::{
-    MIN_TRIGRAM_TERM_CHARS, MatchFtsQuery, SanitizeError, prepare_match_query,
+    MIN_TRIGRAM_TERM_CHARS, MatchFtsQuery, SanitizeError, fts_quote, prepare_match_query,
     prepare_operator_query,
 };
 use std::{ffi::c_char, mem::transmute, sync::OnceLock};

@@ -37,9 +37,7 @@ fn real_model_boundaries_coverage_and_frozen_query_parity() {
                         == target
                 })
                 .expect("construct exact tokenizer boundary");
-            let t = gemma
-                .query_tokens(&model, &text, &gemma.spec.query_prefix)
-                .unwrap();
+            let t = gemma.query_tokens(&model, &text).unwrap();
             assert_eq!(t.len(), target.min(MAX_TOKENS));
             if target > MAX_TOKENS {
                 assert_eq!(t.last(), Some(&model.vocab().eos()));
@@ -254,9 +252,7 @@ fn real_model_bit_dump_for_build_parity() {
         .map(|(label, text)| {
             let tokens = {
                 let model = gemma.model.lock().unwrap();
-                gemma
-                    .query_tokens(&model, text, &gemma.spec.query_prefix)
-                    .unwrap()
+                gemma.query_tokens(&model, text).unwrap()
             };
             let vector = gemma.embed_query(text).unwrap();
             assert_eq!(vector.len(), EMBEDDING_DIMS);
@@ -279,7 +275,7 @@ fn real_model_bit_dump_for_build_parity() {
     };
     let texts: Vec<&str> = documents.iter().map(|(_, t)| t.as_str()).collect();
     let embedded = gemma
-        .embed_documents_batch_with_options(&texts, &EmbedOptions::default())
+        .embed_documents_batch(&texts, &EmbedOptions::default())
         .unwrap();
     assert_eq!(embedded.len(), documents.len());
     let document_records: Vec<Value> = documents
@@ -366,10 +362,11 @@ fn frozen_full_index_search_contract_parity() {
         fn embed_document(&self, _: &str) -> Result<ChunkedEmbedding, EmbedError> {
             Err(EmbedError::EmptySequence)
         }
-        fn embed_documents_batch(&self, _: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-            Err(EmbedError::EmptySequence)
-        }
-        fn embed_text(&self, _: &str, _: &str) -> Result<Vec<f32>, EmbedError> {
+        fn embed_documents_batch(
+            &self,
+            _: &[&str],
+            _: &EmbedOptions,
+        ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
             Err(EmbedError::EmptySequence)
         }
     }

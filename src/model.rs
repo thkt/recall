@@ -1,6 +1,6 @@
 use crate::{
     embedding::{EMBEDDING_DIMS, Embed},
-    native::{Gemma, gpu_available},
+    native::{Gemma, MAX_TOKENS, gpu_available},
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension};
@@ -59,8 +59,8 @@ impl Default for ModelSpec {
             tokenizer_revision: "914f7f89142e33e77833254d9c9b90c3cef7303b".into(),
             tokenizer_url: "https://huggingface.co/google/embeddinggemma-2/resolve/914f7f89142e33e77833254d9c9b90c3cef7303b/tokenizer.json".into(),
             tokenizer_sha256: "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4".into(),
-            dimensions: 768,
-            max_tokens: 8192,
+            dimensions: EMBEDDING_DIMS,
+            max_tokens: MAX_TOKENS,
             overlap_tokens: 2048,
             query_prefix: "task: search result | query: ".into(),
             document_prefix: "title: none | text: ".into(),
@@ -90,7 +90,9 @@ impl ModelSpec {
         }
         ensure!(!self.model_id.is_empty(), "model_id must not be empty");
         ensure!(
-            self.dimensions == 768 && self.max_tokens == 8192 && self.overlap_tokens == 2048,
+            self.dimensions == EMBEDDING_DIMS
+                && self.max_tokens == MAX_TOKENS
+                && self.overlap_tokens == 2048,
             "unsupported model dimensions or token splitting contract"
         );
         ensure!(
@@ -206,14 +208,15 @@ impl fmt::Display for DegradedReason {
         )
     }
 }
+pub const DOWNLOAD_COMMAND: &str = "recall model download";
 pub struct EmbedderDegraded(pub DegradedReason);
 impl EmbedderDegraded {
-    pub fn user_note(&self, download: &str) -> Option<String> {
+    pub fn user_note(&self) -> Option<String> {
         match self.0 {
             #[cfg(test)]
             DegradedReason::Disabled => None,
             DegradedReason::NotInstalled => Some(format!(
-                "embedding model not installed; run `{download}` to enable semantic search"
+                "embedding model not installed; run `{DOWNLOAD_COMMAND}` to enable semantic search"
             )),
             DegradedReason::ProbeFailed | DegradedReason::BackendUnavailable => {
                 Some("embedding model unavailable; results from text search only".into())

@@ -528,7 +528,7 @@ pub(crate) fn fts_expand_short_terms(
             }
             Piece::Word(word) => word,
         };
-        if token.chars().count() >= 3 || is_fts5_operator(token) {
+        if token.chars().count() >= MIN_TRIGRAM_TERM_CHARS || is_fts5_operator(token) {
             parts.push(fts_quote(token));
             continue;
         }

@@ -53,7 +53,6 @@ fn a_fresh_session_overtakes_a_year_old_one_that_scored_ten_percent_higher() {
             _ => Some(NOW_MS - 365 * MS_PER_DAY),
         },
         NOW_MS,
-        RECENCY_BOOST_WEIGHT,
     );
 
     assert_eq!(results[0].0, "new");
@@ -63,7 +62,7 @@ fn a_fresh_session_overtakes_a_year_old_one_that_scored_ten_percent_higher() {
 fn a_session_without_a_timestamp_keeps_its_score() {
     let mut results = vec![("undated".to_owned(), 0.5)];
 
-    apply_recency_boost(&mut results, |_| None, NOW_MS, RECENCY_BOOST_WEIGHT);
+    apply_recency_boost(&mut results, |_| None, NOW_MS);
 
     assert_eq!(results, [("undated".to_owned(), 0.5)]);
 }

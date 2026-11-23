@@ -124,11 +124,7 @@ fn check_integrity(conn: &Connection) -> Result<DoctorCheck> {
 }
 
 fn check_orphan_embeddings(conn: &Connection) -> Result<DoctorCheck> {
-    let orphans: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM vec_chunks WHERE chunk_id NOT IN (SELECT id FROM qa_chunks)",
-        [],
-        |r| r.get(0),
-    )?;
+    let orphans = db::count_orphan_embeddings(conn)?;
     Ok(if orphans == 0 {
         DoctorCheck::pass("orphan_embeddings")
     } else {
@@ -166,14 +162,17 @@ fn check_model<F>(load_embedder: &F) -> DoctorCheck
 where
     F: Fn() -> Result<Arc<dyn Embed>, DegradedReason>,
 {
-    const REMEDY: &str = "recall model download";
     let embedder = match load_embedder() {
         Ok(e) => e,
         Err(reason @ DegradedReason::NotInstalled) => {
             return DoctorCheck::info("model", format!("{reason}; search runs FTS-only"));
         }
         Err(reason) => {
-            return DoctorCheck::fail("model", format!("model not loadable: {reason}"), REMEDY);
+            return DoctorCheck::fail(
+                "model",
+                format!("model not loadable: {reason}"),
+                model::DOWNLOAD_COMMAND,
+            );
         }
     };
     match embedder.embed_query("recall doctor probe") {
@@ -181,9 +180,13 @@ where
         Ok(v) => DoctorCheck::fail(
             "model",
             format!("embedding width {} != expected {EMBEDDING_DIMS}", v.len()),
-            REMEDY,
+            model::DOWNLOAD_COMMAND,
         ),
-        Err(e) => DoctorCheck::fail("model", format!("model embed failed: {e}"), REMEDY),
+        Err(e) => DoctorCheck::fail(
+            "model",
+            format!("model embed failed: {e}"),
+            model::DOWNLOAD_COMMAND,
+        ),
     }
 }
 

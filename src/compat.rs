@@ -1,4 +1,4 @@
-use crate::storage::MatchFtsQuery;
+use crate::storage::{MIN_TRIGRAM_TERM_CHARS, MatchFtsQuery, fts_quote};
 
 const MAX_COMBINATIONS: usize = 100;
 enum Segment {
@@ -81,10 +81,6 @@ impl Wire<'_> {
         Some(segments)
     }
 }
-fn quote(term: &str) -> String {
-    format!("\"{}\"", term.replace('"', "\"\""))
-}
-
 pub fn clean_for_trigram(query: &MatchFtsQuery) -> Option<String> {
     let segments = Wire {
         text: query.as_str().as_bytes(),
@@ -100,8 +96,8 @@ pub fn clean_for_trigram(query: &MatchFtsQuery) -> Option<String> {
     let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
     for segment in segments {
         match segment {
-            Segment::Fixed(term) if term.chars().count() >= 3 => {
-                let term = quote(&term);
+            Segment::Fixed(term) if term.chars().count() >= MIN_TRIGRAM_TERM_CHARS => {
+                let term = fts_quote(&term);
                 for clause in &mut clauses {
                     clause.push(term.clone());
                 }
@@ -109,8 +105,8 @@ pub fn clean_for_trigram(query: &MatchFtsQuery) -> Option<String> {
             Segment::Alternatives(terms) if !overflow => {
                 let terms: Vec<_> = terms
                     .into_iter()
-                    .filter(|t| t.chars().count() >= 3)
-                    .map(|t| quote(&t))
+                    .filter(|t| t.chars().count() >= MIN_TRIGRAM_TERM_CHARS)
+                    .map(|t| fts_quote(&t))
                     .collect();
                 if terms.is_empty() {
                     continue;

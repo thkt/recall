@@ -174,9 +174,7 @@ impl BatchEmbedder<'_, '_> {
         self.observer
             .count("inference_chunks", self.progress.inferred);
         let inference = self.observer.stage("inference");
-        let result = self
-            .embedder
-            .embed_documents_batch_with_options(&texts, self.options);
+        let result = self.embedder.embed_documents_batch(&texts, self.options);
         inference.finish(if result.is_ok() {
             "complete; not saved"
         } else {
@@ -574,7 +572,12 @@ impl Embed for MockEmbedder {
         )
     }
 
-    fn embed_documents_batch(&self, texts: &[&str]) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+    fn embed_documents_batch(
+        &self,
+        texts: &[&str],
+        options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+        self.captured_options.lock().unwrap().push(*options);
         if let Some(poison) = self
             .fail_on_texts
             .iter()
@@ -583,19 +586,6 @@ impl Embed for MockEmbedder {
             return Err(Self::inference_error(format!("poison text: {poison}")));
         }
         texts.iter().map(|t| self.embed_document(t)).collect()
-    }
-
-    fn embed_text(&self, text: &str, _prefix: &str) -> Result<Vec<f32>, EmbedError> {
-        Ok(Self::deterministic_vector(text))
-    }
-
-    fn embed_documents_batch_with_options(
-        &self,
-        texts: &[&str],
-        options: &EmbedOptions,
-    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        self.captured_options.lock().unwrap().push(*options);
-        self.embed_documents_batch(texts)
     }
 }
 
