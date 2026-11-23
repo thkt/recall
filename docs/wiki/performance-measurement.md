@@ -36,6 +36,3 @@ scenes: ["plan", "pr-create"]
 - #379 / #381 この計測を Acceptance Criteria と Manual verification に組み込んだ
 - #383 パッチなしビルドと交互に各 15 回測り、全回 `degraded: false`、results 一致を確かめた
 - [research:issue-342-scope.md](../research/issue-342-scope.md) 計測条件と範囲の扱い
-- [research:index-observability-measurements.md](../research/index-observability-measurements.md) HW・commit・SHA の記録、段階時間が足し算にならないこと
-- [research:bounded-pending-measurements.md](../research/bounded-pending-measurements.md) 候補 commit の計測を提出版の合格に流用しない
-- [research:index-reuse-measurements.md](../research/index-reuse-measurements.md) 計測版と提出版の差分の記録

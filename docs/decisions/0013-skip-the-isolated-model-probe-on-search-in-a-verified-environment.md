@@ -52,7 +52,7 @@ The agreed rules come from the Issue #379 Agreement section (user answers on 202
 
 The record store lives in [src/model/probe_record.rs](../../src/model/probe_record.rs), and both loaders live in [src/model.rs](../../src/model.rs).
 
-Degraded reasons and notes on the skip path stay those of [DR 0001](0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md). Reading the two sysctl values needs `libc::sysctlbyname`, so one function carries `#[allow(unsafe_code)]` with `SAFETY` comments under the crate's `unsafe_code = "deny"` lint, as the sqlite-vec registration in [src/storage.rs](../../src/storage.rs) does.
+Degraded reasons and notes on the skip path stay those of [DR 0001](0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md). Reading the two sysctl values needs `libc::sysctlbyname`, so one function carries `#[allow(unsafe_code)]` with `SAFETY` comments under the crate's `unsafe_code = "deny"` lint, as the sqlite-vec registration in [src/db.rs](../../src/db.rs) does.
 
 | Element         | Behavior                                                                                                                                                                                                                                       |
 | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

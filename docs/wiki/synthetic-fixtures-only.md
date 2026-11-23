@@ -32,5 +32,3 @@ scenes: ["issue-create", "implement", "pr-create"]
 - #358 実データの index 操作とリリース・Homebrew 更新を実施していないと明記した
 - [research:session-provenance-classification.md](../research/session-provenance-classification.md) ローカル観測の集計を一般的な精度の保証にしない
 - [research:issue-342-scope.md](../research/issue-342-scope.md) 合成データのみで再現した
-- [research:bounded-pending-measurements.md](../research/bounded-pending-measurements.md) 合成データのみで、私的ログや本番 DB を使わない計測
-- [research:index-reuse-measurements.md](../research/index-reuse-measurements.md) 同上
