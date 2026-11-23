@@ -58,13 +58,7 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<Connection> {
         model::check_index(&existing, model::selected())
             .map_err(|e| RecallError::DatabaseRead(e.to_string()))?;
     }
-    let mut conn = db::open_db(path).map_err(|error| {
-        if error.is::<RecallError>() {
-            error
-        } else {
-            error.context("Failed to open database")
-        }
-    })?;
+    let mut conn = db::open_db(path).context("Failed to open database")?;
     model::bind_index(&mut conn, model::selected())?;
     Ok(conn)
 }
