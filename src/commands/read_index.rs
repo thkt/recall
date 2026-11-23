@@ -6,7 +6,6 @@ use rusqlite::Connection;
 use crate::db::{self, SchemaState};
 use crate::envelope::{CommandOutput, Note};
 use crate::error::RecallError;
-use crate::require_current_schema;
 
 pub(crate) struct ReadIndex {
     pub(crate) conn: Connection,
@@ -35,6 +34,15 @@ impl ReadIndex {
     }
 }
 
+fn require_current_schema(state: SchemaState) -> Result<(), RecallError> {
+    match state {
+        SchemaState::Current | SchemaState::Empty => Ok(()),
+        SchemaState::Stale => Err(RecallError::DataError(
+            "database schema is out of date; run `recall rebuild` to migrate it".to_owned(),
+        )),
+    }
+}
+
 impl Snapshot {
     #[must_use]
     pub(crate) fn finish(&self, mut out: CommandOutput) -> CommandOutput {
@@ -60,3 +68,6 @@ impl Snapshot {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

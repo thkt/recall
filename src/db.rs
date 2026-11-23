@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
+use std::ffi::c_char;
 use std::fs;
 use std::io;
+use std::mem::transmute;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::embedding::EMBEDDING_DIMS;
 use crate::runtime::info;
-use crate::storage::ensure_sqlite_vec;
 use anyhow::Result;
+use rusqlite::ffi::{SQLITE_OK, sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tracing::warn;
 
@@ -25,6 +28,25 @@ pub enum SchemaState {
     Empty,
     Current,
     Stale,
+}
+
+#[allow(unsafe_code)]
+fn ensure_sqlite_vec() -> anyhow::Result<()> {
+    static REGISTER: OnceLock<i32> = OnceLock::new();
+    // SAFETY: sqlite-vec's FFI declaration erases the arguments of sqlite3_vec_init.
+    // Its pinned SQLite extension ABI matches the callback signature used below.
+    let code = *REGISTER.get_or_init(|| unsafe {
+        sqlite3_auto_extension(Some(transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut sqlite3,
+                *mut *mut c_char,
+                *const sqlite3_api_routines,
+            ) -> i32,
+        >(sqlite_vec::sqlite3_vec_init as *const ())))
+    });
+    anyhow::ensure!(code == SQLITE_OK, "sqlite-vec registration failed: {code}");
+    Ok(())
 }
 
 pub fn open_db_readonly(path: &Path) -> Result<(Connection, OpenTier)> {

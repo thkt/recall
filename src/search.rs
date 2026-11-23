@@ -1,15 +1,11 @@
 use std::collections::{HashMap, HashSet};
-use std::slice;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{panic, thread};
 
-use crate::compat::anon_placeholders;
-use crate::compat::filter::{
-    append_eq_filter, append_like_prefix_filter, append_timestamp_cutoff_filter, escape_like,
-};
 use crate::embedding::Embed;
-use crate::storage::{
+use crate::fts_query::{
     MIN_TRIGRAM_TERM_CHARS, SanitizeError, prepare_match_query, prepare_operator_query,
+    segment_script_boundaries,
 };
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -17,13 +13,16 @@ use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
-use crate::date::MS_PER_DAY;
 use crate::db::table_def;
 use crate::embedder::f32_as_bytes;
 use crate::error::RecallError;
 use crate::hybrid::{self, MAX_RECENCY_FACTOR, rrf_merge_sessions};
 use crate::model;
 use crate::parser::{SessionData, Source};
+
+pub(crate) mod filter;
+
+use filter::{anon_placeholders, append_search_filters};
 
 pub(crate) const MAX_LIMIT: u16 = 100;
 const VEC_CANDIDATE_COUNT: usize = 3 * MAX_LIMIT as usize;
@@ -84,59 +83,6 @@ impl Default for SearchOptions {
             include_automated: false,
             now_ms: None,
         }
-    }
-}
-
-fn append_search_filters(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn ToSql>>,
-    column: &'static str,
-    opts: &SearchOptions,
-    now_ms: i64,
-) {
-    if opts.project.is_some() || opts.days.is_some() || opts.source.is_some() {
-        sql.push_str(" AND ");
-        sql.push_str(column);
-        sql.push_str(" IN (SELECT s2.session_id FROM sessions s2 WHERE 1 = 1");
-        if let Some(ref project) = opts.project {
-            append_like_prefix_filter(sql, params, "s2.project", slice::from_ref(project));
-        }
-        let cutoff = opts.days.map(|d| now_ms - d * MS_PER_DAY);
-        append_timestamp_cutoff_filter(sql, params, "s2.timestamp", cutoff);
-        let source_str = opts.source.as_ref().map(Source::as_str);
-        append_eq_filter(sql, params, "s2.source", source_str);
-        sql.push(')');
-    }
-    if let Some(ref file) = opts.file {
-        sql.push_str(" AND ");
-        sql.push_str(column);
-        sql.push_str(
-            " IN (SELECT sf.session_id FROM session_files sf \
-             WHERE sf.path = ? OR sf.path LIKE ? ESCAPE '\\')",
-        );
-        params.push(Box::new(file.clone()));
-        let mut suffix = String::from("%/");
-        suffix.push_str(&escape_like(file));
-        params.push(Box::new(suffix));
-    }
-    let current = match &opts.current {
-        CurrentSession::Ignore => None,
-        CurrentSession::Exclude(id) => Some((" <> ?", id)),
-        CurrentSession::Only(id) => Some((" = ?", id)),
-    };
-    if let Some((op, id)) = current {
-        sql.push_str(" AND ");
-        sql.push_str(column);
-        sql.push_str(op);
-        params.push(Box::new(id.clone()));
-    }
-    if !opts.include_automated {
-        sql.push_str(" AND ");
-        sql.push_str(column);
-        sql.push_str(
-            " IN (SELECT s3.session_id FROM sessions s3 \
-             WHERE COALESCE(s3.session_type, 'interactive') <> 'automated')",
-        );
     }
 }
 
@@ -655,58 +601,6 @@ fn vec_search(
         hits.push(r?);
     }
     Ok(hits)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Script {
-    Han,
-    Hiragana,
-    Katakana,
-    Latin,
-    Other,
-}
-
-fn classify_script(c: char) -> Script {
-    match c {
-        'a'..='z' | 'A'..='Z' | '0'..='9' => Script::Latin,
-        '\u{3040}'..='\u{309F}' => Script::Hiragana,
-        '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}' => {
-            Script::Katakana
-        }
-        '\u{3005}'
-        | '\u{3400}'..='\u{4DBF}'
-        | '\u{4E00}'..='\u{9FFF}'
-        | '\u{F900}'..='\u{FAFF}' => Script::Han,
-        _ => Script::Other,
-    }
-}
-
-fn segment_script_boundaries(query: &str) -> String {
-    let mut out = String::with_capacity(query.len() + 8);
-    let mut in_quotes = false;
-    let mut prev: Option<Script> = None;
-    for c in query.chars() {
-        if c == '"' {
-            in_quotes = !in_quotes;
-            out.push(c);
-            prev = None;
-            continue;
-        }
-        if in_quotes {
-            out.push(c);
-            continue;
-        }
-        let cur = classify_script(c);
-        if cur != Script::Other
-            && let Some(p) = prev
-            && p != cur
-        {
-            out.push(' ');
-        }
-        out.push(c);
-        prev = (cur != Script::Other).then_some(cur);
-    }
-    out
 }
 
 struct KeywordQuery {

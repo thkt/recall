@@ -6,13 +6,13 @@ use rusqlite::{Connection, OptionalExtension};
 use tracing::warn;
 
 use crate::ansi;
-use crate::commands::{ReadIndex, build_markdown};
-use crate::compat::filter::escape_like;
+use crate::commands::{ReadIndex, build_markdown, resolve_db_path};
+use crate::date::format_timestamp;
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser;
 use crate::parser::Source;
-use crate::{format_timestamp, resolve_db_path};
+use crate::search::filter::escape_like;
 
 fn write_show_header(
     buf: &mut String,

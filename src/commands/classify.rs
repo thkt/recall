@@ -7,11 +7,11 @@ use std::time::SystemTime;
 use anyhow::Result;
 use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 
-use crate::commands::ReadIndex;
+use crate::commands::{ReadIndex, open_or_create_db, resolve_db_path};
 use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser::Source;
-use crate::{ansi, classify, open_or_create_db, parser, resolve_db_path};
+use crate::{ansi, classify, parser};
 
 pub(crate) struct ClassifyOutcome {
     session_id: String,

@@ -1,215 +1,20 @@
 #![cfg(test)]
 use std::assert_matches;
 use std::fs;
+use std::io::ErrorKind;
+use std::path::Path;
+use std::sync::Arc;
+
+use rusqlite::Connection;
 
 use super::*;
+use crate::commands::open_or_create_db;
 use crate::commands::search::{SearchArgs, run_search_with};
 use crate::commands::show::{DEFAULT_WINDOW, run_show};
 use crate::commands::status::run_status_with;
+use crate::embedding::Embed;
 use crate::envelope::Note;
-
-#[cfg(unix)]
-#[test]
-fn create_db_file_sets_owner_only_0600_mode() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = tempfile::TempDir::new().unwrap();
-    let db_path = dir.path().join("index.db");
-
-    create_db_file(&db_path).unwrap();
-
-    let mode = fs::metadata(&db_path).unwrap().permissions().mode();
-    assert_eq!(
-        mode & 0o777,
-        0o600,
-        "created DB must be owner-only 0o600, got {:o}",
-        mode & 0o777,
-    );
-}
-
-#[test]
-fn create_db_file_creates_missing_parent_dirs() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let db_path = dir.path().join("recall").join("recall.db");
-
-    create_db_file(&db_path).unwrap();
-
-    assert!(
-        db_path.exists(),
-        "DB file must be created under a fresh parent dir"
-    );
-}
-
-#[test]
-fn create_db_file_errors_when_parent_cannot_be_created() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let blocker = dir.path().join("not_a_dir");
-    create_db_file(&blocker).unwrap();
-    let db_path = blocker.join("sub").join("recall.db");
-
-    let err = create_db_file(&db_path).unwrap_err();
-
-    assert_ne!(
-        err.kind(),
-        ErrorKind::AlreadyExists,
-        "expected a parent-creation failure, got {err:?}"
-    );
-}
-
-#[test]
-fn opening_an_index_for_another_model_for_writing_fails_before_changing_its_schema_or_journal_mode()
-{
-    let dir = tempfile::TempDir::new().unwrap();
-    let db_path = dir.path().join("recall.db");
-    let other_model = Connection::open(&db_path).unwrap();
-    other_model
-        .execute_batch(
-            "CREATE TABLE embedding_identity (singleton INTEGER PRIMARY KEY, fingerprint TEXT, manifest TEXT);
-             INSERT INTO embedding_identity VALUES (1, 'another model', '{}');",
-        )
-        .unwrap();
-    drop(other_model);
-
-    open_or_create_db(&db_path).unwrap_err();
-
-    let conn = Connection::open(&db_path).unwrap();
-    let tables = db::collect_strings(&conn, "SELECT name FROM sqlite_master ORDER BY name");
-    let journal_mode: String = conn
-        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(
-        (tables, journal_mode),
-        (vec!["embedding_identity".to_owned()], "delete".to_owned())
-    );
-}
-
-#[test]
-fn resolve_default_db_path_uses_local_share_when_xdg_unset() {
-    let home = Path::new("/home/u");
-
-    let path = resolve_default_db_path(None, Some(home)).unwrap();
-
-    assert_eq!(
-        path,
-        Path::new("/home/u/.local/share/recall/indexes")
-            .join(model::selected().identity())
-            .join("recall.db")
-    );
-}
-
-#[test]
-fn resolve_default_db_path_prefers_absolute_xdg_data_home() {
-    let path =
-        resolve_default_db_path(Some(OsStr::new("/xdg/data")), Some(Path::new("/home/u"))).unwrap();
-
-    assert_eq!(
-        path,
-        Path::new("/xdg/data/recall/indexes")
-            .join(model::selected().identity())
-            .join("recall.db")
-    );
-}
-
-#[test]
-fn resolve_default_db_path_ignores_relative_xdg_data_home() {
-    let path = resolve_default_db_path(
-        Some(OsStr::new("relative/data")),
-        Some(Path::new("/home/u")),
-    )
-    .unwrap();
-
-    assert_eq!(
-        path,
-        Path::new("/home/u/.local/share/recall/indexes")
-            .join(model::selected().identity())
-            .join("recall.db")
-    );
-}
-
-#[test]
-fn resolve_db_path_passes_through_explicit_path() {
-    let explicit = PathBuf::from("/tmp/custom/recall.db");
-
-    let path = resolve_db_path(&Some(explicit.clone())).unwrap();
-
-    assert_eq!(path, explicit);
-}
-
-#[test]
-fn resolve_db_path_defaults_to_recall_db_under_data_dir() {
-    let path = resolve_db_path(&None).unwrap();
-
-    assert!(
-        path.ends_with(
-            Path::new("recall/indexes")
-                .join(model::selected().identity())
-                .join("recall.db")
-        ),
-        "default path must include the selected model identity, got {path:?}"
-    );
-}
-
-#[test]
-fn format_timestamp_prints_the_utc_calendar_date_or_unknown() {
-    for (input, expected) in [
-        (None, "unknown"),
-        (Some(0), "1970-01-01"),
-        (Some(1709251200000), "2024-03-01"),
-        (Some(-date::MS_PER_DAY), "1969-12-31"),
-    ] {
-        assert_eq!(format_timestamp(input), expected, "input: {input:?}");
-    }
-}
-
-#[test]
-fn try_load_embedder_cached_reports_reason_aware_notes_once() {
-    for (reason, expected) in [
-        (
-            DegradedReason::NotInstalled,
-            vec![
-                "note: embedding model not installed; run `recall model download` to enable semantic search.",
-            ],
-        ),
-        (
-            DegradedReason::ProbeFailed,
-            vec!["note: embedding model unavailable; results from text search only."],
-        ),
-        (
-            DegradedReason::BackendUnavailable,
-            vec!["note: embedding model unavailable; results from text search only."],
-        ),
-        (DegradedReason::Disabled, vec![]),
-    ] {
-        let mut notes = Vec::new();
-        let result = try_load_embedder_cached_with_reporter(
-            || Err(reason),
-            |msg| notes.push(msg.to_owned()),
-        );
-
-        assert_eq!(result.err(), Some(reason));
-        assert_eq!(notes, expected, "reason: {reason:?}");
-    }
-}
-
-#[test]
-fn search_degraded_note_covers_backend_failures() {
-    assert_eq!(
-        search_degraded_note(DegradedReason::BackendUnavailable).as_deref(),
-        Some("note: embedding model unavailable; results from text search only.")
-    );
-    assert_eq!(search_degraded_note(DegradedReason::Disabled), None);
-}
-
-#[test]
-fn try_load_embedder_cached_returns_loaded_embedder() {
-    let loaded: Arc<dyn Embed> = Arc::new(embedder::MockEmbedder::new());
-    let returned = try_load_embedder_cached_with(|| Ok(Arc::clone(&loaded)))
-        .expect("a loaded embedder must be returned");
-    assert!(
-        Arc::ptr_eq(&returned, &loaded),
-        "the returned embedder must be the one the loader opened"
-    );
-}
+use crate::model::DegradedReason;
 
 struct FailingWriter;
 
@@ -324,7 +129,7 @@ fn a_text_run_whose_result_fails_to_write_prints_no_notes() {
 #[test]
 fn exit_code_for_write_maps_write_failure_to_io_error() {
     let code = exit_code_for_write(Err(io::Error::other("stdout unavailable")), false);
-    assert_eq!(code, ExitCode::from(codes::IO_ERR));
+    assert_eq!(code, ExitCode::from(ErrorCode::IoError.code()));
 }
 
 #[test]
@@ -369,13 +174,13 @@ fn index_token_budget_flag_clamps_above_256000_ceiling_down() {
 #[test]
 fn test_rebuild_recognized_by_shorthand_expansion() {
     let args: Vec<OsString> = ["recall", "rebuild"].iter().map(OsString::from).collect();
-    assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
+    assert!(try_expand_shorthand(&args).is_none());
 }
 
 #[test]
 fn doctor_recognized_by_shorthand_expansion() {
     let args: Vec<OsString> = ["recall", "doctor"].iter().map(OsString::from).collect();
-    assert!(try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none());
+    assert!(try_expand_shorthand(&args).is_none());
     let cli = Cli::try_parse_from(["recall", "doctor"]).unwrap();
     assert_matches!(cli.command, Some(Command::Doctor { fix: false }));
 }
@@ -393,10 +198,7 @@ fn embed_token_shorthand_expands_to_search() {
         .iter()
         .map(OsString::from)
         .collect();
-    assert_eq!(
-        try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS),
-        Some(expected)
-    );
+    assert_eq!(try_expand_shorthand(&args), Some(expected));
 }
 
 #[test]
@@ -613,30 +415,6 @@ fn search_result_and_session_data_stay_non_serialize() {
         ),
         "SessionData must not derive Serialize (ADR-0001): the --json schema is built explicitly"
     );
-}
-
-#[test]
-fn require_current_schema_stale_is_data_error_naming_rebuild() {
-    let err = require_current_schema(db::SchemaState::Stale).unwrap_err();
-    assert!(
-        matches!(err, RecallError::DataError(_)),
-        "stale schema must be a DataError, got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("recall rebuild"),
-        "message must name the fix: {err}"
-    );
-    assert_eq!(err.error_code().code(), 65);
-}
-
-#[test]
-fn require_current_schema_current_is_ok() {
-    assert!(require_current_schema(db::SchemaState::Current).is_ok());
-}
-
-#[test]
-fn require_current_schema_empty_is_ok() {
-    assert!(require_current_schema(db::SchemaState::Empty).is_ok());
 }
 
 #[test]

@@ -279,19 +279,29 @@ recall doctor --fix     # 孤立した embedding の削除とモデルの復旧�
 
 ```text
 src/
-├── main.rs       CLI定義・DBとモデルの共通処理・出力の振り分け
-├── commands/     サブコマンド実装（index・search・show・status・classify・doctor）
-├── parser/       Claude Code / Codex の JSONL パーサー
-├── indexer.rs    mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
-├── search.rs     FTS5 + ハイブリッドベクトル検索（graceful degradation）
-├── hybrid.rs     RRF 統合 + recency boost
-├── model.rs      固定manifest・artifact検証・独立probe（検証済み環境のsearchでは省略）・索引のモデル識別
-├── native.rs     llama.cpp/MetalによるEmbeddingGemma encoder
-├── embedding.rs  embeddingの共通型・オプション
-├── embedder.rs   index時embeddingのオーケストレーション（世代を照合してチャンクをバッチ保存）
-├── chunker.rs    Q&Aペアチャンカー（サイズ分割。本文照合による再利用はindexer）
-├── db.rs         SQLite スキーマ（WAL, FTS5, sqlite-vec）
-└── date.rs       日付ユーティリティ
+├── main.rs            CLI定義・省略形の展開・出力の振り分け
+├── commands.rs        サブコマンドが共有するDBパスの解決・所有者限定のDB作成・embedderの読み込み
+├── commands/          サブコマンド実装（index・search・show・status・classify・doctor）
+├── parser/            Claude Code / Codex の JSONL パーサー
+├── indexer.rs         mtime・サイズ追跡によるインクリメンタルインデクサー + チャンク生成
+├── index_observer.rs  indexの段階ごとの所要時間と件数をstderrに出す
+├── classify.rs        由来と最初のユーザー発言からセッション種別（interactive / automated）を判定
+├── search.rs          FTS5 + ハイブリッドベクトル検索（graceful degradation）
+├── search/filter.rs   キーワード検索・ベクトル検索・ファイル一覧が共有する検索オプションの絞り込み
+├── fts_query.rs       FTS5クエリの無害化・演算子の構文解析・短い語の展開・CJKの文字種境界での分割
+├── hybrid.rs          RRF 統合 + recency boost
+├── model.rs           固定manifest・artifact検証・独立probe（検証済み環境のsearchでは省略）・索引のモデル識別
+├── native.rs          llama.cpp/MetalによるEmbeddingGemma encoder
+├── embedding.rs       embeddingの共通型・オプション
+├── embedder.rs        index時embeddingのオーケストレーション（世代を照合してチャンクをバッチ保存）
+├── chunker.rs         Q&Aペアチャンカー（サイズ分割。本文照合による再利用はindexer）
+├── db.rs              SQLite スキーマ（WAL, FTS5, sqlite-vec）
+├── date.rs            日付ユーティリティ
+├── envelope.rs        コマンドの出力・note・`--json` のエンベロープ
+├── error.rs           エラー種別・終了コード・エラーのエンベロープ
+├── output.rs          閉じたパイプを成功として扱うstdoutへの書き出し
+├── runtime.rs         stderrへのメッセージ・ホームディレクトリの取得・ログの初期化
+└── ansi.rs            表示するセッション文字列からの制御文字の除去
 ```
 
 シングルバイナリ。SQLite、llama.cpp、sqlite-vecは静的リンクしています。

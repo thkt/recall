@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::commands::{ReadIndex, build_markdown};
+use crate::commands::{ReadIndex, build_markdown, resolve_db_path, try_load_embedder_cached_with};
 use crate::db;
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::{EMBEDDING_DIMS, Embed};
@@ -13,7 +13,6 @@ use crate::envelope::{CommandOutput, Note};
 use crate::error::{RecallError, download_error};
 use crate::model::{self, DegradedReason, IndexIdentityError, download_and_verify_model};
 use crate::runtime::info as cli_info;
-use crate::{resolve_db_path, try_load_embedder_cached_with};
 
 enum CheckStatus {
     Pass,

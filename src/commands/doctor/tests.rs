@@ -2,12 +2,12 @@ use std::cell::Cell;
 use std::fs;
 use std::sync::Arc;
 
+use crate::commands::open_or_create_db;
 use crate::commands::search::run_search_in;
 use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError, EmbedOptions};
 use crate::envelope::render_text_notes;
 use crate::model::tests::{CachedArtifacts, FakeHost};
-use crate::open_or_create_db;
 use crate::tests::{bare_empty_db, printed_envelope, search_command, seed_healthy_index};
 
 use super::*;

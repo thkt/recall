@@ -8,7 +8,7 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 
 1. フィルタ条件は `append_search_filters` (共有 helper)に追加し、FTS 候補クエリ・vec 検索・file-list の全経路が同じ helper を通ることを確認する
 2. 「フィルタ指定なしなら早期 return」等のガード条件も新しい軸に合わせて更新する
-3. `crate::compat::assert_filter_symmetric` で vec-only 回帰テストを併設する(FTS 経路のみのテストで済ませない。既存フィルタ project / days / source には全て併設済み)
+3. `src/search/tests.rs` の `assert_filter_symmetric` で vec-only 回帰テストを併設する(FTS 経路のみのテストで済ませない。既存フィルタ project / days / source には全て併設済み)
 4. 候補を件数で打ち切るのは、新しさの加点と RRF の融合を両 leg に適用した後にする。FTS 側は一致した全セッションを読み、vec 側の件数は `VEC_CANDIDATE_COUNT` の 1 か所で決める(DR 0016)
 5. クエリ正規化を入れる場合は index 側と query 側の設定を同一インスタンスで揃える(片側だけ正規化すると match が空振る)
 
@@ -29,4 +29,4 @@ hybrid 検索は FTS leg と vector leg の 2 経路を持ち、RRF が両集合
 - #376 automated 除外件数の絞り込みを `append_search_filters` で検索本体と揃え、ベクトルだけで一致するセッションを数えない非対称を Review focus に挙げた
 - #416 両 leg を 3×limit で打ち切ってから加点と融合を適用していたため、小さい `--limit` で新しいセッションが落ちた。FTS 側の打ち切りを外し、vec 側の件数を limit によらず 300 件にした
 - [research:session-provenance-classification.md](../research/session-provenance-classification.md) 共有フィルターの維持を完了条件にし、このページを参照した
-- 現行コード: `src/search.rs` の `append_search_filters` (全フィルタの適用)、`build_keyword_session_query` / `vec_search` / `file_list_outcome` (3 経路からの呼び出し)、`src/search/tests.rs` の `combined_filters_apply_to_text_search` / `combined_filters_apply_to_hybrid_search` / `combined_filters_apply_to_the_file_list` (同じ fixture を 3 経路それぞれで検索) と `assert_filter_symmetric` を用いたテスト (対称性固定)
+- 現行コード: `src/search/filter.rs` の `append_search_filters` (全フィルタの適用)、`src/search.rs` の `build_keyword_session_query` / `vec_search` / `file_list_outcome` (3 経路からの呼び出し)、`src/search/tests.rs` の `combined_filters_apply_to_text_search` / `combined_filters_apply_to_hybrid_search` / `combined_filters_apply_to_the_file_list` (同じ fixture を 3 経路それぞれで検索) と `assert_filter_symmetric` を用いたテスト (対称性固定)

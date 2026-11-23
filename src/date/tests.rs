@@ -42,3 +42,15 @@ fn months_and_days_outside_the_calendar_are_rejected() {
     assert_eq!(days_from_civil(2024, 9, 31), None);
     assert_eq!(days_from_civil(2024, 11, 31), None);
 }
+
+#[test]
+fn format_timestamp_prints_the_utc_calendar_date_or_unknown() {
+    for (input, expected) in [
+        (None, "unknown"),
+        (Some(0), "1970-01-01"),
+        (Some(1709251200000), "2024-03-01"),
+        (Some(-MS_PER_DAY), "1969-12-31"),
+    ] {
+        assert_eq!(format_timestamp(input), expected, "input: {input:?}");
+    }
+}

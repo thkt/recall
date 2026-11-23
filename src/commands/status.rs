@@ -3,10 +3,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::commands::{ReadIndex, build_markdown};
+use crate::commands::{ReadIndex, build_markdown, resolve_db_path};
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, ModelHost};
-use crate::resolve_db_path;
 use crate::runtime::info as cli_info;
 
 pub(crate) fn run_status(verbose: bool, db_path: &Option<PathBuf>) -> Result<CommandOutput> {
