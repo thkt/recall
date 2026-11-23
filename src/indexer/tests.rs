@@ -780,7 +780,7 @@ fn same_size_rewrite_while_a_log_is_read_is_indexed_by_the_next_run() {
 }
 
 #[test]
-fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
+fn a_session_without_a_stored_size_preserves_embeddings_and_retries_until_model_returns() {
     let db_dir = TempDir::new().unwrap();
     let db_path = db_dir.path().join("index.db");
     let mut conn = open_db(&db_path).unwrap();
@@ -821,7 +821,7 @@ fn legacy_size_upgrade_preserves_embeddings_and_retries_until_model_returns() {
         ]
     };
     let before = snapshot(&conn);
-    conn.execute_batch("ALTER TABLE sessions DROP COLUMN file_size;")
+    conn.execute_batch("UPDATE sessions SET file_size = NULL;")
         .unwrap();
     drop(conn);
     rewrite_with_mtime(

@@ -52,6 +52,9 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<Connection> {
     }
     {
         let (existing, _) = db::open_db_readonly(path)?;
+        if db::schema_state(&existing)? == db::SchemaState::Unsupported {
+            return Err(db::UNSUPPORTED_INDEX.error().into());
+        }
         model::check_index(&existing, model::selected())
             .map_err(|e| RecallError::DatabaseRead(e.to_string()))?;
     }

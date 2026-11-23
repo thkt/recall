@@ -46,17 +46,19 @@ fn persistent_files(path: &Path) -> Vec<Option<(Vec<u8>, fs::Permissions)>> {
 }
 
 #[test]
-fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
+fn classify_preview_preserves_the_schema_and_mtime_before_explicit_apply() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("recall.db");
     let conn = Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE sessions (
             session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT,
-            project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, session_type TEXT
+            project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, file_size INTEGER,
+            session_type TEXT, files_scanned INTEGER, chunks_indexed INTEGER
          );
          CREATE VIRTUAL TABLE messages USING fts5(session_id UNINDEXED, role, text, tokenize='trigram');
-         INSERT INTO sessions VALUES ('synthetic', 'claude', '/missing-synthetic.jsonl', '/p', 's', 0, 123, 'interactive');
+         INSERT INTO sessions (session_id, source, file_path, project, slug, timestamp, mtime, session_type)
+             VALUES ('synthetic', 'claude', '/missing-synthetic.jsonl', '/p', 's', 0, 123, 'interactive');
          INSERT INTO messages VALUES ('synthetic', 'user', '<command-message>run</command-message>');",
     ).unwrap();
     let schema = collect_strings(
@@ -120,7 +122,7 @@ fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
             &conn,
             "SELECT json_array(mtime, session_type) FROM sessions"
         ),
-        ["[null,\"automated\"]"]
+        ["[123.0,\"automated\"]"]
     );
     assert_eq!(
         collect_strings(
@@ -139,9 +141,9 @@ fn classify_preview_preserves_legacy_schema_and_mtime_before_explicit_apply() {
 fn classify_preview_rejects_missing_read_structure_without_writes() {
     for ddl in [
         "",
-        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT, session_type TEXT)",
-        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT); CREATE TABLE messages (session_id TEXT, role TEXT, text TEXT)",
-        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT, session_type TEXT); CREATE TABLE messages (session_id TEXT, role TEXT)",
+        "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, \
+         project TEXT, slug TEXT, timestamp INTEGER, mtime REAL, file_size INTEGER, \
+         session_type TEXT, files_scanned INTEGER, chunks_indexed INTEGER)",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("recall.db");
@@ -161,6 +163,39 @@ fn classify_preview_rejects_missing_read_structure_without_writes() {
             assert!(message.contains("classify --dry-run"), "{message}");
             assert!(message.contains("recall rebuild"), "{message}");
             assert!(message.contains("no such"), "{message}");
+            assert!(
+                persistent_files(&path) == before,
+                "DB/WAL contents and permissions changed"
+            );
+        }
+    }
+}
+
+#[test]
+fn classify_preview_refuses_an_index_older_than_v0_14_without_writes() {
+    for ddl in [
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT, session_type TEXT)",
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT); CREATE TABLE messages (session_id TEXT, role TEXT, text TEXT)",
+        "CREATE TABLE sessions (session_id TEXT, source TEXT, file_path TEXT, session_type TEXT); CREATE TABLE messages (session_id TEXT, role TEXT)",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("recall.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(ddl).unwrap();
+        drop(conn);
+        let before = persistent_files(&path);
+        for all in [false, true] {
+            let error = run_classify(all, true, &Some(path.clone())).unwrap_err();
+            let payload: Value =
+                serde_json::from_str(&render_json_error(&error_envelope(&error))).unwrap();
+            assert_eq!(
+                payload,
+                json!({"error": {
+                    "code": "DATA_ERROR",
+                    "message": "this index's schema predates recall 0.14.0 and cannot be opened; build a new index with `recall index` at another `--db-path`, or upgrade this one by running `recall classify` from recall 0.16.1 on it",
+                    "retryable": false
+                }})
+            );
             assert!(
                 persistent_files(&path) == before,
                 "DB/WAL contents and permissions changed"

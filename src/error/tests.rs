@@ -25,19 +25,19 @@ fn a_query_syntax_error_exits_65_and_lists_the_supported_query_syntax() {
 
 #[test]
 fn a_data_error_that_is_not_about_the_query_carries_no_query_hint() {
-    let stale_schema = RecallError::DataError(
-        "database schema is out of date; run `recall rebuild` to migrate it".into(),
+    let unfinished_index = RecallError::DataError(
+        "this index was not fully created; run `recall index` to finish it".into(),
     );
     let missing_scanned_files = RecallError::DataError(
         "`--file` needs the scanned-files index; run `recall index` once to record it.".into(),
     );
 
     assert_eq!(
-        [stale_schema, missing_scanned_files].map(|e| reported(&e.into())),
+        [unfinished_index, missing_scanned_files].map(|e| reported(&e.into())),
         [
             (
                 ExitCode::from(65),
-                r#"{"error":{"code":"DATA_ERROR","message":"database schema is out of date; run `recall rebuild` to migrate it","retryable":false}}"#.to_owned()
+                r#"{"error":{"code":"DATA_ERROR","message":"this index was not fully created; run `recall index` to finish it","retryable":false}}"#.to_owned()
             ),
             (
                 ExitCode::from(65),
@@ -50,10 +50,10 @@ fn a_data_error_that_is_not_about_the_query_carries_no_query_hint() {
 #[test]
 fn an_unreadable_index_exits_65_without_a_query_hint() {
     assert_eq!(
-        reported(&RecallError::DatabaseRead("database schema is out of date".into()).into()),
+        reported(&RecallError::DatabaseRead("this index was not fully created".into()).into()),
         (
             ExitCode::from(65),
-            r#"{"error":{"code":"DATA_ERROR","message":"database schema is out of date","retryable":false}}"#.to_owned()
+            r#"{"error":{"code":"DATA_ERROR","message":"this index was not fully created","retryable":false}}"#.to_owned()
         )
     );
 }

@@ -199,15 +199,15 @@ fn try_load_embedder_cached_returns_loaded_embedder() {
 }
 
 #[test]
-fn read_commands_use_pre_generation_index_without_migrating_it() {
+fn read_commands_use_a_v0_14_index_without_migrating_it() {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("recall.db");
     let conn = open_or_create_db(&path).unwrap();
     conn.execute_batch(
-        "DROP TRIGGER qa_chunks_insert_generation;
-             DROP TRIGGER qa_chunks_update_generation;
-             DROP TABLE qa_chunk_generation;
-             ALTER TABLE qa_chunks DROP COLUMN generation;",
+        "ALTER TABLE sessions DROP COLUMN message_rowid_lo;
+         ALTER TABLE sessions DROP COLUMN message_rowid_hi;
+         ALTER TABLE qa_chunks DROP COLUMN vec_rowid_lo;
+         ALTER TABLE qa_chunks DROP COLUMN vec_rowid_hi;",
     )
     .unwrap();
     db::seed_session(&conn, "s1");
