@@ -236,9 +236,7 @@ fn indexing_over_an_old_embedding_table_with_rows_refuses_and_keeps_them() {
 
     assert_eq!((code, stdout.as_str()), (Some(65), ""));
     assert!(
-        stderr.ends_with(
-            "\nerror: legacy vector index has no model identity; keep it for rollback and build Gemma in a separate --db-path\n"
-        ),
+        stderr.ends_with(&format!("error: {UNSUPPORTED_INDEX}\n")),
         "{stderr}"
     );
     assert_eq!(

@@ -194,8 +194,8 @@ overrides the path, while model identity checks still apply.
 When upgrading from Ruri, keep the old binary and `~/.local/share/recall/recall.db`
 for rollback. Remove any old `RECALL_DB` override or choose a new `--db-path`, then
 run `recall model download` and `recall index` to build the Gemma index from your
-session logs. Old vectors are not converted: an unidentified nonempty vector
-index allows FTS-only reads with a degraded note and refuses writes.
+session logs. Old vectors are not converted, and this version refuses to open
+the Ruri index.
 
 See [model validation, updates and rollback](docs/gemma-model-updates.md) for
 `--model-manifest` / `RECALL_MODEL_MANIFEST` and independent test indexes.

@@ -173,8 +173,7 @@ recall model manifest > gemma-manifest.json   # 対応するモデル・索引�
 
 旧Ruriから切り替える場合は、旧バイナリと `~/.local/share/recall/recall.db` を切戻し用に保持します。
 旧 `RECALL_DB` 指定を解除するか新しい `--db-path` を選び、`recall model download` と
-`recall index` でセッションログからGemma用の索引を構築してください。旧vectorは変換しません。
-識別情報がない非空ベクトル索引はFTS-onlyのdegraded読取りとなり、書込みは拒否します。
+`recall index` でセッションログからGemma用の索引を構築してください。旧vectorは変換しません。この版はRuriの索引を開きません。
 
 `--model-manifest` / `RECALL_MODEL_MANIFEST` による更新・切戻しと独立した検証用索引については、
 [モデルの検証・更新手順](docs/gemma-model-updates.md)を参照してください。
