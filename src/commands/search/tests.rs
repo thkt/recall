@@ -1,12 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use crate::commands::open_or_create_db;
 use crate::envelope::render_text_notes;
 use crate::model::tests::FakeHost;
 use crate::tests::{
     bare_empty_db, mock_loader, payload_keys, printed_envelope, search_command, seed_healthy_index,
     vec_chunk_count,
 };
-use crate::{db, embedder, open_or_create_db};
+use crate::{db, embedder};
 
 use super::*;
 

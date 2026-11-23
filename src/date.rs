@@ -44,5 +44,13 @@ pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
+pub fn format_timestamp(ts_ms: Option<i64>) -> String {
+    let Some(ts) = ts_ms else {
+        return "unknown".to_owned();
+    };
+    let (y, m, d) = civil_from_days(ts.div_euclid(MS_PER_DAY));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 #[cfg(test)]
 mod tests;

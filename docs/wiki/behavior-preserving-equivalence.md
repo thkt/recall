@@ -20,7 +20,7 @@ scenes: ["implement", "pr-create"]
 ## 参照コード
 
 - `src/native/real_tests.rs` の `real_model_bit_dump_for_build_parity`（トークン列と埋め込みのビット列を書き出して、ビルド間で比べる）
-- `src/compat.rs` の `assert_filter_symmetric`（フィルターありとなしの結果を比べる共通 helper）
+- `src/search/tests.rs` の `assert_filter_symmetric`（フィルターありとなしの結果を比べる共通 helper）
 
 ## 根拠
 

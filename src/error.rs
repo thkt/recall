@@ -1,9 +1,8 @@
 use std::io;
 use std::process::ExitCode;
 
+use crate::fts_query::{MIN_TRIGRAM_TERM_CHARS, SanitizeError};
 use crate::model::ModelDownloadError;
-use crate::runtime::codes;
-use crate::storage::{MIN_TRIGRAM_TERM_CHARS, SanitizeError};
 use serde::Serialize;
 
 use crate::envelope::{ErrorEnvelope, ErrorPayload};
@@ -22,12 +21,12 @@ pub(crate) enum ErrorCode {
 impl ErrorCode {
     pub(crate) fn code(self) -> u8 {
         match self {
-            Self::UsageError => codes::USAGE,
-            Self::DataError => codes::DATA_ERROR,
-            Self::Internal => codes::INTERNAL,
-            Self::IoError => codes::IO_ERR,
-            Self::TempFailure => codes::TEMP_FAIL,
-            Self::Unknown => codes::UNKNOWN,
+            Self::UsageError => 64,
+            Self::DataError => 65,
+            Self::Internal => 70,
+            Self::IoError => 74,
+            Self::TempFailure => 75,
+            Self::Unknown => 104,
         }
     }
 }

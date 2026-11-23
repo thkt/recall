@@ -6,7 +6,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Args;
 
-use crate::commands::{ReadIndex, build_markdown};
+use crate::commands::{ReadIndex, build_markdown, resolve_db_path, try_load_embedder_cached_with};
+use crate::date::format_timestamp;
 use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
 use crate::error::RecallError;
@@ -14,7 +15,6 @@ use crate::model::{self, DegradedReason, EmbedderDegraded};
 use crate::parser::Source;
 use crate::runtime::{done, warning};
 use crate::{ansi, search};
-use crate::{format_timestamp, resolve_db_path, try_load_embedder_cached_with};
 
 #[derive(Debug, Args)]
 pub(crate) struct SearchArgs {

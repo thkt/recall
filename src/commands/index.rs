@@ -4,16 +4,16 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::commands::{
+    open_or_create_db, resolve_db_path, search_degraded_note,
+    try_load_embedder_cached_with_reporter,
+};
 use crate::db::fix_orphan_embeddings;
 use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, DegradedReason, ModelHost, degrade_with_warn};
 use crate::runtime::{done, home_dir, info as cli_info, warning};
 use crate::{ansi, embedder, index_observer, indexer};
-use crate::{
-    open_or_create_db, resolve_db_path, search_degraded_note,
-    try_load_embedder_cached_with_reporter,
-};
 
 fn preserved_embedded_note(count: usize) -> Option<String> {
     (count > 0).then(|| {

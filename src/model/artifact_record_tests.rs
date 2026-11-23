@@ -1,6 +1,7 @@
 use super::*;
 use crate::commands::doctor::run_doctor_in;
 use crate::commands::index::index_embedder;
+use crate::commands::open_or_create_db;
 use crate::commands::search::run_search_in;
 use crate::commands::status::run_status_in;
 use crate::embedder::MockEmbedder;
@@ -8,7 +9,6 @@ use crate::embedding::Embed;
 use crate::error::RecallError;
 use crate::model::tests::FakeHost;
 use crate::model::{ModelHost, cache, hash_file};
-use crate::open_or_create_db;
 use crate::tests::{search_command, seed_healthy_index};
 use std::cell::Cell;
 use std::sync::Arc;

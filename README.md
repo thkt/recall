@@ -300,19 +300,29 @@ Add to `~/.claude/settings.json`:
 
 ```text
 src/
-├── main.rs       CLI definition, shared DB and model helpers, output dispatch
-├── commands/     Subcommand implementations (index, search, show, status, classify, doctor)
-├── parser/       JSONL parsers for Claude Code and Codex formats
-├── indexer.rs    Incremental indexer with mtime/size tracking + chunk generation
-├── search.rs     FTS5 + hybrid vector search with graceful degradation
-├── hybrid.rs     RRF merge + recency boost
-├── model.rs      Pinned manifests, artifact verification, isolated probe (skipped by search in a verified environment) and index identity
-├── native.rs     EmbeddingGemma encoder via llama.cpp/Metal
-├── embedding.rs  Shared embedding types and options
-├── embedder.rs   Index-time embedding orchestration (generation-checked chunk batches)
-├── chunker.rs    Q&A pair chunker with size splitting (exact-content reuse in indexer)
-├── db.rs         SQLite schema (WAL, FTS5, sqlite-vec)
-└── date.rs       Civil calendar date utilities
+├── main.rs            CLI definition, shorthand expansion, output dispatch
+├── commands.rs        DB path resolution, owner-only DB creation, and embedder loading shared by subcommands
+├── commands/          Subcommand implementations (index, search, show, status, classify, doctor)
+├── parser/            JSONL parsers for Claude Code and Codex formats
+├── indexer.rs         Incremental indexer with mtime/size tracking + chunk generation
+├── index_observer.rs  Index stage timings and counters reported on stderr
+├── classify.rs        Session type (interactive / automated) from provenance and the first user turn
+├── search.rs          FTS5 + hybrid vector search with graceful degradation
+├── search/filter.rs   Search option filters shared by the keyword, vector, and file-list queries
+├── fts_query.rs       FTS5 query sanitizing, operator parsing, short-term expansion, CJK script segmentation
+├── hybrid.rs          RRF merge + recency boost
+├── model.rs           Pinned manifests, artifact verification, isolated probe (skipped by search in a verified environment) and index identity
+├── native.rs          EmbeddingGemma encoder via llama.cpp/Metal
+├── embedding.rs       Shared embedding types and options
+├── embedder.rs        Index-time embedding orchestration (generation-checked chunk batches)
+├── chunker.rs         Q&A pair chunker with size splitting (exact-content reuse in indexer)
+├── db.rs              SQLite schema (WAL, FTS5, sqlite-vec)
+├── date.rs            Civil calendar date utilities
+├── envelope.rs        Command output, notes, and the `--json` envelope
+├── error.rs           Error kinds, exit codes, and the error envelope
+├── output.rs          stdout writer that treats a closed pipe as success
+├── runtime.rs         stderr messages, home directory lookup, log setup
+└── ansi.rs            Control character stripping for printed session text
 ```
 
 Single binary. SQLite, llama.cpp, and sqlite-vec are statically linked.

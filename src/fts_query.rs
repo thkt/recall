@@ -265,6 +265,58 @@ pub fn fts_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Han,
+    Hiragana,
+    Katakana,
+    Latin,
+    Other,
+}
+
+fn classify_script(c: char) -> Script {
+    match c {
+        'a'..='z' | 'A'..='Z' | '0'..='9' => Script::Latin,
+        '\u{3040}'..='\u{309F}' => Script::Hiragana,
+        '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9D}' => {
+            Script::Katakana
+        }
+        '\u{3005}'
+        | '\u{3400}'..='\u{4DBF}'
+        | '\u{4E00}'..='\u{9FFF}'
+        | '\u{F900}'..='\u{FAFF}' => Script::Han,
+        _ => Script::Other,
+    }
+}
+
+pub fn segment_script_boundaries(query: &str) -> String {
+    let mut out = String::with_capacity(query.len() + 8);
+    let mut in_quotes = false;
+    let mut prev: Option<Script> = None;
+    for c in query.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            out.push(c);
+            prev = None;
+            continue;
+        }
+        if in_quotes {
+            out.push(c);
+            continue;
+        }
+        let cur = classify_script(c);
+        if cur != Script::Other
+            && let Some(p) = prev
+            && p != cur
+        {
+            out.push(' ');
+        }
+        out.push(c);
+        prev = (cur != Script::Other).then_some(cur);
+    }
+    out
+}
+
 pub fn prepare_match_query(
     conn: &Connection,
     query: &str,

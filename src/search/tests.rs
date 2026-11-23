@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use crate::compat::assert_filter_symmetric;
-
 use super::*;
+use crate::date::MS_PER_DAY;
 use crate::db::{seed_session_file, setup_test_db};
 use crate::embedder::MockEmbedder;
 use crate::hybrid::RECENCY_BOOST_WEIGHT;
@@ -11,6 +10,25 @@ use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
 
 const NOW_MS: i64 = 1_750_000_000_000;
 const NONE: [&str; 0] = [];
+
+fn assert_filter_symmetric<S, F, U>(seed: S, filtered: F, unfiltered: U)
+where
+    S: FnOnce() -> (String, String),
+    F: FnOnce() -> Vec<String>,
+    U: FnOnce() -> Vec<String>,
+{
+    let (keep, drop) = seed();
+    let before = unfiltered();
+    assert!(
+        before.contains(&keep) && before.contains(&drop),
+        "unfiltered paths must reach both seeded sessions"
+    );
+    let after = filtered();
+    assert!(
+        after.contains(&keep) && !after.contains(&drop),
+        "filter must retain the matching session and remove the nonmatching session from the merged result"
+    );
+}
 
 fn insert_session(conn: &Connection, sid: &str, source: &str, project: &str, ts: i64) {
     conn.execute(
@@ -1331,7 +1349,7 @@ fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with
     assert_eq!(
         ids(&results),
         ["s1"],
-        "split into 校正 する the query expands to {split_query_combinations} combinations and overflows MAX_COMBINATIONS in src/compat.rs; at a cap of {split_query_combinations} or more this test passes without the gate, and a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone fails"
+        "split into 校正 する the query expands to {split_query_combinations} combinations and overflows MAX_TRIGRAM_COMBINATIONS in src/fts_query.rs; at a cap of {split_query_combinations} or more this test passes without the gate, and a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone fails"
     );
 }
 
@@ -1353,7 +1371,7 @@ fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_a
     assert_eq!(
         matched,
         ["both", "rust-only"],
-        "Rust 校正 する expands to {split_query_combinations} combinations and overflows MAX_COMBINATIONS in src/compat.rs, so only Rust is searched"
+        "Rust 校正 する expands to {split_query_combinations} combinations and overflows MAX_TRIGRAM_COMBINATIONS in src/fts_query.rs, so only Rust is searched"
     );
 }
 

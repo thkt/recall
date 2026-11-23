@@ -2,13 +2,13 @@ mod ansi;
 mod chunker;
 mod classify;
 mod commands;
-mod compat;
 mod date;
 mod db;
 mod embedder;
 mod embedding;
 mod envelope;
 mod error;
+mod fts_query;
 mod hybrid;
 mod index_observer;
 mod indexer;
@@ -18,32 +18,23 @@ mod output;
 mod parser;
 mod runtime;
 mod search;
-mod storage;
 
 use std::borrow::Cow;
 use std::env;
-use std::ffi::{OsStr, OsString};
-
-use std::fs::{OpenOptions, create_dir_all};
-use std::io::{self, ErrorKind, Write};
+use std::ffi::OsString;
+use std::io::{self, Write};
 use std::num::ParseIntError;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::Arc;
 
-use crate::embedding::Embed;
-use crate::model::handle_probe_if_needed;
-use crate::model::{DegradedReason, EmbedderDegraded, download_and_verify_model, record_degraded};
-use crate::runtime::{
-    codes, exit_error, home_dir, info as cli_info, init_subscriber, try_expand_shorthand,
-};
-use anyhow::{Context, Error, Result};
+use crate::model::{download_and_verify_model, handle_probe_if_needed};
+use crate::runtime::{exit_error, init_subscriber};
+use anyhow::{Error, Result};
 use clap::error::ErrorKind as ClapErrorKind;
 use clap::{Args, Parser, Subcommand};
-use rusqlite::Connection;
 
 use crate::envelope::{CommandOutput, render_json_error, render_json_success, render_text_notes};
-use crate::error::{RecallError, classify_exit_code, download_error, error_envelope};
+use crate::error::{ErrorCode, RecallError, classify_exit_code, download_error, error_envelope};
 use crate::output::{WriteOutcome, write_result};
 
 const LOG_FILTER_VERBOSE: &str = "recall=info";
@@ -157,112 +148,9 @@ struct EmbedFlags {
     forward_pause_ms: Option<u64>,
 }
 
-fn create_db_file(path: &Path) -> io::Result<()> {
-    create_dir_all(path.parent().unwrap_or(Path::new("")))?;
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)?;
-    Ok(())
-}
-
-fn format_timestamp(ts_ms: Option<i64>) -> String {
-    let Some(ts) = ts_ms else {
-        return "unknown".to_owned();
-    };
-    let days = ts.div_euclid(date::MS_PER_DAY);
-    let (y, m, d) = date::civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn open_or_create_db(path: &Path) -> Result<Connection> {
-    match create_db_file(path) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).context("Failed to create database file"),
-    }
-    {
-        let (existing, _) = db::open_db_readonly(path)?;
-        model::check_index(&existing, model::selected())
-            .map_err(|e| RecallError::DatabaseRead(e.to_string()))?;
-    }
-    let mut conn = db::open_db(path).context("Failed to open database")?;
-    model::bind_index(&mut conn, model::selected())?;
-    Ok(conn)
-}
-
-fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
-    match db_path {
-        Some(p) => Ok(p.clone()),
-        None => resolve_default_db_path(
-            env::var_os("XDG_DATA_HOME").as_deref(),
-            home_dir().as_deref(),
-        ),
-    }
-}
-
-fn resolve_default_db_path(xdg_data_home: Option<&OsStr>, home: Option<&Path>) -> Result<PathBuf> {
-    let data_home = match xdg_data_home.map(Path::new) {
-        Some(p) if p.is_absolute() => p.to_path_buf(),
-        _ => home
-            .context("Could not determine home directory")?
-            .join(".local")
-            .join("share"),
-    };
-    Ok(data_home
-        .join("recall")
-        .join("indexes")
-        .join(model::selected().identity())
-        .join("recall.db"))
-}
-
-fn try_load_embedder_cached_with<F>(open_embedder: F) -> Result<Arc<dyn Embed>, DegradedReason>
-where
-    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
-{
-    try_load_embedder_cached_with_reporter(open_embedder, cli_info)
-}
-
-fn try_load_embedder_cached_with_reporter<F, I>(
-    open_embedder: F,
-    mut report_info: I,
-) -> Result<Arc<dyn Embed>, DegradedReason>
-where
-    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
-    I: FnMut(&str),
-{
-    open_embedder().inspect_err(|&reason| {
-        if let Some(note) = search_degraded_note(reason) {
-            report_info(&note);
-        }
-        if reason != DegradedReason::NotInstalled {
-            record_degraded(reason, "embedder load");
-        }
-    })
-}
-
-fn search_degraded_note(reason: DegradedReason) -> Option<String> {
-    EmbedderDegraded(reason)
-        .user_note()
-        .map(|note| format!("note: {note}."))
-}
-
 fn parse_token_budget(s: &str) -> Result<usize, ParseIntError> {
     let value: usize = s.parse()?;
     Ok(value.min(embedder::TOKEN_BUDGET_CEILING))
-}
-
-fn require_current_schema(state: db::SchemaState) -> Result<(), RecallError> {
-    match state {
-        db::SchemaState::Current | db::SchemaState::Empty => Ok(()),
-        db::SchemaState::Stale => Err(RecallError::DataError(
-            "database schema is out of date; run `recall rebuild` to migrate it".to_owned(),
-        )),
-    }
 }
 
 fn emit_success(out: &CommandOutput, json_mode: bool) -> io::Result<WriteOutcome> {
@@ -309,8 +197,36 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
 ];
 const GLOBAL_FLAGS: &[&str] = &["--verbose", "-v", "--json"];
 
+fn try_expand_shorthand(args: &[OsString]) -> Option<Vec<OsString>> {
+    let mut i = 1;
+    while i < args.len() {
+        let s = args[i].to_str()?;
+        if matches!(s, "--db-path" | "--model-manifest") {
+            i += 2;
+            continue;
+        }
+        if s.starts_with("--db-path=")
+            || s.starts_with("--model-manifest=")
+            || GLOBAL_FLAGS.contains(&s)
+        {
+            i += 1;
+            continue;
+        }
+        if s == "--help" || s == "-h" || KNOWN_SUBCOMMANDS.contains(&s) {
+            return None;
+        }
+        if s.starts_with('-') {
+            return None;
+        }
+        let mut result = args.to_vec();
+        result.insert(i, "search".into());
+        return Some(result);
+    }
+    None
+}
+
 fn parse_cli(args: Vec<OsString>) -> Result<Cli, ExitCode> {
-    let parsed = match try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS) {
+    let parsed = match try_expand_shorthand(&args) {
         Some(expanded) => Cli::try_parse_from(expanded),
         None => Cli::try_parse_from(args),
     };
@@ -321,7 +237,7 @@ fn handle_parse_error(err: &clap::Error) -> ExitCode {
     let _ = err.print();
     match err.kind() {
         ClapErrorKind::DisplayHelp => ExitCode::SUCCESS,
-        _ => ExitCode::from(codes::USAGE),
+        _ => ExitCode::from(ErrorCode::UsageError.code()),
     }
 }
 
