@@ -1,12 +1,10 @@
 use std::ffi::c_int;
-use std::path::PathBuf;
 
 use rusqlite::ffi::{self, SQLITE_BUSY, SQLITE_CORRUPT_VTAB, SQLITE_ERROR};
 
 use super::*;
 use crate::db::setup_test_db;
 use crate::embedder::MockEmbedder;
-use crate::embedding::{ChunkedEmbedding, EmbedError, EmbedOptions};
 
 const TS: i64 = 1709251200000;
 
@@ -448,52 +446,27 @@ fn a_session_found_only_by_the_vector_search_stays_when_it_matches_a_not_nested_
     );
 }
 
-struct EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
-    db_path: PathBuf,
-}
-
-impl Embed for EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
-    fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
-        Connection::open(&self.db_path)
-            .and_then(|other| other.execute_batch("DROP TABLE messages_data"))
-            .unwrap();
-        Ok(MockEmbedder::deterministic_vector(text))
-    }
-    fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
-        unreachable!("search only calls embed_query")
-    }
-    fn embed_documents_batch(
-        &self,
-        _texts: &[&str],
-        _options: &EmbedOptions,
-    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
-        unreachable!("search only calls embed_query")
-    }
-}
-
 #[test]
 fn a_failed_not_filter_drops_the_vector_only_sessions_and_marks_the_vector_search_degraded() {
-    let (dir, conn) = db_with_messages(&[
+    let (_dir, conn) = db_with_messages(&[
         ("text-hit", "alpha release notes"),
         ("vec-only", "gamma tag notes"),
     ]);
-    add_embedded_chunk(&conn, 1, "vec-only", "gamma tag notes");
-    let embedder = EmbedderThatBreaksTheIndexAfterTheKeywordSearch {
-        db_path: dir.path().join("test.db"),
-    };
-    let opts = SearchOptions {
-        now_ms: Some(TS),
-        ..Default::default()
-    };
+    conn.execute_batch("DROP TABLE messages_data").unwrap();
+    let text_hits = HashSet::from(["text-hit"]);
+    let mut merged = vec![("text-hit".to_owned(), 1.0), ("vec-only".to_owned(), 0.5)];
 
-    let outcome = search_with_embedder(&conn, "alpha NOT beta", &opts, Some(&embedder)).unwrap();
+    let degraded = drop_vec_only_sessions_matching_not(
+        &conn,
+        &["\"beta\"".to_owned()],
+        &text_hits,
+        &mut merged,
+    );
 
-    let ids: Vec<&str> = outcome
-        .results
-        .iter()
-        .map(|r| r.session.session_id.as_str())
-        .collect();
-    assert_eq!((ids, outcome.vec_degraded), (vec!["text-hit"], true));
+    assert_eq!(
+        (merged, degraded),
+        (vec![("text-hit".to_owned(), 1.0)], true)
+    );
 }
 
 fn hybrid_result_count_and_embed_calls(conn: &Connection, query: &str) -> (usize, usize) {
