@@ -1,6 +1,6 @@
 # index の観測とホスト計測
 
-Gemma移行後の現行pipelineはversion 2です。以下の過去の時間・メモリ計測は実行当時のRuri構成の記録であり、Gemmaの性能値としては扱いません。モデルと索引の更新・切戻しは [Gemma手順](gemma-model-updates.md) を参照してください。
+Gemma移行後の現行pipelineはversion 2です。モデルと索引の更新・切戻しは [Gemma手順](gemma-model-updates.md) を参照してください。
 
 `index` と `rebuild` は、長い処理に入る前に `index: <段階>: started` をstderrへ出す。TTY・非TTYで同じ段階名を使用する。単一のモデルロードや推論の内部進捗は取得しないため、その間は開始表示が現在の段階を示す。解析とFTS書込みはファイルごとに交互に実行する `parse_fts` 段階である。進捗だけの精密な総数取得を繰り返さず、列挙結果・選択結果・処理中のカウンターを利用する。
 
@@ -47,7 +47,7 @@ Gemma移行後の現行pipelineはversion 2です。以下の過去の時間・�
 
 ## 4ケースの実モデル計測
 
-macOS / Apple Silicon、`Cargo.toml` の要求版以上のRust、Xcode command-line tools・CMake、利用可能なモデルを用意したホストで実施する。再現手順を以下に示す。2026-09-21の結果は[実モデル・オーバーヘッド計測](research/index-observability-measurements.md)を参照。[Issue #324](https://github.com/thkt/recall/issues/324) の受入条件と [ADR-0001](decisions/0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md) の出力契約に従う。媒体のcaptureは不要。
+macOS / Apple Silicon、`Cargo.toml` の要求版以上のRust、Xcode command-line tools・CMake、利用可能なモデルを用意したホストで実施する。再現手順を以下に示す。[Issue #324](https://github.com/thkt/recall/issues/324) の受入条件と [ADR-0001](decisions/0001-freeze-the-json-output-envelope-as-a-stable-consumer-contract.md) の出力契約に従う。媒体のcaptureは不要。
 
 ```sh
 python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-results \
@@ -63,8 +63,7 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-
 
 計測オーバーヘッドは開始版 `ef814f3dbf1cf2897459e7e8ece1d9e413716ed7` と変更版を同じrelease条件でビルドし、同じ合成入力・モデル・出力先種別で比較する。開始版には `--baseline` を付ける（段階観測と中断通知がないため3ケースのwall比較だけを行う）。繰返し回数、実行順、各測定値とばらつきを残し、短い無変更ケースと推論を含むケースを分ける。旧版の全体時間を段階時間として流用しない。計測あり/なしの差だけでなく今回の進捗表示費用も含む比較であり、改善効果や数値SLOは測定前に断定しない。
 
-実測は検証コマンドやCIの代替ではない。fmt / nextest ci / clippyと既存CIも対象版で確認する。調査版・比較基準・測定候補・引継ぎ版の対応と、証拠を再利用できる範囲は[実測記録](research/index-observability-measurements.md)を参照する。
-
+実測は検証コマンドやCIの代替ではない。fmt / nextest ci / clippyと既存CIも対象版で確認する。
 
 ## チャンク再利用の条件と追記計測
 
@@ -102,10 +101,7 @@ python3 scripts/measure-index.py /absolute/path/to/recall /absolute/path/to/new-
 
 保存本文とチャンクのsource rowid範囲は、メッセージの会話内位置へ正規化したSHA-256で照合する。mtime更新前後と追記後/rebuild後の一致をスクリプトが検査し、新旧版間の一致もJSONを比較して確認する。SQLiteの割当ページ容量・使用ページ容量も保存する。ページ容量には既存データや空き領域の影響があり、新しい状態だけの容量とは扱わない。Python計測ではvector値を読まない。保持vectorのbyte一致、一部だけ埋め込み済みの重複本文、末尾assistant、切詰め・差し替え、規則変更の回帰テストは、stub（`MockEmbedder`）で埋め込み、推論件数と保存件数を観測値の `inference_chunks`・`chunks_saved` で数える。失敗・再開と別接続の旧推論結果拒否の回帰テストは、同じstubで埋め込み結果の件数（`embedded`・`failed_count`）と保存内容を確認する。
 
-PRの測定記録にはハードウェア・モデル・件数・変更量、推論入力数とバッチ回数、再利用数、段階時間とwall、保存データの一致、ページ容量を示す。双方を同じ入力・設定で交互順に繰り返し、無変更の追加費用と追記の削減を分ける。中断の1試行成功を一般的な競合保証にせず、stubのbyte一致を実モデルのfloat値一致や検索品質の証明にしない。[#324の既存測定](research/index-observability-measurements.md) は今回の性能結果ではない。実モデル計測・設定済みfull check・CIと独立評価はホストで実施し、この手順の追加だけで費用に見合うことを確認済みとはしない。
-
-引継ぎ時の[#325実測記録](research/index-reuse-measurements.md)は、上記の512ファイルの手順とは別に、ホスト用scriptで合成1会話256往復へ1往復を追記した結果である。測定版・入力fingerprint・保存内容の照合結果・未測定範囲は同記録を参照し、提出版との差分を確認して再利用する。過去の実測を提出版のfull checkやCIの成功へ読み替えない。
-
+PRの測定記録にはハードウェア・モデル・件数・変更量、推論入力数とバッチ回数、再利用数、段階時間とwall、保存データの一致、ページ容量を示す。双方を同じ入力・設定で交互順に繰り返し、無変更の追加費用と追記の削減を分ける。中断の1試行成功を一般的な競合保証にせず、stubのbyte一致を実モデルのfloat値一致や検索品質の証明にしない。実モデル計測・設定済みfull check・CIと独立評価はホストで実施し、この手順の追加だけで費用に見合うことを確認済みとはしない。
 
 ## 未処理本文の有限ページと比較計測
 
@@ -128,7 +124,7 @@ PRの測定記録にはハードウェア・モデル・件数・変更量、推
 - `pending_metadata_bytes`：未処理一覧のcapacity × 要素サイズ。照合用HashSetを含まない。
 - `pending_pages`：取得したページ数。全件が世代不一致で本文0件のページも数える。
 
-取得方式の比較では、毎ページpending照合を繰り返す方式は #138 の利点を失うため採らない。ID keysetだけのページ取得はmetadataを減らせる一方、長さの近い入力を全体からまとめる現在の推論効率を変える。今回のmetadata一覧方式は O(P) の小さい一覧を残してその長さ順を保つ選択である。1,024件・8 MiBは実装上の比較対象値であり、実測済みの最適値や人が合意した性能SLOではない。今回の実測と制約は[本文保持量の比較記録](research/bounded-pending-measurements.md)に記す。
+取得方式の比較では、毎ページpending照合を繰り返す方式は #138 の利点を失うため採らない。ID keysetだけのページ取得はmetadataを減らせる一方、長さの近い入力を全体からまとめる現在の推論効率を変える。今回のmetadata一覧方式は O(P) の小さい一覧を残してその長さ順を保つ選択である。1,024件・8 MiBは実装上の比較対象値であり、実測済みの最適値や人が合意した性能SLOではない。
 
 ### 追加比較の手順
 

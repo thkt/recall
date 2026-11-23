@@ -30,4 +30,3 @@ GitHub の CI や調査用サンドボックスでは、実モデル・GPU・Met
 - #319〜#327 調査時に Metal Toolchain がなく（`cannot execute tool 'metal'`）製品テストをビルドできなかったと記録した（当時の MLX 依存）
 - [research:session-provenance-classification.md](../research/session-provenance-classification.md) サンドボックスで CMake の mlx.git 取得が DNS 制約で止まり、MLX を外した一時 crate の確認は製品の検証に数えなかった
 - [research:issue-342-scope.md](../research/issue-342-scope.md) 同じ制約と、ホストの full check への引き継ぎ
-- [research:index-observability-measurements.md](../research/index-observability-measurements.md) Metal が使えないサンドボックスの計測を除外した
