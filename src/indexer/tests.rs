@@ -68,7 +68,7 @@ fn reindexing_unchanged_logs_indexes_nothing_and_leaves_stored_rows_unchanged() 
 }
 
 #[test]
-fn test_index_from_dirs_reindexes_appended_file() {
+fn a_log_that_grew_since_the_last_run_is_parsed_again_into_the_same_session() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");
@@ -897,7 +897,7 @@ fn slash_command_first_turn_is_stored_as_automated_and_human_first_turn_as_inter
 }
 
 #[test]
-fn test_incremental_scan_picks_up_new_file_in_existing_codex_day_dir() {
+fn a_new_codex_log_in_an_already_indexed_day_directory_is_indexed_on_the_next_run() {
     let (_dir, mut conn) = setup_test_db();
     let tmp = TempDir::new().unwrap();
     let claude_dir = tmp.path().join("claude_projects");

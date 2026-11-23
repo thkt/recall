@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn test_xml_wrapper_with_leading_whitespace_is_automated() {
+fn a_first_turn_that_opens_with_a_tool_wrapper_tag_is_automated_even_after_leading_whitespace() {
     for turn in [
         "\n            <command-message>clear</command-message>",
         "<user_action>\n  <context>review</context>",
@@ -17,14 +17,14 @@ fn test_xml_wrapper_with_leading_whitespace_is_automated() {
 }
 
 #[test]
-fn test_continuation_marker_is_automated() {
+fn a_first_turn_that_opens_with_the_continuation_notice_is_automated() {
     let turn =
         "This session is being continued from a previous conversation that ran out of context.";
     assert_eq!(classify_first_turn(turn), SessionType::Automated);
 }
 
 #[test]
-fn test_human_and_empty_turn_is_interactive() {
+fn a_plain_question_or_a_blank_first_turn_is_interactive() {
     for turn in ["how do I implement authentication?", "", "   \n  "] {
         assert_eq!(
             classify_first_turn(turn),
