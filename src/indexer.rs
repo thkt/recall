@@ -507,7 +507,7 @@ fn index_all(
         observer.count("files_empty", empty);
         observer.count("files_failed", failed);
         observer.count("files_deferred", preserved_embedded);
-        stage.progress(position + 1, sources.len(), 0);
+        stage.progress(position + 1, sources.len());
     }
 
     stage.finish("processed; awaiting FTS transaction commit");
@@ -662,7 +662,7 @@ pub(crate) fn settle(
         );
     }
     let on_backfill_progress = |done: usize, total: usize| {
-        backfill.progress(done.saturating_sub(1), total, 0);
+        backfill.progress(done.saturating_sub(1), total);
     };
     let scanned_backfilled = backfill_session_files(
         conn,

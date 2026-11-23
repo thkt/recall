@@ -1615,45 +1615,6 @@ fn parse_loss_notes_come_after_the_embedding_root_and_preserved_notes_of_the_sam
 }
 
 #[test]
-fn embed_failure_note_strips_control_characters_and_keeps_the_first_120_characters_of_the_error() {
-    let outcome = IndexOutcome {
-        embed: EmbedPass::Ran(embedder::EmbedResult {
-            embedded: 0,
-            failed_count: 2,
-            first_error: Some(format!(
-                "batch: \x1b[31mboom\x1b[0m {}{}",
-                "e".repeat(100),
-                "界".repeat(200)
-            )),
-        }),
-        skipped_roots: Vec::new(),
-        preserved_embedded: 0,
-        parse_diagnostics: Vec::new(),
-        observations: serde_json::Value::Null,
-    };
-
-    assert_eq!(
-        printed_envelope(&outcome),
-        serde_json::json!({
-            "data": {
-                "embedded": 0,
-                "failed_count": 2,
-                "observations": null,
-                "parse_diagnostics": [],
-                "preserved_embedded": 0,
-                "skipped_roots": [],
-            },
-            "degraded": true,
-            "notes": [format!(
-                "2 chunk(s) failed to embed (batch: boom {}{}); rerun `recall index` to retry",
-                "e".repeat(100),
-                "界".repeat(8)
-            )],
-        })
-    );
-}
-
-#[test]
 fn index_with_a_claude_root_that_cannot_be_read_reports_its_preserved_session_as_incomplete_enumeration()
  {
     let src = tempfile::TempDir::new().unwrap();
@@ -1826,7 +1787,6 @@ fn freeze_index_payload_key_set() {
         embed: EmbedPass::Ran(embedder::EmbedResult {
             embedded: 4,
             failed_count: 0,
-            first_error: None,
         }),
         skipped_roots: vec![indexer::SkippedRoot {
             source: parser::Source::Codex,
@@ -1910,7 +1870,6 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
         embed: EmbedPass::Ran(embedder::EmbedResult {
             embedded: 0,
             failed_count: 2,
-            first_error: Some("batch failed".to_owned()),
         }),
         ..IndexOutcome::default()
     };
@@ -1922,7 +1881,7 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
         ),
         (
             String::new(),
-            "note: 2 chunk(s) failed to embed (batch failed); rerun `recall index` to retry\n"
+            "note: 2 chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry\n"
                 .to_owned()
         ),
         "index_and_report prints every other note itself; the embed failure reaches stderr only as a tracing line without the remedy"

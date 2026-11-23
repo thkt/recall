@@ -375,39 +375,19 @@ fn row_or_default<T>(result: rusqlite::Result<T>, session_id: &str) -> Option<T>
     }
 }
 
-// why-not: `messages.session_id` is UNINDEXED, so a MATCH per session reads every matching row each time.
-fn fts_rows_per_session<T>(
-    conn: &Connection,
-    fts_query: &str,
-    session_ids: &[&str],
-    pick: &str,
-    decode: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>,
-) -> Result<HashMap<String, T>> {
-    let sql = format!(
-        "SELECT session_id, {pick} FROM messages \
-         WHERE messages MATCH ? AND session_id IN ({}) GROUP BY session_id",
-        anon_placeholders(session_ids.len())
-    );
-    let mut params: Vec<&dyn ToSql> = vec![&fts_query];
-    params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        Ok((row.get::<_, String>(0)?, decode(row)?))
-    });
-    let mut picked = HashMap::new();
-    match rows.and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()) {
-        Ok(rows) => picked.extend(rows),
-        Err(e) => warn!(error = %e, "snippet extraction failed"),
-    }
-    Ok(picked)
+#[derive(Default)]
+struct MatchingMessages {
+    best: HashMap<String, i64>,
+    first: HashMap<String, i64>,
 }
 
+// why-not: `messages.session_id` is UNINDEXED, so a MATCH per session reads every matching row each time.
 // why-not: `MIN(rank)` with bare columns leaves a rank tie to SQLite, and a window sorts every matching row.
-fn best_matching_messages(
+fn matching_messages(
     conn: &Connection,
     fts_query: &str,
     session_ids: &[&str],
-) -> Result<HashMap<String, i64>> {
+) -> Result<MatchingMessages> {
     let sql = format!(
         "SELECT session_id, rowid, rank FROM messages \
          WHERE messages MATCH ? AND session_id IN ({})",
@@ -417,6 +397,7 @@ fn best_matching_messages(
     params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
     let mut stmt = conn.prepare(&sql)?;
     let mut best: HashMap<String, (f64, i64)> = HashMap::new();
+    let mut first: HashMap<String, i64> = HashMap::new();
     let read = stmt
         .query_map(params.as_slice(), |row| {
             Ok((
@@ -428,6 +409,8 @@ fn best_matching_messages(
         .and_then(|rows| {
             for row in rows {
                 let (session_id, rowid, rank) = row?;
+                let earliest = first.entry(session_id.clone()).or_insert(rowid);
+                *earliest = rowid.min(*earliest);
                 let kept = best.entry(session_id).or_insert((rank, rowid));
                 if rank.total_cmp(&kept.0).then(rowid.cmp(&kept.1)).is_lt() {
                     *kept = (rank, rowid);
@@ -436,13 +419,16 @@ fn best_matching_messages(
             Ok(())
         });
     if let Err(e) = read {
-        warn!(error = %e, "best matching message lookup failed");
-        return Ok(HashMap::new());
+        warn!(error = %e, "matching message lookup failed");
+        return Ok(MatchingMessages::default());
     }
-    Ok(best
-        .into_iter()
-        .map(|(session_id, (_, rowid))| (session_id, rowid))
-        .collect())
+    Ok(MatchingMessages {
+        best: best
+            .into_iter()
+            .map(|(session_id, (_, rowid))| (session_id, rowid))
+            .collect(),
+        first,
+    })
 }
 
 fn fetch_chunks(
@@ -452,14 +438,9 @@ fn fetch_chunks(
     vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<SearchResult>> {
     let session_ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
-    let (best_hits, first_hits) = match fts_query {
-        Some(q) => (
-            best_matching_messages(conn, q, &session_ids)?,
-            fts_rows_per_session(conn, q, &session_ids, "MIN(rowid)", |row| {
-                row.get::<_, i64>(1)
-            })?,
-        ),
-        None => (HashMap::new(), HashMap::new()),
+    let matching = match fts_query {
+        Some(q) => matching_messages(conn, q, &session_ids)?,
+        None => MatchingMessages::default(),
     };
     let rowid_match_sql = "SELECT c.id, MAX(c.content) FROM qa_chunks c \
         WHERE c.session_id = ?1 AND c.src_rowid_lo IS NOT NULL \
@@ -476,7 +457,7 @@ fn fetch_chunks(
     let vec_chunk_sql = "SELECT content FROM qa_chunks WHERE id = ?1";
     let mut vec_chunk_stmt = conn.prepare(vec_chunk_sql)?;
     let mut excerpt_of = |sid: &str| -> (String, Option<i64>) {
-        if let Some(rowid) = best_hits.get(sid) {
+        if let Some(rowid) = matching.best.get(sid) {
             if let Some((chunk_id, content)) = row_or_default(
                 rowid_match_stmt.query_row(rusqlite::params![sid, rowid], |row| {
                     Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -492,7 +473,7 @@ fn fetch_chunks(
                 return (content, None);
             }
         }
-        if let (Some(fts_query), Some(rowid)) = (fts_query, first_hits.get(sid))
+        if let (Some(fts_query), Some(rowid)) = (fts_query, matching.first.get(sid))
             && let Some(snippet) = row_or_default(
                 snippet_stmt.query_row(rusqlite::params![fts_query, rowid], |row| row.get(0)),
                 sid,

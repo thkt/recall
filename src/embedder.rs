@@ -23,16 +23,15 @@ pub(crate) const TOKEN_BUDGET_CEILING: usize = 256_000;
 pub(crate) struct EmbedResult {
     pub embedded: usize,
     pub failed_count: usize,
-    pub first_error: Option<String>,
 }
 
 impl EmbedResult {
     pub(crate) fn warn_if_batches_failed(&self) {
         if self.failed_count > 0 {
-            let first_error = self.first_error.as_deref().unwrap_or("unknown");
             warn!(
                 failed_count = self.failed_count,
-                first_error, "embedding skipped chunks after batch failures"
+                first_error = "batch inference failed",
+                "embedding skipped chunks after batch failures"
             );
         }
     }
@@ -207,9 +206,6 @@ impl BatchEmbedder<'_, '_> {
         let result = &mut self.progress.result;
         result.failed_count += count;
         self.observer.count("chunks_failed", result.failed_count);
-        if result.first_error.is_none() {
-            result.first_error = Some("batch inference failed".to_owned());
-        }
     }
 
     fn save(&mut self, batch: &[PendingChunk], embeddings: &[ChunkedEmbedding]) {

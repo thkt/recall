@@ -13,7 +13,7 @@ use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, DegradedReason, ModelHost, degrade_with_warn};
 use crate::runtime::{done, home_dir, info as cli_info, warning};
-use crate::{ansi, embedder, index_observer, indexer};
+use crate::{embedder, index_observer, indexer};
 
 fn preserved_embedded_note(count: usize) -> Option<String> {
     (count > 0).then(|| {
@@ -97,8 +97,6 @@ impl IndexOutcome {
     }
 }
 
-const EMBED_ERROR_NOTE_MAX_CHARS: usize = 120;
-
 pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     let mut notes = Vec::new();
     let (embedded, failed_count) = match &outcome.embed {
@@ -108,13 +106,8 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
         }
         EmbedPass::Ran(result) => {
             if result.failed_count > 0 {
-                let raw = result.first_error.as_deref().unwrap_or("unknown error");
-                let err: String = ansi::strip_control_chars(raw)
-                    .chars()
-                    .take(EMBED_ERROR_NOTE_MAX_CHARS)
-                    .collect();
                 notes.push(Note::new(format!(
-                    "{n} chunk(s) failed to embed ({err}); rerun `recall index` to retry",
+                    "{n} chunk(s) failed to embed (batch inference failed); rerun `recall index` to retry",
                     n = result.failed_count,
                 )));
             }

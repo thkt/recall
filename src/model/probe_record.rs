@@ -1,14 +1,12 @@
 use super::digest_hex;
 use sha2::{Digest, Sha256};
-#[cfg(target_vendor = "apple")]
-use std::ptr;
 use std::{
     env,
     ffi::{CStr, OsStr, OsString},
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, ErrorKind, Write},
     path::{Path, PathBuf},
-    process,
+    process, ptr,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -74,7 +72,6 @@ pub(super) fn ggml_vars(
     ggml
 }
 
-#[cfg(target_vendor = "apple")]
 #[allow(unsafe_code)]
 fn sysctl_string(name: &CStr) -> io::Result<String> {
     let mut len: libc::size_t = 0;
@@ -109,14 +106,6 @@ fn sysctl_string(name: &CStr) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&buf)
         .trim_end_matches('\0')
         .to_owned())
-}
-
-#[cfg(not(target_vendor = "apple"))]
-fn sysctl_string(name: &CStr) -> io::Result<String> {
-    Err(io::Error::new(
-        ErrorKind::Unsupported,
-        format!("sysctl {name:?} is read only on Apple platforms"),
-    ))
 }
 
 pub(super) fn record_dir(
