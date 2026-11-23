@@ -92,13 +92,13 @@ pub(crate) struct Stage<'a> {
 }
 
 impl Stage<'_> {
-    pub(crate) fn progress(&self, processed: usize, total: usize, saved: usize) {
+    pub(crate) fn progress(&self, processed: usize, total: usize) {
         if processed != total && self.last.borrow().elapsed() < Duration::from_secs(1) {
             return;
         }
         *self.last.borrow_mut() = Instant::now();
         self.observer.emit(&format!(
-            "index: {}: processed={processed}/{total} unprocessed={} committed={saved}",
+            "index: {}: processed={processed}/{total} unprocessed={} committed=0",
             self.name,
             total.saturating_sub(processed)
         ));

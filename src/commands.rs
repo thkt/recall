@@ -107,7 +107,7 @@ where
             report_info(&note);
         }
         if reason != DegradedReason::NotInstalled {
-            record_degraded(reason, "embedder load");
+            record_degraded(reason);
         }
     })
 }

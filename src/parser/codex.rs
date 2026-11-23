@@ -153,7 +153,7 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
 }
 
 fn extract_date_from_path(path: &str) -> Option<String> {
-    let segments: Vec<&str> = path.split(['/', '\\']).collect();
+    let segments: Vec<&str> = path.split('/').collect();
     for window in segments.windows(4) {
         if window[0] == "sessions"
             && window[1].len() == 4
@@ -168,7 +168,7 @@ fn extract_date_from_path(path: &str) -> Option<String> {
 }
 
 fn date_from_rollout_name(path: &str) -> Option<String> {
-    let name = path.rsplit(['/', '\\']).next()?;
+    let name = path.rsplit('/').next()?;
     let date = name.strip_prefix("rollout-")?.get(..10)?;
     let is_shaped = date.bytes().enumerate().all(|(i, b)| match i {
         4 | 7 => b == b'-',

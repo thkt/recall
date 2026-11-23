@@ -19,11 +19,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[path = "model/artifact_record.rs"]
 mod artifact_record;
-#[path = "model/cache.rs"]
 mod cache;
-#[path = "model/probe_record.rs"]
 mod probe_record;
 pub(crate) use artifact_record::{ArtifactCheck, ResolvedArtifacts};
 use artifact_record::{ArtifactRecords, resolve_artifacts};
@@ -224,8 +221,8 @@ impl EmbedderDegraded {
         }
     }
 }
-pub fn record_degraded(reason: DegradedReason, stage: &str) {
-    tracing::warn!(%reason,stage,"semantic search unavailable");
+pub fn record_degraded(reason: DegradedReason) {
+    tracing::warn!(%reason,stage="embedder load","semantic search unavailable");
 }
 pub fn degrade_with_warn<E: fmt::Display>(
     stage: &'static str,
@@ -580,5 +577,4 @@ pub fn bind_index(conn: &mut Connection, spec: &ModelSpec) -> Result<()> {
 }
 
 #[cfg(test)]
-#[path = "model/tests.rs"]
 pub(crate) mod tests;

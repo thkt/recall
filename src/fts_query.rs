@@ -603,16 +603,8 @@ fn expand_token_via_vocab(
     {
         Ok(terms) if !terms.is_empty() => Ok(Some(terms)),
         Ok(_) => Ok(None),
-        Err(e) if is_missing_table_error(&e) => Ok(None),
         Err(e) => Err(SanitizeError::VocabLookupFailed(e.to_string())),
     }
-}
-
-fn is_missing_table_error(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("no such table")
-    )
 }
 
 fn is_valid_sql_identifier(value: &str) -> bool {
@@ -641,11 +633,9 @@ pub(crate) fn fts_expand_short_terms(
     if !is_valid_sql_identifier(vocab_table) {
         return Err(SanitizeError::InvalidVocabTable(vocab_table.to_owned()));
     }
-    let mut stmt = match conn.prepare_cached(&vocab_lookup_sql(vocab_table)) {
-        Ok(s) => Some(s),
-        Err(e) if is_missing_table_error(&e) => None,
-        Err(e) => return Err(SanitizeError::VocabLookupFailed(e.to_string())),
-    };
+    let mut stmt = conn
+        .prepare_cached(&vocab_lookup_sql(vocab_table))
+        .map_err(|e| SanitizeError::VocabLookupFailed(e.to_string()))?;
 
     let mut parts = Vec::new();
     let pieces = scan_tokens(query.as_str(), |_| false);
@@ -662,11 +652,7 @@ pub(crate) fn fts_expand_short_terms(
             parts.push(MatchSegment::Fixed(token.to_owned()));
             continue;
         }
-        let expanded = match stmt.as_mut() {
-            Some(s) => expand_token_via_vocab(s, token)?,
-            None => None,
-        };
-        parts.push(match expanded {
+        parts.push(match expand_token_via_vocab(&mut stmt, token)? {
             Some(terms) => MatchSegment::Alternatives(terms),
             None => MatchSegment::Fixed(token.to_owned()),
         });

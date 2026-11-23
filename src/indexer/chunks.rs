@@ -109,7 +109,7 @@ pub(super) fn index_chunks_observed(
             }
             store_session_chunks(&tx, session_id, &chunks, &mut stats)?;
             stats.sessions_chunked += 1;
-            stage.progress(stats.sessions_chunked, total, 0);
+            stage.progress(stats.sessions_chunked, total);
         }
         remaining = rest;
     }

@@ -1,7 +1,7 @@
 use std::fs;
 
 use crate::db;
-use crate::tests::printed_envelope;
+use crate::test_support::printed_envelope;
 
 use super::*;
 

@@ -9,7 +9,7 @@ use crate::embedding::Embed;
 use crate::error::RecallError;
 use crate::model::tests::FakeHost;
 use crate::model::{ModelHost, cache, hash_file};
-use crate::tests::{search_command, seed_healthy_index};
+use crate::test_support::{search_command, seed_healthy_index};
 use std::cell::Cell;
 use std::sync::Arc;
 use std::thread;
