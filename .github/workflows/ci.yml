@@ -103,11 +103,13 @@ jobs:
       - name: Generate combined lcov coverage
         run: cargo llvm-cov report --lcov --output-path lcov.info
 
-      - name: Test coverage filter script
+      - name: Test the Python scripts
         run: |
           python3 -m venv /tmp/pytest-venv
           /tmp/pytest-venv/bin/pip install --quiet pytest
-          /tmp/pytest-venv/bin/python -m pytest .github/scripts/test_filter_lcov_cfg_test.py -q
+          /tmp/pytest-venv/bin/python -m pytest \
+            .github/scripts/test_filter_lcov_cfg_test.py \
+            scripts/test_measure_search.py -q
 
       - name: Strip cfg(test) blocks from lcov via filter script
         run: |
