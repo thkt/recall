@@ -1091,6 +1091,62 @@ fn doctor_of_an_index_older_than_v0_14_reports_an_unsupported_schema_and_both_wa
 }
 
 #[test]
+fn doctor_of_an_index_whose_create_did_not_finish_reports_it_and_names_recall_index() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 session_id TEXT PRIMARY KEY, source TEXT, file_path TEXT, project TEXT,
+                 slug TEXT, timestamp INTEGER, mtime REAL, file_size INTEGER,
+                 session_type TEXT, files_scanned INTEGER, chunks_indexed INTEGER
+             );",
+        )
+        .unwrap();
+    }
+
+    let out = FakeHost::healthy()
+        .serve(db_dir.path(), &db_dir.path().join("probe"), |host| {
+            run_doctor_in(false, false, &Some(db_path.clone()), host, no_recover)
+        })
+        .unwrap();
+
+    assert_eq!(
+        out.markdown,
+        concat!(
+            "Health: degraded\n",
+            "  schema [FAIL] this index was not fully created -> run `recall index` to finish it\n",
+            "  model_identity [ok]\n",
+            "  model [ok]\n",
+        )
+    );
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": {
+                "checks": [
+                    {
+                        "detail": "this index was not fully created",
+                        "name": "schema",
+                        "ok": false,
+                        "remedy": "run `recall index` to finish it",
+                    },
+                    { "detail": null, "name": "model_identity", "ok": true, "remedy": null },
+                    { "detail": null, "name": "model", "ok": true, "remedy": null },
+                ],
+                "healthy": false,
+                "model_recovered": null,
+                "model_recovery_retryable": null,
+                "repaired": null,
+            },
+            "degraded": true,
+            "notes": ["schema: run `recall index` to finish it"],
+        })
+    );
+}
+
+#[test]
 fn doctor_fix_refuses_to_graft_recall_tables_into_a_foreign_empty_db() {
     let db_dir = tempfile::TempDir::new().unwrap();
     let db_path = bare_empty_db(db_dir.path());
