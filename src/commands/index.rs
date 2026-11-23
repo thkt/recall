@@ -55,7 +55,7 @@ pub(crate) fn index_and_report(
         embed_options,
         &index_observer::Observer::stderr(),
     )?;
-    if let Some(note) = &outcome.degraded_note {
+    if let Some(note) = outcome.degraded_note() {
         cli_info(note);
     }
     if let Some(note) = preserved_embedded_note(outcome.preserved_embedded) {
@@ -68,40 +68,59 @@ pub(crate) fn index_embedder(host: &ModelHost<'_>) -> Result<Arc<dyn Embed>, Deg
     try_load_embedder_cached_with_reporter(|| host.load_probing(), |_: &str| {})
 }
 
+pub(crate) enum EmbedPass {
+    Ran(embedder::EmbedResult),
+    Deferred(Option<String>),
+}
+
+impl Default for EmbedPass {
+    fn default() -> Self {
+        Self::Ran(embedder::EmbedResult::default())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct IndexOutcome {
-    pub(crate) degraded_note: Option<String>,
-    pub(crate) embedded: usize,
-    pub(crate) failed_count: usize,
-    pub(crate) first_error: Option<String>,
+    pub(crate) embed: EmbedPass,
     pub(crate) skipped_roots: Vec<indexer::SkippedRoot>,
     pub(crate) preserved_embedded: usize,
     pub(crate) parse_diagnostics: Vec<indexer::FileParseDiagnostics>,
     pub(crate) observations: serde_json::Value,
 }
 
+impl IndexOutcome {
+    pub(crate) fn degraded_note(&self) -> Option<&str> {
+        match &self.embed {
+            EmbedPass::Deferred(note) => note.as_deref(),
+            EmbedPass::Ran(_) => None,
+        }
+    }
+}
+
 const EMBED_ERROR_NOTE_MAX_CHARS: usize = 120;
 
 pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
-    debug_assert!(
-        outcome.degraded_note.is_none() || outcome.failed_count == 0,
-        "model-absent and embed-stop degradation are mutually exclusive"
-    );
     let mut notes = Vec::new();
-    if let Some(note) = &outcome.degraded_note {
-        notes.push(Note::shown(note.clone()));
-    }
-    if outcome.failed_count > 0 {
-        let raw = outcome.first_error.as_deref().unwrap_or("unknown error");
-        let err: String = ansi::strip_control_chars(raw)
-            .chars()
-            .take(EMBED_ERROR_NOTE_MAX_CHARS)
-            .collect();
-        notes.push(Note::new(format!(
-            "{n} chunk(s) failed to embed ({err}); rerun `recall index` to retry",
-            n = outcome.failed_count,
-        )));
-    }
+    let (embedded, failed_count) = match &outcome.embed {
+        EmbedPass::Deferred(note) => {
+            notes.extend(note.clone().map(Note::shown));
+            (0, 0)
+        }
+        EmbedPass::Ran(result) => {
+            if result.failed_count > 0 {
+                let raw = result.first_error.as_deref().unwrap_or("unknown error");
+                let err: String = ansi::strip_control_chars(raw)
+                    .chars()
+                    .take(EMBED_ERROR_NOTE_MAX_CHARS)
+                    .collect();
+                notes.push(Note::new(format!(
+                    "{n} chunk(s) failed to embed ({err}); rerun `recall index` to retry",
+                    n = result.failed_count,
+                )));
+            }
+            (result.embedded, result.failed_count)
+        }
+    };
     for skipped in &outcome.skipped_roots {
         notes.push(Note::shown(skipped.note()));
     }
@@ -144,8 +163,8 @@ pub(crate) fn index_command_output(outcome: &IndexOutcome) -> CommandOutput {
     let data = serde_json::json!({
         "observations": outcome.observations,
         "parse_diagnostics": parse_diagnostics,
-        "embedded": outcome.embedded,
-        "failed_count": outcome.failed_count,
+        "embedded": embedded,
+        "failed_count": failed_count,
         "skipped_roots": skipped_roots,
         "preserved_embedded": outcome.preserved_embedded,
     });
@@ -225,10 +244,7 @@ where
             )?;
             result.warn_if_batches_failed();
             IndexOutcome {
-                degraded_note: None,
-                embedded: result.embedded,
-                failed_count: result.failed_count,
-                first_error: result.first_error,
+                embed: EmbedPass::Ran(result),
                 skipped_roots,
                 preserved_embedded,
                 parse_diagnostics,
@@ -241,11 +257,11 @@ where
             extraction.finish("complete");
             observer.start_embedding(pending_total);
             IndexOutcome {
-                degraded_note: search_degraded_note(reason),
+                embed: EmbedPass::Deferred(search_degraded_note(reason)),
                 skipped_roots,
                 preserved_embedded,
                 parse_diagnostics,
-                ..IndexOutcome::default()
+                observations: serde_json::Value::Null,
             }
         }
     };
