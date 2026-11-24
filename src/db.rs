@@ -403,16 +403,34 @@ pub(crate) fn delete_chunk_vectors(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedVectors {
+    OfSession,
+    OfUnanchoredChunks,
+}
+
+impl RecordedVectors {
+    fn ranges_sql(self) -> &'static str {
+        match self {
+            Self::OfSession => {
+                "SELECT id, vec_rowid_lo, vec_rowid_hi FROM qa_chunks \
+                 WHERE session_id = ?1 AND vec_rowid_lo IS NOT NULL"
+            }
+            Self::OfUnanchoredChunks => {
+                "SELECT id, vec_rowid_lo, vec_rowid_hi FROM qa_chunks \
+                 WHERE session_id = ?1 AND vec_rowid_lo IS NOT NULL AND src_rowid_lo IS NULL"
+            }
+        }
+    }
+}
+
 pub(crate) fn delete_recorded_vectors(
     conn: &Connection,
     session_id: &str,
-    filter: &str,
+    scope: RecordedVectors,
 ) -> Result<()> {
     let ranges: Vec<(i64, i64, i64)> = conn
-        .prepare_cached(&format!(
-            "SELECT id, vec_rowid_lo, vec_rowid_hi FROM qa_chunks \
-             WHERE session_id = ?1 AND vec_rowid_lo IS NOT NULL{filter}"
-        ))?
+        .prepare_cached(scope.ranges_sql())?
         .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (chunk_id, lo, hi) in ranges {

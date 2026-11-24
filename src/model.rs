@@ -340,7 +340,7 @@ pub(crate) struct ModelHost<'a> {
 impl ModelHost<'_> {
     pub(crate) fn load_probing(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
         let artifacts = (self.resolve_when_needed)(ArtifactCheck::HashAndRecord)?;
-        load_probing(&artifacts.root, (self.probe_records)().as_ref(), self.steps)
+        probing_load(&artifacts.root, (self.probe_records)().as_ref(), self.steps).into_result()
     }
 
     pub(crate) fn load_for_search(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
@@ -381,14 +381,6 @@ pub(crate) const HOST: ModelHost<'static> = ModelHost {
     probe_records: &probe_records_on_host,
     steps: &HOST_STEPS,
 };
-
-pub(crate) fn load_probing(
-    root: &Path,
-    records: Option<&ProbeRecords>,
-    steps: &LoadSteps<'_>,
-) -> Result<Arc<dyn Embed>, DegradedReason> {
-    probing_load(root, records, steps).into_result()
-}
 
 enum CheckedLoad {
     Loaded(Arc<dyn Embed>),

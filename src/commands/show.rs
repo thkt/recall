@@ -12,7 +12,7 @@ use crate::envelope::CommandOutput;
 use crate::error::RecallError;
 use crate::parser;
 use crate::parser::Source;
-use crate::search::filter::escape_like;
+use crate::search::filter::like_prefix;
 
 fn write_show_header(
     buf: &mut String,
@@ -90,7 +90,7 @@ fn resolve_session(conn: &Connection, session_id: &str) -> Result<parser::Sessio
         "SELECT session_id, source, file_path, project, slug, timestamp \
          FROM sessions WHERE session_id LIKE ?1 ESCAPE '\\' ORDER BY session_id",
     )?;
-    let pattern = format!("{}%", escape_like(session_id));
+    let pattern = like_prefix(session_id);
     let rows = stmt.query_map([&pattern], |row| {
         let source_str: String = row.get(1)?;
         Ok(parser::SessionData {

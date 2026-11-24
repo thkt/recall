@@ -116,7 +116,6 @@ fn classify(err: &anyhow::Error) -> ErrorCode {
     if let Some(e) = err.downcast_ref::<SanitizeError>() {
         return match e {
             SanitizeError::VocabLookupFailed(_) => ErrorCode::IoError,
-            SanitizeError::InvalidVocabTable(_) => ErrorCode::Internal,
             SanitizeError::EmptyInput | SanitizeError::NoSearchableTerms => ErrorCode::DataError,
         };
     }

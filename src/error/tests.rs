@@ -126,10 +126,6 @@ fn query_sanitizer_failures_exit_by_cause() {
         exit(SanitizeError::VocabLookupFailed("disk".into())),
         ExitCode::from(74)
     );
-    assert_eq!(
-        exit(SanitizeError::InvalidVocabTable("1bad".into())),
-        ExitCode::from(70)
-    );
     assert_eq!(exit(SanitizeError::EmptyInput), ExitCode::from(65));
     assert_eq!(exit(SanitizeError::NoSearchableTerms), ExitCode::from(65));
 }
