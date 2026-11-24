@@ -70,13 +70,13 @@ pub fn parse_codex_session(path: &Path) -> Result<Option<ParseResult>> {
         return Ok(None);
     };
 
+    let path_str = path.to_string_lossy();
+    let date_slug = extract_date_from_path(&path_str);
+    let uuid_short = extract_uuid_short(&initial_session_id);
+
     let mut origin = CodexOrigin::new(initial_session_id);
     let mut project = String::new();
     let mut earliest_ts = None;
-
-    let path_str = path.to_string_lossy();
-    let date_slug = extract_date_from_path(&path_str);
-    let uuid_short = extract_uuid_short(&origin.session_id);
 
     let (messages, diagnostics) = parse_jsonl_entries(path, |entry| {
         if let Some(ts) = entry.get("timestamp").and_then(parse_iso_timestamp) {
