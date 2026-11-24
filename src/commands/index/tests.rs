@@ -2156,3 +2156,48 @@ fn rebuild_whose_compaction_fails_succeeds_with_the_same_result_and_one_warning_
     );
     assert!(free_pages(&failed_dir.path().join("recall.db")) > 0);
 }
+
+#[test]
+fn compaction_while_another_connection_reads_frees_pages_and_reports_the_wal_was_not_emptied() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    create_free_pages(&db_path);
+    let conn = open_db(&db_path).unwrap();
+    conn.busy_timeout(Duration::from_millis(50)).unwrap();
+    let reader = Connection::open(&db_path).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    reader
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+        .unwrap();
+    let (observer, lines) = index_observer::recording();
+
+    compact_index(&conn, &observer);
+
+    let free: i64 = conn
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        free, 0,
+        "VACUUM itself completes while the reader stays open"
+    );
+    assert!(wal_bytes(&db_path) > 0);
+    let lines = lines.borrow().clone();
+    assert_eq!(
+        compaction_lines(&lines),
+        [
+            "index: compaction: started (not yet complete)",
+            "index: compaction: compacted; write-ahead log not emptied",
+        ]
+    );
+    let warnings: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("warning: "))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            "warning: compacted the index, but could not empty its write-ahead log because another connection is still reading it; searches may stay slower until the next `recall index` writes to the index"
+        ]
+    );
+    reader.execute_batch("COMMIT").unwrap();
+}

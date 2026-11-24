@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::embedding::EMBEDDING_DIMS;
 use crate::error::RecallError;
 use crate::runtime::info;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use rusqlite::ffi::{SQLITE_OK, sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tracing::warn;
@@ -470,13 +470,20 @@ fn migrate_vector_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn compact(conn: &Connection) -> Result<()> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Compaction {
+    WalEmptied,
+    WalStillRead,
+}
+
+pub(crate) fn compact(conn: &Connection) -> Result<Compaction> {
     conn.execute_batch("VACUUM")?;
     let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
-    if busy != 0 {
-        bail!("another connection is still reading the write-ahead log");
-    }
-    Ok(())
+    Ok(if busy == 0 {
+        Compaction::WalEmptied
+    } else {
+        Compaction::WalStillRead
+    })
 }
 
 pub(crate) fn open_existing_db(path: &Path) -> Result<Connection> {

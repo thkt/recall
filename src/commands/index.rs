@@ -9,7 +9,7 @@ use crate::commands::{
     open_or_create_db, resolve_db_path, search_degraded_note,
     try_load_embedder_cached_with_reporter,
 };
-use crate::db::{compact, fix_orphan_embeddings};
+use crate::db::{Compaction, compact, fix_orphan_embeddings};
 use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, DegradedReason, ModelHost, degrade_with_warn};
@@ -271,7 +271,11 @@ where
 fn compact_index(conn: &Connection, observer: &index_observer::Observer) {
     let compaction = observer.stage("compaction");
     match compact(conn) {
-        Ok(()) => compaction.finish("complete"),
+        Ok(Compaction::WalEmptied) => compaction.finish("complete"),
+        Ok(Compaction::WalStillRead) => {
+            compaction.finish("compacted; write-ahead log not emptied");
+            observer.warn("compacted the index, but could not empty its write-ahead log because another connection is still reading it; searches may stay slower until the next `recall index` writes to the index");
+        }
         Err(error) => {
             compaction.finish("failed; indexed data kept uncompacted");
             observer.warn(&format!(

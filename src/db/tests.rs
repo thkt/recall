@@ -1127,7 +1127,7 @@ fn compacting_an_index_whose_middle_vector_block_was_removed_keeps_every_vector_
         .map(|&t| nearest_chunk_ids(&conn, t))
         .collect();
 
-    compact(&conn).unwrap();
+    assert_eq!(compact(&conn).unwrap(), Compaction::WalEmptied);
 
     assert_eq!(collect_strings(&conn, block_rowids), ["[1,3]"]);
     let diverged: i64 = conn
