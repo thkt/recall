@@ -1,5 +1,8 @@
 use crate::commands::open_or_create_db;
-use crate::test_support::{bare_empty_db, payload_keys, printed_envelope};
+use crate::commands::search::run_search_with;
+use crate::test_support::{
+    bare_empty_db, mock_loader, payload_keys, printed_envelope, search_command, seed_healthy_index,
+};
 use crate::{db, embedder};
 
 use super::*;
@@ -101,5 +104,37 @@ fn freeze_status_payload_key_set() {
         payload_keys(&with_db.data),
         frozen,
         "status --json keys are frozen on the with-database branch"
+    );
+}
+
+#[test]
+fn status_and_search_on_an_index_built_for_another_model_both_note_that_search_is_text_only() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    let conn = open_or_create_db(&db_path).unwrap();
+    seed_healthy_index(&conn);
+    conn.execute(
+        "UPDATE embedding_identity SET fingerprint = 'other-model'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let text_only = serde_json::json!([
+        "semantic search unavailable: index embedding identity mismatch; use a separate --db-path for this model or select the matching --model-manifest; results are text-only"
+    ]);
+
+    let status =
+        printed_envelope(&run_status_with(false, &Some(db_path.clone()), || true).unwrap());
+    let search = printed_envelope(
+        &run_search_with(search_command("healthy"), &Some(db_path), mock_loader).unwrap(),
+    );
+
+    assert_eq!(
+        (&status["degraded"], &status["notes"]),
+        (&serde_json::json!(true), &text_only)
+    );
+    assert_eq!(
+        (&search["degraded"], &search["notes"]),
+        (&serde_json::json!(true), &text_only)
     );
 }

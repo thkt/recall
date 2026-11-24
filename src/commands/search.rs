@@ -6,7 +6,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Args;
 
-use crate::commands::{ReadIndex, build_markdown, resolve_db_path, try_load_embedder_cached_with};
+use crate::commands::{
+    ReadIndex, build_markdown, identity_mismatch_note, resolve_db_path,
+    try_load_embedder_cached_with,
+};
 use crate::date::format_timestamp;
 use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
@@ -188,19 +191,13 @@ where
         return Ok(index.snapshot.finish(search_idle_output()));
     }
 
-    let identity_error = if query.is_some() {
-        model::check_index(conn, model::selected()).err()
+    let identity_note = if query.is_some() {
+        identity_mismatch_note(conn)
     } else {
         None
     };
-    let (mut degraded, mut notes, embedder) = if let Some(error) = identity_error {
-        (
-            true,
-            vec![Note::new(format!(
-                "semantic search unavailable: {error}; results are text-only"
-            ))],
-            None,
-        )
+    let (mut degraded, mut notes, embedder) = if let Some(note) = identity_note {
+        (true, vec![note], None)
     } else if query.is_some() {
         let embedder = load_embedder();
         let (degraded, notes) = search_degraded_state(&embedder);
