@@ -668,7 +668,7 @@ pub(crate) fn settle(
         );
     }
     let on_backfill_progress = |done: usize, total: usize| {
-        backfill.progress(done.saturating_sub(1), total);
+        backfill.progress(done, total);
     };
     let scanned_backfilled = backfill_session_files(
         conn,

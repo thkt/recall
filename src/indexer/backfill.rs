@@ -151,7 +151,7 @@ pub(super) fn backfill_session_files(
     let tx = conn.transaction()?;
     for (done, (session_id, file_path, source)) in sessions.iter().enumerate() {
         if let Some(cb) = on_progress {
-            cb(done + 1, total);
+            cb(done, total);
         }
         let scanned =
             match reread_scanned_files(&tx, Path::new(file_path), source, logs_read_this_run)? {

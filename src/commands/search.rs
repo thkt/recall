@@ -257,12 +257,10 @@ where
 fn extract_parent_session(file_path: &str) -> Option<&str> {
     let idx = file_path.find("/subagents/")?;
     let prefix = &file_path[..idx];
-    let parent = prefix.rsplit('/').next()?;
-    if parent.is_empty() {
-        None
-    } else {
-        Some(parent)
-    }
+    prefix
+        .rsplit('/')
+        .next()
+        .filter(|parent| !parent.is_empty())
 }
 
 fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> fmt::Result {
@@ -270,14 +268,10 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> fmt:
     let date = format_timestamp(s.timestamp);
     let slug = ansi::strip_control_chars(&s.slug);
     let project = ansi::strip_control_chars(&s.project);
-    let proj_name = if project.is_empty() {
-        "unknown"
-    } else {
-        Path::new(project.as_ref())
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unknown")
-    };
+    let proj_name = Path::new(project.as_ref())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
     writeln!(
         w,
         "[{}] {} | {} | {} [{}]",
@@ -296,11 +290,9 @@ fn format_result(w: &mut impl Write, i: usize, r: &search::SearchResult) -> fmt:
     if let Some(parent) = extract_parent_session(&file_path) {
         writeln!(w, "    Parent: {parent}")?;
     }
-    if !r.excerpt.is_empty() {
-        let excerpt = ansi::strip_control_chars(&r.excerpt);
-        for line in excerpt.trim().lines() {
-            writeln!(w, "    > {line}")?;
-        }
+    let excerpt = ansi::strip_control_chars(&r.excerpt);
+    for line in excerpt.trim().lines() {
+        writeln!(w, "    > {line}")?;
     }
     writeln!(w, "    inspect: {}", inspect_hint(&session_id, r.chunk_id))?;
     writeln!(w)?;
