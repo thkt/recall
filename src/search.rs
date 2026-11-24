@@ -3,10 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::{panic, thread};
 
 use crate::embedding::Embed;
-use crate::fts_query::{
-    MIN_TRIGRAM_TERM_CHARS, SanitizeError, prepare_match_query, prepare_operator_query,
-    segment_script_boundaries,
-};
+use crate::fts_query::{SanitizeError, prepare_match_query, prepare_operator_query};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
@@ -604,16 +601,7 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
             embed_text: Some(operator.embed_text),
         }));
     }
-    let segmented = segment_script_boundaries(query);
-    let fts_input = if segmented
-        .split_whitespace()
-        .any(|t| t.chars().count() >= MIN_TRIGRAM_TERM_CHARS)
-    {
-        segmented
-    } else {
-        query.to_owned()
-    };
-    match prepare_match_query(conn, &fts_input, "messages_vocab") {
+    match prepare_match_query(conn, query) {
         Ok(m) => Ok(Some(KeywordQuery {
             fts: m.to_trigram_match(),
             not_operands: Vec::new(),
@@ -623,9 +611,7 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
             debug!(%query, "query produced no searchable terms");
             Ok(None)
         }
-        Err(e @ (SanitizeError::InvalidVocabTable(_) | SanitizeError::VocabLookupFailed(_))) => {
-            Err(e.into())
-        }
+        Err(e @ SanitizeError::VocabLookupFailed(_)) => Err(e.into()),
     }
 }
 

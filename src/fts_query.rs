@@ -205,8 +205,6 @@ pub enum SanitizeError {
     EmptyInput,
     #[error("search query contains no searchable terms")]
     NoSearchableTerms,
-    #[error("invalid vocab table name: {0:?}")]
-    InvalidVocabTable(String),
     #[error("fts vocab lookup failed: {0}")]
     VocabLookupFailed(String),
 }
@@ -289,7 +287,7 @@ fn classify_script(c: char) -> Script {
     }
 }
 
-pub fn segment_script_boundaries(query: &str) -> String {
+fn segment_script_boundaries(query: &str) -> String {
     let mut out = String::with_capacity(query.len() + 8);
     let mut in_quotes = false;
     let mut prev: Option<Script> = None;
@@ -317,13 +315,18 @@ pub fn segment_script_boundaries(query: &str) -> String {
     out
 }
 
-pub fn prepare_match_query(
-    conn: &Connection,
-    query: &str,
-    vocab_table: &str,
-) -> Result<MatchFtsQuery, SanitizeError> {
-    let sanitized = sanitize_fts_query(query)?;
-    fts_expand_short_terms(conn, &sanitized, vocab_table)
+pub fn prepare_match_query(conn: &Connection, query: &str) -> Result<MatchFtsQuery, SanitizeError> {
+    let segmented = segment_script_boundaries(query);
+    let keeps_a_trigram_anchor = segmented
+        .split_whitespace()
+        .any(|t| t.chars().count() >= MIN_TRIGRAM_TERM_CHARS);
+    let fts_input = if keeps_a_trigram_anchor {
+        segmented.as_str()
+    } else {
+        query
+    };
+    let sanitized = sanitize_fts_query(fts_input)?;
+    fts_expand_short_terms(conn, &sanitized)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,34 +610,17 @@ fn expand_token_via_vocab(
     }
 }
 
-fn is_valid_sql_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    let head_ok = chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
-    let tail_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    head_ok && tail_ok
-}
-
-fn vocab_lookup_sql(vocab_table: &str) -> String {
-    // why-not: a LIKE prefix makes fts5vocab read every term, while a range on `term` narrows its scan.
-    format!(
-        "SELECT term FROM {vocab_table} \
-         WHERE term >= ?1 AND term < ?2 \
-         ORDER BY cnt DESC, term LIMIT 25"
-    )
-}
+// why-not: a LIKE prefix makes fts5vocab read every term, while a range on `term` narrows its scan.
+const VOCAB_LOOKUP_SQL: &str = "SELECT term FROM messages_vocab \
+     WHERE term >= ?1 AND term < ?2 \
+     ORDER BY cnt DESC, term LIMIT 25";
 
 pub(crate) fn fts_expand_short_terms(
     conn: &Connection,
     query: &SanitizedFtsQuery,
-    vocab_table: &str,
 ) -> Result<MatchFtsQuery, SanitizeError> {
-    if !is_valid_sql_identifier(vocab_table) {
-        return Err(SanitizeError::InvalidVocabTable(vocab_table.to_owned()));
-    }
     let mut stmt = conn
-        .prepare_cached(&vocab_lookup_sql(vocab_table))
+        .prepare_cached(VOCAB_LOOKUP_SQL)
         .map_err(|e| SanitizeError::VocabLookupFailed(e.to_string()))?;
 
     let mut parts = Vec::new();
