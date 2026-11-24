@@ -35,7 +35,7 @@ use tracing::{debug, info};
 use crate::chunker;
 
 use crate::classify::classify_session;
-use crate::db::{EMPTY_MESSAGE_RANGE, delete_recorded_vectors};
+use crate::db::{EMPTY_MESSAGE_RANGE, RecordedVectors, delete_recorded_vectors};
 use crate::index_observer::Observer;
 use crate::parser::{Message, ParseResult, Role, Source, parse_session_including_empty};
 
@@ -185,7 +185,7 @@ fn delete_session_messages(tx: &Transaction, session_id: &str) -> Result<()> {
 
 fn delete_session_dependents(tx: &Transaction, session_id: &str) -> Result<()> {
     delete_session_messages(tx, session_id)?;
-    delete_recorded_vectors(tx, session_id, "")?;
+    delete_recorded_vectors(tx, session_id, RecordedVectors::OfSession)?;
     tx.execute("DELETE FROM qa_chunks WHERE session_id = ?", [session_id])?;
     tx.execute(
         "DELETE FROM session_files WHERE session_id = ?",
@@ -364,7 +364,7 @@ fn reconcile_chunks(
     }
     if stored.values().any(|ids| !ids.is_empty()) {
         if stored.values().flatten().any(|id| embedded.contains(id)) {
-            delete_recorded_vectors(tx, session_id, " AND src_rowid_lo IS NULL")?;
+            delete_recorded_vectors(tx, session_id, RecordedVectors::OfUnanchoredChunks)?;
         }
         stats.removed = tx.execute(
             "DELETE FROM qa_chunks WHERE session_id = ? AND src_rowid_lo IS NULL",
