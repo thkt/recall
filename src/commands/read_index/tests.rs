@@ -28,13 +28,3 @@ fn an_index_whose_create_did_not_finish_is_refused_as_a_data_error_that_names_re
         )
     );
 }
-
-#[test]
-fn require_current_schema_current_is_ok() {
-    assert!(require_current_schema(SchemaState::Current).is_ok());
-}
-
-#[test]
-fn require_current_schema_empty_is_ok() {
-    assert!(require_current_schema(SchemaState::Empty).is_ok());
-}

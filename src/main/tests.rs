@@ -245,37 +245,53 @@ fn search_result_and_session_data_stay_non_serialize() {
     );
 }
 
+fn output_with_text(text: &str) -> CommandOutput {
+    CommandOutput::with_notes(
+        text.to_owned(),
+        serde_json::json!({"messages": [{"text": "回答\n\"引用\""}]}),
+        true,
+        vec![Note::new("diagnostic\nwith \"quotes\"")],
+    )
+}
+
 #[test]
-fn emit_success_preserves_text_newlines_and_json_envelope() {
-    for text in ["", "質問と回答", "answer\n", "answer\n\n"] {
-        let out = CommandOutput::with_notes(
-            text.to_owned(),
-            serde_json::json!({"messages": [{"text": "回答\n\"引用\""}]}),
-            true,
-            vec![Note::new("diagnostic\nwith \"quotes\"")],
-        );
+fn text_output_ends_in_exactly_the_newlines_it_had_and_adds_one_only_when_missing() {
+    for (text, printed) in [
+        ("", ""),
+        ("質問と回答", "質問と回答\n"),
+        ("answer\n", "answer\n"),
+        ("answer\n\n", "answer\n\n"),
+    ] {
         let mut buf = Vec::new();
         assert_eq!(
-            emit_success_to(&out, false, &mut buf, &mut io::sink()).unwrap(),
+            emit_success_to(&output_with_text(text), false, &mut buf, &mut io::sink()).unwrap(),
             WriteOutcome::Written,
         );
-        let expected = if text.is_empty() || text.ends_with('\n') {
-            text.to_owned()
-        } else {
-            format!("{text}\n")
-        };
-        assert_eq!(buf, expected.as_bytes());
-
-        buf.clear();
-        assert_eq!(
-            emit_success_to(&out, true, &mut buf, &mut io::sink()).unwrap(),
-            WriteOutcome::Written,
-        );
-        let envelope: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(
-            envelope,
-            serde_json::json!({"data": out.data, "degraded": true, "notes": ["diagnostic\nwith \"quotes\""]}),
-        );
-        assert_eq!(buf.last(), Some(&b'\n'));
+        assert_eq!(String::from_utf8(buf).unwrap(), printed, "text: {text:?}");
     }
+}
+
+#[test]
+fn json_output_prints_one_newline_terminated_envelope_with_data_degraded_and_notes() {
+    let mut buf = Vec::new();
+    assert_eq!(
+        emit_success_to(
+            &output_with_text("質問と回答"),
+            true,
+            &mut buf,
+            &mut io::sink()
+        )
+        .unwrap(),
+        WriteOutcome::Written,
+    );
+    let printed = String::from_utf8(buf).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&printed).unwrap(),
+        serde_json::json!({
+            "data": {"messages": [{"text": "回答\n\"引用\""}]},
+            "degraded": true,
+            "notes": ["diagnostic\nwith \"quotes\""],
+        }),
+    );
+    assert!(printed.ends_with("}\n"), "{printed:?}");
 }

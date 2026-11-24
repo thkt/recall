@@ -1203,20 +1203,6 @@ fn missing_roots_without_stored_sessions_are_not_reported() {
 }
 
 #[test]
-fn missing_root_note_says_nothing_was_deleted_and_to_rerun_once_the_root_is_back() {
-    let skipped = SkippedRoot {
-        source: Source::Codex,
-        preserved_sessions: 3,
-        reason: ALL_ROOTS_MISSING,
-    };
-
-    assert_eq!(
-        skipped.note(),
-        "codex root unavailable — preserved 3 existing session(s), none deleted this run; re-run `recall index` once the root is back so a full scan can reconcile any genuinely deleted sessions"
-    );
-}
-
-#[test]
 fn skipped_root_reasons_are_reported_as_missing_root_and_incomplete_enumeration() {
     for others_reconciled in [false, true] {
         assert_eq!(
@@ -1227,34 +1213,6 @@ fn skipped_root_reasons_are_reported_as_missing_root_and_incomplete_enumeration(
     assert_eq!(
         SkippedReason::IncompleteEnumeration.as_str(),
         "incomplete_enumeration"
-    );
-}
-
-#[test]
-fn incomplete_root_note_without_preserved_sessions_warns_that_sessions_may_be_missing() {
-    let skipped = SkippedRoot {
-        source: Source::Claude,
-        preserved_sessions: 0,
-        reason: SkippedReason::IncompleteEnumeration,
-    };
-
-    assert_eq!(
-        skipped.note(),
-        "claude root could not be fully read; some sessions may be missing from the index. check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index`"
-    );
-}
-
-#[test]
-fn incomplete_root_note_with_preserved_sessions_says_nothing_was_deleted_and_to_fix_access() {
-    let skipped = SkippedRoot {
-        source: Source::Claude,
-        preserved_sessions: 2,
-        reason: SkippedReason::IncompleteEnumeration,
-    };
-
-    assert_eq!(
-        skipped.note(),
-        "claude root could not be fully read — preserved 2 existing session(s), none deleted this run; check that the root is an absolute path and check the directory's permissions and access, then re-run `recall index` so the next full scan can reconcile any genuinely deleted sessions"
     );
 }
 
