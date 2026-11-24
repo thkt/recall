@@ -404,7 +404,7 @@ fn search_loader_with_a_matching_record_loads_without_starting_the_probe() {
     records.record_success();
     let host = FakeHost::healthy();
 
-    let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).0);
+    let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result());
 
     assert!(loaded.is_ok());
     assert_eq!(host.probes.get(), 0);
@@ -425,7 +425,7 @@ fn search_loader_skip_path_without_a_gpu_returns_backend_unavailable_and_clears_
         ..FakeHost::healthy()
     };
 
-    let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).0);
+    let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result());
 
     assert_eq!(loaded.err(), Some(DegradedReason::BackendUnavailable));
     assert_eq!(host.probes.get(), 0);
@@ -454,12 +454,12 @@ fn search_loader_skip_path_load_or_self_check_failure_clears_the_record() {
         let records = store(&dir);
         records.record_success();
 
-        let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).0);
+        let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result());
 
         assert_eq!(loaded.err(), Some(DegradedReason::ProbeFailed));
         assert_eq!(host.probes.get(), 0);
         assert!(!records.may_skip());
-        let _ = host.run(|steps| search_load(dir.path(), Some(&records), steps).0);
+        let _ = host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result());
         assert_eq!(host.probes.get(), 1, "the next search runs the probe");
     }
 }
@@ -471,7 +471,7 @@ fn search_loader_runs_the_probe_when_the_record_is_missing_or_the_environment_is
     let host = FakeHost::healthy();
 
     assert!(
-        host.run(|steps| search_load(dir.path(), Some(&records), steps).0)
+        host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result())
             .is_ok()
     );
     assert_eq!(host.probes.get(), 1, "no record: the probe runs");
@@ -479,7 +479,7 @@ fn search_loader_runs_the_probe_when_the_record_is_missing_or_the_environment_is
     drop(records.begin_skipped_load().unwrap());
     for expected in [2, 3] {
         assert!(
-            host.run(|steps| search_load(dir.path(), Some(&records), steps).0)
+            host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result())
                 .is_ok()
         );
         assert_eq!(
@@ -494,7 +494,7 @@ fn search_loader_runs_the_probe_when_the_record_is_missing_or_the_environment_is
         "an environment marked no-skip gets no record that nothing would read"
     );
 
-    let probes_without_store = host.run(|steps| search_load(dir.path(), None, steps).0);
+    let probes_without_store = host.run(|steps| search_load(dir.path(), None, steps).into_result());
     assert!(probes_without_store.is_ok());
     assert_eq!(host.probes.get(), 4, "no usable store: the probe runs");
 }
@@ -511,7 +511,7 @@ fn search_loader_runs_the_probe_when_the_running_marker_cannot_be_created() {
     }
     let host = FakeHost::healthy();
 
-    let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).0);
+    let loaded = host.run(|steps| search_load(dir.path(), Some(&records), steps).into_result());
 
     #[cfg(unix)]
     {
