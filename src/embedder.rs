@@ -11,7 +11,6 @@ use crate::embedding::EMBEDDING_DIMS;
 use crate::embedding::{ChunkedEmbedding, Embed, EmbedError};
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Result as SqlResult, Row, TransactionBehavior};
-use tracing::warn;
 
 use crate::index_observer::Observer;
 
@@ -21,18 +20,6 @@ pub(crate) use crate::embedding::EmbedOptions;
 pub(crate) struct EmbedResult {
     pub embedded: usize,
     pub failed_count: usize,
-}
-
-impl EmbedResult {
-    pub(crate) fn warn_if_batches_failed(&self) {
-        if self.failed_count > 0 {
-            warn!(
-                failed_count = self.failed_count,
-                first_error = "batch inference failed",
-                "embedding skipped chunks after batch failures"
-            );
-        }
-    }
 }
 
 const EMBED_BATCH_SIZE: usize = 128;

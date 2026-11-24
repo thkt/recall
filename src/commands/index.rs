@@ -237,7 +237,6 @@ where
                 &embed_options,
                 observer,
             )?;
-            result.warn_if_batches_failed();
             IndexOutcome {
                 embed: EmbedPass::Ran(result),
                 skipped_roots,
