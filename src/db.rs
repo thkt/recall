@@ -470,6 +470,22 @@ fn migrate_vector_rowid_range_if_needed(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Compaction {
+    WalEmptied,
+    WalStillRead,
+}
+
+pub(crate) fn compact(conn: &Connection) -> Result<Compaction> {
+    conn.execute_batch("VACUUM")?;
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    Ok(if busy == 0 {
+        Compaction::WalEmptied
+    } else {
+        Compaction::WalStillRead
+    })
+}
+
 pub(crate) fn open_existing_db(path: &Path) -> Result<Connection> {
     ensure_sqlite_vec()?;
     let mut flags = OpenFlags::default();

@@ -35,6 +35,10 @@ impl Observer {
         }
     }
 
+    pub(crate) fn warn(&self, message: &str) {
+        self.emit(&format!("warning: {message}"));
+    }
+
     pub(crate) fn count(&self, key: &'static str, value: usize) {
         self.counts.borrow_mut().insert(key, value);
     }

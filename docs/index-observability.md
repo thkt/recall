@@ -28,6 +28,7 @@ Gemma移行後の現行pipelineはversion 2です。モデルと索引の更新�
 | `pending_extraction` | 埋め込み未処理のID・世代・byte長の一回の照合とソート、および各ページの本文取得の累積。利用不可時はIDだけで件数を取得 |
 | `inference` | 全バッチの推論時間の累積。tokenize、分割、指定したforward pauseを含む |
 | `embedding_db_save` | 全バッチの保存時間の累積。writer lock待ち、世代/本文照合、書込み、commitを含む |
+| `compaction` | 埋め込みの段階の後の `VACUUM` と `PRAGMA wal_checkpoint(TRUNCATE)`。その実行で500件以上のファイルを取り込んだとき（`files_updated_committed` が500以上）と `rebuild` のときだけ実行し、それ以外はキーを省略する。途中でエラー終了した実行では実行しない。`VACUUM` が失敗した場合は `failed; indexed data kept uncompacted` と表示し、詰め直せなかったことを示す警告を1行出す。`VACUUM` が成功した後、別の接続が `busy_timeout`（30秒）まで待ってもwrite-ahead logを読み続けている場合は `compacted; write-ahead log not emptied` と表示し、空きページはなくなったがlogを空にできなかったことを示す別の警告を1行出す。どちらの場合も終了コードとJSONの結果は変えない |
 
 `total`、`fts_transaction`、`enumeration`、`parse_fts`、`parse`、`fts_excluding_parse`を足してはならない。FTS transactionの分解は `parse + fts_excluding_parse`。独立した段階だけを選んでも、その間のソート・集計・表示やrebuildの孤立vector修復などがあるため `total` との完全一致は要求しない。
 

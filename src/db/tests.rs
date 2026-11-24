@@ -1083,3 +1083,66 @@ fn upgrading_an_index_without_vector_ranges_stores_each_range_and_returns_gapped
         (schema, ranges, vectors)
     );
 }
+
+fn nearest_chunk_ids(conn: &Connection, target: f32) -> Vec<i64> {
+    let mut query = vec![0.0f32; EMBEDDING_DIMS];
+    query[0] = target;
+    let mut stmt = conn
+        .prepare(
+            "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ?1 AND k = 20 ORDER BY distance",
+        )
+        .unwrap();
+    stmt.query_map([f32_as_bytes(&query)], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn compacting_an_index_whose_middle_vector_block_was_removed_keeps_every_vector_on_its_chunk() {
+    let tmp = NamedTempFile::new().unwrap();
+    let mut conn = open_db(tmp.path()).unwrap();
+    let tx = conn.transaction().unwrap();
+    for id in 1..=3072_i64 {
+        seed_chunk(&tx, id, &format!("chunk {id}"));
+        let mut vector = vec![0.0f32; EMBEDDING_DIMS];
+        vector[0] = id as f32;
+        seed_chunk_vector(&tx, id, 0, f32_as_bytes(&vector));
+    }
+    tx.execute(
+        "DELETE FROM vec_chunks WHERE chunk_id BETWEEN 1025 AND 2048",
+        [],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let block_rowids = "SELECT json_group_array(rowid) FROM vec_chunks_vector_chunks00";
+    assert_eq!(
+        collect_strings(&conn, block_rowids),
+        ["[1,3]"],
+        "the fixture must leave a gap in the vector block rowids"
+    );
+    let targets = [10.25, 1600.25, 3000.25];
+    let before: Vec<Vec<i64>> = targets
+        .iter()
+        .map(|&t| nearest_chunk_ids(&conn, t))
+        .collect();
+
+    assert_eq!(compact(&conn).unwrap(), Compaction::WalEmptied);
+
+    assert_eq!(collect_strings(&conn, block_rowids), ["[1,3]"]);
+    let diverged: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM vec_chunks_vector_chunks00 WHERE _rowid_ <> rowid",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(diverged, 0);
+    let after: Vec<Vec<i64>> = targets
+        .iter()
+        .map(|&t| nearest_chunk_ids(&conn, t))
+        .collect();
+    assert_eq!(after, before);
+    assert_eq!(after[2][0], 3000);
+    assert_eq!(after[1][0], 2049);
+}

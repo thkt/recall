@@ -3,12 +3,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use rusqlite::Connection;
 
 use crate::commands::{
     open_or_create_db, resolve_db_path, search_degraded_note,
     try_load_embedder_cached_with_reporter,
 };
-use crate::db::fix_orphan_embeddings;
+use crate::db::{Compaction, compact, fix_orphan_embeddings};
 use crate::embedding::Embed;
 use crate::envelope::{CommandOutput, Note};
 use crate::model::{self, DegradedReason, ModelHost, degrade_with_warn};
@@ -202,6 +203,7 @@ where
     let embed_capable = load_result.is_ok();
 
     let stats = indexer::index_from_dirs_observed(&mut conn, opts, embed_capable, observer)?;
+    let bulk_run = indexer::is_bulk_run(stats.indexed, opts.force);
     observer.count("sessions_stored", stats.total_sessions);
     report_indexed_sessions(&stats);
 
@@ -258,9 +260,30 @@ where
             }
         }
     };
+    if bulk_run {
+        compact_index(&conn, observer);
+    }
     pipeline.finish("complete; see counts for deferred or failed work");
     outcome.observations = observer.snapshot();
     Ok(outcome)
+}
+
+fn compact_index(conn: &Connection, observer: &index_observer::Observer) {
+    let compaction = observer.stage("compaction");
+    match compact(conn) {
+        Ok(Compaction::WalEmptied) => compaction.finish("complete"),
+        Ok(Compaction::WalStillRead) => {
+            compaction.finish("compacted; write-ahead log not emptied");
+            observer.warn("compacted the index, but could not empty its write-ahead log because another connection is still reading it; searches may stay slower until the next `recall index` writes to the index");
+        }
+        Err(error) => {
+            compaction.finish("failed; indexed data kept uncompacted");
+            observer.warn(&format!(
+                "could not compact the index ({}); indexed sessions and embeddings are kept, and the next `recall rebuild` or `recall index` that ingests 500 or more files compacts it again",
+                format!("{error:#}").replace(['\n', '\r'], " ")
+            ))
+        }
+    }
 }
 
 fn load_and_probe_embedder<F>(
