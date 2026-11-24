@@ -8,10 +8,14 @@ pub(super) fn anon_placeholders(n: usize) -> String {
     vec!["?"; n].join(",")
 }
 
-pub(crate) fn escape_like(s: &str) -> String {
+fn escape_like(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+pub(crate) fn like_prefix(s: &str) -> String {
+    format!("{}%", escape_like(s))
 }
 
 fn append_eq_filter(sql: &mut String, p: &mut Vec<Box<dyn ToSql>>, col: &str, v: Option<&str>) {
@@ -41,7 +45,7 @@ fn append_like_prefix_filter(
 ) {
     if let Some(v) = v {
         sql.push_str(&format!(" AND ({col} LIKE ? ESCAPE '\\')"));
-        p.push(Box::new(format!("{}%", escape_like(v))));
+        p.push(Box::new(like_prefix(v)));
     }
 }
 
@@ -71,9 +75,7 @@ pub(super) fn append_search_filters(
              WHERE sf.path = ? OR sf.path LIKE ? ESCAPE '\\')",
         );
         params.push(Box::new(file.clone()));
-        let mut suffix = String::from("%/");
-        suffix.push_str(&escape_like(file));
-        params.push(Box::new(suffix));
+        params.push(Box::new(format!("%/{}", escape_like(file))));
     }
     let current = match &opts.current {
         CurrentSession::Ignore => None,
