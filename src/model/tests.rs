@@ -530,7 +530,7 @@ fn default_loader_runs_the_probe_even_when_a_matching_record_exists() {
     records.record_success();
     let host = FakeHost::healthy();
 
-    let loaded = host.run(|steps| load_probing(dir.path(), Some(&records), steps));
+    let loaded = host.run(|steps| probing_load(dir.path(), Some(&records), steps).into_result());
 
     assert!(loaded.is_ok());
     assert_eq!(host.probes.get(), 1);
@@ -574,7 +574,8 @@ fn default_loader_records_success_only_after_the_parent_self_check_passes() {
         let records = store(&dir);
         records.record_success();
 
-        let loaded = host.run(|steps| load_probing(dir.path(), Some(&records), steps));
+        let loaded =
+            host.run(|steps| probing_load(dir.path(), Some(&records), steps).into_result());
 
         assert_eq!(
             loaded.err(),
@@ -589,7 +590,8 @@ fn default_loader_records_success_only_after_the_parent_self_check_passes() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let records = store(&dir);
-    let loaded = FakeHost::healthy().run(|steps| load_probing(dir.path(), Some(&records), steps));
+    let loaded = FakeHost::healthy()
+        .run(|steps| probing_load(dir.path(), Some(&records), steps).into_result());
     assert!(loaded.is_ok());
     assert!(records.may_skip());
 }
