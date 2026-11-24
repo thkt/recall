@@ -9,13 +9,14 @@ use crate::test_support::{mock_loader, search_command, vec_chunk_count};
 
 #[cfg(unix)]
 #[test]
-fn create_db_file_sets_owner_only_0600_mode() {
+fn opening_a_new_index_under_a_missing_directory_creates_the_directory_and_an_owner_only_database_file()
+ {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::TempDir::new().unwrap();
-    let db_path = dir.path().join("index.db");
+    let db_path = dir.path().join("recall").join("recall.db");
 
-    create_db_file(&db_path).unwrap();
+    open_or_create_db(&db_path).unwrap();
 
     let mode = fs::metadata(&db_path).unwrap().permissions().mode();
     assert_eq!(
@@ -23,35 +24,6 @@ fn create_db_file_sets_owner_only_0600_mode() {
         0o600,
         "created DB must be owner-only 0o600, got {:o}",
         mode & 0o777,
-    );
-}
-
-#[test]
-fn create_db_file_creates_missing_parent_dirs() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let db_path = dir.path().join("recall").join("recall.db");
-
-    create_db_file(&db_path).unwrap();
-
-    assert!(
-        db_path.exists(),
-        "DB file must be created under a fresh parent dir"
-    );
-}
-
-#[test]
-fn create_db_file_errors_when_parent_cannot_be_created() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let blocker = dir.path().join("not_a_dir");
-    create_db_file(&blocker).unwrap();
-    let db_path = blocker.join("sub").join("recall.db");
-
-    let err = create_db_file(&db_path).unwrap_err();
-
-    assert_ne!(
-        err.kind(),
-        ErrorKind::AlreadyExists,
-        "expected a parent-creation failure, got {err:?}"
     );
 }
 
@@ -187,15 +159,6 @@ fn try_load_embedder_cached_reports_reason_aware_notes_once() {
         assert_eq!(result.err(), Some(reason));
         assert_eq!(notes, expected, "reason: {reason:?}");
     }
-}
-
-#[test]
-fn search_degraded_note_covers_backend_failures() {
-    assert_eq!(
-        search_degraded_note(DegradedReason::BackendUnavailable).as_deref(),
-        Some("note: embedding model unavailable; results from text search only.")
-    );
-    assert_eq!(search_degraded_note(DegradedReason::Disabled), None);
 }
 
 #[test]

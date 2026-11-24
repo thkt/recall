@@ -20,12 +20,17 @@ def test_brace_delta_counts_structural_braces():
     assert brace_delta("fn f() {}") == 0
 
 
-@pytest.mark.parametrize("header", ["#![cfg(test)]", "#![cfg(not(test))]", 'const S: &str = r#"\n#![cfg(test)]\n"#;'])
-def test_file_guard_only_excludes_actual_test_only_source(tmp_path, header):
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("#![cfg(test)]", {1, 2}),
+        ("#![cfg(not(test))]", set()),
+        ('const S: &str = r#"\n#![cfg(test)]\n"#;', set()),
+    ],
+)
+def test_file_guard_only_excludes_actual_test_only_source(tmp_path, header, expected):
     src = tmp_path / "guarded.rs"
-    text = header + "\nfn example() {}\n"
-    src.write_text(text)
-    expected = set(range(1, len(text.splitlines()) + 1)) if header == "#![cfg(test)]" else set()
+    src.write_text(header + "\nfn example() {}\n")
     assert cfg_test_ranges(src) == expected
 
 

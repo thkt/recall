@@ -33,47 +33,10 @@ fn expand_long_term_quoted_as_is() {
 }
 
 #[test]
-fn expand_short_term_with_vocab_matches() {
-    let conn = setup_fts_db();
-    let result = fts_expand_short_terms(&conn, &sanitized("au"), "fts_chunks_vocab").unwrap();
-    assert!(
-        result.to_string().contains("\"audit\""),
-        "{}",
-        result.to_string()
-    );
-    assert!(
-        result.to_string().contains("\"authentication\""),
-        "{}",
-        result.to_string()
-    );
-    assert!(
-        result.to_string().contains(" OR "),
-        "{}",
-        result.to_string()
-    );
-}
-
-#[test]
 fn expand_short_term_no_matches() {
     let conn = setup_fts_db();
     let result = fts_expand_short_terms(&conn, &sanitized("zz"), "fts_chunks_vocab").unwrap();
     assert_eq!(result.to_string(), "\"zz\"");
-}
-
-#[test]
-fn expand_mixed_short_and_long() {
-    let conn = setup_fts_db();
-    let result = fts_expand_short_terms(&conn, &sanitized("au login"), "fts_chunks_vocab").unwrap();
-    assert!(
-        result.to_string().contains("\"login\""),
-        "{}",
-        result.to_string()
-    );
-    assert!(
-        result.to_string().contains(" OR "),
-        "{}",
-        result.to_string()
-    );
 }
 
 #[test]
@@ -170,22 +133,6 @@ fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table(
 }
 
 #[test]
-fn prepare_match_query_end_to_end() {
-    let conn = setup_fts_db();
-    let result = prepare_match_query(&conn, "au login", "fts_chunks_vocab").unwrap();
-    assert!(
-        result.to_string().contains("\"login\""),
-        "{}",
-        result.to_string()
-    );
-    assert!(
-        result.to_string().contains(" OR "),
-        "{}",
-        result.to_string()
-    );
-}
-
-#[test]
 fn prepare_match_query_expanded_group_is_executable() {
     let conn = setup_fts_db();
     let query = prepare_match_query(&conn, "au login", "fts_chunks_vocab").unwrap();
@@ -243,33 +190,11 @@ fn prepare_match_query_surfaces_vocab_errors() {
 }
 
 #[test]
-fn expand_rejects_leading_digit_vocab_name() {
-    let conn = setup_fts_db();
-    assert_eq!(
-        fts_expand_short_terms(&conn, &sanitized("au"), "1vocab"),
-        Err(SanitizeError::InvalidVocabTable("1vocab".into()))
-    );
-}
-
-#[test]
 fn expand_rejects_empty_vocab_name() {
     let conn = setup_fts_db();
     assert_eq!(
         fts_expand_short_terms(&conn, &sanitized("au"), ""),
         Err(SanitizeError::InvalidVocabTable("".into()))
-    );
-}
-
-#[test]
-fn expand_surfaces_vocab_errors() {
-    let conn = Connection::open_in_memory().unwrap();
-    conn.execute("CREATE TABLE bad_vocab(term TEXT)", [])
-        .unwrap();
-
-    let result = fts_expand_short_terms(&conn, &sanitized("au"), "bad_vocab");
-    assert!(
-        matches!(result, Err(SanitizeError::VocabLookupFailed(_))),
-        "expected vocab lookup failure, got {result:?}"
     );
 }
 

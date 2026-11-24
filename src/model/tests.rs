@@ -176,16 +176,17 @@ fn empty_index() -> Connection {
 fn model_or_tokenizer_or_prefix_changes_select_a_new_index_identity() {
     let old = ModelSpec::default();
     let id = old.identity();
-    for field in ["weights", "tokenizer", "prefix", "revision"] {
+    let changes: [fn(&mut ModelSpec); 4] = [
+        |s| s.model_sha256 = "0".repeat(64),
+        |s| s.tokenizer_sha256 = "1".repeat(64),
+        |s| s.query_prefix.push_str("new "),
+        |s| s.revision = "2".repeat(40),
+    ];
+    for change in changes {
         let mut next = old.clone();
-        match field {
-            "weights" => next.model_sha256 = "0".repeat(64),
-            "tokenizer" => next.tokenizer_sha256 = "1".repeat(64),
-            "prefix" => next.query_prefix.push_str("new "),
-            _ => next.revision = "2".repeat(40),
-        }
+        change(&mut next);
         next.validate().unwrap();
-        assert_ne!(id, next.identity());
+        assert_ne!(id, next.identity(), "{next:?}");
     }
 }
 #[test]

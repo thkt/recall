@@ -201,21 +201,22 @@ fn index_doctor_and_status_hash_every_time_and_status_writes_no_record() {
 
 #[test]
 fn search_hashes_again_when_a_manifest_checksum_changes() {
-    for field in ["model_sha256", "tokenizer_sha256"] {
+    let changes: [fn(&mut ModelSpec); 2] = [
+        |s| s.model_sha256 = "0".repeat(64),
+        |s| s.tokenizer_sha256 = "0".repeat(64),
+    ];
+    for change in changes {
         let model = SyntheticModel::new();
         model.resolve(ArtifactCheck::HashAndRecord).unwrap();
         let mut next = model.spec.clone();
-        match field {
-            "model_sha256" => next.model_sha256 = "0".repeat(64),
-            _ => next.tokenizer_sha256 = "0".repeat(64),
-        }
+        change(&mut next);
 
         let resolved = model.resolve_with(&next, ArtifactCheck::TrustRecord);
 
         assert_eq!(
             (resolved.err(), model.hashes.get()),
             (Some(DegradedReason::ProbeFailed), 2),
-            "{field}"
+            "{next:?}"
         );
     }
 }
