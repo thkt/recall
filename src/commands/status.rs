@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
-use crate::commands::{ReadIndex, build_markdown, resolve_db_path};
-use crate::envelope::{CommandOutput, Note};
+use crate::commands::{ReadIndex, build_markdown, identity_mismatch_note, resolve_db_path};
+use crate::envelope::CommandOutput;
 use crate::model::{self, ModelHost};
 use crate::runtime::info as cli_info;
 
@@ -84,11 +84,9 @@ pub(crate) fn run_status_with(
     });
 
     let mut out = index.snapshot.finish(CommandOutput::ok(markdown, data));
-    if let Err(error) = model::check_index(conn, model::selected()) {
+    if let Some(note) = identity_mismatch_note(conn) {
         out.degraded = true;
-        out.notes.push(Note::new(format!(
-            "semantic search unavailable: {error}; results are text-only"
-        )));
+        out.notes.push(note);
     }
     Ok(out)
 }

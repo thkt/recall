@@ -11,6 +11,7 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::embedding::Embed;
+use crate::envelope::Note;
 use crate::error::RecallError;
 use crate::model::{self, DegradedReason, EmbedderDegraded, record_degraded};
 use crate::runtime::{home_dir, info as cli_info};
@@ -61,6 +62,16 @@ pub(crate) fn open_or_create_db(path: &Path) -> Result<Connection> {
     let mut conn = db::open_db(path).context("Failed to open database")?;
     model::bind_index(&mut conn, model::selected())?;
     Ok(conn)
+}
+
+pub(crate) fn identity_mismatch_note(conn: &Connection) -> Option<Note> {
+    model::check_index(conn, model::selected())
+        .err()
+        .map(|error| {
+            Note::new(format!(
+                "semantic search unavailable: {error}; results are text-only"
+            ))
+        })
 }
 
 pub(crate) fn resolve_db_path(db_path: &Option<PathBuf>) -> Result<PathBuf> {
