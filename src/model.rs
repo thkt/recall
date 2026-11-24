@@ -345,14 +345,13 @@ impl ModelHost<'_> {
 
     pub(crate) fn load_for_search(&self) -> Result<Arc<dyn Embed>, DegradedReason> {
         let artifacts = (self.resolve_when_needed)(ArtifactCheck::TrustRecord)?;
-        let (loaded, parent_check_failed) =
-            search_load(&artifacts.root, (self.probe_records)().as_ref(), self.steps);
-        if (loaded.is_err() || parent_check_failed)
+        let loaded = search_load(&artifacts.root, (self.probe_records)().as_ref(), self.steps);
+        if loaded.distrusts_artifacts()
             && let Some(record) = &artifacts.trusted_record
         {
             record.clear();
         }
-        loaded
+        loaded.into_result()
     }
 
     pub(crate) fn artifacts_ready(&self) -> bool {
@@ -388,10 +387,36 @@ pub(crate) fn load_probing(
     records: Option<&ProbeRecords>,
     steps: &LoadSteps<'_>,
 ) -> Result<Arc<dyn Embed>, DegradedReason> {
-    probing_load(root, records, steps).0
+    probing_load(root, records, steps).into_result()
 }
 
-type CheckedLoad = (Result<Arc<dyn Embed>, DegradedReason>, bool);
+enum CheckedLoad {
+    Loaded(Arc<dyn Embed>),
+    LoadedDespiteParentSelfCheckMiss(Arc<dyn Embed>),
+    Failed(DegradedReason),
+}
+
+impl CheckedLoad {
+    fn distrusts_artifacts(&self) -> bool {
+        !matches!(self, Self::Loaded(_))
+    }
+
+    fn into_result(self) -> Result<Arc<dyn Embed>, DegradedReason> {
+        match self {
+            Self::Loaded(model) | Self::LoadedDespiteParentSelfCheckMiss(model) => Ok(model),
+            Self::Failed(reason) => Err(reason),
+        }
+    }
+}
+
+impl From<Result<Arc<dyn Embed>, DegradedReason>> for CheckedLoad {
+    fn from(loaded: Result<Arc<dyn Embed>, DegradedReason>) -> Self {
+        match loaded {
+            Ok(model) => Self::Loaded(model),
+            Err(reason) => Self::Failed(reason),
+        }
+    }
+}
 
 fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_>) -> CheckedLoad {
     let records_a_skip_can_read = records.filter(|records| !records.no_skip());
@@ -405,21 +430,27 @@ fn probing_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'
             DegradedReason::ProbeFailed,
         )(error)),
     };
-    let mut parent_check_failed = false;
-    if let Some(records) = records_a_skip_can_read {
-        let verified = loaded.as_ref().is_ok_and(|model| {
-            timed("self-check embedding", || self_check(model.as_ref()))
-                .inspect_err(|error| tracing::warn!(%error, "parent model self-check failed"))
-                .is_ok()
-        });
-        if verified {
-            records.record_success();
-        } else {
+    let Some(records) = records_a_skip_can_read else {
+        return loaded.into();
+    };
+    let model = match loaded {
+        Ok(model) => model,
+        Err(reason) => {
             records.clear();
+            return CheckedLoad::Failed(reason);
         }
-        parent_check_failed = loaded.is_ok() && !verified;
+    };
+    match timed("self-check embedding", || self_check(model.as_ref())) {
+        Ok(()) => {
+            records.record_success();
+            CheckedLoad::Loaded(model)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "parent model self-check failed");
+            records.clear();
+            CheckedLoad::LoadedDespiteParentSelfCheckMiss(model)
+        }
     }
-    (loaded, parent_check_failed)
 }
 
 fn search_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_>) -> CheckedLoad {
@@ -439,7 +470,7 @@ fn search_load(root: &Path, records: Option<&ProbeRecords>, steps: &LoadSteps<'_
     if loaded.is_err() {
         records.clear();
     }
-    (loaded, false)
+    loaded.into()
 }
 
 fn load_skipping_probe(
