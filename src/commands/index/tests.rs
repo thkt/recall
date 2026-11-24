@@ -3,7 +3,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use crate::db::collect_strings;
+use crate::db::{collect_strings, open_db};
 use crate::envelope::{render_json_success, render_text_notes};
 use crate::model::tests::FakeHost;
 use crate::test_support::{mock_loader, payload_keys, vec_chunk_count};
@@ -1886,4 +1886,273 @@ fn a_text_index_run_adds_only_the_embed_failure_note_to_the_lines_it_already_pri
         ),
         "index_and_report prints every other note itself; the embed failure reaches stderr only as a tracing line without the remedy"
     );
+}
+
+fn seed_numbered_sessions(claude_dir: &Path, count: usize) {
+    fs::create_dir_all(claude_dir).unwrap();
+    for n in 0..count {
+        fs::write(
+            claude_dir.join(format!("session-{n}.jsonl")),
+            format!(
+                r#"{{"type":"user","cwd":"/proj","message":{{"role":"user","content":"compaction probe {n}"}},"timestamp":"2026-03-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+}
+
+fn create_free_pages(db_path: &Path) {
+    let conn = open_db(db_path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE junk (body BLOB);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 64)
+         INSERT INTO junk SELECT randomblob(65536) FROM n;
+         DROP TABLE junk;",
+    )
+    .unwrap();
+    assert!(free_pages(db_path) > 0, "the fixture must leave free pages");
+}
+
+fn free_pages(db_path: &Path) -> i64 {
+    Connection::open(db_path)
+        .unwrap()
+        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn idle_reader(db_path: &Path) -> Connection {
+    let reader = Connection::open(db_path).unwrap();
+    reader
+        .query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap();
+    reader
+}
+
+fn wal_bytes(db_path: &Path) -> u64 {
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push("-wal");
+    fs::metadata(wal).unwrap().len()
+}
+
+fn compaction_lines(lines: &[String]) -> Vec<String> {
+    index_observer::stable_lines(lines)
+        .into_iter()
+        .filter(|line| line.starts_with("index: compaction:"))
+        .collect()
+}
+
+const COMPACTION_COMPLETE: [&str; 2] = [
+    "index: compaction: started (not yet complete)",
+    "index: compaction: complete",
+];
+
+fn run_index_recorded(
+    db_path: &Path,
+    claude_dir: &Path,
+    force: bool,
+    embedder: Option<Arc<dyn Embed>>,
+) -> (Result<IndexOutcome>, Vec<String>) {
+    let codex_dir = claude_dir.with_file_name("no_codex");
+    let opts = indexer::IndexOptions {
+        force,
+        claude_dir,
+        codex_dir: &codex_dir,
+        codex_archived_dir: None,
+    };
+    let (observer, lines) = index_observer::recording();
+    let outcome = index_and_report_observed(
+        &Some(db_path.to_path_buf()),
+        &opts,
+        || embedder.ok_or(DegradedReason::NotInstalled),
+        embedder::EmbedOptions::default(),
+        &observer,
+    );
+    let lines = lines.borrow().clone();
+    (outcome, lines)
+}
+
+#[test]
+fn index_that_ingests_500_files_leaves_no_free_pages_and_an_empty_wal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let claude_dir = dir.path().join("claude");
+    create_free_pages(&db_path);
+    seed_numbered_sessions(&claude_dir, 500);
+    let reader = idle_reader(&db_path);
+
+    let (outcome, lines) = run_index_recorded(&db_path, &claude_dir, false, None);
+
+    let outcome = outcome.unwrap();
+    assert_eq!(
+        outcome.observations["counts"]["files_updated_committed"],
+        500
+    );
+    assert_eq!(free_pages(&db_path), 0);
+    assert_eq!(
+        wal_bytes(&db_path),
+        0,
+        "the WAL must be emptied while another connection keeps it from being removed on close"
+    );
+    assert_eq!(compaction_lines(&lines), COMPACTION_COMPLETE);
+    drop(reader);
+}
+
+#[test]
+fn index_that_ingests_499_files_keeps_its_free_pages_and_prints_no_compaction_stage() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let claude_dir = dir.path().join("claude");
+    create_free_pages(&db_path);
+    seed_numbered_sessions(&claude_dir, 499);
+
+    let (outcome, lines) = run_index_recorded(&db_path, &claude_dir, false, None);
+
+    let outcome = outcome.unwrap();
+    assert_eq!(
+        outcome.observations["counts"]["files_updated_committed"],
+        499
+    );
+    assert!(free_pages(&db_path) > 0);
+    assert!(compaction_lines(&lines).is_empty(), "{lines:#?}");
+    assert!(
+        outcome.observations["seconds"].get("compaction").is_none(),
+        "a run without compaction omits its timing"
+    );
+}
+
+#[test]
+fn rebuild_compacts_even_when_it_ingests_a_single_file() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let claude_dir = dir.path().join("claude");
+    create_free_pages(&db_path);
+    seed_numbered_sessions(&claude_dir, 1);
+    let reader = idle_reader(&db_path);
+
+    let (outcome, lines) = run_index_recorded(
+        &db_path,
+        &claude_dir,
+        true,
+        Some(Arc::new(embedder::MockEmbedder::new())),
+    );
+
+    let outcome = outcome.unwrap();
+    assert!(matches!(
+        outcome.embed,
+        EmbedPass::Ran(embedder::EmbedResult { embedded: 1, .. })
+    ));
+    assert_eq!(free_pages(&db_path), 0);
+    assert_eq!(wal_bytes(&db_path), 0);
+    assert_eq!(compaction_lines(&lines), COMPACTION_COMPLETE);
+    assert!(
+        outcome.observations["seconds"]["compaction"]
+            .as_f64()
+            .is_some()
+    );
+    drop(reader);
+}
+
+#[test]
+fn rebuild_that_fails_to_save_embeddings_does_not_compact() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("recall.db");
+    let claude_dir = dir.path().join("claude");
+    create_free_pages(&db_path);
+    open_db(&db_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_embedding_save BEFORE UPDATE OF vec_rowid_lo ON qa_chunks
+             WHEN NEW.vec_rowid_lo IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, 'injected embedding save failure'); END;",
+        )
+        .unwrap();
+    seed_numbered_sessions(&claude_dir, 1);
+
+    let (outcome, lines) = run_index_recorded(
+        &db_path,
+        &claude_dir,
+        true,
+        Some(Arc::new(embedder::MockEmbedder::new())),
+    );
+
+    let error = outcome.err().expect("the embedding save must fail");
+    assert!(
+        format!("{error:#}").contains("injected embedding save failure"),
+        "{error:#}"
+    );
+    assert!(compaction_lines(&lines).is_empty(), "{lines:#?}");
+    assert!(free_pages(&db_path) > 0);
+}
+
+fn poison_vacuum(db_path: &Path) {
+    open_db(db_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE vacuum_poison (x);
+             CREATE INDEX vacuum_poison_idx ON vacuum_poison (x);
+             PRAGMA writable_schema = ON;
+             UPDATE sqlite_master SET sql = 'CREATE INDEX vacuum_poison_idx ON vacuum_poison (no_such_fn(x))'
+                 WHERE name = 'vacuum_poison_idx';
+             PRAGMA writable_schema = OFF;",
+        )
+        .unwrap();
+}
+
+#[test]
+fn rebuild_whose_compaction_fails_succeeds_with_the_same_result_and_one_warning_line() {
+    let run = |poisoned: bool| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("recall.db");
+        let claude_dir = dir.path().join("claude");
+        create_free_pages(&db_path);
+        if poisoned {
+            poison_vacuum(&db_path);
+        }
+        seed_numbered_sessions(&claude_dir, 1);
+        let (outcome, lines) = run_index_recorded(
+            &db_path,
+            &claude_dir,
+            true,
+            Some(Arc::new(embedder::MockEmbedder::new())),
+        );
+        let outcome = outcome.expect("a failed compaction must not fail the run");
+        let vectors = vec_chunk_count(&Connection::open(&db_path).unwrap());
+        (
+            printed_json_without_stage_timings(&outcome),
+            lines,
+            vectors,
+            dir,
+        )
+    };
+    let (clean_json, clean_lines, clean_vectors, _clean_dir) = run(false);
+    let (failed_json, failed_lines, failed_vectors, failed_dir) = run(true);
+
+    assert_eq!(failed_json, clean_json);
+    assert_eq!(failed_json["data"]["embedded"], 1);
+    assert_eq!(failed_vectors, clean_vectors);
+    assert_eq!(compaction_lines(&clean_lines), COMPACTION_COMPLETE);
+    assert_eq!(
+        compaction_lines(&failed_lines),
+        [
+            "index: compaction: started (not yet complete)",
+            "index: compaction: failed; indexed data kept uncompacted",
+        ]
+    );
+    let warnings: Vec<&String> = failed_lines
+        .iter()
+        .filter(|line| line.starts_with("warning: "))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            "warning: could not compact the index (no such function: no_such_fn: Error code 1: SQL logic error); indexed sessions and embeddings are kept, and the next `recall rebuild` or `recall index` that ingests 500 or more files compacts it again"
+        ]
+    );
+    assert!(
+        !clean_lines.iter().any(|line| line.starts_with("warning: ")),
+        "{clean_lines:#?}"
+    );
+    assert!(free_pages(&failed_dir.path().join("recall.db")) > 0);
 }

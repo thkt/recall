@@ -526,8 +526,14 @@ fn index_all(
     })
 }
 
+const BULK_RUN_MIN_FILES: usize = 500;
+
+pub(crate) fn is_bulk_run(indexed: usize, force: bool) -> bool {
+    force || indexed >= BULK_RUN_MIN_FILES
+}
+
 fn finalize_fts(conn: &mut Connection, indexed: usize, force: bool) -> Result<()> {
-    if force || indexed >= 500 {
+    if is_bulk_run(indexed, force) {
         conn.execute("INSERT INTO messages(messages) VALUES('optimize')", [])?;
     }
     conn.execute(
