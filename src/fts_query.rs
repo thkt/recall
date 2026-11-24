@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::fmt;
 use std::iter::repeat_n;
 
@@ -178,6 +179,7 @@ impl MatchFtsQuery {
     }
 }
 
+#[cfg(test)]
 impl fmt::Display for MatchFtsQuery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let parts: Vec<String> = self

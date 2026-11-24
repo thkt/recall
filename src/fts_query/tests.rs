@@ -130,21 +130,22 @@ fn the_vocabulary_lookup_hands_both_bounds_of_its_range_to_the_vocabulary_table(
 }
 
 #[test]
-fn prepare_match_query_expanded_group_is_executable() {
+fn the_match_string_of_an_expanded_short_word_finds_only_the_message_holding_both_words() {
     let conn = setup_fts_db();
-    let query = prepare_match_query(&conn, "au login").unwrap();
+    let query = prepare_match_query(&conn, "au login")
+        .unwrap()
+        .to_trigram_match()
+        .unwrap();
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM messages WHERE messages MATCH ?1",
-            [query.to_string()],
+            [&query],
             |row| row.get(0),
         )
-        .unwrap_or_else(|e| panic!("MATCH rejected {:?}: {e}", query.to_string()));
+        .unwrap_or_else(|e| panic!("MATCH rejected {query:?}: {e}"));
     assert_eq!(
-        count,
-        1,
-        "expected exactly 'authentication login session' to match, query: {:?}",
-        query.to_string()
+        count, 1,
+        "expected exactly 'authentication login session' to match, query: {query:?}"
     );
 }
 
