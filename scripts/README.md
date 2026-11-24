@@ -80,5 +80,22 @@ search, and the number of searches over the limit. It prints no query and no res
 run on a real index. The exit status is 1 when a 95th percentile exceeds `--limit-seconds`
 (default 2) or a search fails.
 
+Searches that follow each other read the index and the model from the OS file cache. A search
+after the machine did other work reads them from disk. `--drop-from-memory FILE` measures that
+case: it adds the modes `hybrid_after_drop` and `keyword_only_after_drop`, which remove the file
+from the OS file cache before every search. Repeat the option for each file, for example the
+index (`recall status --verbose` prints its path) and the model's `model.gguf`:
+
+```sh
+python3 scripts/measure-search.py /absolute/path/to/recall /absolute/path/to/queries.txt \
+  --drop-from-memory /absolute/path/to/recall.db \
+  --drop-from-memory /absolute/path/to/model.gguf
+```
+
+`left_in_memory_fraction` is the largest share of a file that stayed in the cache after a
+removal. A value above 0 means those searches read part of the file from memory, so their
+times are shorter than a read from disk. The removal uses `msync` with `MS_INVALIDATE`, which
+empties the cache on macOS only.
+
 All scripts preserve their results separately from the
 [dated migration validation record](../docs/audit/2026-10-16-gemma-validation.json).

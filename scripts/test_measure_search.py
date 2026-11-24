@@ -18,19 +18,35 @@ if query == "slow":
 if query == "bad":
     sys.stderr.write("error: boom\\n")
     sys.exit(65)
+watched = os.environ.get("STUB_WATCHED_FILE")
+if watched:
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("measure_search", os.environ["STUB_SCRIPT"])
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    with open(os.environ["STUB_LOG"], "a") as log:
+        log.write(f"{script.fraction_in_memory(Path(watched))}\\n")
+    Path(watched).read_bytes()
 model_dir = os.environ.get("RECALL_MODEL_DIR")
 degraded = bool(model_dir) and not os.listdir(model_dir)
 print(json.dumps({"data": {"results": [{"session_id": "private-session"}]}, "degraded": degraded}))
 """
 
 
-def measure(tmp_path, queries, *options):
+def measure(tmp_path, queries, *options, watched_file=None):
     binary = tmp_path / "recall"
     binary.write_text(STUB)
     binary.chmod(0o755)
     queries_file = tmp_path / "queries.txt"
     queries_file.write_text(queries)
     env = {key: value for key, value in os.environ.items() if key != "RECALL_MODEL_DIR"}
+    if watched_file:
+        env.update(
+            STUB_WATCHED_FILE=str(watched_file),
+            STUB_SCRIPT=str(SCRIPT),
+            STUB_LOG=str(tmp_path / "in-memory.log"),
+        )
     done = subprocess.run(
         [sys.executable, str(SCRIPT), str(binary), str(queries_file), *options],
         capture_output=True,
@@ -97,3 +113,55 @@ def test_a_queries_file_without_a_query_is_refused(tmp_path):
 
     assert (done.returncode, done.stdout) == (1, "")
     assert "holds no query" in done.stderr
+
+
+def test_every_search_after_a_drop_starts_with_the_file_out_of_memory(tmp_path):
+    index = tmp_path / "index.db"
+    index.write_bytes(os.urandom(1 << 20))
+
+    done = measure(
+        tmp_path, "first\nsecond\n", "--runs", "2", "--drop-from-memory", str(index),
+        watched_file=index,
+    )
+
+    report = json.loads(done.stdout)
+    assert {name: mode["runs"] for name, mode in report["modes"].items()} == {
+        "hybrid": 4,
+        "keyword_only": 4,
+        "hybrid_after_drop": 4,
+        "keyword_only_after_drop": 4,
+    }
+    assert report["modes"]["hybrid_after_drop"]["left_in_memory_fraction"] == 0
+    in_memory = [float(line) for line in (tmp_path / "in-memory.log").read_text().split()]
+    kept, hybrid_dropped, keyword_dropped = in_memory[:10], in_memory[11:15], in_memory[16:]
+    assert (set(kept), set(hybrid_dropped), set(keyword_dropped)) == ({1.0}, {0.0}, {0.0})
+
+
+def test_a_search_slower_than_the_limit_after_a_drop_fails_the_report(tmp_path):
+    index = tmp_path / "index.db"
+    index.write_bytes(b"index")
+
+    done = measure(
+        tmp_path, "slow\n", "--runs", "1", "--limit-seconds", "0.3", "--drop-from-memory", str(index)
+    )
+
+    report = json.loads(done.stdout)
+    assert (done.returncode, report["within_limit"]) == (1, False)
+    assert report["modes"]["hybrid_after_drop"]["over_limit"] == 1
+
+
+def test_a_missing_file_to_drop_is_refused_before_any_search(tmp_path):
+    done = measure(tmp_path, "first\n", "--drop-from-memory", str(tmp_path / "absent.db"))
+
+    assert (done.returncode, done.stdout) == (1, "")
+    assert "names no file: absent.db" in done.stderr
+
+
+def test_an_empty_file_to_drop_is_refused(tmp_path):
+    empty = tmp_path / "empty.db"
+    empty.touch()
+
+    done = measure(tmp_path, "first\n", "--drop-from-memory", str(empty))
+
+    assert done.returncode == 1
+    assert "cannot map empty.db" in done.stderr
