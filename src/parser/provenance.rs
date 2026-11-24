@@ -121,7 +121,7 @@ impl<'a> ClaudeOrigin<'a> {
 }
 
 pub(super) struct CodexOrigin {
-    pub session_id: String,
+    session_id: String,
     metadata_id: Option<String>,
     origin: SessionOrigin,
 }
