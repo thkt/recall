@@ -233,10 +233,6 @@ fn handle_parse_error(err: &clap::Error) -> ExitCode {
     }
 }
 
-fn no_payload() -> CommandOutput {
-    CommandOutput::ok(String::new(), serde_json::Value::Null)
-}
-
 fn run(cli: Cli) -> Result<CommandOutput> {
     model::select(cli.model_manifest.as_deref())
         .map_err(|e| RecallError::DatabaseRead(format!("invalid model manifest: {e}")))?;
@@ -268,7 +264,7 @@ fn run(cli: Cli) -> Result<CommandOutput> {
         .map(|o| commands::index::index_command_output(&o)),
         Some(Command::Model(ModelCommand::Download)) => {
             download_and_verify_model().map_err(|e| download_error(&e))?;
-            Ok(no_payload())
+            Ok(CommandOutput::ok(String::new(), serde_json::Value::Null))
         }
         Some(Command::Model(ModelCommand::Manifest)) => {
             let data = serde_json::to_value(model::selected())?;

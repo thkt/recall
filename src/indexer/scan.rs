@@ -79,13 +79,9 @@ impl RemovalGate {
         }
     }
 
-    fn is_fully_read(&self, source: Source) -> bool {
-        self.fully_read.contains(&source)
-    }
-
     pub(super) fn allows(&self, source: Option<Source>, path: &Path) -> bool {
         source.is_some_and(|source| {
-            self.is_fully_read(source)
+            self.fully_read.contains(&source)
                 && !self
                     .missing_roots
                     .iter()
@@ -141,7 +137,7 @@ fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
         match fs::metadata(root) {
             Ok(meta) if meta.is_dir() => {
                 any_present = true;
-                all_read &= collect_jsonl_files(root, &mut out.sources, source);
+                all_read &= collect_jsonl_files(root, &mut out.sources, source, 0);
             }
             Err(e)
                 if !matches!(
@@ -180,11 +176,7 @@ fn classify_roots(source: Source, roots: &[&Path], out: &mut ScanOutcome) {
 
 const MAX_DIR_DEPTH: usize = 10;
 
-fn collect_jsonl_files(dir: &Path, out: &mut Vec<(PathBuf, Source)>, source: Source) -> bool {
-    collect_jsonl_files_inner(dir, out, source, 0)
-}
-
-fn collect_jsonl_files_inner(
+fn collect_jsonl_files(
     dir: &Path,
     out: &mut Vec<(PathBuf, Source)>,
     source: Source,
@@ -231,7 +223,7 @@ pub(super) fn collect_from_entries(
         }
         let path = entry.path();
         if ft.is_dir() {
-            fully_read &= collect_jsonl_files_inner(&path, out, source, depth + 1);
+            fully_read &= collect_jsonl_files(&path, out, source, depth + 1);
         } else if is_session_log(&path, source) {
             out.push((path, source));
         }

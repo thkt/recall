@@ -242,7 +242,7 @@ impl BatchEmbedder<'_, '_> {
                     let rowid = tx.last_insert_rowid();
                     range = Some(range.map_or((rowid, rowid), |(lo, _)| (lo, rowid)));
                 }
-                let Some((lo, hi)) = range else { continue };
+                let (lo, hi) = range.expect("a ChunkedEmbedding holds at least one embedding");
                 ensure!(
                     is_contiguous_range(lo, hi, chunked.chunks().len()),
                     "embeddings of chunk {id} received rowids {lo}..={hi} that are not consecutive"

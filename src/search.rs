@@ -881,7 +881,11 @@ pub fn search_with_embedder<'q>(
 
     let sessions: Vec<SessionData> = merged
         .into_iter()
-        .filter_map(|(sid, _)| meta_map.remove(&sid))
+        .map(|(sid, _)| {
+            meta_map
+                .remove(&sid)
+                .expect("merged keeps only sessions whose metadata was fetched")
+        })
         .collect();
     Ok(SearchOutcome {
         results: fetch_chunks(conn, fts_query, sessions, &vec_chunks)?,
