@@ -341,7 +341,7 @@ fn a_query_syntax_error_is_reported_even_when_the_vector_search_could_answer() {
 }
 
 #[test]
-fn a_search_failure_that_is_not_a_query_syntax_error_stays_a_data_error() {
+fn a_match_whose_session_id_is_an_integer_is_an_unreadable_row_instead_of_a_failed_search() {
     let (_dir, conn) = db_with_messages(&[]);
     conn.execute(
         "INSERT INTO messages (session_id, role, text) VALUES (42, 'user', 'alpha notes')",
@@ -353,10 +353,10 @@ fn a_search_failure_that_is_not_a_query_syntax_error_stays_a_data_error() {
         ..Default::default()
     };
 
-    assert_eq!(
-        rejection_with(&conn, "alpha", &opts),
-        r#"DataError("Search failed: Invalid column type Integer at index: 0, name: session_id")"#
-    );
+    let outcome = search_with_embedder(&conn, "alpha", &opts, None).unwrap();
+
+    assert_eq!(outcome.results.len(), 0);
+    assert!(outcome.results_incomplete);
 }
 
 fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str) {
@@ -458,6 +458,7 @@ fn a_failed_not_filter_drops_the_vector_only_sessions_and_marks_the_vector_searc
 
     let degraded = drop_vec_only_sessions_matching_not(
         &conn,
+        &MessageSessions::StoredPerRow,
         &["\"beta\"".to_owned()],
         &text_hits,
         &mut merged,
