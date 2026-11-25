@@ -19,7 +19,12 @@ use crate::parser::{SessionData, Source};
 
 pub(crate) mod filter;
 
+mod message_sessions;
+
 use filter::{anon_placeholders, append_search_filters};
+use message_sessions::{
+    FilteredSessions, MatchedRow, MatchedRows, MessageSessions, distinct_session_ids,
+};
 
 pub(crate) const MAX_LIMIT: u16 = 100;
 const VEC_CANDIDATE_COUNT: usize = 3 * MAX_LIMIT as usize;
@@ -137,23 +142,58 @@ fn decode_session_at(row: &rusqlite::Row, first_column: usize) -> rusqlite::Resu
     }))
 }
 
-fn build_keyword_session_query(
-    fts_query: &str,
+fn best_rank_per_session(rows: &[MatchedRow]) -> HashMap<Option<&str>, f64> {
+    let mut best: HashMap<Option<&str>, f64> = HashMap::new();
+    for row in rows {
+        let kept = best.entry(row.session_id.as_deref()).or_insert(row.rank);
+        if row.rank.total_cmp(kept).is_lt() {
+            *kept = row.rank;
+        }
+    }
+    best
+}
+
+type KeywordRow = (String, f64, rusqlite::Result<Option<DecodedSession>>);
+
+fn filtered_keyword_rows(
+    conn: &Connection,
+    best_rank: &HashMap<Option<&str>, f64>,
     opts: &SearchOptions,
     now_ms: i64,
-) -> (String, Vec<Box<dyn ToSql>>) {
-    let mut inner =
-        "SELECT session_id, MIN(rank) AS best_rank FROM messages WHERE messages MATCH ?".to_owned();
-    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(fts_query.to_owned())];
-    append_search_filters(&mut inner, &mut params, "session_id", opts, now_ms);
-    inner.push_str(" GROUP BY session_id");
-    let sql = format!(
-        "SELECT m.session_id, m.best_rank, \
-         s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp \
-         FROM ({inner}) m LEFT JOIN sessions s ON s.session_id = m.session_id \
-         ORDER BY m.best_rank, m.session_id"
+) -> Result<Vec<rusqlite::Result<KeywordRow>>> {
+    let session_ids: Vec<Option<&str>> = best_rank.keys().copied().collect();
+    let filtered = FilteredSessions::new(
+        "j.value AS session_id, s.session_id, s.source, s.file_path, s.project, s.slug, s.timestamp",
+        " LEFT JOIN sessions s ON s.session_id = j.value",
+        &session_ids,
+        opts,
+        now_ms,
     );
-    (sql, params)
+    debug_assert_eq!(
+        filtered.params.len(),
+        filtered.sql.matches('?').count(),
+        "param count must match SQL placeholder count"
+    );
+    let mut stmt = conn
+        .prepare(&filtered.sql)
+        .context("Failed to prepare search query")?;
+    let mut rows: Vec<rusqlite::Result<KeywordRow>> = stmt
+        .query_map(rusqlite::params_from_iter(filtered.params.iter()), |row| {
+            let session_id: String = row.get(0)?;
+            let rank = best_rank[&Some(session_id.as_str())];
+            let session = match row.get::<_, Option<String>>(1)? {
+                Some(_) => decode_session_at(row, 1).map(Some),
+                None => Ok(None),
+            };
+            Ok((session_id, rank, session))
+        })
+        .context("Search query failed")?
+        .collect();
+    rows.sort_by(|a, b| match (a, b) {
+        (Ok(a), Ok(b)) => a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)),
+        _ => a.is_err().cmp(&b.is_err()),
+    });
+    Ok(rows)
 }
 
 struct SkippedSession {
@@ -164,6 +204,7 @@ struct SkippedSession {
 
 #[derive(Default)]
 struct KeywordSessions {
+    matched: Vec<MatchedRow>,
     order: Vec<(String, f64)>,
     ranked: Vec<(f64, SessionData)>,
     skipped: Vec<SkippedSession>,
@@ -172,35 +213,21 @@ struct KeywordSessions {
 
 fn find_keyword_sessions(
     conn: &Connection,
+    message_sessions: &MessageSessions,
     opts: &SearchOptions,
     fts_query: &str,
     now_ms: i64,
 ) -> Result<KeywordSessions> {
-    let (sql, params) = build_keyword_session_query(fts_query, opts, now_ms);
-    debug_assert_eq!(
-        params.len(),
-        sql.matches('?').count(),
-        "param count must match SQL placeholder count"
-    );
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("Failed to prepare search query")?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            let session_id: String = row.get(0)?;
-            let best_rank: f64 = row.get(1)?;
-            let session = match row.get::<_, Option<String>>(2)? {
-                Some(_) => decode_session_at(row, 2).map(Some),
-                None => Ok(None),
-            };
-            Ok((session_id, best_rank, session))
-        })
-        .context("Search query failed")?;
+    let MatchedRows {
+        rows: matched,
+        not_text_ids,
+        mut first_error,
+        errors: mut row_errors,
+    } = message_sessions.matched_rows(conn, fts_query);
+    let rows = filtered_keyword_rows(conn, &best_rank_per_session(&matched), opts, now_ms)?;
 
     let mut order = Vec::new();
     let mut ranked = Vec::new();
-    let mut first_error = None;
-    let mut row_errors = 0;
     let mut skipped = Vec::new();
     let (mut missing_row, mut unknown_source, mut unreadable_metadata) = (0, 0, 0);
     let mut first_metadata_error = None;
@@ -247,6 +274,12 @@ fn find_keyword_sessions(
         }
         warn!(row_errors, %err, "rows skipped during search");
     }
+    if not_text_ids > 0 {
+        warn!(
+            not_text_ids,
+            "matches whose session id is not UTF-8 text skipped"
+        );
+    }
     // why-not: a warn line per skipped session would repeat on every search, since every match is read.
     if !skipped.is_empty() {
         let first_error = first_metadata_error
@@ -258,10 +291,11 @@ fn find_keyword_sessions(
         );
     }
     Ok(KeywordSessions {
+        matched,
         order,
         ranked,
         skipped,
-        unreadable_rows: row_errors > 0,
+        unreadable_rows: row_errors > 0 || not_text_ids > 0,
     })
 }
 
@@ -378,67 +412,44 @@ struct MatchingMessages {
     first: HashMap<String, i64>,
 }
 
-// why-not: `messages.session_id` is UNINDEXED, so a MATCH per session reads every matching row each time.
 // why-not: `MIN(rank)` with bare columns leaves a rank tie to SQLite, and a window sorts every matching row.
-fn matching_messages(
-    conn: &Connection,
-    fts_query: &str,
-    session_ids: &[&str],
-) -> Result<MatchingMessages> {
-    let sql = format!(
-        "SELECT session_id, rowid, rank FROM messages \
-         WHERE messages MATCH ? AND session_id IN ({})",
-        anon_placeholders(session_ids.len())
-    );
-    let mut params: Vec<&dyn ToSql> = vec![&fts_query];
-    params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
-    let mut stmt = conn.prepare(&sql)?;
+fn matching_messages(matched: &[MatchedRow], session_ids: &HashSet<&str>) -> MatchingMessages {
     let mut best: HashMap<String, (f64, i64)> = HashMap::new();
     let mut first: HashMap<String, i64> = HashMap::new();
-    let read = stmt
-        .query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        })
-        .and_then(|rows| {
-            for row in rows {
-                let (session_id, rowid, rank) = row?;
-                let earliest = first.entry(session_id.clone()).or_insert(rowid);
-                *earliest = rowid.min(*earliest);
-                let kept = best.entry(session_id).or_insert((rank, rowid));
-                if rank.total_cmp(&kept.0).then(rowid.cmp(&kept.1)).is_lt() {
-                    *kept = (rank, rowid);
-                }
-            }
-            Ok(())
-        });
-    if let Err(e) = read {
-        warn!(error = %e, "matching message lookup failed");
-        return Ok(MatchingMessages::default());
+    for row in matched {
+        let Some(session_id) = row
+            .session_id
+            .as_deref()
+            .filter(|sid| session_ids.contains(sid))
+        else {
+            continue;
+        };
+        let (rowid, rank) = (row.rowid, row.rank);
+        let earliest = first.entry(session_id.to_owned()).or_insert(rowid);
+        *earliest = rowid.min(*earliest);
+        let kept = best.entry(session_id.to_owned()).or_insert((rank, rowid));
+        if rank.total_cmp(&kept.0).then(rowid.cmp(&kept.1)).is_lt() {
+            *kept = (rank, rowid);
+        }
     }
-    Ok(MatchingMessages {
+    MatchingMessages {
         best: best
             .into_iter()
             .map(|(session_id, (_, rowid))| (session_id, rowid))
             .collect(),
         first,
-    })
+    }
 }
 
 fn fetch_chunks(
     conn: &Connection,
     fts_query: Option<&str>,
+    matched: &[MatchedRow],
     sessions: Vec<SessionData>,
     vec_chunks: &HashMap<String, i64>,
 ) -> Result<Vec<SearchResult>> {
-    let session_ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
-    let matching = match fts_query {
-        Some(q) => matching_messages(conn, q, &session_ids)?,
-        None => MatchingMessages::default(),
-    };
+    let session_ids: HashSet<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+    let matching = matching_messages(matched, &session_ids);
     let rowid_match_sql = "SELECT c.id, MAX(c.content) FROM qa_chunks c \
         WHERE c.session_id = ?1 AND c.src_rowid_lo IS NOT NULL \
           AND ?2 BETWEEN c.src_rowid_lo AND c.src_rowid_hi HAVING COUNT(*) = 1";
@@ -617,6 +628,7 @@ fn keyword_query(conn: &Connection, query: &str) -> Result<Option<KeywordQuery>>
 
 fn drop_vec_only_sessions_matching_not(
     conn: &Connection,
+    message_sessions: &MessageSessions,
     not_operands: &[String],
     fts_ids: &HashSet<&str>,
     merged: &mut Vec<(String, f64)>,
@@ -632,7 +644,7 @@ fn drop_vec_only_sessions_matching_not(
     if vec_only.is_empty() {
         return false;
     }
-    match sessions_matching_any(conn, not_operands, &vec_only) {
+    match sessions_matching_any(conn, message_sessions, not_operands, &vec_only) {
         Ok(excluded) => {
             merged.retain(|(sid, _)| !excluded.contains(sid));
             false
@@ -647,24 +659,25 @@ fn drop_vec_only_sessions_matching_not(
 
 fn sessions_matching_any(
     conn: &Connection,
+    message_sessions: &MessageSessions,
     operands: &[String],
     session_ids: &[&str],
 ) -> Result<HashSet<String>> {
-    let operands = operands.join(" OR ");
-    let sql = format!(
-        "SELECT DISTINCT session_id FROM messages \
-         WHERE messages MATCH ? AND session_id IN ({})",
-        anon_placeholders(session_ids.len())
-    );
-    let mut params: Vec<&dyn ToSql> = vec![&operands];
-    params.extend(session_ids.iter().map(|sid| sid as &dyn ToSql));
-    let mut stmt = conn
-        .prepare(&sql)
-        .context("Failed to prepare NOT filter query")?;
-    stmt.query_map(params.as_slice(), |row| row.get::<_, String>(0))
-        .and_then(|rows| rows.collect::<rusqlite::Result<_>>())
-        .context("NOT filter query failed")
+    let matched = message_sessions.matched_rows(conn, &operands.join(" OR "));
+    if let Some(e) = matched.first_error {
+        return Err(anyhow::Error::from(e).context("NOT filter query failed"));
+    }
+    let wanted: HashSet<&str> = session_ids.iter().copied().collect();
+    Ok(matched
+        .rows
+        .into_iter()
+        .filter_map(|row| row.session_id)
+        .filter(|sid| wanted.contains(sid.as_str()))
+        .collect())
 }
+
+const AUTOMATED_SESSION: &str = " IN (SELECT s4.session_id FROM sessions s4 \
+     WHERE COALESCE(s4.session_type, 'interactive') = 'automated')";
 
 pub fn count_excluded_automated(
     conn: &Connection,
@@ -674,36 +687,39 @@ pub fn count_excluded_automated(
     if opts.include_automated {
         return Ok(0);
     }
+    let snapshot = conn.unchecked_transaction()?;
+    let conn: &Connection = &snapshot;
     let now_ms = resolve_now_ms(opts)?;
     let unfiltered = SearchOptions {
         include_automated: true,
         ..opts.clone()
     };
-    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
-    let (mut sql, column) = match query {
+    let (sql, params) = match query {
         Some(query) => {
             let Some(fts_query) = keyword_query(conn, query)?.and_then(|k| k.fts) else {
                 return Ok(0);
             };
-            params.push(Box::new(fts_query));
-            (
-                "SELECT COUNT(DISTINCT session_id) FROM messages WHERE messages MATCH ?".to_owned(),
-                "session_id",
-            )
+            let matched = MessageSessions::load(conn)?.matched_rows(conn, &fts_query);
+            if let Some(e) = matched.first_error {
+                return Err(e.into());
+            }
+            let session_ids = distinct_session_ids(&matched.rows);
+            let mut filtered =
+                FilteredSessions::new("COUNT(*)", "", &session_ids, &unfiltered, now_ms);
+            filtered
+                .sql
+                .push_str(&format!(" AND j.value{AUTOMATED_SESSION}"));
+            (filtered.sql, filtered.params)
         }
-        None if opts.file.is_some() => (
-            "SELECT COUNT(*) FROM sessions s WHERE 1 = 1".to_owned(),
-            "s.session_id",
-        ),
+        None if opts.file.is_some() => {
+            let mut sql = "SELECT COUNT(*) FROM sessions s WHERE 1 = 1".to_owned();
+            let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+            append_search_filters(&mut sql, &mut params, "s.session_id", &unfiltered, now_ms);
+            sql.push_str(&format!(" AND s.session_id{AUTOMATED_SESSION}"));
+            (sql, params)
+        }
         None => return Ok(0),
     };
-    append_search_filters(&mut sql, &mut params, column, &unfiltered, now_ms);
-    sql.push_str(" AND ");
-    sql.push_str(column);
-    sql.push_str(
-        " IN (SELECT s4.session_id FROM sessions s4 \
-         WHERE COALESCE(s4.session_type, 'interactive') = 'automated')",
-    );
     debug_assert_eq!(
         params.len(),
         sql.matches('?').count(),
@@ -729,6 +745,8 @@ pub fn search_with_embedder<'q>(
     if opts.limit == 0 {
         return Ok(SearchOutcome::nominal(Vec::new()));
     }
+    let snapshot = conn.unchecked_transaction()?;
+    let conn: &Connection = &snapshot;
 
     if opts.file.is_some() && table_def(conn, "session_files")?.is_none() {
         return Err(RecallError::DataError(
@@ -747,6 +765,7 @@ pub fn search_with_embedder<'q>(
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
+    let message_sessions = MessageSessions::load(conn)?;
     let hybrid_embedder = match embedder {
         Some(embedder) => has_vec_data(conn).map(|has_data| has_data.then_some(embedder)),
         None => Ok(None),
@@ -761,7 +780,7 @@ pub fn search_with_embedder<'q>(
             _ => None,
         };
         let found = match fts_query {
-            Some(q) => find_keyword_sessions(conn, opts, q, now_ms),
+            Some(q) => find_keyword_sessions(conn, &message_sessions, opts, q, now_ms),
             None => Ok(KeywordSessions::default()),
         };
         let embedding = embedding.map(|handle| {
@@ -806,8 +825,13 @@ pub fn search_with_embedder<'q>(
             .map(|hit| (hit.session_id.as_str(), hit.distance)),
     );
     let fts_ids: HashSet<&str> = found.order.iter().map(|(sid, _)| sid.as_str()).collect();
-    let vec_degraded =
-        drop_vec_only_sessions_matching_not(conn, &keyword.not_operands, &fts_ids, &mut merged);
+    let vec_degraded = drop_vec_only_sessions_matching_not(
+        conn,
+        &message_sessions,
+        &keyword.not_operands,
+        &fts_ids,
+        &mut merged,
+    );
 
     let vec_only: Vec<&str> = merged
         .iter()
@@ -874,7 +898,7 @@ pub fn search_with_embedder<'q>(
         })
         .collect();
     Ok(SearchOutcome {
-        results: fetch_chunks(conn, fts_query, sessions, &vec_chunks)?,
+        results: fetch_chunks(conn, fts_query, &found.matched, sessions, &vec_chunks)?,
         vec_degraded,
         results_incomplete: incomplete,
     })
@@ -902,7 +926,13 @@ fn keyword_only_outcome(
         });
     }
     Ok(SearchOutcome {
-        results: fetch_chunks(conn, fts_query, ranking.sessions, &HashMap::new())?,
+        results: fetch_chunks(
+            conn,
+            fts_query,
+            &found.matched,
+            ranking.sessions,
+            &HashMap::new(),
+        )?,
         vec_degraded,
         results_incomplete,
     })
@@ -961,6 +991,8 @@ fn file_list_outcome(
     })
 }
 
+#[cfg(test)]
+mod range_tests;
 #[cfg(test)]
 mod syntax_tests;
 #[cfg(test)]
