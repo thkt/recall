@@ -7,10 +7,9 @@ use crate::commands::status::run_status_in;
 use crate::embedder::MockEmbedder;
 use crate::embedding::Embed;
 use crate::error::RecallError;
-use crate::model::tests::FakeHost;
+use crate::model::tests::{FakeHost, SharedCell};
 use crate::model::{ModelHost, cache, hash_file};
 use crate::test_support::{search_command, seed_healthy_index};
-use std::cell::Cell;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -19,7 +18,7 @@ struct SyntheticModel {
     dir: tempfile::TempDir,
     root: PathBuf,
     spec: ModelSpec,
-    hashes: Cell<usize>,
+    hashes: SharedCell<usize>,
 }
 
 impl SyntheticModel {
@@ -38,7 +37,7 @@ impl SyntheticModel {
             dir,
             root,
             spec,
-            hashes: Cell::new(0),
+            hashes: SharedCell::new(0),
         }
     }
 

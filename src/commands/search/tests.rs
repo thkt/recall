@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crate::commands::open_or_create_db;
 use crate::envelope::render_text_notes;
@@ -804,6 +806,36 @@ fn search_shows_a_match_outside_any_chunk_as_a_snippet_with_a_full_show_inspect_
     );
 }
 
+const HEALTHY_CHUNK_HYBRID_MARKDOWN: &str = concat!(
+    "Found 1 sessions:\n",
+    "\n",
+    "[1] 1970-01-01 | slug | p [claude]\n",
+    "    /p\n",
+    "    ID: s1\n",
+    "    > healthy chunk\n",
+    "    inspect: recall show s1 --chunk 1 --window 3\n",
+    "\n",
+);
+
+fn healthy_chunk_hybrid_envelope() -> serde_json::Value {
+    serde_json::json!({
+        "data": {
+            "results": [{
+                "chunk": 1,
+                "excerpt": "healthy chunk",
+                "inspect": "recall show s1 --chunk 1 --window 3",
+                "project": "/p",
+                "session_id": "s1",
+                "slug": "slug",
+                "source": "claude",
+                "timestamp": 0,
+            }],
+        },
+        "degraded": false,
+        "notes": [],
+    })
+}
+
 #[test]
 fn two_searches_in_one_environment_start_the_probe_only_for_the_first() {
     let db_dir = tempfile::TempDir::new().unwrap();
@@ -831,36 +863,98 @@ fn two_searches_in_one_environment_start_the_probe_only_for_the_first() {
         })
         .unwrap();
 
-    let expected_markdown = concat!(
-        "Found 1 sessions:\n",
-        "\n",
-        "[1] 1970-01-01 | slug | p [claude]\n",
-        "    /p\n",
-        "    ID: s1\n",
-        "    > healthy chunk\n",
-        "    inspect: recall show s1 --chunk 1 --window 3\n",
-        "\n",
+    assert_eq!(first_search.markdown, HEALTHY_CHUNK_HYBRID_MARKDOWN);
+    assert_eq!(
+        printed_envelope(&first_search),
+        healthy_chunk_hybrid_envelope()
     );
-    let expected_envelope = serde_json::json!({
-        "data": {
-            "results": [{
-                "chunk": 1,
-                "excerpt": "healthy chunk",
-                "inspect": "recall show s1 --chunk 1 --window 3",
-                "project": "/p",
-                "session_id": "s1",
-                "slug": "slug",
-                "source": "claude",
-                "timestamp": 0,
-            }],
-        },
-        "degraded": false,
-        "notes": [],
-    });
-    assert_eq!(first_search.markdown, expected_markdown);
-    assert_eq!(printed_envelope(&first_search), expected_envelope);
-    assert_eq!(second_search.markdown, expected_markdown);
-    assert_eq!(printed_envelope(&second_search), expected_envelope);
+    assert_eq!(second_search.markdown, HEALTHY_CHUNK_HYBRID_MARKDOWN);
+    assert_eq!(
+        printed_envelope(&second_search),
+        healthy_chunk_hybrid_envelope()
+    );
     assert_eq!(host.probes.get(), 1, "the second search skipped the probe");
     assert_eq!(host.loads.get(), 2, "each search loaded the model");
+}
+
+#[test]
+fn search_starts_the_text_search_before_the_model_finishes_loading_and_returns_hybrid_results() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = db_dir.path().join("recall.db");
+    seed_healthy_index(&open_or_create_db(&db_path).unwrap());
+    let (keyword_search_started, keyword_search_start) = mpsc::channel();
+
+    let out = run_search_observing_keyword_search(
+        search_command("healthy chunk"),
+        &Some(db_path),
+        move || match keyword_search_start.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => Ok(Arc::new(embedder::MockEmbedder::new()) as Arc<dyn Embed>),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {
+                Err(DegradedReason::ProbeFailed)
+            }
+        },
+        move || {
+            let _ = keyword_search_started.send(());
+        },
+    )
+    .unwrap();
+
+    assert_eq!(out.markdown, HEALTHY_CHUNK_HYBRID_MARKDOWN);
+    assert_eq!(printed_envelope(&out), healthy_chunk_hybrid_envelope());
+}
+
+#[test]
+fn search_whose_model_fails_to_load_and_whose_query_has_no_searchable_term_returns_no_results_with_an_unavailable_note()
+ {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = index_with_one_message(db_dir.path(), "authentication flow");
+
+    let out = run_search_with(search_command("   "), &Some(db_path), || {
+        Err(DegradedReason::ProbeFailed)
+    })
+    .unwrap();
+
+    assert_eq!(out.markdown, "No matching sessions found.");
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "results": [] },
+            "degraded": true,
+            "notes": ["semantic search unavailable: embedding model unavailable; results from text search only"],
+        })
+    );
+}
+
+#[test]
+#[should_panic(expected = "model load panicked while the text search ran")]
+fn search_whose_model_load_panics_passes_the_original_panic_message_to_the_caller() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = index_with_one_message(db_dir.path(), "authentication flow");
+
+    let _ = run_search_with(search_command("authentication"), &Some(db_path), || {
+        panic!("model load panicked while the text search ran")
+    });
+}
+
+#[test]
+fn search_on_an_index_without_chunk_embeddings_returns_text_matches_without_embedding_the_query() {
+    let db_dir = tempfile::TempDir::new().unwrap();
+    let db_path = index_with_one_message(db_dir.path(), "authentication flow");
+
+    let out = run_search_with(
+        search_command("authentication"),
+        &Some(db_path),
+        runtime_failing_loader,
+    )
+    .unwrap();
+
+    assert_eq!(out.markdown, AUTHENTICATION_FLOW_MATCH_MARKDOWN);
+    assert_eq!(
+        printed_envelope(&out),
+        serde_json::json!({
+            "data": { "results": authentication_flow_match_results() },
+            "degraded": false,
+            "notes": [],
+        })
+    );
 }

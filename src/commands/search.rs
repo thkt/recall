@@ -1,7 +1,8 @@
-use std::env;
 use std::fmt::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread::{self, ScopedJoinHandle};
+use std::{env, panic};
 
 use anyhow::Result;
 use clap::Args;
@@ -148,13 +149,33 @@ pub(crate) fn run_search_in(
     })
 }
 
+type EmbedderLoad = Result<Arc<dyn Embed>, DegradedReason>;
+
+fn join_embedder_load(handle: ScopedJoinHandle<'_, EmbedderLoad>) -> EmbedderLoad {
+    handle
+        .join()
+        .unwrap_or_else(|payload| panic::resume_unwind(payload))
+}
+
 pub(crate) fn run_search_with<F>(
     args: SearchArgs,
     db_path: &Option<PathBuf>,
     load_embedder: F,
 ) -> Result<CommandOutput>
 where
-    F: FnOnce() -> Result<Arc<dyn Embed>, DegradedReason>,
+    F: FnOnce() -> EmbedderLoad + Send,
+{
+    run_search_observing_keyword_search(args, db_path, load_embedder, || {})
+}
+
+fn run_search_observing_keyword_search<F>(
+    args: SearchArgs,
+    db_path: &Option<PathBuf>,
+    load_embedder: F,
+    before_keyword_search: impl FnOnce(),
+) -> Result<CommandOutput>
+where
+    F: FnOnce() -> EmbedderLoad + Send,
 {
     let SearchArgs {
         query,
@@ -196,15 +217,7 @@ where
     } else {
         None
     };
-    let (mut degraded, mut notes, embedder) = if let Some(note) = identity_note {
-        (true, vec![note], None)
-    } else if query.is_some() {
-        let embedder = load_embedder();
-        let (degraded, notes) = search_degraded_state(&embedder);
-        (degraded, notes, embedder.ok())
-    } else {
-        (false, Vec::new(), None)
-    };
+    let loads_model = identity_note.is_none() && query.is_some();
 
     let options = search::SearchOptions {
         project,
@@ -216,8 +229,32 @@ where
         include_automated,
         now_ms: None,
     };
-    let outcome =
-        search::search_with_embedder(conn, query.as_deref(), &options, embedder.as_deref())?;
+    let (load, outcome) = thread::scope(|scope| {
+        let mut loading = loads_model.then(|| scope.spawn(load_embedder));
+        let mut awaited = None;
+        let outcome = {
+            let (loading, awaited) = (&mut loading, &mut awaited);
+            search::search_awaiting_embedder(
+                conn,
+                query.as_deref(),
+                &options,
+                move || {
+                    let load = awaited.insert(join_embedder_load(loading.take()?));
+                    let embedder: &dyn Embed = load.as_deref().ok()?;
+                    Some(embedder)
+                },
+                before_keyword_search,
+            )
+        };
+        (awaited.or_else(|| loading.map(join_embedder_load)), outcome)
+    });
+
+    let (mut degraded, mut notes) = match (identity_note, &load) {
+        (Some(note), _) => (true, vec![note]),
+        (None, Some(load)) => search_degraded_state(load),
+        (None, None) => (false, Vec::new()),
+    };
+    let outcome = outcome?;
     let results = outcome.results;
 
     if outcome.vec_degraded {
