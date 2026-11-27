@@ -314,9 +314,9 @@ fn self_check(model: &dyn Embed) -> Result<()> {
 }
 
 pub(crate) struct LoadSteps<'a> {
-    pub(crate) probe: &'a dyn Fn(&Path) -> Result<bool>,
-    pub(crate) gpu_available: &'a dyn Fn() -> Result<bool>,
-    pub(crate) load: &'a dyn Fn(&Path) -> Result<Arc<dyn Embed>>,
+    pub(crate) probe: &'a (dyn Fn(&Path) -> Result<bool> + Sync),
+    pub(crate) gpu_available: &'a (dyn Fn() -> Result<bool> + Sync),
+    pub(crate) load: &'a (dyn Fn(&Path) -> Result<Arc<dyn Embed>> + Sync),
 }
 
 fn load_verified(root: &Path) -> Result<Arc<dyn Embed>> {
@@ -329,11 +329,12 @@ const HOST_STEPS: LoadSteps<'static> = LoadSteps {
     load: &load_verified,
 };
 
-type ResolveArtifacts<'a> = &'a dyn Fn(ArtifactCheck) -> Result<ResolvedArtifacts, DegradedReason>;
+type ResolveArtifacts<'a> =
+    &'a (dyn Fn(ArtifactCheck) -> Result<ResolvedArtifacts, DegradedReason> + Sync);
 
 pub(crate) struct ModelHost<'a> {
     pub(crate) resolve_when_needed: ResolveArtifacts<'a>,
-    pub(crate) probe_records: &'a dyn Fn() -> Option<ProbeRecords>,
+    pub(crate) probe_records: &'a (dyn Fn() -> Option<ProbeRecords> + Sync),
     pub(crate) steps: &'a LoadSteps<'a>,
 }
 

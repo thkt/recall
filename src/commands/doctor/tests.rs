@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::fs;
 use std::sync::Arc;
 
@@ -7,7 +6,7 @@ use crate::commands::search::run_search_in;
 use crate::embedder;
 use crate::embedding::{ChunkedEmbedding, EmbedError, EmbedOptions};
 use crate::envelope::render_text_notes;
-use crate::model::tests::{CachedArtifacts, FakeHost};
+use crate::model::tests::{CachedArtifacts, FakeHost, SharedCell};
 use crate::test_support::{bare_empty_db, printed_envelope, search_command, seed_healthy_index};
 
 use super::*;
@@ -553,7 +552,7 @@ fn doctor_fix_recovers_unloadable_model_flipping_healthy() {
     seed_healthy_index(&conn);
     drop(conn);
     let host = FakeHost {
-        artifacts: Cell::new(CachedArtifacts::Corrupt),
+        artifacts: SharedCell::new(CachedArtifacts::Corrupt),
         ..FakeHost::healthy()
     };
 

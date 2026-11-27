@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{panic, thread};
 
 use crate::embedding::Embed;
 use crate::fts_query::{SanitizeError, prepare_match_query, prepare_operator_query};
@@ -736,11 +735,22 @@ pub fn search(conn: &Connection, query: &str, opts: &SearchOptions) -> Result<Ve
     Ok(search_with_embedder(conn, query, opts, None)?.results)
 }
 
+#[cfg(test)]
 pub fn search_with_embedder<'q>(
     conn: &Connection,
     query: impl Into<Option<&'q str>>,
     opts: &SearchOptions,
     embedder: Option<&dyn Embed>,
+) -> Result<SearchOutcome> {
+    search_awaiting_embedder(conn, query.into(), opts, || embedder, || {})
+}
+
+pub fn search_awaiting_embedder<'e>(
+    conn: &Connection,
+    query: Option<&str>,
+    opts: &SearchOptions,
+    await_embedder: impl FnOnce() -> Option<&'e dyn Embed>,
+    before_keyword_search: impl FnOnce(),
 ) -> Result<SearchOutcome> {
     if opts.limit == 0 {
         return Ok(SearchOutcome::nominal(Vec::new()));
@@ -758,48 +768,37 @@ pub fn search_with_embedder<'q>(
 
     let now_ms = resolve_now_ms(opts)?;
 
-    let Some(query) = query.into() else {
+    let Some(query) = query else {
         return file_list_outcome(conn, opts, now_ms);
     };
     let Some(keyword) = keyword_query(conn, query)? else {
         return Ok(SearchOutcome::nominal(Vec::new()));
     };
     let fts_query = keyword.fts.as_deref();
-    let message_sessions = MessageSessions::load(conn)?;
-    let hybrid_embedder = match embedder {
+    let (message_sessions, found) = model::timed("keyword search", || -> Result<_> {
+        let message_sessions = MessageSessions::load(conn)?;
+        before_keyword_search();
+        let found = match fts_query {
+            Some(q) => find_keyword_sessions(conn, &message_sessions, opts, q, now_ms)?,
+            None => KeywordSessions::default(),
+        };
+        Ok((message_sessions, found))
+    })?;
+
+    let hybrid_embedder = match await_embedder() {
         Some(embedder) => has_vec_data(conn).map(|has_data| has_data.then_some(embedder)),
         None => Ok(None),
     };
-    let embed_text = keyword.embed_text.as_deref().unwrap_or(query);
-
-    let (found, embedding) = thread::scope(|scope| {
-        let embedding = match &hybrid_embedder {
-            Ok(Some(embedder)) => Some(scope.spawn(move || {
-                model::timed("query embedding", || embedder.embed_query(embed_text))
-            })),
-            _ => None,
-        };
-        let found = match fts_query {
-            Some(q) => find_keyword_sessions(conn, &message_sessions, opts, q, now_ms),
-            None => Ok(KeywordSessions::default()),
-        };
-        let embedding = embedding.map(|handle| {
-            handle
-                .join()
-                .unwrap_or_else(|payload| panic::resume_unwind(payload))
-        });
-        (found, embedding)
-    });
-    let found = found?;
-
-    if let Err(e) = &hybrid_embedder {
-        warn!(error = %e, "vec_chunks probe failed, using text search only");
-        return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
-    }
-
-    let Some(embedding) = embedding else {
-        return keyword_only_outcome(conn, fts_query, found, opts, now_ms, false);
+    let embedder = match hybrid_embedder {
+        Ok(Some(embedder)) => embedder,
+        Ok(None) => return keyword_only_outcome(conn, fts_query, found, opts, now_ms, false),
+        Err(e) => {
+            warn!(error = %e, "vec_chunks probe failed, using text search only");
+            return keyword_only_outcome(conn, fts_query, found, opts, now_ms, true);
+        }
     };
+    let embed_text = keyword.embed_text.as_deref().unwrap_or(query);
+    let embedding = model::timed("query embedding", || embedder.embed_query(embed_text));
 
     let incomplete = found.unreadable_rows;
 

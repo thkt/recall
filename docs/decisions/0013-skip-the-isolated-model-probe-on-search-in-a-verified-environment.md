@@ -86,6 +86,7 @@ Degraded reasons and notes on the skip path stay those of [DR 0001](0001-freeze-
 
 - Issue: [#379](https://github.com/thkt/recall/issues/379), including the measurements and the Agreement section quoted above
 - Related: #352 (probe timeout on a virtual GPU), #377 and #378 (earlier search time reductions)
+- Since [#535](https://github.com/thkt/recall/issues/535), `recall search` prepares the model on a separate thread while the main thread runs the FTS search, so the FTS search runs inside the crash detection window. A process crash on the SQLite side during that window leaves the skipped load's marker unlocked, and the next search records it as a model crash and stops skipping in that environment. thkt accepted this risk on 2026-11-27. This parallel load is not the rejected "parallel load" option above, which loaded the model in the parent while the probe child ran
 
 ### Reassessment Triggers
 

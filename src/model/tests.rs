@@ -2,7 +2,7 @@
 use super::*;
 use crate::embedder::MockEmbedder;
 use crate::error::classify_exit_code;
-use std::cell::Cell;
+use std::sync::{Mutex, PoisonError};
 #[test]
 fn checksum_format_and_the_persisted_identity_of_the_spec_fields_in_their_order_survive_digest_updates()
  {
@@ -303,30 +303,46 @@ pub(crate) enum CachedArtifacts {
     Corrupt,
 }
 
+pub(crate) struct SharedCell<T>(Mutex<T>);
+
+impl<T: Copy> SharedCell<T> {
+    pub(crate) fn new(value: T) -> Self {
+        Self(Mutex::new(value))
+    }
+
+    pub(crate) fn get(&self) -> T {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn set(&self, value: T) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = value;
+    }
+}
+
 pub(crate) struct FakeHost {
-    pub(crate) artifacts: Cell<CachedArtifacts>,
+    pub(crate) artifacts: SharedCell<CachedArtifacts>,
     pub(crate) probe_result: fn() -> Result<bool>,
     pub(crate) gpu: fn() -> Result<bool>,
     pub(crate) model: fn() -> Result<Arc<dyn Embed>>,
-    pub(crate) probes: Cell<usize>,
-    pub(crate) loads: Cell<usize>,
+    pub(crate) probes: SharedCell<usize>,
+    pub(crate) loads: SharedCell<usize>,
 }
 
 impl FakeHost {
     pub(crate) fn healthy() -> Self {
         Self {
-            artifacts: Cell::new(CachedArtifacts::Verified),
+            artifacts: SharedCell::new(CachedArtifacts::Verified),
             probe_result: || Ok(true),
             gpu: || Ok(true),
             model: || Ok(Arc::new(MockEmbedder::new())),
-            probes: Cell::new(0),
-            loads: Cell::new(0),
+            probes: SharedCell::new(0),
+            loads: SharedCell::new(0),
         }
     }
 
     pub(crate) fn not_installed() -> Self {
         Self {
-            artifacts: Cell::new(CachedArtifacts::NotInstalled),
+            artifacts: SharedCell::new(CachedArtifacts::NotInstalled),
             ..Self::healthy()
         }
     }
