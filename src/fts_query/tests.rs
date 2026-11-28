@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::db::setup_test_db;
 
@@ -483,5 +485,176 @@ fn the_sanitizer_the_expansion_and_the_operator_query_all_end_an_unclosed_phrase
     assert_eq!(
         operator("alpha AND \"beta gamma").match_query.as_deref(),
         Some("(\"alpha\" AND \"beta gamma\")")
+    );
+}
+
+fn fixed(term: &str) -> MatchSegment {
+    MatchSegment::Fixed(term.to_owned())
+}
+
+fn alternatives(terms: &[&str]) -> MatchSegment {
+    MatchSegment::Alternatives(terms.iter().map(|t| (*t).to_owned()).collect())
+}
+
+fn numbered_terms(prefix: &str, count: usize) -> MatchSegment {
+    MatchSegment::Alternatives((0..count).map(|i| format!("{prefix}{i:02}")).collect())
+}
+
+#[test]
+fn the_match_string_writes_each_fixed_word_once_and_each_candidate_group_as_one_or_group_in_query_order()
+ {
+    let query = MatchFtsQuery(vec![
+        fixed("GitHub"),
+        alternatives(&["設定を", "設定の"]),
+        fixed("ab"),
+        alternatives(&["テスト"]),
+        alternatives(&["xy", "z"]),
+        alternatives(&["abc", "abd", "ab"]),
+        fixed("Actions"),
+    ]);
+
+    assert_eq!(
+        query.to_trigram_match().as_deref(),
+        Some(
+            r#""GitHub" AND ("設定を" OR "設定の") AND "テスト" AND ("abc" OR "abd") AND "Actions""#
+        )
+    );
+}
+
+#[test]
+fn the_match_string_keeps_candidate_groups_at_100_combinations_and_drops_them_at_101() {
+    let at_cap = MatchFtsQuery(vec![
+        fixed("Rust"),
+        numbered_terms("設定", 10),
+        numbered_terms("テス", 10),
+    ]);
+    let over_cap = MatchFtsQuery(vec![
+        fixed("Rust"),
+        numbered_terms("設定", 101),
+        alternatives(&["xy"]),
+    ]);
+
+    let at_cap_match = at_cap.to_trigram_match().unwrap();
+    assert!(
+        at_cap_match.starts_with(r#""Rust" AND ("設定00" OR "#),
+        "{at_cap_match}"
+    );
+    assert_eq!(at_cap_match.matches(" OR ").count(), 9 + 9);
+    assert_eq!(over_cap.to_trigram_match().as_deref(), Some(r#""Rust""#));
+}
+
+#[test]
+fn the_match_string_is_absent_when_no_word_of_three_or_more_characters_remains() {
+    let query = MatchFtsQuery(vec![fixed("ab"), alternatives(&["xy", "z"])]);
+
+    assert_eq!(query.to_trigram_match(), None);
+}
+
+fn clause_product_match(query: &MatchFtsQuery) -> String {
+    let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
+    for segment in &query.0 {
+        match segment {
+            MatchSegment::Fixed(term) => {
+                for clause in &mut clauses {
+                    clause.push(fts_quote(term));
+                }
+            }
+            MatchSegment::Alternatives(terms) => {
+                clauses = clauses
+                    .into_iter()
+                    .flat_map(|clause| {
+                        terms.iter().map(move |term| {
+                            let mut expanded = clause.clone();
+                            expanded.push(fts_quote(term));
+                            expanded
+                        })
+                    })
+                    .collect();
+            }
+        }
+    }
+    clauses
+        .into_iter()
+        .map(|terms| format!("({})", terms.join(" AND ")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+fn matched_session_ids(conn: &Connection, fts_query: &str) -> BTreeSet<String> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT session_id FROM messages WHERE messages MATCH ?1")
+        .unwrap();
+    stmt.query_map([fts_query], |row| row.get(0))
+        .and_then(|rows| rows.collect())
+        .unwrap_or_else(|e| panic!("MATCH rejected {fts_query:?}: {e}"))
+}
+
+#[test]
+fn the_factored_match_string_finds_the_same_sessions_as_the_product_of_its_clauses() {
+    let (_dir, conn) = setup_test_db();
+    for (session_id, text) in [
+        ("both-a", "Rust 設定を テストした"),
+        ("both-b", "Rust 設定の テスターを呼んだ"),
+        ("no-test", "Rust 設定を変えた"),
+        ("no-rust", "設定の テストをした"),
+        ("other", "Python 設定を テストした"),
+    ] {
+        conn.execute(
+            "INSERT INTO messages (session_id, role, text) VALUES (?1, 'user', ?2)",
+            [session_id, text],
+        )
+        .unwrap();
+    }
+    let query = prepare_match_query(&conn, "Rust 設定 テス").unwrap();
+    let product = clause_product_match(&query);
+    let factored = query.to_trigram_match().unwrap();
+    assert!(
+        product.matches(" OR ").count() > factored.matches(" OR ").count(),
+        "product: {product}, factored: {factored}"
+    );
+
+    let from_product = matched_session_ids(&conn, &product);
+    let from_factored = matched_session_ids(&conn, &factored);
+
+    assert_eq!(from_factored, from_product);
+    assert_eq!(
+        from_factored.into_iter().collect::<Vec<_>>(),
+        ["both-a", "both-b"]
+    );
+}
+
+#[test]
+fn a_short_hiragana_word_is_dropped_when_the_query_has_a_word_of_three_or_more_characters() {
+    let (_dir, conn) = index_with_messages(&["のりもの", "ワークフロー"]);
+
+    assert_eq!(expand_in(&conn, "の ワークフロー"), r#""ワークフロー""#);
+    assert_eq!(expand_in(&conn, "ワークフロー の"), r#""ワークフロー""#);
+    assert_eq!(expand_in(&conn, "の and"), r#""and""#);
+}
+
+#[test]
+fn a_short_hiragana_word_is_expanded_when_the_query_has_no_word_of_three_or_more_characters() {
+    let (_dir, conn) = index_with_messages(&["のりもの"]);
+
+    assert_eq!(expand_in(&conn, "の"), r#"("のりも")"#);
+}
+
+#[test]
+fn a_quoted_short_hiragana_phrase_is_kept_beside_a_long_word() {
+    let (_dir, conn) = index_with_messages(&["のりもの"]);
+
+    assert_eq!(
+        expand_in(&conn, "\"の\" ワークフロー"),
+        r#""の" AND "ワークフロー""#
+    );
+}
+
+#[test]
+fn a_short_word_that_is_not_all_hiragana_is_expanded_beside_a_long_word() {
+    let (_dir, conn) = index_with_messages(&["のーと", "設定を", "テスト", "abc"]);
+
+    assert_eq!(
+        expand_in(&conn, "のー 設定 テス ab ワークフロー"),
+        r#"("のーと") AND ("設定を") AND ("テスト") AND ("abc") AND "ワークフロー""#
     );
 }

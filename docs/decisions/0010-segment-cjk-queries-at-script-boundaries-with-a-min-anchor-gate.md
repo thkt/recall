@@ -64,6 +64,8 @@ Eight tests in src/search/tests.rs cover the rule, the gate and the cap, each th
 
 ## More Information
 
+[DR 0025](0025-factor-out-vocabulary-candidates-and-drop-short-hiragana-words.md) drops a short hiragana word beside a word of three or more characters, writes candidate groups outside the fixed terms, and moves the cap test to `Rust 校正 設定`.
+
 ### Reassessment Triggers
 
 - `MAX_TRIGRAM_COMBINATIONS` in src/fts_query.rs changes (raised, lowered, or removed): the ≥3-char anchor gate's framing of "a fixed term survives the cap" no longer holds and must be re-derived against the new value
