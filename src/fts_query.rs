@@ -131,51 +131,22 @@ impl MatchFtsQuery {
             });
         let overflow = combinations_counting_short_terms > MAX_TRIGRAM_COMBINATIONS;
         let long_enough = |term: &&String| term.chars().count() >= MIN_TRIGRAM_TERM_CHARS;
-        let mut clauses: Vec<Vec<String>> = vec![Vec::new()];
+        let mut parts: Vec<String> = Vec::new();
         for segment in &self.0 {
             match segment {
-                MatchSegment::Fixed(term) if long_enough(&term) => {
-                    let term = fts_quote(term);
-                    for clause in &mut clauses {
-                        clause.push(term.clone());
-                    }
-                }
+                MatchSegment::Fixed(term) if long_enough(&term) => parts.push(fts_quote(term)),
                 MatchSegment::Alternatives(terms) if !overflow => {
-                    let terms: Vec<_> = terms
+                    let terms = terms
                         .iter()
                         .filter(long_enough)
                         .map(|t| fts_quote(t))
                         .collect();
-                    if terms.is_empty() {
-                        continue;
-                    }
-                    clauses = clauses
-                        .into_iter()
-                        .flat_map(|clause| {
-                            terms.iter().map(move |term| {
-                                let mut expanded = clause.clone();
-                                expanded.push(term.clone());
-                                expanded
-                            })
-                        })
-                        .collect();
+                    parts.extend(join_group(terms, " OR "));
                 }
                 _ => {}
             }
         }
-        if clauses[0].is_empty() {
-            return None;
-        }
-        if clauses.len() == 1 {
-            return Some(clauses.remove(0).join(" AND "));
-        }
-        Some(
-            clauses
-                .into_iter()
-                .map(|terms| format!("({})", terms.join(" AND ")))
-                .collect::<Vec<_>>()
-                .join(" OR "),
-        )
+        (!parts.is_empty()).then(|| parts.join(" AND "))
     }
 }
 
@@ -625,9 +596,15 @@ pub(crate) fn fts_expand_short_terms(
         .prepare_cached(VOCAB_LOOKUP_SQL)
         .map_err(|e| SanitizeError::VocabLookupFailed(e.to_string()))?;
 
+    let pieces: Vec<Piece<'_>> = scan_tokens(query.as_str(), |_| false)
+        .into_iter()
+        .flatten()
+        .collect();
+    let has_trigram_anchor = pieces.iter().any(|piece| match piece {
+        Piece::Word(text) | Piece::Phrase(text) => text.chars().count() >= MIN_TRIGRAM_TERM_CHARS,
+    });
     let mut parts = Vec::new();
-    let pieces = scan_tokens(query.as_str(), |_| false);
-    for piece in pieces.into_iter().flatten() {
+    for piece in pieces {
         let token = match piece {
             Piece::Phrase("") => continue,
             Piece::Phrase(text) => {
@@ -638,6 +615,13 @@ pub(crate) fn fts_expand_short_terms(
         };
         if token.chars().count() >= MIN_TRIGRAM_TERM_CHARS || is_fts5_operator(token) {
             parts.push(MatchSegment::Fixed(token.to_owned()));
+            continue;
+        }
+        if has_trigram_anchor
+            && token
+                .chars()
+                .all(|c| classify_script(c) == Script::Hiragana)
+        {
             continue;
         }
         parts.push(match expand_token_via_vocab(&mut stmt, token)? {

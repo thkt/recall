@@ -30,6 +30,7 @@ This directory contains important decisions about the project.
 | [0022](0022-refuse-indexes-built-before-v0140.md) | Refuse Indexes Built Before v0.14.0 | accepted | 2026-11-23 |
 | [0023](0023-resolve-search-matches-to-sessions-by-stored-message-rowid-range.md) | Resolve Search Matches to Sessions by Stored Message Rowid Range | accepted | 2026-11-25 |
 | [0024](0024-store-chunk-embeddings-as-int8-at-a-scale-of-300.md) | Store Chunk Embeddings as int8 at a Scale of 300 | accepted | 2026-11-28 |
+| [0025](0025-factor-out-vocabulary-candidates-and-drop-short-hiragana-words.md) | Factor Out Vocabulary Candidates and Drop Short Hiragana Words | accepted | 2026-11-28 |
 
 ## By Status
 
@@ -58,6 +59,7 @@ This directory contains important decisions about the project.
 - **0022**: Refuse Indexes Built Before v0.14.0
 - **0023**: Resolve Search Matches to Sessions by Stored Message Rowid Range
 - **0024**: Store Chunk Embeddings as int8 at a Scale of 300
+- **0025**: Factor Out Vocabulary Candidates and Drop Short Hiragana Words
 
 ### Superseded
 

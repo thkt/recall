@@ -1319,21 +1319,15 @@ fn a_no_space_query_across_scripts_finds_the_same_session_as_the_spaced_query() 
     assert_eq!(ids(&spaced), ["s1"]);
 }
 
-fn seed_fifteen_words_starting_with_kousei_and_suru(conn: &Connection) {
-    insert_session(conn, "kousei", "claude", "/proj", NOW_MS);
-    insert_message(
-        conn,
-        "kousei",
-        "user",
-        "校正案 校正版 校正中 校正後 校正前 校正用 校正例 校正集 校正表 校正記 校正号 校正点 校正字 校正形 校正面",
-    );
-    insert_session(conn, "suru", "claude", "/proj", NOW_MS);
-    insert_message(
-        conn,
-        "suru",
-        "user",
-        "する案 する版 する中 する後 する前 する用 する例 する集 する表 する記 する号 する点 する字 する形 する面",
-    );
+fn seed_fifteen_words_starting_with(conn: &Connection, session_id: &str, prefix: &str) {
+    insert_session(conn, session_id, "claude", "/proj", NOW_MS);
+    let words: Vec<String> = [
+        "案", "版", "中", "後", "前", "用", "例", "集", "表", "記", "号", "点", "字", "形", "面",
+    ]
+    .iter()
+    .map(|tail| format!("{prefix}{tail}"))
+    .collect();
+    insert_message(conn, session_id, "user", &words.join(" "));
 }
 
 #[test]
@@ -1341,7 +1335,8 @@ fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
     insert_message(&conn, "s1", "user", "これを校正する手順をまとめた");
-    seed_fifteen_words_starting_with_kousei_and_suru(&conn);
+    seed_fifteen_words_starting_with(&conn, "kousei", "校正");
+    seed_fifteen_words_starting_with(&conn, "suru", "する");
     let trigrams_per_prefix_with_s1 = 15 + 1;
     let split_query_combinations = trigrams_per_prefix_with_s1 * trigrams_per_prefix_with_s1;
 
@@ -1358,22 +1353,50 @@ fn a_short_kanji_and_hiragana_query_finds_the_session_when_many_words_start_with
 fn a_query_whose_short_parts_match_too_many_words_is_searched_by_its_long_part_alone() {
     let (_dir, conn) = setup_test_db();
     insert_session(&conn, "both", "claude", "/proj", NOW_MS);
-    insert_message(&conn, "both", "user", "Rustで校正する手順");
+    insert_message(&conn, "both", "user", "Rustで校正と設定の手順");
     insert_session(&conn, "rust-only", "claude", "/proj", NOW_MS);
-    insert_message(&conn, "rust-only", "user", "Rustの設定をまとめた");
-    seed_fifteen_words_starting_with_kousei_and_suru(&conn);
+    insert_message(&conn, "rust-only", "user", "Rustのメモをまとめた");
+    seed_fifteen_words_starting_with(&conn, "kousei", "校正");
+    seed_fifteen_words_starting_with(&conn, "settei", "設定");
     let trigrams_per_prefix_with_both = 15 + 1;
     let split_query_combinations = trigrams_per_prefix_with_both * trigrams_per_prefix_with_both;
 
-    let results = search(&conn, "Rust校正する", &at_now()).unwrap();
+    let results = search(&conn, "Rust 校正 設定", &at_now()).unwrap();
 
     let mut matched = ids(&results);
     matched.sort_unstable();
     assert_eq!(
         matched,
         ["both", "rust-only"],
-        "Rust 校正 する expands to {split_query_combinations} combinations and overflows MAX_TRIGRAM_COMBINATIONS in src/fts_query.rs, so only Rust is searched"
+        "Rust 校正 設定 expands to {split_query_combinations} combinations and overflows MAX_TRIGRAM_COMBINATIONS in src/fts_query.rs, so only Rust is searched"
     );
+}
+
+#[test]
+fn a_query_with_a_long_word_finds_a_session_without_any_word_that_starts_with_its_short_hiragana_word()
+ {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "s1", "user", "GitHub ワークフロー を直した");
+    insert_session(&conn, "decoy", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "decoy", "user", "のりもの が好き");
+
+    let results = search(&conn, "GitHub のワークフロー", &at_now()).unwrap();
+
+    assert_eq!(ids(&results), ["s1"]);
+}
+
+#[test]
+fn a_query_with_a_long_word_narrows_by_the_words_that_start_with_its_short_kanji_word() {
+    let (_dir, conn) = setup_test_db();
+    insert_session(&conn, "with-setting", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "with-setting", "user", "GitHub の設定を変えた");
+    insert_session(&conn, "without-setting", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "without-setting", "user", "GitHub のメモを書いた");
+
+    let results = search(&conn, "GitHub 設定", &at_now()).unwrap();
+
+    assert_eq!(ids(&results), ["with-setting"]);
 }
 
 #[test]
