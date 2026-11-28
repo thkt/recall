@@ -856,8 +856,8 @@ fn model_present_rebuild_heals_orphan_vec_rows() {
         let conn = open_or_create_db(&db_path).unwrap();
         let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
         conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, 0)",
-            rusqlite::params![embedder::f32_as_bytes(&orphan), ORPHAN_ID],
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), ?2, 0)",
+            rusqlite::params![embedder::quantize_int8(&orphan), ORPHAN_ID],
         )
         .unwrap();
     }
@@ -913,8 +913,8 @@ fn model_absent_rebuild_heals_orphan_and_preserves_embeddings() {
         let conn = open_or_create_db(&db_path).unwrap();
         let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
         conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, 0)",
-            rusqlite::params![embedder::f32_as_bytes(&orphan), ORPHAN_ID],
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), ?2, 0)",
+            rusqlite::params![embedder::quantize_int8(&orphan), ORPHAN_ID],
         )
         .unwrap();
     }

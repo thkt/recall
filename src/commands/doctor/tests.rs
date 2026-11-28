@@ -41,8 +41,8 @@ fn doctor_flags_orphan_embedding_referencing_missing_chunk() {
     seed_healthy_index(&conn);
     let emb = embedder::MockEmbedder::deterministic_vector("orphan");
     conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-        rusqlite::params![embedder::f32_as_bytes(&emb)],
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), 999, 0)",
+        rusqlite::params![embedder::quantize_int8(&emb)],
     )
     .unwrap();
     drop(conn);
@@ -104,8 +104,8 @@ fn doctor_fix_repairs_orphan_and_rechecks_healthy() {
     seed_healthy_index(&conn);
     let orphan = embedder::MockEmbedder::deterministic_vector("orphan");
     conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 999, 0)",
-        rusqlite::params![embedder::f32_as_bytes(&orphan)],
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), 999, 0)",
+        rusqlite::params![embedder::quantize_int8(&orphan)],
     )
     .unwrap();
     drop(conn);

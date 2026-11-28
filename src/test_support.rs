@@ -25,8 +25,8 @@ pub(crate) fn seed_healthy_index(conn: &Connection) {
     db::seed_chunk(conn, 1, "healthy chunk");
     let emb = embedder::MockEmbedder::deterministic_vector("healthy chunk");
     conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0)",
-        rusqlite::params![embedder::f32_as_bytes(&emb)],
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), 1, 0)",
+        rusqlite::params![embedder::quantize_int8(&emb)],
     )
     .unwrap();
 }

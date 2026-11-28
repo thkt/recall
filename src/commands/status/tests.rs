@@ -16,8 +16,8 @@ fn status_counts_a_chunk_with_two_sub_embeddings_as_one_embedded_chunk() {
     db::seed_chunk(&conn, 1, "one chunk, two sub-embeddings");
     let embedding = embedder::MockEmbedder::deterministic_vector("one chunk, two sub-embeddings");
     conn.execute(
-        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 1, 0), (?1, 1, 1)",
-        [embedder::f32_as_bytes(&embedding)],
+        "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), 1, 0), (vec_int8(?1), 1, 1)",
+        [embedder::quantize_int8(&embedding)],
     )
     .unwrap();
     drop(conn);

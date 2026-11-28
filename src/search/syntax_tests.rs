@@ -367,8 +367,8 @@ fn add_embedded_chunk(conn: &Connection, chunk_id: i64, sid: &str, content: &str
     .unwrap();
     let embedding = MockEmbedder::deterministic_vector(content);
     conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-        rusqlite::params![chunk_id, f32_as_bytes(&embedding)],
+        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+        rusqlite::params![chunk_id, quantize_int8(&embedding)],
     )
     .unwrap();
 }
