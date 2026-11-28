@@ -54,7 +54,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Install nextest
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-nextest
 
@@ -105,7 +105,7 @@ jobs:
             llama-coverage-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ steps.vendor.outputs.hash }}-
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-llvm-cov
 
@@ -203,7 +203,7 @@ jobs:
           submodules: recursive
 
       - name: Install cargo-deny and cargo-audit
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: cargo-deny,cargo-audit
 
