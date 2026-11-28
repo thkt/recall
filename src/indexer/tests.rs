@@ -6,9 +6,7 @@ use crate::commands::classify::reclassify_sessions;
 use crate::db::{
     collect_strings, open_db, seed_chunk_vector, seed_session, seed_session_file, setup_test_db,
 };
-use crate::embedder::{
-    EmbedOptions, MockEmbedder, embed_pending_observed, embed_recent_chunks, f32_as_bytes,
-};
+use crate::embedder::{EmbedOptions, MockEmbedder, embed_pending_observed, embed_recent_chunks};
 use crate::index_observer::{recording, stable_lines};
 use crate::parser::LineDiagnostics;
 use crate::search::{SearchOptions, search};
@@ -2196,7 +2194,7 @@ fn seed_legacy_chunk(conn: &Connection, id: i64, content: &str) {
     )
     .unwrap();
     let embedding = MockEmbedder::deterministic_vector(content);
-    seed_chunk_vector(conn, id, 0, f32_as_bytes(&embedding));
+    seed_chunk_vector(conn, id, 0, &embedding);
 }
 
 #[test]
@@ -4286,8 +4284,12 @@ fn reconciliation_rollback_and_failed_inference_preserve_reusable_work_for_resum
             |r| r.get::<_, i64>(0),
         )
         .unwrap();
-    let bytes = f32_as_bytes(&MockEmbedder::deterministic_vector("stable\nanswer")).to_vec();
-    seed_chunk_vector(&conn, stable, 0, &bytes);
+    seed_chunk_vector(
+        &conn,
+        stable,
+        0,
+        &MockEmbedder::deterministic_vector("stable\nanswer"),
+    );
     let before = chunk_vectors_without_ids(&conn);
     write_reuse_conversation(
         &path,

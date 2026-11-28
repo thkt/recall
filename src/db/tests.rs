@@ -1,5 +1,5 @@
 use super::*;
-use crate::embedder::{f32_as_bytes, pending_count};
+use crate::embedder::{INT8_SCALE, f32_as_bytes, pending_count, quantize_int8};
 use tempfile::NamedTempFile;
 
 #[path = "../../tests/support/stale_snapshot_note.rs"]
@@ -1027,7 +1027,7 @@ fn upgrading_an_index_without_vector_ranges_stores_each_range_and_returns_gapped
     ] {
         seed_chunk(&conn, id, content);
     }
-    let emb = f32_as_bytes(&[0.1f32; EMBEDDING_DIMS]).to_vec();
+    let emb = quantize_int8(&[0.1f32; EMBEDDING_DIMS]);
     for (rowid, chunk_id, sub_idx) in [
         (1, 1, 0),
         (2, 1, 1),
@@ -1039,7 +1039,8 @@ fn upgrading_an_index_without_vector_ranges_stores_each_range_and_returns_gapped
         (8, 99, 1),
     ] {
         conn.execute(
-            "INSERT INTO vec_chunks (rowid, chunk_id, sub_idx, embedding) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO vec_chunks (rowid, chunk_id, sub_idx, embedding) \
+             VALUES (?1, ?2, ?3, vec_int8(?4))",
             rusqlite::params![rowid, chunk_id, sub_idx, emb],
         )
         .unwrap();
@@ -1084,15 +1085,21 @@ fn upgrading_an_index_without_vector_ranges_stores_each_range_and_returns_gapped
     );
 }
 
-fn nearest_chunk_ids(conn: &Connection, target: f32) -> Vec<i64> {
-    let mut query = vec![0.0f32; EMBEDDING_DIMS];
-    query[0] = target;
+fn distinct_vector_of(id: i64) -> Vec<f32> {
+    let mut vector = vec![0.0f32; EMBEDDING_DIMS];
+    vector[0] = (id % 128) as f32 / INT8_SCALE;
+    vector[1] = (id / 128 * 5) as f32 / INT8_SCALE;
+    vector
+}
+
+fn nearest_chunk_ids(conn: &Connection, id: i64) -> Vec<i64> {
     let mut stmt = conn
         .prepare(
-            "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH ?1 AND k = 20 ORDER BY distance",
+            "SELECT chunk_id FROM vec_chunks WHERE embedding MATCH vec_int8(?1) AND k = 20 \
+             ORDER BY distance",
         )
         .unwrap();
-    stmt.query_map([f32_as_bytes(&query)], |r| r.get(0))
+    stmt.query_map([quantize_int8(&distinct_vector_of(id))], |r| r.get(0))
         .unwrap()
         .map(Result::unwrap)
         .collect()
@@ -1105,9 +1112,7 @@ fn compacting_an_index_whose_middle_vector_block_was_removed_keeps_every_vector_
     let tx = conn.transaction().unwrap();
     for id in 1..=3072_i64 {
         seed_chunk(&tx, id, &format!("chunk {id}"));
-        let mut vector = vec![0.0f32; EMBEDDING_DIMS];
-        vector[0] = id as f32;
-        seed_chunk_vector(&tx, id, 0, f32_as_bytes(&vector));
+        seed_chunk_vector(&tx, id, 0, &distinct_vector_of(id));
     }
     tx.execute(
         "DELETE FROM vec_chunks WHERE chunk_id BETWEEN 1025 AND 2048",
@@ -1121,7 +1126,7 @@ fn compacting_an_index_whose_middle_vector_block_was_removed_keeps_every_vector_
         ["[1,3]"],
         "the fixture must leave a gap in the vector block rowids"
     );
-    let targets = [10.25, 1600.25, 3000.25];
+    let targets = [10, 2049, 3000];
     let before: Vec<Vec<i64>> = targets
         .iter()
         .map(|&t| nearest_chunk_ids(&conn, t))
@@ -1143,6 +1148,190 @@ fn compacting_an_index_whose_middle_vector_block_was_removed_keeps_every_vector_
         .map(|&t| nearest_chunk_ids(&conn, t))
         .collect();
     assert_eq!(after, before);
-    assert_eq!(after[2][0], 3000);
-    assert_eq!(after[1][0], 2049);
+    assert_eq!(after.iter().map(|ids| ids[0]).collect::<Vec<_>>(), targets);
+}
+
+fn vector_with(components: &[f32]) -> Vec<f32> {
+    let mut vector = vec![0.0f32; EMBEDDING_DIMS];
+    vector[..components.len()].copy_from_slice(components);
+    vector
+}
+
+fn leading_levels(conn: &Connection, rowid: i64, count: usize) -> Vec<i8> {
+    let bytes: Vec<u8> = conn
+        .query_row(
+            "SELECT embedding FROM vec_chunks WHERE rowid = ?1",
+            [rowid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(bytes.len(), EMBEDDING_DIMS);
+    bytes[..count].iter().map(|b| b.cast_signed()).collect()
+}
+
+#[test]
+fn the_bundled_sqlite_stores_int8_vectors_at_a_given_rowid_and_finds_them_by_nearest_distance() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+    seed_session(&conn, "s1");
+    seed_chunk(&conn, 1, "near");
+    seed_chunk(&conn, 2, "far");
+    for (rowid, chunk_id, vector) in [
+        (41, 1, vector_with(&[0.3, 0.1])),
+        (97, 2, vector_with(&[-0.3, -0.1])),
+    ] {
+        conn.execute(
+            "INSERT INTO vec_chunks (rowid, chunk_id, sub_idx, embedding) \
+             VALUES (?1, ?2, 0, vec_int8(?3))",
+            rusqlite::params![rowid, chunk_id, quantize_int8(&vector)],
+        )
+        .unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.id, v.rowid, v.distance FROM qa_chunks c \
+             JOIN ( \
+                 SELECT rowid, chunk_id, distance FROM vec_chunks \
+                 WHERE embedding MATCH vec_int8(?) \
+                 ORDER BY distance \
+                 LIMIT ? \
+             ) v ON c.id = v.chunk_id \
+             ORDER BY v.distance",
+        )
+        .unwrap();
+    let hits: Vec<(i64, i64, f64)> = stmt
+        .query_map(
+            rusqlite::params![quantize_int8(&vector_with(&[0.3, 0.1])), 10],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+
+    assert_eq!(
+        hits.iter()
+            .map(|&(id, rowid, _)| (id, rowid))
+            .collect::<Vec<_>>(),
+        [(1, 41), (2, 97)]
+    );
+    assert_eq!(hits[0].2, 0.0);
+}
+
+#[test]
+fn a_new_index_stores_embeddings_as_768_int8_components() {
+    let tmp = NamedTempFile::new().unwrap();
+    let conn = open_db(tmp.path()).unwrap();
+
+    let definition = table_def(&conn, "vec_chunks").unwrap().unwrap();
+
+    assert!(
+        definition.contains("embedding INT8[768]"),
+        "unexpected vec_chunks definition: {definition}"
+    );
+    assert_eq!(vector_storage(&conn).unwrap(), VectorStorage::Int8);
+}
+
+fn index_with_float32_vectors(path: &Path) {
+    let conn = open_db(path).unwrap();
+    seed_session(&conn, "s1");
+    for (id, content) in [(1, "two vectors"), (2, "one vector"), (3, "no sub index")] {
+        seed_chunk(&conn, id, content);
+    }
+    replace_with_float32_vectors(&conn);
+    for (rowid, chunk_id, sub_idx, components) in [
+        (5, 1, Some(0), vec![0.1, -0.2, 0.375, -0.375]),
+        (6, 1, Some(1), vec![0.5, -0.5, 0.0, 0.0001]),
+        (9, 2, Some(0), vec![-0.3877, 0.3877, 127.0 / 300.0, -0.001]),
+        (12, 3, None, vec![0.25, 0.0, 0.0, 0.0]),
+    ] {
+        conn.execute(
+            "INSERT INTO vec_chunks (rowid, chunk_id, sub_idx, embedding) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                rowid,
+                chunk_id,
+                sub_idx,
+                f32_as_bytes(&vector_with(&components))
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute_batch(
+        "UPDATE qa_chunks SET vec_rowid_lo = 5, vec_rowid_hi = 6 WHERE id = 1;
+         UPDATE qa_chunks SET vec_rowid_lo = 9, vec_rowid_hi = 9 WHERE id = 2;
+         UPDATE qa_chunks SET vec_rowid_lo = 12, vec_rowid_hi = 12 WHERE id = 3;",
+    )
+    .unwrap();
+    assert_eq!(vector_storage(&conn).unwrap(), VectorStorage::Float32);
+}
+
+const VECTOR_IDENTITIES: &str =
+    "SELECT json_array(rowid, chunk_id, sub_idx) FROM vec_chunks ORDER BY rowid";
+
+#[test]
+fn opening_an_index_with_float32_embeddings_for_writing_stores_each_one_as_int8_in_place() {
+    let tmp = NamedTempFile::new().unwrap();
+    index_with_float32_vectors(tmp.path());
+
+    let conn = open_db(tmp.path()).unwrap();
+
+    assert_eq!(vector_storage(&conn).unwrap(), VectorStorage::Int8);
+    assert_eq!(
+        collect_strings(&conn, VECTOR_IDENTITIES),
+        ["[5,1,0]", "[6,1,1]", "[9,2,0]", "[12,3,null]"]
+    );
+    assert_eq!(leading_levels(&conn, 5, 4), [30, -60, 113, -113]);
+    assert_eq!(leading_levels(&conn, 6, 4), [127, -127, 0, 0]);
+    assert_eq!(leading_levels(&conn, 9, 4), [-116, 116, 127, 0]);
+    assert_eq!(leading_levels(&conn, 12, 4), [75, 0, 0, 0]);
+    assert_eq!(
+        collect_strings(&conn, VECTOR_RANGES),
+        ["[1,5,6]", "[2,9,9]", "[3,12,12]"]
+    );
+}
+
+#[test]
+fn reopening_a_migrated_index_for_writing_runs_no_ddl_and_keeps_every_embedding_byte() {
+    let tmp = NamedTempFile::new().unwrap();
+    index_with_float32_vectors(tmp.path());
+    let migrated = open_db(tmp.path()).unwrap();
+    let (schema, vectors) = (
+        schema_snapshot(&migrated),
+        embeddings_with_null_sub_idx(&migrated),
+    );
+    drop(migrated);
+
+    let reopened = open_db(tmp.path()).unwrap();
+
+    assert_eq!(
+        (
+            schema_snapshot(&reopened),
+            embeddings_with_null_sub_idx(&reopened)
+        ),
+        (schema, vectors)
+    );
+}
+
+fn embeddings_with_null_sub_idx(conn: &Connection) -> Vec<(i64, i64, Option<i64>, Vec<u8>)> {
+    conn.prepare("SELECT rowid, chunk_id, sub_idx, embedding FROM vec_chunks ORDER BY rowid")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn the_recorded_rowid_range_of_a_chunk_deletes_its_migrated_embeddings() {
+    let tmp = NamedTempFile::new().unwrap();
+    index_with_float32_vectors(tmp.path());
+    let conn = open_db(tmp.path()).unwrap();
+    assert_eq!(collect_strings(&conn, VECTOR_IDENTITIES).len(), 4);
+
+    delete_recorded_vectors(&conn, "s1", RecordedVectors::OfSession).unwrap();
+
+    assert_eq!(
+        collect_strings(&conn, VECTOR_IDENTITIES),
+        Vec::<String>::new()
+    );
 }

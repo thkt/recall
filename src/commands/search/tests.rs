@@ -704,8 +704,8 @@ fn search_shows_a_vector_only_match_with_its_closest_chunk_and_a_chunk_inspect_l
         .unwrap();
         let embedding = embedder::MockEmbedder::deterministic_vector("authentication");
         conn.execute(
-            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, 7, 0)",
-            [embedder::f32_as_bytes(&embedding)],
+            "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), 7, 0)",
+            [embedder::quantize_int8(&embedding)],
         )
         .unwrap();
     }

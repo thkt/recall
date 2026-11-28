@@ -8,6 +8,7 @@ use std::process;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::embedder::quantize_int8;
 use crate::embedding::EMBEDDING_DIMS;
 use crate::error::RecallError;
 use crate::runtime::info;
@@ -313,19 +314,103 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
 
     create_generation_tracking(conn)?;
 
-    conn.execute_batch(&format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-            embedding FLOAT[{EMBEDDING_DIMS}],
-            +chunk_id INTEGER,
-            +sub_idx INTEGER
-        );"
-    ))?;
+    conn.execute_batch(&vec_chunks_table_sql())?;
 
     conn.execute_batch(MESSAGES_VOCAB_SQL)?;
 
     migrate_message_rowid_range_if_needed(conn)?;
     migrate_vector_rowid_range_if_needed(conn)?;
+    migrate_vectors_to_int8_if_needed(conn)?;
 
+    Ok(())
+}
+
+const INT8_VECTOR_COLUMN: &str = "embedding INT8[";
+
+fn vec_chunks_table_sql() -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+            {INT8_VECTOR_COLUMN}{EMBEDDING_DIMS}],
+            +chunk_id INTEGER,
+            +sub_idx INTEGER
+        );"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VectorStorage {
+    Float32,
+    Int8,
+}
+
+pub(crate) fn vector_storage(conn: &Connection) -> Result<VectorStorage> {
+    let definition = table_def(conn, "vec_chunks")?.unwrap_or_default();
+    Ok(if definition.contains(INT8_VECTOR_COLUMN) {
+        VectorStorage::Int8
+    } else {
+        VectorStorage::Float32
+    })
+}
+
+struct StoredVector {
+    rowid: i64,
+    chunk_id: i64,
+    sub_idx: Option<i64>,
+    embedding: Vec<u8>,
+}
+
+fn float32_components(bytes: &[u8]) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        bytes.len() == EMBEDDING_DIMS * size_of::<f32>(),
+        "a stored embedding holds {} bytes, not {EMBEDDING_DIMS} float32 values",
+        bytes.len()
+    );
+    let (components, _) = bytes.as_chunks::<4>();
+    Ok(components.iter().map(|b| f32::from_le_bytes(*b)).collect())
+}
+
+fn migrate_vectors_to_int8_if_needed(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if vector_storage(&tx)? == VectorStorage::Int8 {
+        tx.commit()?;
+        return Ok(());
+    }
+    info("recall: storing embeddings as int8 to shrink the vector table; this runs once");
+    let vectors: Vec<StoredVector> = {
+        let mut stmt = tx.prepare("SELECT rowid, chunk_id, sub_idx, embedding FROM vec_chunks")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Vec<u8>>(3)?))
+        })?;
+        let mut vectors = Vec::new();
+        for row in rows {
+            let (rowid, chunk_id, sub_idx, float32) = row?;
+            vectors.push(StoredVector {
+                rowid,
+                chunk_id,
+                sub_idx,
+                embedding: quantize_int8(&float32_components(&float32)?),
+            });
+        }
+        vectors
+    };
+    tx.execute_batch("DROP TABLE vec_chunks;")?;
+    tx.execute_batch(&vec_chunks_table_sql())?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO vec_chunks (rowid, chunk_id, sub_idx, embedding) \
+             VALUES (?1, ?2, ?3, vec_int8(?4))",
+        )?;
+        for v in &vectors {
+            insert.execute(rusqlite::params![
+                v.rowid,
+                v.chunk_id,
+                v.sub_idx,
+                v.embedding
+            ])?;
+        }
+    }
+    tx.commit()?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
     Ok(())
 }
 
@@ -574,10 +659,10 @@ pub(crate) fn seed_chunk(conn: &Connection, id: i64, content: &str) {
 }
 
 #[cfg(test)]
-pub(crate) fn seed_chunk_vector(conn: &Connection, chunk_id: i64, sub_idx: i64, embedding: &[u8]) {
+pub(crate) fn seed_chunk_vector(conn: &Connection, chunk_id: i64, sub_idx: i64, embedding: &[f32]) {
     conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (?1, ?2, ?3)",
-        rusqlite::params![chunk_id, sub_idx, embedding],
+        "INSERT INTO vec_chunks (chunk_id, sub_idx, embedding) VALUES (?1, ?2, vec_int8(?3))",
+        rusqlite::params![chunk_id, sub_idx, quantize_int8(embedding)],
     )
     .unwrap();
     conn.execute(
@@ -585,6 +670,19 @@ pub(crate) fn seed_chunk_vector(conn: &Connection, chunk_id: i64, sub_idx: i64, 
          WHERE id = ?2",
         rusqlite::params![conn.last_insert_rowid(), chunk_id],
     )
+    .unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn replace_with_float32_vectors(conn: &Connection) {
+    conn.execute_batch(&format!(
+        "DROP TABLE vec_chunks;
+         CREATE VIRTUAL TABLE vec_chunks USING vec0(
+             embedding FLOAT[{EMBEDDING_DIMS}],
+             +chunk_id INTEGER,
+             +sub_idx INTEGER
+         );"
+    ))
     .unwrap();
 }
 

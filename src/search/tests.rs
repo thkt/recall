@@ -3,7 +3,9 @@ use std::path::Path;
 
 use super::*;
 use crate::date::MS_PER_DAY;
-use crate::db::{seed_session_file, setup_test_db};
+use crate::db::{
+    open_db, open_db_readonly, replace_with_float32_vectors, seed_session_file, setup_test_db,
+};
 use crate::embedder::MockEmbedder;
 use crate::hybrid::RECENCY_BOOST_WEIGHT;
 use crate::indexer::{IndexOptions, index_chunks, index_from_dirs};
@@ -74,10 +76,9 @@ fn insert_null_session_id_message(conn: &Connection, text: &str) {
 
 fn embed_chunk(conn: &Connection, chunk_id: i64, text: &str) {
     let embedding = MockEmbedder::deterministic_vector(text);
-    let embedding_bytes: &[u8] = f32_as_bytes(&embedding);
     conn.execute(
-        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-        rusqlite::params![chunk_id, embedding_bytes],
+        "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, vec_int8(?2))",
+        rusqlite::params![chunk_id, quantize_int8(&embedding)],
     )
     .unwrap();
 }
@@ -2551,4 +2552,79 @@ fn excluded_automated_count_reports_a_broken_vocab_table_as_an_error() {
         ),
         "a vocab table without the cnt column must surface as a vocab lookup failure, got {err:?}"
     );
+}
+
+#[test]
+fn hybrid_search_on_an_int8_index_finds_a_vector_only_match_without_degrading() {
+    let (_dir, conn) = setup_test_db();
+    assert_eq!(vector_storage(&conn).unwrap(), VectorStorage::Int8);
+    insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "s1", "user", "authentication flow discussion");
+    insert_session(&conn, "s2", "claude", "/proj", NOW_MS);
+    insert_message(&conn, "s2", "user", "unrelated topic about weather");
+    insert_chunk(&conn, 1, "s2", "authentication");
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &at_now(),
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        found_by_session(&outcome.results),
+        [
+            ("s1", "**authentication** flow di...", None),
+            ("s2", "authentication", Some(1)),
+        ]
+    );
+    assert!(!outcome.vec_degraded);
+}
+
+#[test]
+fn hybrid_search_on_a_read_only_index_with_float32_embeddings_finds_a_vector_only_match() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("recall.db");
+    {
+        let conn = open_db(&path).unwrap();
+        insert_session(&conn, "s1", "claude", "/proj", NOW_MS);
+        insert_message(&conn, "s1", "user", "authentication flow discussion");
+        insert_session(&conn, "s2", "claude", "/proj", NOW_MS);
+        insert_message(&conn, "s2", "user", "unrelated topic about weather");
+        replace_with_float32_vectors(&conn);
+        conn.execute(
+            "INSERT INTO qa_chunks (id, session_id, content, timestamp) \
+             VALUES (1, 's2', 'authentication', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (1, ?1)",
+            [f32_as_bytes(&MockEmbedder::deterministic_vector(
+                "authentication",
+            ))],
+        )
+        .unwrap();
+    }
+    let (conn, _) = open_db_readonly(&path).unwrap();
+    assert_eq!(vector_storage(&conn).unwrap(), VectorStorage::Float32);
+
+    let outcome = search_with_embedder(
+        &conn,
+        "authentication",
+        &at_now(),
+        Some(&MockEmbedder::new()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        found_by_session(&outcome.results),
+        [
+            ("s1", "**authentication** flow di...", None),
+            ("s2", "authentication", Some(1)),
+        ]
+    );
+    assert!(!outcome.vec_degraded);
+    assert_eq!(vector_storage(&conn).unwrap(), VectorStorage::Float32);
 }

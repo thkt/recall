@@ -63,6 +63,18 @@ pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
     bytemuck::cast_slice(v)
 }
 
+pub(crate) const INT8_SCALE: f32 = 300.0;
+
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn quantize_int8(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .map(|x| {
+            let level = (x * INT8_SCALE).round().clamp(-127.0, 127.0) as i8;
+            level.cast_unsigned()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) fn embed_chunks(
     conn: &mut Connection,
@@ -230,7 +242,7 @@ impl BatchEmbedder<'_, '_> {
                 }
             }
             let mut insert = tx.prepare_cached(
-                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, ?3)",
+                "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (vec_int8(?1), ?2, ?3)",
             )?;
             let mut record = tx.prepare_cached(
                 "UPDATE qa_chunks SET vec_rowid_lo = ?1, vec_rowid_hi = ?2 WHERE id = ?3",
@@ -238,7 +250,11 @@ impl BatchEmbedder<'_, '_> {
             for (chunked, id, _) in &current {
                 let mut range: Option<(i64, i64)> = None;
                 for (sub_idx, sub_emb) in chunked.chunks().iter().enumerate() {
-                    insert.execute(rusqlite::params![f32_as_bytes(sub_emb), id, sub_idx as i64])?;
+                    insert.execute(rusqlite::params![
+                        quantize_int8(sub_emb),
+                        id,
+                        sub_idx as i64
+                    ])?;
                     let rowid = tx.last_insert_rowid();
                     range = Some(range.map_or((rowid, rowid), |(lo, _)| (lo, rowid)));
                 }

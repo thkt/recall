@@ -240,7 +240,7 @@ fn assert_vectors_match_current_content(conn: &Connection) {
         let (bytes, content, sub_idx) = row.unwrap();
         assert_eq!(
             bytes,
-            f32_as_bytes(&MockEmbedder::deterministic_vector(&content))
+            quantize_int8(&MockEmbedder::deterministic_vector(&content))
         );
         assert_eq!(sub_idx, 0);
     }
@@ -810,4 +810,78 @@ fn saving_a_changed_chunk_again_replaces_all_its_old_vectors_and_records_the_new
         ),
         ["[1,5,7]", "[2,3,4]"]
     );
+}
+
+#[test]
+fn int8_levels_round_half_away_from_zero_and_saturate_beyond_127_over_300() {
+    let levels: Vec<i8> = quantize_int8(&[
+        0.375,
+        -0.375,
+        127.0 / 300.0,
+        0.43,
+        -0.43,
+        1.0,
+        -1.0,
+        0.0,
+        f32::NAN,
+    ])
+    .into_iter()
+    .map(u8::cast_signed)
+    .collect();
+
+    assert_eq!(levels, [113, -113, 127, 127, -127, 127, -127, 0, 0]);
+}
+
+struct FixedEmbedder(Vec<f32>);
+
+impl Embed for FixedEmbedder {
+    fn embed_query(&self, _text: &str) -> Result<Vec<f32>, EmbedError> {
+        Ok(self.0.clone())
+    }
+    fn embed_document(&self, _text: &str) -> Result<ChunkedEmbedding, EmbedError> {
+        ChunkedEmbedding::try_new(vec![self.0.clone()])
+    }
+    fn embed_documents_batch(
+        &self,
+        texts: &[&str],
+        _options: &EmbedOptions,
+    ) -> Result<Vec<ChunkedEmbedding>, EmbedError> {
+        texts.iter().map(|t| self.embed_document(t)).collect()
+    }
+}
+
+#[test]
+fn indexing_stores_each_embedding_component_times_300_rounded_into_int8() {
+    let (_dir, mut conn) = setup_test_db();
+    seed_session(&conn, "s1");
+    seed_chunk(&conn, 1, "content 0");
+    let mut vector = vec![0.0f32; EMBEDDING_DIMS];
+    vector[..5].copy_from_slice(&[0.1, -0.2, 0.375, -0.5, 0.0001]);
+    let chunks = pending_chunks(&conn, usize::MAX).unwrap();
+
+    embed_chunks(
+        &mut conn,
+        &FixedEmbedder(vector),
+        &chunks,
+        None,
+        &EmbedOptions::default(),
+    )
+    .unwrap();
+
+    let stored: Vec<u8> = conn
+        .query_row(
+            "SELECT embedding FROM vec_chunks WHERE chunk_id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored.len(), EMBEDDING_DIMS);
+    assert_eq!(
+        stored[..5]
+            .iter()
+            .map(|b| b.cast_signed())
+            .collect::<Vec<_>>(),
+        [30, -60, 113, -127, 0]
+    );
+    assert!(stored[5..].iter().all(|&b| b == 0));
 }

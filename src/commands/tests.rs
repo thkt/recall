@@ -184,6 +184,7 @@ fn read_commands_use_a_v0_14_index_without_migrating_it() {
          ALTER TABLE qa_chunks DROP COLUMN vec_rowid_hi;",
     )
     .unwrap();
+    db::replace_with_float32_vectors(&conn);
     db::seed_session(&conn, "s1");
     let content = "synthetic legacy content";
     db::seed_chunk(&conn, 1, content);

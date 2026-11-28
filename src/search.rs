@@ -9,8 +9,8 @@ use rusqlite::OptionalExtension;
 use rusqlite::types::ToSql;
 use tracing::{debug, warn};
 
-use crate::db::table_def;
-use crate::embedder::f32_as_bytes;
+use crate::db::{VectorStorage, table_def, vector_storage};
+use crate::embedder::{f32_as_bytes, quantize_int8};
 use crate::error::RecallError;
 use crate::hybrid::{self, MAX_RECENCY_FACTOR, rrf_merge_sessions};
 use crate::model;
@@ -524,12 +524,16 @@ fn resolve_now_ms(opts: &SearchOptions) -> Result<i64> {
     }
 }
 
-fn has_vec_data(conn: &Connection) -> Result<bool> {
-    Ok(conn
+fn stored_vector_storage(conn: &Connection) -> Result<Option<VectorStorage>> {
+    let has_data = conn
         .query_row("SELECT 1 FROM vec_chunks LIMIT 1", [], |_| Ok(()))
         .optional()
         .context("Failed to probe vec_chunks for embeddings")?
-        .is_some())
+        .is_some();
+    if !has_data {
+        return Ok(None);
+    }
+    Ok(Some(vector_storage(conn)?))
 }
 
 struct VecHit {
@@ -540,19 +544,23 @@ struct VecHit {
 
 fn vec_search(
     conn: &Connection,
+    storage: VectorStorage,
     embedding: &[f32],
     opts: &SearchOptions,
     now_ms: i64,
 ) -> Result<Vec<VecHit>> {
-    let embedding_bytes: &[u8] = f32_as_bytes(embedding);
+    let (embedding_bytes, query_vector): (Vec<u8>, &str) = match storage {
+        VectorStorage::Float32 => (f32_as_bytes(embedding).to_vec(), "?"),
+        VectorStorage::Int8 => (quantize_int8(embedding), "vec_int8(?)"),
+    };
 
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT c.session_id, c.id, v.distance AS d, row_number() OVER ( \
          PARTITION BY c.session_id ORDER BY v.distance, c.id) AS n \
          FROM qa_chunks c \
          JOIN ( \
              SELECT chunk_id, distance FROM vec_chunks \
-             WHERE embedding MATCH ? \
+             WHERE embedding MATCH {query_vector} \
              ORDER BY distance \
              LIMIT ? \
          ) v ON c.id = v.chunk_id \
@@ -786,11 +794,13 @@ pub fn search_awaiting_embedder<'e>(
     })?;
 
     let hybrid_embedder = match await_embedder() {
-        Some(embedder) => has_vec_data(conn).map(|has_data| has_data.then_some(embedder)),
+        Some(embedder) => {
+            stored_vector_storage(conn).map(|storage| storage.map(|storage| (embedder, storage)))
+        }
         None => Ok(None),
     };
-    let embedder = match hybrid_embedder {
-        Ok(Some(embedder)) => embedder,
+    let (embedder, storage) = match hybrid_embedder {
+        Ok(Some(found)) => found,
         Ok(None) => return keyword_only_outcome(conn, fts_query, found, opts, now_ms, false),
         Err(e) => {
             warn!(error = %e, "vec_chunks probe failed, using text search only");
@@ -804,7 +814,7 @@ pub fn search_awaiting_embedder<'e>(
 
     let vec_hits = match embedding
         .map_err(anyhow::Error::from)
-        .and_then(|embedding| vec_search(conn, &embedding, opts, now_ms))
+        .and_then(|embedding| vec_search(conn, storage, &embedding, opts, now_ms))
     {
         Ok(hits) => hits,
         Err(e) => {
